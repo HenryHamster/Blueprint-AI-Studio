@@ -59,6 +59,7 @@ from app.routers.directions import (
     create_message,
     trigger_strategic_cycle,
 )
+from app.shared_state import get_project_integration_branch
 from app.task_capabilities import USER_LAUNCHABLE_TASK_TYPES, task_capability_contract
 
 
@@ -120,8 +121,29 @@ class OperatorTaskCreate(_StrictModel):
         max_length=255,
         pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$",
     )
+    base_branch: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$",
+    )
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
+    )
+    direction_id: _DirectionId | None = None
+    criterion_ids: list[str] | None = Field(default=None, max_length=50)
+    depends_on: list[uuid.UUID] = Field(default_factory=list, max_length=50)
+    require_deps_landed_on: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$",
+    )
+    release_base_branch: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$",
     )
     acceptance_evidence: AcceptanceEvidence | None = None
     work_class: Literal["exploratory", "confirmatory", "productization"] | None = None
@@ -155,6 +177,31 @@ class OperatorTaskCreate(_StrictModel):
             raise ValueError(
                 f"branch is required for task_type '{self.task_type.value}'"
             )
+        if self.criterion_ids is not None:
+            normalized: list[str] = []
+            for raw_key in self.criterion_ids:
+                if not isinstance(raw_key, str) or not raw_key.strip():
+                    raise ValueError(
+                        "criterion_ids entries must be non-empty strings"
+                    )
+                key = raw_key.strip()
+                if len(key) > 64:
+                    raise ValueError(
+                        "criterion_ids entries must be at most 64 characters"
+                    )
+                if key in normalized:
+                    raise ValueError(
+                        f"criterion_ids contains duplicate key {key!r}"
+                    )
+                normalized.append(key)
+            self.criterion_ids = normalized
+            if normalized and (
+                self.acceptance_evidence is None
+                or self.acceptance_evidence.kind != "named_test"
+            ):
+                raise ValueError(
+                    "criterion_ids require named_test acceptance_evidence"
+                )
         return self
 
 
@@ -322,6 +369,14 @@ def _operator_task_receipt(value: Any) -> dict[str, Any]:
             "requires_approval",
             "is_duplicate",
             "idempotent",
+            "direction_id",
+            "criterion_ids",
+            "criterion_ids_explicit",
+            "criterion_release_version_id",
+            "base_branch",
+            "depends_on",
+            "require_deps_landed_on",
+            "release_base_branch",
         )
         if key in source
     }
@@ -426,10 +481,27 @@ async def create_operator_task(
     github_repo = str(project.github_repo or "").strip()
     if not github_owner or not github_repo:
         raise HTTPException(status_code=409, detail="Project repository is not configured")
+    integration_branch = get_project_integration_branch(project)
+    for field_name in (
+        "base_branch",
+        "require_deps_landed_on",
+        "release_base_branch",
+    ):
+        declared_branch = getattr(payload, field_name)
+        if declared_branch is not None and declared_branch != integration_branch:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{field_name} must name the project integration branch "
+                    f"{integration_branch!r}"
+                ),
+            )
+    canonical_fields = payload.model_dump(exclude_none=True)
+    canonical_fields["base_branch"] = payload.base_branch or integration_branch
     canonical = CreateTaskPayload(
         github_repo=f"{github_owner}/{github_repo}",
         project_id=project.id,
-        **payload.model_dump(exclude_none=True),
+        **canonical_fields,
     )
     result = await create_task_manually(
         request=request,

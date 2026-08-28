@@ -1152,6 +1152,11 @@ async def claim_public_conversation_turn(
     )
 
     try:
+        attachment_manifests = await _canonical_delivery_attachment_manifests(
+            session,
+            project_id,
+            claim.rows,
+        )
         live_work_authority = await _fast_live_work_authority(
             session,
             project=project,
@@ -1168,6 +1173,7 @@ async def claim_public_conversation_turn(
             transcript_sequence=transcript_sequence,
             decision_authority=live_work_authority,
             memory_query=_memory_query_from_claimed_operator_rows(claim.rows),
+            attachment_manifests=attachment_manifests,
         )
     except (ContextEnvelopeFenceError, ValueError) as exc:
         await session.rollback()
@@ -1451,6 +1457,11 @@ async def deliver_workday_consultation(
         project=project,
         resident_task_id=task.id,
     )
+    attachment_manifests = await _canonical_delivery_attachment_manifests(
+        session,
+        project_id,
+        claim_rows,
+    )
     envelope = await build_and_store_context_envelope_snapshot(
         session,
         project_id=project_id,
@@ -1462,6 +1473,7 @@ async def deliver_workday_consultation(
         transcript_sequence=max(int(row.sequence or 0) for row in claim_rows),
         decision_authority=live_work_authority,
         memory_query=_memory_query_from_claimed_operator_rows(claim_rows),
+        attachment_manifests=attachment_manifests,
     )
     try:
         packet = await create_or_get_workday_consultation_packet(
@@ -2390,6 +2402,55 @@ def _poll_message_dict(message: ProjectMessage) -> dict[str, Any]:
     }
 
 
+def _ordered_delivery_attachments(
+    context: object,
+    artifact_attachments: Sequence[dict[str, Any]],
+    *,
+    degraded: bool,
+) -> list[dict[str, Any]]:
+    """Mirror the exact poll order used by the signed Fast attachment manifest."""
+
+    if degraded:
+        return []
+    raw_ordinary = context.get("attachments") if isinstance(context, dict) else None
+    ordinary = list(raw_ordinary) if isinstance(raw_ordinary, list) else []
+    return ordinary + list(artifact_attachments)
+
+
+async def _canonical_delivery_attachment_manifests(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    rows: Sequence[ProjectMessage],
+) -> dict[str, list[dict[str, Any]]]:
+    """Bind exactly the attachments the poll will expose, in poll order."""
+
+    from app.strategic_memory_envelope import canonical_attachment_manifest
+
+    artifacts_degraded = False
+    try:
+        artifact_attachments = await _materialize_workday_artifact_attachments(
+            session,
+            project_id,
+            list(rows),
+        )
+    except WorkdayArtifactBatchLimit:
+        # Recovery of an immutable oversized claim keeps every text row but
+        # deliberately omits all attachments, matching the poll projection.
+        artifact_attachments = {}
+        artifacts_degraded = True
+
+    manifests: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        row_context = row.context if isinstance(row.context, dict) else {}
+        delivered_attachments = _ordered_delivery_attachments(
+            row_context,
+            artifact_attachments.get(row.id, []),
+            degraded=artifacts_degraded,
+        )
+        manifests[str(row.id)] = canonical_attachment_manifest(delivered_attachments)
+    return manifests
+
+
 def _validated_sha256(value: Any, *, field: str) -> str:
     checksum = str(value or "")
     if _LOWERCASE_SHA256_RE.fullmatch(checksum) is None:
@@ -3223,7 +3284,11 @@ async def agent_poll_messages(
                 image_budget_exempt_message_ids=frozenset(
                     row.id
                     for row in remaining_rows
-                    if since_dt is not None and row.created_at <= since_dt
+                    if (
+                        not resident_claim_group_selected
+                        and since_dt is not None
+                        and row.created_at <= since_dt
+                    )
                 ),
             )
             break
@@ -3413,42 +3478,6 @@ async def agent_poll_messages(
             conversation_floor_sequence=conversation_floor_sequence,
         )
 
-    projected_messages: list[dict[str, Any]] = []
-    for row in remaining_rows:
-        projected = _poll_message_dict(row)
-        # Carry the server-qualified lane choice into the agent projection.  A
-        # direct Workday execution can legitimately spend several minutes in
-        # authenticated strategic tools before it can publish its receipt-bound
-        # reply; the agent uses this marker only to select that deeper turn
-        # budget.  Always remove any caller-supplied value first so ordinary
-        # conversation cannot self-upgrade its execution allowance.
-        projected_context = dict(projected.get("context") or {})
-        projected_context.pop("_direct_workday_execution", None)
-        if _operator_requests_direct_workday_execution(row):
-            projected_context["_direct_workday_execution"] = True
-        projected["context"] = projected_context
-        if resident_claim_artifacts_degraded:
-            projected["content"] = (
-                f"{projected.get('content') or ''}\n\n"
-                "[System recovery notice: attachments from this interrupted "
-                "turn exceeded the safe delivery limit and were not included. "
-                "Ask the operator to resend the relevant artifact if needed.]"
-            )
-            degraded_context = dict(projected.get("context") or {})
-            degraded_context.pop("attachments", None)
-            degraded_context["_artifact_delivery_deferred"] = True
-            projected["context"] = degraded_context
-        extras = artifact_attachments.get(row.id, [])
-        if extras:
-            context = dict(projected.get("context") or {})
-            ordinary = context.get("attachments")
-            ordinary_attachments = (
-                list(ordinary) if isinstance(ordinary, list) else []
-            )
-            context["attachments"] = ordinary_attachments + extras
-            projected["context"] = context
-        projected_messages.append(projected)
-
     # The ordinary Workday poll remains deliberately broad: it also carries
     # activity/non-conversation work that must not disappear during the typed
     # foreground rollout.  Give Fast a server-computed subset from the one
@@ -3462,7 +3491,7 @@ async def agent_poll_messages(
     # Stamping rows fast-eligible hands them to the typed Fast lane
     # exclusively; the agent never lets legacy Workday answer them. Without a
     # server-qualified Fast activation that lane can never run, so the stamp
-    # would silently park operator messages forever — leave the rows on the
+    # would silently park operator messages forever -- leave the rows on the
     # legacy Workday reply path instead.
     if resident_poll and remaining_rows and resident_typed_fast_activation_enabled():
         from app.strategic_conversation_query import strategic_conversation_predicate
@@ -3492,6 +3521,46 @@ async def agent_poll_messages(
                 )
             )
         ]
+
+    fast_message_id_set = set(fast_message_ids)
+    projected_messages: list[dict[str, Any]] = []
+    for row in remaining_rows:
+        projected = _poll_message_dict(row)
+        # Carry the server-qualified lane choice into the agent projection.  A
+        # direct Workday execution can legitimately spend several minutes in
+        # authenticated strategic tools before it can publish its receipt-bound
+        # reply; the agent uses this marker only to select that deeper turn
+        # budget.  Always remove any caller-supplied value first so ordinary
+        # conversation cannot self-upgrade its execution allowance.
+        projected_context = dict(projected.get("context") or {})
+        projected_context.pop("_direct_workday_execution", None)
+        if _operator_requests_direct_workday_execution(row):
+            projected_context["_direct_workday_execution"] = True
+        projected["context"] = projected_context
+        if resident_claim_artifacts_degraded:
+            if str(row.id) not in fast_message_id_set:
+                projected["content"] = (
+                    f"{projected.get('content') or ''}\n\n"
+                    "[System recovery notice: attachments from this interrupted "
+                    "turn exceeded the safe delivery limit and were not included. "
+                    "Ask the operator to resend the relevant artifact if needed.]"
+                )
+            degraded_context = dict(projected.get("context") or {})
+            degraded_context["_artifact_delivery_deferred"] = True
+            projected["context"] = degraded_context
+        extras = artifact_attachments.get(row.id, [])
+        context = dict(projected.get("context") or {})
+        delivered_attachments = _ordered_delivery_attachments(
+            context,
+            extras,
+            degraded=resident_claim_artifacts_degraded,
+        )
+        if delivered_attachments:
+            context["attachments"] = delivered_attachments
+        else:
+            context.pop("attachments", None)
+        projected["context"] = context
+        projected_messages.append(projected)
 
     visible_message_ids = {row.id for row in remaining_rows}
     fast_claim_groups: list[dict[str, object]] = []

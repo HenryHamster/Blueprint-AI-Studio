@@ -50,6 +50,15 @@ _acceptance_window_recompute_state: dict[
 ] = {}
 
 CRITERION_RELEASE_VERSION_CONTEXT_KEY = "criterion_release_version_id"
+# When true, ``Task.criterion_ids`` is an exact operator-authored assignment.
+# Merge evidence must not widen it by unioning every key owned by the task's
+# broader direction.
+EXPLICIT_CRITERION_IDS_CONTEXT_KEY = "criterion_ids_explicit"
+
+# Server-owned immutable snapshot of operator task-creation authority. Runtime
+# task mutation may change scheduling fields, but replay and receipt semantics
+# remain anchored to this request-time record.
+OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY = "_operator_task_creation_authority"
 
 
 def normalize_evidence_contract(raw: Any) -> dict[str, Any] | None:
@@ -1815,8 +1824,11 @@ async def record_task_merge_evidence(
     Direction criterion_keys are fetched via the ``direction_id`` stored in
     ``task.context`` at merge time, so criteria mapped to a direction *later in
     the same release version* are also captured.  A mapping bound to another
-    release version is ignored.  This fetch is best-effort: if the Direction row
-    is missing or the query fails (``direction_fetch_failed``), only
+    release version is ignored.  Tasks carrying
+    ``criterion_ids_explicit=True`` are the exception: their persisted
+    ``task.criterion_ids`` are an exact operator-authored subset and must not be
+    widened from the direction.  The direction fetch is otherwise best-effort:
+    if the row is missing or the query fails (``direction_fetch_failed``), only
     ``task.criterion_ids`` is used.
 
     ``preloaded_direction`` and ``preloaded_open_ver`` are optional batch
@@ -1874,7 +1886,10 @@ async def record_task_merge_evidence(
     # would otherwise be silently missed.
     task_context: dict = getattr(task, "context", None) or {}
     direction_id_key: str | None = task_context.get("direction_id")
-    if direction_id_key:
+    criterion_ids_are_explicit = (
+        task_context.get(EXPLICIT_CRITERION_IDS_CONTEXT_KEY) is True
+    )
+    if direction_id_key and not criterion_ids_are_explicit:
         try:
             if preloaded_direction is not None:
                 direction_row = preloaded_direction

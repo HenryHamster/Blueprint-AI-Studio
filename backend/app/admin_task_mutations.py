@@ -23,6 +23,11 @@ from app.broadcast import broadcast_to_project  # noqa: F401
 from app.branch_resolution import (
     _signal_blocking_project_branch_configuration,
 )
+from app.acceptance_criteria import (
+    CRITERION_RELEASE_VERSION_CONTEXT_KEY,
+    EXPLICIT_CRITERION_IDS_CONTEXT_KEY,
+    OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY,
+)
 from app.landed_signal import (
     corroborate_and_apply_merged_landed_signal,
     mark_unblocked_non_merge,
@@ -866,6 +871,22 @@ async def _apply_simple_mutations(
             "base_branch",
             "original_task_id",
         )
+        creation_authority = (task.context or {}).get(
+            OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY
+        )
+        criterion_ids_are_explicit = (
+            (task.context or {}).get(EXPLICIT_CRITERION_IDS_CONTEXT_KEY) is True
+        )
+        if isinstance(creation_authority, dict):
+            immutable_identity_keys += (
+                "direction_id",
+                "require_deps_landed_on",
+                "release_base_branch",
+            )
+        if criterion_ids_are_explicit:
+            immutable_identity_keys += ("acceptance_evidence",)
+            if not isinstance(creation_authority, dict):
+                immutable_identity_keys += ("direction_id",)
         changed_identity = [
             key
             for key in immutable_identity_keys
@@ -955,7 +976,18 @@ async def _apply_simple_mutations(
             "pr_merged",
             "pr_closed_unmerged",
             "pr_rejected",
+            CRITERION_RELEASE_VERSION_CONTEXT_KEY,
+            EXPLICIT_CRITERION_IDS_CONTEXT_KEY,
+            OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY,
         }
+        creation_authority = (task.context or {}).get(
+            OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY
+        )
+        if (task.context or {}).get(EXPLICIT_CRITERION_IDS_CONTEXT_KEY) is True or (
+            isinstance(creation_authority, dict)
+            and creation_authority.get("direction_id") is not None
+        ):
+            protected_context_keys.add("direction_id")
         attempted_protected = sorted(
             key
             for key in payload["context"]
@@ -1304,6 +1336,30 @@ async def modify_task_apply(
                 raise HTTPException(status_code=404, detail="Task not found")
             task = locked_task
             task_locked_for_generic_mutation = True
+
+    creation_authority = (task.context or {}).get(
+        OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY
+    )
+    if isinstance(creation_authority, dict):
+        exact_authority_changes: list[str] = []
+        if "payloads" in payload and payload["payloads"] != task.payloads:
+            exact_authority_changes.append("payloads")
+        if "depends_on" in payload:
+            proposed_depends_on = (
+                payload["depends_on"]
+                if isinstance(payload["depends_on"], list)
+                else []
+            )
+            if proposed_depends_on != list(task.depends_on or []):
+                exact_authority_changes.append("depends_on")
+        if exact_authority_changes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Generic task mutation cannot rewrite exact operator "
+                    "admission authority: " + ", ".join(exact_authority_changes)
+                ),
+            )
 
     # A backend sidecar is an independent grader only while its frozen prompt,
     # delivery topology, and complete context remain backend-authored. Blocking

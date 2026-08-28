@@ -19,6 +19,7 @@ from sqlmodel import func, select
 from app.auth import get_current_user, get_current_user_optional, require_admin
 from app.main import app
 from app.models import (
+    Direction,
     Project,
     ProjectMember,
     ProjectMessage,
@@ -26,6 +27,7 @@ from app.models import (
     ServiceCredential,
     Task,
     TaskStatus,
+    VersionAcceptanceCriterion,
 )
 from app.service_credentials import (
     hash_service_token,
@@ -328,6 +330,124 @@ async def test_task_create_is_explicit_member_scoped_strict_and_never_creates_sh
         (await db_session.execute(select(func.count(Project.id)))).scalar() or 0
     )
     assert final_project_count == initial_project_count
+
+
+@pytest.mark.asyncio
+async def test_task_create_can_atomically_stage_exact_authority_while_paused(
+    override_get_session, db_session
+):
+    project = await _persist_project(
+        db_session,
+        name="Paused exact admission",
+        directions=[
+            {"id": "d-exact", "text": "Exact task scope", "status": "active"}
+        ],
+    )
+    project.paused = True
+    project.integration_branch = "automain"
+    project.promotion_target = "main"
+    version = ReleaseVersion(
+        project_id=project.id, version_number=54, status="open", phase="build"
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+    criterion_ids = ["c-duration", "c-retention"]
+    db_session.add_all(
+        [
+            Direction(
+                project_id=project.id,
+                direction_key="d-exact",
+                status="active",
+                data={
+                    "id": "d-exact",
+                    "status": "active",
+                    "criterion_release_version_id": str(version.id),
+                },
+                criterion_keys=[*criterion_ids, "c-direction-only"],
+            ),
+            *[
+                VersionAcceptanceCriterion(
+                    project_id=project.id,
+                    release_version_id=version.id,
+                    criterion_key=key,
+                    status="active",
+                    text=key,
+                )
+                for key in [*criterion_ids, "c-direction-only"]
+            ],
+        ]
+    )
+    predecessor = make_task(
+        project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "first", "base_branch": "automain"}],
+    )
+    db_session.add(predecessor)
+    await db_session.commit()
+    await db_session.refresh(predecessor)
+    _credential, token = await _seed_operator(db_session, project)
+
+    async with _real_auth_client() as client:
+        response = await client.post(
+            f"{OPERATOR_URL}/projects/{project.id}/tasks",
+            json=_operator_task_body(
+                task_type="create",
+                prompt="Implement only the bounded budget consumers.",
+                base_branch="automain",
+                direction_id="d-exact",
+                criterion_ids=criterion_ids,
+                depends_on=[str(predecessor.id)],
+                require_deps_landed_on="automain",
+                release_base_branch="automain",
+                acceptance_evidence={
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_exact_admission.py::test_contract",
+                },
+            ),
+            headers=_auth(token),
+        )
+        server_defaulted = await client.post(
+            f"{OPERATOR_URL}/projects/{project.id}/tasks",
+            json=_operator_task_body(
+                title="Server-selected integration base",
+                prompt="Let the server select the current integration branch.",
+            ),
+            headers=_auth(token),
+        )
+        wrong_base = await client.post(
+            f"{OPERATOR_URL}/projects/{project.id}/tasks",
+            json=_operator_task_body(base_branch="main"),
+            headers=_auth(token),
+        )
+
+    assert response.status_code == 201, response.text
+    assert server_defaulted.status_code == 201, server_defaulted.text
+    assert server_defaulted.json()["base_branch"] == "automain"
+    assert wrong_base.status_code == 400, wrong_base.text
+    assert "project integration branch 'automain'" in wrong_base.text
+    assert response.json()["direction_id"] == "d-exact"
+    assert response.json()["criterion_ids"] == criterion_ids
+    assert response.json()["criterion_ids_explicit"] is True
+    assert response.json()["criterion_release_version_id"] == str(version.id)
+    assert response.json()["base_branch"] == "automain"
+    assert response.json()["depends_on"] == [str(predecessor.id)]
+    assert response.json()["require_deps_landed_on"] == "automain"
+    assert response.json()["release_base_branch"] == "automain"
+    created = await db_session.get(Task, uuid.UUID(response.json()["id"]))
+    assert created is not None
+    assert created.status == TaskStatus.QUEUED
+    assert created.criterion_ids == criterion_ids
+    assert created.depends_on == [str(predecessor.id)]
+    assert created.context["direction_id"] == "d-exact"
+    assert created.context["criterion_ids_explicit"] is True
+    assert created.context["_operator_task_creation_authority"]["base_branch"] == (
+        "automain"
+    )
+    assert created.first_payload["base_branch"] == "automain"
+    assert created.first_payload["require_deps_landed_on"] == "automain"
+    await db_session.refresh(project)
+    assert project.paused is True
 
 
 @pytest.mark.asyncio

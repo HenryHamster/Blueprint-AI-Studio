@@ -1727,12 +1727,9 @@ def _tasks_create(args: argparse.Namespace) -> None:
     if scoped:
         forbidden = {
             "--repo": getattr(args, "repo", None),
-            "--base-branch": getattr(args, "base_branch", None),
             "--model": getattr(args, "model", None),
             "--effort": getattr(args, "effort", None),
             "--hotfix": getattr(args, "hotfix", False),
-            "--require-deps-landed-on": getattr(args, "require_deps_landed_on", None),
-            "--release-base-branch": getattr(args, "release_base_branch", None),
             "--acceptance-evidence-file": getattr(
                 args, "acceptance_evidence_file", None
             ),
@@ -1742,8 +1739,9 @@ def _tasks_create(args: argparse.Namespace) -> None:
             print(
                 "ERROR: project-operator task creation does not authorize "
                 + ", ".join(requested)
-                + ". Project/repository/base/provider authority is derived "
-                "server-side, and scoped commands cannot read local evidence files.",
+                + ". Project/repository/provider authority is derived server-side, "
+                "the base branch is constrained to the project integration branch, "
+                "and scoped commands cannot read local evidence files.",
                 file=sys.stderr,
             )
             raise APIError("task creation authority flag is not permitted")
@@ -1837,6 +1835,15 @@ def _tasks_create(args: argparse.Namespace) -> None:
         if not isinstance(acceptance_evidence, dict):
             print("ERROR: acceptance evidence file must contain a JSON object.", file=sys.stderr)
             raise APIError("invalid acceptance evidence file")
+    if getattr(args, "criterion_ids", None) and (
+        not isinstance(acceptance_evidence, dict)
+        or acceptance_evidence.get("kind") != "named_test"
+    ):
+        print(
+            "ERROR: --criterion-id requires --acceptance-test.",
+            file=sys.stderr,
+        )
+        raise APIError("criterion ids require named test evidence")
     if capability.get("requires_acceptance_evidence") and acceptance_evidence is None:
         print(
             f"ERROR: code-producing task type {task_type!r} requires acceptance evidence. "
@@ -1857,7 +1864,7 @@ def _tasks_create(args: argparse.Namespace) -> None:
     if not scoped:
         body["github_repo"] = github_repo
         body["project_id"] = target_project_id
-    if not scoped and base_branch is not None:
+    if base_branch is not None:
         body["base_branch"] = base_branch
     if not scoped and getattr(args, "model", None):
         body["model"] = args.model
@@ -1869,12 +1876,11 @@ def _tasks_create(args: argparse.Namespace) -> None:
         "pr_number": getattr(args, "pr_number", None),
         "branch": getattr(args, "branch", None),
         "idempotency_key": getattr(args, "idempotency_key", None),
-        "require_deps_landed_on": (
-            None if scoped else getattr(args, "require_deps_landed_on", None)
-        ),
-        "release_base_branch": (
-            None if scoped else getattr(args, "release_base_branch", None)
-        ),
+        "require_deps_landed_on": getattr(args, "require_deps_landed_on", None),
+        "release_base_branch": getattr(args, "release_base_branch", None),
+        "direction_id": getattr(args, "direction_id", None),
+        "criterion_ids": getattr(args, "criterion_ids", None),
+        "depends_on": getattr(args, "depends_on", None),
         "work_class": getattr(args, "work_class", None),
         "stop_or_pivot_condition": getattr(args, "stop_or_pivot_condition", None),
     }
@@ -8455,6 +8461,15 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="Hold until dependencies land on this branch.")
     p_tasks_create.add_argument("--release-base-branch", default=None,
                                 help="Base branch to use after dependency release.")
+    p_tasks_create.add_argument(
+        "--direction-id", default=None,
+        help="Canonical direction id to attach to the task.")
+    p_tasks_create.add_argument(
+        "--criterion-id", dest="criterion_ids", action="append", default=None,
+        help="Exact active criterion key to prove (repeatable; requires --acceptance-test).")
+    p_tasks_create.add_argument(
+        "--depends-on", action="append", default=None, metavar="TASK_ID",
+        help="Structural prerequisite task UUID (repeatable).")
     p_tasks_create.add_argument(
         "--acceptance-test", default=None, metavar="PATH[::TEST]",
         help="Declare a named test as acceptance evidence.")

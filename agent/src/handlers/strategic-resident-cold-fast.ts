@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import type WebSocket from 'ws';
 import {
   apiGet, apiPost, sanitize, sendLog,
@@ -145,28 +145,235 @@ export function selectTypedFastClaimMessages(
     : null;
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map(key => (
+      `${JSON.stringify(key)}:${canonicalJson(record[key])}`
+    )).join(',')}}`;
+  }
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) throw new Error('attachment manifest contains a non-JSON value');
+  return encoded;
+}
+
+function sha256Text(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function canonicalBase64Bytes(value: unknown): Buffer | null {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value.length % 4 !== 0
+    || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)
+  ) return null;
+  const decoded = Buffer.from(value, 'base64');
+  return decoded.toString('base64') === value ? decoded : null;
+}
+
+function canonicalGcsLocator(value: unknown): string | null {
+  if (typeof value !== 'string' || value.trim().length === 0) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(value.trim());
+  } catch {
+    return null;
+  }
+  if (parsed.username || parsed.password || parsed.port) return null;
+  let bucket = '';
+  let objectName = '';
+  const hostname = parsed.hostname.toLowerCase();
+  if (parsed.protocol === 'gs:' && hostname) {
+    bucket = hostname;
+    objectName = parsed.pathname.replace(/^\/+/, '');
+  } else if (parsed.protocol === 'https:' && hostname === 'storage.googleapis.com') {
+    const path = parsed.pathname.replace(/^\/+/, '');
+    const separator = path.indexOf('/');
+    if (separator < 1) return null;
+    bucket = path.slice(0, separator).toLowerCase();
+    objectName = path.slice(separator + 1);
+  } else if (parsed.protocol === 'https:' && hostname.endsWith('.storage.googleapis.com')) {
+    bucket = hostname.slice(0, -'.storage.googleapis.com'.length);
+    objectName = parsed.pathname.replace(/^\/+/, '');
+  }
+  return bucket && objectName ? `gs://${bucket}/${objectName}` : null;
+}
+
+export function canonicalAttachmentManifest(attachments: unknown): Array<Record<string, unknown>> {
+  if (attachments === undefined || attachments === null) return [];
+  if (!Array.isArray(attachments)) throw new Error('active operator attachments must be an array');
+  if (attachments.length > 24) throw new Error('active operator attachment manifest exceeds item limit');
+  return attachments.map((raw, position) => {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error('active operator attachment entries must be objects');
+    }
+    const attachment = raw as Record<string, unknown>;
+    let identityKey = 'position';
+    let identityValue = String(position);
+    for (const candidate of ['artifact_ref_id', 'attachment_id', 'id']) {
+      const candidateValue = attachment[candidate];
+      if (candidateValue !== undefined && candidateValue !== null && String(candidateValue).trim()) {
+        identityKey = candidate;
+        identityValue = String(candidateValue).trim();
+        break;
+      }
+    }
+    const entry: Record<string, unknown> = {
+      position,
+      identity_sha256: sha256Text(`${identityKey}:${identityValue}`),
+      type: String(attachment.type ?? attachment.kind ?? 'attachment').trim().toLowerCase()
+        || 'attachment',
+    };
+    const mimeType = String(attachment.mime_type ?? attachment.media_type ?? '').trim().toLowerCase();
+    if (mimeType) entry.mime_type = mimeType;
+    const name = String(attachment.name ?? attachment.filename ?? '').trim();
+    if (name) entry.name_sha256 = sha256Text(name);
+
+    const decodedData = canonicalBase64Bytes(attachment.data);
+    if (attachment.size_bytes !== undefined && attachment.size_bytes !== null) {
+      if (
+        typeof attachment.size_bytes !== 'number'
+        || !Number.isSafeInteger(attachment.size_bytes)
+        || attachment.size_bytes < 0
+      ) throw new Error('active operator attachment size is invalid');
+      entry.size_bytes = attachment.size_bytes;
+    } else if (decodedData !== null) {
+      entry.size_bytes = decodedData.length;
+    }
+
+    const suppliedContentSha = String(
+      attachment.image_checksum ?? attachment.sha256 ?? '',
+    ).trim().toLowerCase();
+    if (/^[0-9a-f]{64}$/.test(suppliedContentSha)) {
+      entry.content_sha256 = suppliedContentSha;
+    } else if (decodedData !== null) {
+      entry.content_sha256 = createHash('sha256').update(decodedData).digest('hex');
+    }
+    const revisionChecksum = String(attachment.checksum ?? '').trim().toLowerCase();
+    if (revisionChecksum) {
+      if (/^[0-9a-f]{64}$/.test(revisionChecksum)) {
+        entry.revision_checksum = revisionChecksum;
+      } else {
+        entry.revision_checksum_sha256 = sha256Text(revisionChecksum);
+      }
+    }
+    const locator = canonicalGcsLocator(attachment.storage_uri ?? attachment.url);
+    if (locator !== null) entry.locator_sha256 = sha256Text(locator);
+    if (attachment.required === true) entry.required = true;
+    if (typeof attachment.truncated === 'boolean') entry.truncated = attachment.truncated;
+    for (const countField of ['snapshot_char_count', 'original_char_count']) {
+      const countValue = attachment[countField];
+      if (countValue === undefined || countValue === null) continue;
+      if (
+        typeof countValue !== 'number'
+        || !Number.isSafeInteger(countValue)
+        || countValue < 0
+      ) throw new Error(`active operator attachment ${countField} is invalid`);
+      entry[countField] = countValue;
+    }
+    entry.descriptor_sha256 = sha256Text(canonicalJson(entry));
+    return entry;
+  });
+}
+
 /** Build the exact restricted Fast prompt without consulting the checkout. */
+export function assertSelectedMessagesMatchEnvelope(
+  verified: ReturnType<typeof verifyStrategicContextEnvelope>,
+  selectedMessages: ResidentInboundMessage[],
+): void {
+  if (selectedMessages.length === 0) {
+    throw new Error('active operator input must contain at least one message');
+  }
+  const rows = verified.envelope.recent_conversation;
+  const selectedIds = new Set<string>();
+  let priorSequence = -1;
+  for (const message of selectedMessages) {
+    const messageId = typeof message.id === 'string' ? message.id.trim() : '';
+    if (!messageId || selectedIds.has(messageId)) {
+      throw new Error('active operator input has an invalid or duplicate message id');
+    }
+    selectedIds.add(messageId);
+    const matches = rows.filter((item) => (
+      item !== null
+      && typeof item === 'object'
+      && !Array.isArray(item)
+      && (item as Record<string, unknown>).message_id === messageId
+    ));
+    if (matches.length !== 1) {
+      throw new Error('active operator input is not bound exactly once in the canonical envelope');
+    }
+    const row = matches[0] as Record<string, unknown>;
+    if (row.from_type !== 'user' || message.from_type !== 'user') {
+      throw new Error('active operator input is not bound to a canonical user row');
+    }
+    const sequence = row.sequence;
+    if (!Number.isSafeInteger(sequence) || Number(sequence) <= priorSequence) {
+      throw new Error('active operator input order does not match the canonical envelope');
+    }
+    priorSequence = Number(sequence);
+    const content = message.content ?? '';
+    const bytes = Buffer.from(content, 'utf8');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    if (row.content_bytes !== bytes.length || row.content_sha256 !== sha256) {
+      throw new Error('active operator input content does not match the canonical envelope');
+    }
+    if (!Array.isArray(row.attachment_manifest)) {
+      throw new Error('active operator input is missing its canonical attachment manifest');
+    }
+    const actualAttachmentManifest = canonicalAttachmentManifest(message.context?.attachments);
+    if (canonicalJson(row.attachment_manifest) !== canonicalJson(actualAttachmentManifest)) {
+      throw new Error('active operator input attachments do not match the canonical envelope');
+    }
+  }
+  if (priorSequence !== verified.envelope.transcript_sequence) {
+    throw new Error('active operator input is not the terminal canonical transcript turn');
+  }
+}
+
 export async function buildTypedFastDispatchPrompt(
   verified: ReturnType<typeof verifyStrategicContextEnvelope>,
   selectedMessages: ResidentInboundMessage[],
   transcriptSequence: number,
 ): Promise<string | Array<Record<string, unknown>>> {
-  // The signed envelope already carries the terminal message text.
-  const attachmentOnlyMessages = selectedMessages.map(message => ({ ...message, content: '' }));
-  const attachmentBlocks = await materializeContentBlocks(
-    combineOperatorMessages(attachmentOnlyMessages),
+  assertSelectedMessagesMatchEnvelope(verified, selectedMessages);
+  // The canonical envelope deliberately keeps each historical transcript row
+  // to a small preview. Once the selected poll rows match its server-projected
+  // ids, ordering, full byte counts, and digests, deliver the claimed rows in
+  // full instead of replacing valid API-sized input with the bounded prefix.
+  const activeTurnBlocks = await materializeContentBlocks(
+    combineOperatorMessages(selectedMessages),
   );
   const artifactDeliveryDeferred = selectedMessages.some(message => (
     message.context?._server_artifact_delivery_deferred === true
   ));
+  const activeMessageIds = new Set(selectedMessages.map(message => String(message.id).trim()));
+  const contextEnvelope = {
+    ...verified.envelope,
+    recent_conversation: verified.envelope.recent_conversation.filter((item) => (
+      item === null
+      || typeof item !== 'object'
+      || Array.isArray(item)
+      || !activeMessageIds.has(String((item as Record<string, unknown>).message_id ?? '').trim())
+    )),
+  };
+  // Verification above applies to the original signed bytes. The provider view
+  // omits only the now-separately-delivered active rows so their preview cannot
+  // compete with or duplicate the exact full operator input.
+  const contextFrame = buildFastResidentContextFrame({
+    ...verified,
+    envelope: contextEnvelope,
+    canonicalText: JSON.stringify(contextEnvelope),
+  }, transcriptSequence);
   const promptText = [
-    buildFastResidentContextFrame(verified, transcriptSequence),
+    contextFrame,
     '',
     '## Active operator turn',
     `The canonical context ends at the active operator input (sequence ${verified.envelope.transcript_sequence}).`,
-    attachmentBlocks.length > 0
-      ? 'The model input following this text contains the active turn attachments.'
-      : 'There are no separate attachment blocks for this turn.',
+    activeTurnBlocks.length > 0
+      ? 'The model input following this text is the exact, complete active operator turn accepted by the server. A bounded recent_conversation row may contain only a prefix; never treat that historical preview as the complete active input.'
+      : 'There is no deliverable content in the active operator turn.',
     ...(artifactDeliveryDeferred ? [
       'Recovery notice: attachments from this interrupted turn exceeded the safe delivery limit and were not included. Ask the operator to resend the relevant artifact if it is needed to answer accurately.',
     ] : []),
@@ -176,15 +383,15 @@ export async function buildTypedFastDispatchPrompt(
     'If the operator requests code, configuration, branch, deployment, or other managed-state execution, request Workday to route it through supported Blueprint task tooling. Never promise that Fast will perform the mutation itself.',
     'Do not make a public promise to route, create, or hand off a Blueprint/Workday task. Stage the exact request with mcp__call__request_workday and let the server-owned receipt communicate that it was requested.',
   ].join('\n');
-  if (attachmentBlocks.length === 0) return promptText;
+  if (activeTurnBlocks.length === 0) return promptText;
   return [
     { type: 'text', text: promptText },
-    ...attachmentBlocks.map(block => block as unknown as Record<string, unknown>),
+    ...activeTurnBlocks.map(block => block as unknown as Record<string, unknown>),
   ];
 }
 
 function exactIds(left: string[], right: string[]): boolean {
-  return [...left].sort().join('\n') === [...right].sort().join('\n');
+  return left.length === right.length && left.every((id, index) => id === right[index]);
 }
 
 function projectFastMessages(response: MessagesPollResponse): ResidentInboundMessage[] {

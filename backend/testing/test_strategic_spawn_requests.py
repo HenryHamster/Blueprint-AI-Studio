@@ -166,6 +166,32 @@ async def test_direct_strategic_research_with_cycle_keeps_strategist_provenance(
 
 
 @pytest.mark.asyncio
+async def test_direct_strategic_spawn_remains_allowed_when_autonomy_is_disabled(
+    db_session,
+):
+    """The autonomy fence stops system producers, not explicit Resident work."""
+
+    project, owner = await _owner(db_session)
+    project.autonomous_enabled = False
+    db_session.add(project)
+    await db_session.commit()
+
+    submission = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=owner.id,
+        task_type="create",
+        specification=_spec("Resident-controlled admission", watch=False),
+        idempotency_key="resident-controlled-admission",
+        direction_id=None,
+    )
+
+    assert submission.task is not None
+    assert submission.task.created_by == "STRATEGIC_AGENT"
+    assert submission.task.origination == TASK_ORIGINATION_STRATEGIST
+
+
+@pytest.mark.asyncio
 async def test_submit_rejects_parent_from_another_project(db_session):
     own_project, _own_parent = await _owner(db_session)
     _foreign_project, foreign_parent = await _owner(db_session)

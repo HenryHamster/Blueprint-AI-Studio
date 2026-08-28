@@ -25,14 +25,26 @@ class CreateTaskPayload(BaseModel):
     # has LANDED on the named branch (deterministic, heuristic-free gate).
     # release_base_branch: repoint base_branch to the named branch when the
     # dependency gate opens, so the task starts FROM that branch's state
-    # including its dependencies' merged work. depends_on edges themselves are
-    # attached via PATCH /tasks/{id} (cycle-checked there).
+    # including its dependencies' merged work. New tasks may carry depends_on
+    # atomically below; legacy/operator edits can still attach cycle-checked
+    # edges through PATCH /tasks/{id}.
     require_deps_landed_on: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
     )
     release_base_branch: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
     )
+    # Optional authority attached atomically to the queued task row.  Keeping
+    # these fields in the create contract avoids a create-then-PATCH window in
+    # which the orchestrator could claim an unscoped or dependency-free task.
+    direction_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    criterion_ids: list[str] | None = Field(default=None, max_length=50)
+    depends_on: list[uuid.UUID] = Field(default_factory=list, max_length=50)
     task_type: TaskType = Field(default=TaskType.create)
     pr_number: int | None = None
     branch: str | None = Field(
@@ -81,6 +93,23 @@ class CreateTaskPayload(BaseModel):
                 raise ValueError("must not be blank")
             return normalized
         return v
+
+    @field_validator("criterion_ids")
+    @classmethod
+    def normalize_criterion_ids(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        normalized: list[str] = []
+        for raw_key in value:
+            if not isinstance(raw_key, str) or not raw_key.strip():
+                raise ValueError("criterion_ids entries must be non-empty strings")
+            key = raw_key.strip()
+            if len(key) > 64:
+                raise ValueError("criterion_ids entries must be at most 64 characters")
+            if key in normalized:
+                raise ValueError(f"criterion_ids contains duplicate key {key!r}")
+            normalized.append(key)
+        return normalized
 
     @field_validator(
         "base_branch", "branch", "require_deps_landed_on", "release_base_branch"

@@ -9,7 +9,23 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.models import ModuleFindingChain, Project, ProjectMessage, Task, TaskStatus
+from app.conversation_coordinator import (
+    ConversationPublicReplyOwner,
+    claim_next_workday_consultation_packet,
+    claim_operator_messages,
+    create_or_get_workday_consultation_packet,
+    renew_workday_consultation_packet,
+)
+from app.models import (
+    MessageHandlingState,
+    MessageSurface,
+    ModuleFindingChain,
+    Project,
+    ProjectMessage,
+    StrategicContextEnvelopeSnapshot,
+    Task,
+    TaskStatus,
+)
 from app.module_finding_chain import (
     CHAIN_ESCALATION_THRESHOLD,
     _guard_chain_key,
@@ -25,11 +41,13 @@ from app.module_finding_chain import (
     resolved_review_findings,
 )
 from app.payload_schemas import validate_internal_payload
+from app.project_message_creation import lock_project_and_next_message_sequence
 from app.task_locking import (
     AUTOMATIC_TASK_CREATION_ALLOWED,
     AUTOMATIC_TASK_CREATION_PROJECT_PAUSED,
 )
 from app.review_loop_convergence import build_cross_episode_abandon_candidate
+from app.strategic_memory_envelope import build_and_store_context_envelope_snapshot
 from app.time_utils import _utcnow
 
 
@@ -939,11 +957,19 @@ async def test_owner_election_honours_real_project_authority(db_session):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("blocked", ["paused", "archived"])
+@pytest.mark.parametrize(
+    "blocked_state",
+    [
+        {"paused": True},
+        {"archived": True},
+        {"autonomous_enabled": False},
+    ],
+    ids=["paused", "archived", "autonomy-disabled"],
+)
 async def test_owner_election_refuses_a_project_that_cannot_take_new_work(
-    db_session, blocked
+    db_session, blocked_state
 ):
-    """A paused or archived project must not accumulate latent queued work.
+    """A project without automatic-work authority cannot gain a latent owner.
 
     This is exactly the invariant the earlier heartbeat-side election could not
     hold: it ran behind the reporting task's row lock and so never consulted the
@@ -951,9 +977,9 @@ async def test_owner_election_refuses_a_project_that_cannot_take_new_work(
     remediation owner an ordinary admitted automatic task.
     """
     project = Project(
-        name=f"guard election {blocked}",
+        name=f"guard election {next(iter(blocked_state))}",
         user_id="test-user-123",
-        **{blocked: True},
+        **blocked_state,
     )
     db_session.add(project)
     await db_session.flush()
@@ -1155,18 +1181,188 @@ async def test_failed_owner_stops_being_advertised_as_the_owner(db_session):
     db_session.add(owner)
     await db_session.commit()
 
-    # The next sweep releases the dead owner and elects a replacement, and the
-    # single aggregate message tracks that change instead of freezing on the
-    # corpse.
+    # The next sweep releases the dead owner and elects a replacement. The old
+    # immutable claim is resolved and a new idempotent version carries current
+    # ownership instead of rewriting governed conversation bytes in place.
     replacements = await elect_guard_suppression_owners(db_session)
     await db_session.commit()
     await db_session.refresh(message)
 
+    messages = list(
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.context["event_type"].as_string()
+                    == "remediation_escalated",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    current = next(candidate for candidate in messages if candidate.status == "open")
+    superseded = [candidate for candidate in messages if candidate.status == "resolved"]
+
     assert len(replacements) == 1
     assert replacements[0].id != owner.id
-    assert f"remediation task {owner.id} now owns it." not in message.content
-    assert f"remediation task {replacements[0].id} now owns it." in message.content
-    assert message.context["remediation_task_id"] == str(replacements[0].id)
+    assert len(messages) == 3
+    assert len(superseded) == 2
+    assert f"remediation task {owner.id} now owns it." in message.content
+    assert message.status == "resolved"
+    assert message.resolved_at is not None
+    assert message.resolution
+    assert any("NO remediation task owns it" in candidate.content for candidate in superseded)
+    assert current.status == "open"
+    assert f"remediation task {replacements[0].id} now owns it." in current.content
+    assert current.context["remediation_task_id"] == str(replacements[0].id)
+
+
+@pytest.mark.asyncio
+async def test_escalation_version_preserves_claimed_workday_packet(db_session):
+    project = Project(name="guard escalation packet", user_id="test-user-123")
+    chain = _mature_chain(project.id)
+    resident_task = Task(
+        project_id=project.id,
+        title="resident",
+        payloads=[],
+    )
+    first_owner = Task(
+        project_id=project.id,
+        title="first remediation owner",
+        payloads=[],
+    )
+    replacement_owner = Task(
+        project_id=project.id,
+        title="replacement remediation owner",
+        payloads=[],
+    )
+    db_session.add_all(
+        [project, chain, resident_task, first_owner, replacement_owner]
+    )
+    await db_session.commit()
+
+    await _post_guard_suppression_escalation(db_session, chain, first_owner)
+    await db_session.commit()
+    first_alert = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.context["event_type"].as_string()
+                == "remediation_escalated",
+            )
+        )
+    ).scalars().one()
+
+    operator_sequence = await lock_project_and_next_message_sequence(
+        db_session, project.id
+    )
+    operator_message = ProjectMessage(
+        project_id=project.id,
+        sequence=operator_sequence,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="Please investigate and act.",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+    )
+    db_session.add(operator_message)
+    await db_session.commit()
+
+    incarnation_id = uuid.uuid4()
+    claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id="session",
+        task_id=resident_task.id,
+        worker_generation=1,
+        incarnation_id=incarnation_id,
+        message_ids=[operator_message.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+    )
+    assert claim is not None
+    envelope = await build_and_store_context_envelope_snapshot(
+        db_session,
+        project_id=project.id,
+        session_id="session",
+        claim_id=claim.claim_id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        input_revision=int(operator_message.sequence or 0),
+        transcript_sequence=int(operator_message.sequence or 0),
+        decision_authority={},
+        ledger_revision=0,
+    )
+    packet = await create_or_get_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        claim=claim,
+        envelope=envelope,
+        delivery_key="guard-refresh-regression",
+        question="Perform the exact bounded operation.",
+        resident_session_id="session",
+        atomic_public_reply_id=uuid.uuid4(),
+    )
+    delivery = await claim_next_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        task_id=resident_task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+    )
+    assert delivery is not None
+    packet_id = packet.message.id
+    snapshot_id = uuid.UUID(str(packet.message.context["envelope"]["snapshot_id"]))
+    await db_session.commit()
+
+    chain.occurrences += 1
+    db_session.add(chain)
+    await db_session.flush([chain])
+    await _post_guard_suppression_escalation(
+        db_session, chain, replacement_owner
+    )
+    await db_session.commit()
+
+    assert await db_session.get(ProjectMessage, packet_id) is not None
+    assert (
+        await db_session.get(StrategicContextEnvelopeSnapshot, snapshot_id)
+        is not None
+    )
+    renewed = await renew_workday_consultation_packet(
+        db_session,
+        project_id=project.id,
+        packet_id=packet_id,
+        task_id=resident_task.id,
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        resident_session_id="session",
+        workday_claim_id=delivery.workday_claim_id,
+    )
+    assert renewed.message.id == packet_id
+    assert renewed.workday_claim_id == delivery.workday_claim_id
+
+    await _post_guard_suppression_escalation(
+        db_session, chain, replacement_owner
+    )
+    await db_session.commit()
+    alert_versions = list(
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.context["event_type"].as_string()
+                    == "remediation_escalated",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alert_versions) == 2
+    assert sum(version.status == "open" for version in alert_versions) == 1
+    assert await db_session.get(ProjectMessage, packet_id) is not None
 
 
 def test_escalation_summary_never_claims_an_owner_it_does_not_have():

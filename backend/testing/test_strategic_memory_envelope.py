@@ -1,6 +1,7 @@
 """Focused persistence and byte-identity coverage for Strategic envelopes."""
 
 import base64
+import hashlib
 import json
 import re
 import uuid
@@ -30,6 +31,7 @@ from app.strategic_memory_envelope import (
     build_canonical_envelope_core,
     bump_context_authority_generation,
     bump_privacy_generation_and_purge_context_envelopes,
+    canonical_attachment_manifest,
     canonical_envelope_bytes,
     context_envelope_reference,
     get_fenced_context_envelope_by_reference,
@@ -65,6 +67,57 @@ def test_agent_verifier_supports_the_backend_envelope_schema_version():
     )
     assert match is not None
     assert int(match.group(1)) == ENVELOPE_SCHEMA_VERSION
+
+
+def test_attachment_manifest_binds_stable_delivery_without_exposing_locator():
+    base = {
+        "attachment_id": "11111111-1111-4111-8111-111111111111",
+        "type": "image",
+        "mime_type": "image/png",
+        "name": "diagram.png",
+        "size_bytes": 42,
+        "checksum": "a" * 64,
+        "url": (
+            "https://storage.googleapis.com/private-bucket/diagram.png"
+            "?X-Goog-Signature=first"
+        ),
+    }
+
+    first = canonical_attachment_manifest([base])
+    refreshed = canonical_attachment_manifest(
+        [{**base, "url": base["url"].replace("first", "second")}]
+    )
+    uppercase_bucket = canonical_attachment_manifest(
+        [{**base, "url": base["url"].replace("private-bucket", "PRIVATE-BUCKET")}]
+    )
+    changed = canonical_attachment_manifest(
+        [{**base, "url": base["url"].replace("diagram.png", "other.png")}]
+    )
+
+    assert first == refreshed
+    assert first == uppercase_bucket
+    assert first != changed
+    assert first[0]["size_bytes"] == 42
+    assert first[0]["revision_checksum"] == "a" * 64
+    assert first[0]["locator_sha256"] == hashlib.sha256(
+        b"gs://private-bucket/diagram.png"
+    ).hexdigest()
+    assert first[0]["descriptor_sha256"] == (
+        "78521219af06448fd59b3516b671b66aecb691308562f5096b90412c8e10cf80"
+    )
+    encoded = json.dumps(first)
+    assert "private-bucket" not in encoded
+    assert "X-Goog" not in encoded
+    assert "diagram.png" not in encoded
+
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        canonical_attachment_manifest(
+            [{**base, "size_bytes": 9_007_199_254_740_992}]
+        )
+    with pytest.raises(ValueError, match="original_char_count is invalid"):
+        canonical_attachment_manifest(
+            [{**base, "original_char_count": 9_007_199_254_740_992}]
+        )
 
 
 @pytest.mark.parametrize(
