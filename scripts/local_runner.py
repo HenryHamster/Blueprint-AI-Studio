@@ -204,7 +204,7 @@ _COMPUTE_JOB_VENV_TIMEOUT = 120
 # misattributes blame to the experiment's code):
 #   124  runtime deadline exceeded
 #   125  no-progress watchdog (compute_backends.NO_PROGRESS_WATCHDOG_EXIT_CODE)
-#   123  the runner could NOT establish a Python runtime for this job
+#   123  the runner could NOT provision a required execution prerequisite
 PROVISION_FAILURE_EXIT_CODE = 123
 # Terminal reason string emitted alongside that exit code. It must contain the
 # substring "provisioning": app.failure_classification.classify_compute_terminal
@@ -213,6 +213,12 @@ PROVISION_FAILURE_EXIT_CODE = 123
 # function matches for other classes.
 COMPUTE_RUNTIME_PROVISION_TERMINAL_REASON = (
     "runner provisioning failure: no usable python runtime on this host"
+)
+# A claimed repo-backed job without a freshly minted token cannot establish the
+# checkout its command contract was authored against. Treat that as a typed
+# provisioning/auth failure and never fall through to an empty workspace.
+COMPUTE_REPO_AUTH_PROVISION_TERMINAL_REASON = (
+    "runner provisioning failure: repository authentication unavailable"
 )
 
 
@@ -7595,6 +7601,20 @@ def _run_compute_job(
                 command_log={
                     "text": "[runner] job was cancel-requested at claim; "
                     "command never started",
+                    "truncated": False,
+                },
+            )
+            return
+
+        if repo_clone and not repo_token:
+            outcome = "failure"
+            _report_terminal(
+                exec_status="failed",
+                exit_code=PROVISION_FAILURE_EXIT_CODE,
+                terminal_reason=COMPUTE_REPO_AUTH_PROVISION_TERMINAL_REASON,
+                command_log={
+                    "text": "[runner] repository authentication unavailable for "
+                    "a repo-backed compute job; checkout and command never started",
                     "truncated": False,
                 },
             )

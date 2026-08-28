@@ -1578,6 +1578,34 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
     # stale initial "queued for compute-job launch" status_message.
     assert status_result.message == "compute job succeeded"
 
+    # The runner's heartbeat thread may have prepared a ``running`` report
+    # before the command thread sent its terminal outcome. Receiving that stale
+    # heartbeat after success must not make the monitor see RUNNING again.
+    finished_at = meta["runner_finished_at"]
+    stale = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "running",
+            "exit_code": 99,
+            "result_metrics": {"accuracy": 0.1},
+            "command_log": {"text": "stale live tail", "truncated": False},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert stale.status_code == 200
+
+    await db_session.refresh(job)
+    latched_meta = job.polling_metadata or {}
+    assert latched_meta["runner_exec_status"] == "succeeded"
+    assert latched_meta["runner_exit_code"] == 0
+    assert latched_meta["runner_result_metrics"] == {
+        "accuracy": 0.99,
+        "loss": 0.01,
+    }
+    assert latched_meta["runner_finished_at"] == finished_at
+    latched_status = await backend.poll_status(job)
+    assert latched_status.status == ComputeJobStatus.SUCCEEDED
+
 
 @pytest.mark.asyncio
 async def test_runner_subprocess_poll_status_failed_carries_message():

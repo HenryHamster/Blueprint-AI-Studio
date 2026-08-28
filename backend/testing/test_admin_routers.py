@@ -9440,6 +9440,35 @@ class TestComputeExperimentTaskLaunch:
         }
         assert payload["setup_step"] == "echo host-prep"
 
+    @pytest.mark.asyncio
+    async def test_single_command_resume_fields_persist(
+        self, client: AsyncClient, db_session
+    ):
+        """Operator resume inputs must survive into the stored task contract."""
+        await self._project_with_repo(db_session)
+        predecessor = str(uuid.uuid4())
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                declared_metric="tokens_per_second",
+                input_artifact_job_id=predecessor,
+                no_progress_timeout_seconds=180,
+            ),
+        )
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        stored = task.payloads[0]
+        assert stored["command"] == "python bench.py --json result.json"
+        assert stored["input_artifact_job_id"] == predecessor
+        assert stored["declared_metric"] == "tokens_per_second"
+        assert stored["no_progress_timeout_seconds"] == 180
+
     @pytest.mark.parametrize(
         ("override", "expected_detail"),
         [
@@ -10093,6 +10122,22 @@ class TestComputeExperimentTaskLaunch:
         )
         assert resp.status_code == 422, resp.text
         assert "declared_metric" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_command_and_arms_are_rejected(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                arms=[{"name": "arm-a", "command": "python other.py"}],
+                declared_metric="tokens_per_second",
+            ),
+        )
+
+        assert resp.status_code == 422, resp.text
+        assert "mutually exclusive" in resp.text
 
     @pytest.mark.asyncio
     async def test_neither_command_nor_arms_rejected(

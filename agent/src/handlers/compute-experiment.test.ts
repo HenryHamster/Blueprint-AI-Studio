@@ -131,6 +131,34 @@ describe('handleComputeExperiment', () => {
     }));
   });
 
+  it('forwards the complete single-command resume contract', async () => {
+    vi.mocked(apiPost).mockResolvedValue(jobResponse({ status: 'QUEUED' }));
+    const predecessor = '11111111-1111-4111-8111-111111111111';
+
+    await handleComputeExperiment(
+      'task-1',
+      {
+        ...VALID_PAYLOAD,
+        input_artifact_job_id: predecessor,
+        declared_metric: 'eval/accuracy',
+        no_progress_timeout_seconds: 180,
+      },
+      TASK,
+      '',
+      'o',
+      'r',
+      null,
+      { value: '' },
+    );
+
+    expectCalledWith(apiPost, '/api/agent/compute-jobs', expect.objectContaining({
+      command: 'python bench.py',
+      input_artifact_job_id: predecessor,
+      declared_metric: 'eval/accuracy',
+      no_progress_timeout_seconds: 180,
+    }));
+  });
+
   it('fails fast WITHOUT launching when the spend cap is missing', async () => {
     const payload = { type: 'compute_experiment', command: 'python bench.py', deadline_seconds: 600 };
     await handleComputeExperiment('task-1', payload, TASK, '', 'o', 'r', null, { value: '' });

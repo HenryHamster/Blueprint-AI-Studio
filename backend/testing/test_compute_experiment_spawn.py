@@ -2809,6 +2809,21 @@ def test_arms_contract_validation_missing_declared_metric():
     assert "declared_metric" in reason
 
 
+def test_arms_contract_rejects_simultaneous_command():
+    contract = {
+        "command": "python single.py",
+        "arms": [{"name": "a", "command": "python a.py"}],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+
+    assert ok is False
+    assert "mutually exclusive" in reason
+
+
 def test_arms_contract_validation_empty_declared_metric():
     """declared_metric that is an empty string is rejected."""
     contract = {

@@ -281,6 +281,8 @@ def _validate_compute_launch_contract(
     command = contract.get("command")
 
     if arms is not None:
+        if isinstance(command, str) and command.strip():
+            return False, "command and arms are mutually exclusive"
         # Arms-based multi-arm experiment: validate each arm and synthesize command.
         if not isinstance(arms, list) or len(arms) == 0:
             return False, "arms must be a non-empty list of {name, command} objects"

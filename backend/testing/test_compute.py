@@ -6299,6 +6299,38 @@ async def test_create_compute_job_reuses_matching_active_job_for_task(db_session
     assert len(jobs) == 1
 
 
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"setup_step": "pip install package==1.0"},
+        {"declared_metric": "eval/accuracy"},
+        {
+            "container_registry_auth": {
+                "server": "registry.example.com",
+                "username": "runner",
+                "password": "secret",
+            }
+        },
+    ],
+)
+def test_launch_request_fingerprint_covers_execution_semantics(changed):
+    base = {
+        "command": "python train.py",
+        "machine_type": "e2-standard-2",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "cwd": None,
+        "env": None,
+        "backend_name": "runner-subprocess",
+        "provisioning_model": "STANDARD",
+    }
+
+    original = compute_jobs._build_launch_request_fingerprint(**base)
+    modified = compute_jobs._build_launch_request_fingerprint(**base, **changed)
+
+    assert modified != original
+
+
 @pytest.mark.asyncio
 async def test_live_proof_compute_job_requires_promoted_release(db_session):
     project = Project(name="Live Proof No Promotion", user_id="test-user")

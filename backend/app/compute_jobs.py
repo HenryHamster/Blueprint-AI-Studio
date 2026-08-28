@@ -824,6 +824,9 @@ async def create_compute_job(
         accelerator_count=persisted_accelerator_count,
         live_proof_requirement=live_proof_requirement,
         container_image=container_image,
+        container_registry_auth=container_registry_auth,
+        setup_step=setup_step,
+        declared_metric=declared_metric,
         no_progress_timeout_seconds=capped_np_timeout,
         input_artifact_job_id=resolved_input_artifact_job_id,
     )
@@ -1339,6 +1342,9 @@ def _build_launch_request_fingerprint(
     accelerator_count: int | None = None,
     live_proof_requirement: dict[str, str] | None = None,
     container_image: str | None = None,
+    container_registry_auth: dict | None = None,
+    setup_step: str | None = None,
+    declared_metric: str | None = None,
     no_progress_timeout_seconds: int | None = None,
     input_artifact_job_id: str | None = None,
 ) -> str:
@@ -1348,6 +1354,7 @@ def _build_launch_request_fingerprint(
         "backend": backend_name,
         "command": command,
         "container_image": container_image,
+        "container_registry_auth": container_registry_auth,
         "cwd": cwd,
         "deadline_seconds": deadline_seconds,
         "env": {str(k): str(v) for k, v in (env or {}).items()},
@@ -1355,6 +1362,8 @@ def _build_launch_request_fingerprint(
         "provisioning_model": provisioning_model,
         "spend_cap_usd": float(spend_cap_usd),
         "live_proof_requirement": live_proof_requirement,
+        "setup_step": setup_step,
+        "declared_metric": declared_metric,
         "no_progress_timeout_seconds": no_progress_timeout_seconds,
         "input_artifact_job_id": input_artifact_job_id,
     }

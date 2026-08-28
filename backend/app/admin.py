@@ -2669,6 +2669,8 @@ class ComputeExperimentTaskPayload(BaseModel):
         has_arms = bool(self.arms)
         if not has_command and not has_arms:
             raise ValueError("Either 'command' or 'arms' (with 'declared_metric') must be provided")
+        if has_command and has_arms:
+            raise ValueError("'command' and 'arms' are mutually exclusive")
         if has_arms and not (self.declared_metric and self.declared_metric.strip()):
             raise ValueError("'declared_metric' is required when 'arms' is specified")
         return self
@@ -3819,6 +3821,8 @@ async def create_compute_experiment_task(
         launch_contract["declared_metric"] = payload.declared_metric
     else:
         launch_contract["command"] = payload.command
+        if payload.declared_metric is not None:
+            launch_contract["declared_metric"] = payload.declared_metric
     if payload.success_criterion is not None:
         launch_contract["success_criterion"] = payload.success_criterion.model_dump()
     provenance: dict[str, Any] = {}
