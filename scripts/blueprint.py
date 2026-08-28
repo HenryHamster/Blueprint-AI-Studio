@@ -12,7 +12,8 @@ Every read command is human-readable by default and emits machine JSON when
 the global ``--json`` flag is passed (before or after the subcommand).
 
 Subcommand groups:
-    projects list|onboard  project inventory; onboard a repo as a new project
+    projects list|onboard|pause|resume
+                      project inventory, onboarding, and dispatch pause state
     status            current version phase, deploy state, promotion eligibility
     diagnostics       stuck tasks, circuit breakers, grouped failure modes
     tasks list|show   list/filter tasks, or show one by id
@@ -193,10 +194,13 @@ _ONBOARD_NOTABLE_BUILD_FLAGS = (
 
 
 def cmd_projects(args: argparse.Namespace) -> None:
-    """Dispatch project subcommands: ``list`` (default) / ``onboard``."""
+    """Dispatch project inventory, onboarding, and pause-state commands."""
     sub = getattr(args, "projects_cmd", None) or "list"
     if sub == "onboard":
         _projects_onboard(args)
+        return
+    if sub in {"pause", "resume"}:
+        _projects_set_paused(args, paused=sub == "pause")
         return
     _projects_list(args)
 
@@ -223,6 +227,81 @@ def _render_projects(data: dict) -> None:
             or "-"
         )
         print(f"  {pid} · {name} · {status}")
+
+
+def _require_explicit_project_selection(
+    args: argparse.Namespace, action: str
+) -> str:
+    """Resolve only a project selected on this command line.
+
+    Pause/resume are broad scheduling controls. They must never inherit
+    ``BLUEPRINT_PROJECT_ID``, a config default, or the single visible project.
+    ``main`` normally resolves ``--project`` before dispatch; the name fallback
+    here keeps this helper correct when called directly by focused tests/tools.
+    """
+    project_id = getattr(args, "project_id", None)
+    project_name = getattr(args, "project_name", None)
+    if project_id:
+        return project_id
+    if project_name:
+        return resolve_project_id_by_name(project_name)
+    print(
+        f"ERROR: 'projects {action}' requires an explicit --project-id or "
+        "--project selection; configured and environment defaults are not used.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def _projects_set_paused(args: argparse.Namespace, *, paused: bool) -> None:
+    """Set the persisted project dispatch pause independently of autonomy."""
+    action = "pause" if paused else "resume"
+    project_id = _require_explicit_project_selection(args, action)
+    _require_write_config(f"projects {action}")
+    consequence = (
+        "No new work will dispatch; in-flight tasks will drain"
+        if paused
+        else "Normal dispatch will resume under the project's existing settings"
+    )
+    if not _confirm(
+        f"{action.title()} project {project_id}? {consequence}; "
+        "autonomous_enabled will not change.",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+
+    result = api(
+        "PATCH",
+        f"/api/admin/projects/{project_id}/pause",
+        {"paused": paused},
+    )
+    if not isinstance(result, dict) or result.get("paused") is not paused:
+        observed = result.get("paused") if isinstance(result, dict) else None
+        print(
+            f"ERROR: server did not confirm projects {action}; "
+            f"expected paused={json.dumps(paused)}, "
+            f"received paused={json.dumps(observed)}.",
+            file=sys.stderr,
+        )
+        raise APIError(f"projects {action} readback mismatch")
+    output = {
+        "project_id": project_id,
+        "paused": result.get("paused"),
+        "resident_wakeup_state": result.get("resident_wakeup_state"),
+    }
+    _emit(args, output, _render_project_pause_state)
+
+
+def _render_project_pause_state(data: dict) -> None:
+    """Render the canonical pause endpoint readback without inferred state."""
+    print("=== PROJECT PAUSE STATE ===")
+    print(f"  project_id:             {data.get('project_id')}")
+    print(f"  paused:                 {json.dumps(data.get('paused'))}")
+    print(
+        "  resident_wakeup_state:  "
+        f"{json.dumps(data.get('resident_wakeup_state'), default=str)}"
+    )
 
 
 def _onboard_goal(args: argparse.Namespace) -> str | None:
@@ -1860,7 +1939,12 @@ def _tasks_create(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         raise APIError("PR task metadata is required")
-    body: dict = {"title": title, "prompt": prompt, "task_type": task_type}
+    body: dict = {
+        "title": title,
+        "prompt": prompt,
+        "task_type": task_type,
+        "priority": getattr(args, "priority", 50),
+    }
     if not scoped:
         body["github_repo"] = github_repo
         body["project_id"] = target_project_id
@@ -8060,9 +8144,9 @@ def build_parser() -> argparse.ArgumentParser:
     # projects
     p_projects = sub.add_parser(
         "projects", parents=[common],
-        help="List all projects, or onboard a new one from a GitHub repo.",
-        description="Project inventory and onboarding. Defaults to `list` when no "
-                    "subcommand is given.")
+        help="List, onboard, pause, or resume projects.",
+        description="Project inventory, onboarding, and dispatch pause state. "
+                    "Defaults to `list` when no subcommand is given.")
     projects_sub = p_projects.add_subparsers(dest="projects_cmd")
     projects_sub.add_parser("list", parents=[common],
                             help="List all projects (id, name, status).")
@@ -8096,6 +8180,22 @@ def build_parser() -> argparse.ArgumentParser:
              "(preview_only=true; mutates nothing, never confirms).")
     p_projects_onboard.add_argument("--yes", action="store_true",
                                     help="Skip the confirmation prompt.")
+    p_projects_pause = projects_sub.add_parser(
+        "pause", parents=[common],
+        help="Pause new dispatch while allowing in-flight tasks to drain.",
+        description="PATCH /api/admin/projects/{id}/pause with paused=true. "
+                    "Requires explicit --project-id or --project selection and "
+                    "does not change autonomous_enabled.")
+    p_projects_pause.add_argument("--yes", action="store_true",
+                                  help="Skip the confirmation prompt.")
+    p_projects_resume = projects_sub.add_parser(
+        "resume", parents=[common],
+        help="Resume dispatch under the project's existing settings.",
+        description="PATCH /api/admin/projects/{id}/pause with paused=false. "
+                    "Requires explicit --project-id or --project selection and "
+                    "does not change autonomous_enabled.")
+    p_projects_resume.add_argument("--yes", action="store_true",
+                                   help="Skip the confirmation prompt.")
 
     # coding-agent access bootstrap and CLI fallback
     p_agent_access = sub.add_parser(
@@ -8449,6 +8549,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--effort", default=None,
         choices=["low", "medium", "high", "max"],
         help="Effort/reasoning level override.")
+    p_tasks_create.add_argument(
+        "--priority", type=int, choices=range(0, 101), default=50,
+        help="Immutable scheduling priority from 0 to 100 (default: 50).")
     p_tasks_create.add_argument(
         "--hotfix", action="store_true", help="Mark task as hotfix priority.")
     p_tasks_create.add_argument("--pr-number", type=int, default=None,
@@ -9596,6 +9699,57 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         return 1
 
 
+def _resolve_windows_cli(name: str) -> str:
+    """Resolve a required CLI, including standard Windows install locations."""
+    executable = shutil.which(name)
+    if executable:
+        return executable
+    if sys.platform == "win32":
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        gh_candidates = [program_files / "GitHub CLI" / "gh.exe"]
+        if local_app_data and Path(local_app_data).is_absolute():
+            gh_candidates.append(
+                Path(local_app_data) / "Programs" / "GitHub CLI" / "gh.exe"
+            )
+        candidates = {
+            "gh": tuple(gh_candidates),
+            "ssh": (
+                Path(os.environ.get("SystemRoot", r"C:\Windows"))
+                / "System32"
+                / "OpenSSH"
+                / "ssh.exe",
+                program_files / "Git" / "usr" / "bin" / "ssh.exe",
+            ),
+        }
+        for candidate in candidates.get(name, ()):
+            if candidate.is_file():
+                return str(candidate)
+    raise APIError(
+        f"{name} executable not found on PATH or in standard Windows install locations"
+    )
+
+
+def _deploy_temporary_directory() -> tempfile.TemporaryDirectory:
+    """Create a child-process-accessible directory for deploy artifacts.
+
+    Sandboxed Windows sessions can grant the Python process access to its
+    profile temp directory without granting the same ACL to ``gh``.  A source
+    checkout is already an operator-approved write root, so prefer it for the
+    short-lived manifest download and fall back to the current directory.
+    """
+    kwargs = {"prefix": ".blueprint-deploy-", "ignore_cleanup_errors": True}
+    if sys.platform != "win32":
+        return tempfile.TemporaryDirectory(**kwargs)
+    candidates = (Path(__file__).resolve().parents[1], Path.cwd())
+    for candidate in candidates:
+        try:
+            return tempfile.TemporaryDirectory(dir=str(candidate), **kwargs)
+        except OSError:
+            continue
+    return tempfile.TemporaryDirectory(**kwargs)
+
+
 def _gh(*gh_args: str) -> str:
     """Run gh and return stdout, mapping failure to APIError for main().
 
@@ -9605,7 +9759,7 @@ def _gh(*gh_args: str) -> str:
     """
     try:
         proc = subprocess.run(
-            ["gh", *gh_args], capture_output=True, check=False,
+            [_resolve_windows_cli("gh"), *gh_args], capture_output=True, check=False,
             encoding="utf-8", errors="replace", timeout=120,
         )
     except subprocess.TimeoutExpired:
@@ -9747,7 +9901,7 @@ def _fetch_deploy_manifest(wanted_sha: str | None = None) -> dict:
               + (f" for sha {requested}" if requested else "."))
         raise APIError("no successful deploy run")
     sha = run["headSha"]
-    with tempfile.TemporaryDirectory() as temporary:
+    with _deploy_temporary_directory() as temporary:
         _gh(
             "run", "download", str(run["databaseId"]), "--repo", _DEPLOY_REPO,
             "-n", f"local-app-release-{sha}", "-D", temporary,
@@ -9781,7 +9935,9 @@ def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> boo
     if host is None:
         return _request_release_socket(digest, revision)
     client_path = Path(__file__).resolve().with_name("release_socket_submit.py")
-    command = ["ssh", host, "python3", "-", digest, revision]
+    command = [
+        _resolve_windows_cli("ssh"), host, "python3", "-", digest, revision
+    ]
     with open(client_path, "rb") as client_source:
         proc = subprocess.run(command, check=False, stdin=client_source)
     if proc.returncode == 3:

@@ -52,6 +52,7 @@ class CreateTaskPayload(BaseModel):
     )
     model: str | None = Field(default=None, min_length=1)
     effort: str | None = Field(default=None, pattern=r"^(low|medium|high|max)$")
+    priority: int = Field(default=50, ge=0, le=100)
     # Optional client-supplied idempotency key for deduping retried requests.
     # When provided, the endpoint returns the existing task if one with the same
     # key already exists in an active state, instead of creating a duplicate.

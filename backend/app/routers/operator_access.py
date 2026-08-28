@@ -114,6 +114,7 @@ class OperatorTaskCreate(_StrictModel):
     title: str = Field(min_length=1, max_length=200)
     prompt: str = Field(min_length=1, max_length=50_000)
     task_type: TaskType = TaskType.create
+    priority: int = Field(default=50, ge=0, le=100)
     pr_number: int | None = Field(default=None, ge=1)
     branch: str | None = Field(
         default=None,
@@ -373,6 +374,8 @@ def _operator_task_receipt(value: Any) -> dict[str, Any]:
             "criterion_ids",
             "criterion_ids_explicit",
             "criterion_release_version_id",
+            "creation_priority",
+            "priority",
             "base_branch",
             "depends_on",
             "require_deps_landed_on",
