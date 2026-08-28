@@ -5335,6 +5335,159 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
   it('stops both lanes when the displaced Workday claim cannot be renewed', async () => {
     await runOrdinaryWorkdayOverlapCase(true);
   });
+
+  it('queues confirmed Fast fallback behind an active Workday reply without redispatching Fast', async () => {
+    vi.useFakeTimers();
+    const legacyMessage = {
+      id: 'legacy-before-fast-fallback',
+      content: 'Finish this existing Workday reply first.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    const fastMessage = {
+      id: 'fast-fallback-during-workday',
+      content: 'Answer this after Fast fails its protocol.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let messagePolls = 0;
+    let fastReplyPersisted = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?')) return Promise.resolve(null);
+      messagePolls += 1;
+      if (messagePolls === 1) {
+        return Promise.resolve({ messages: [], fast_message_ids: [], claim_required: true });
+      }
+      if (messagePolls === 2) {
+        return Promise.resolve({
+          messages: [legacyMessage], fast_message_ids: [], claim_required: true,
+        });
+      }
+      if (!fastReplyPersisted) {
+        return Promise.resolve({
+          messages: [fastMessage], fast_message_ids: [fastMessage.id], claim_required: true,
+        });
+      }
+      return Promise.resolve({ messages: [], fast_message_ids: [], claim_required: true });
+    });
+
+    const canonicalEnvelope = {
+      version: 2,
+      project_id: '11111111-1111-4111-8111-111111111111',
+      context_authority_generation: 4,
+      privacy_generation: 2,
+      transcript_sequence: 83,
+      ledger_revision: 0,
+      problem_model: {},
+      decisions: [],
+      memory: { active: [] },
+      recent_conversation: [boundConversationRow(fastMessage, 83)],
+    };
+    const canonicalBytes = Buffer.from(JSON.stringify(canonicalEnvelope), 'utf8');
+    const envelope = {
+      snapshot_id: 'snapshot-fast-fallback-during-workday',
+      canonical_envelope_b64: canonicalBytes.toString('base64'),
+      canonical_sha256: createHash('sha256').update(canonicalBytes).digest('hex'),
+      context_authority_generation: 4,
+      privacy_generation: 2,
+      transcript_sequence: 83,
+      ledger_revision: 0,
+      expires_at: '2035-01-01T00:00:00.000Z',
+    };
+    let stopAfterFallback = false;
+    const replyCoveredIds: string[][] = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({
+          authority_held: true,
+          conversation_claim_held: true,
+          stop_requested: stopAfterFallback,
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true,
+          lease: { lease_id: 'lease-fast-fallback-during-workday', generation: 1 },
+        });
+      }
+      if (url.endsWith('/messages/claim')) {
+        const messageIds = body.message_ids as string[];
+        return Promise.resolve({
+          claim_id: messageIds.includes(fastMessage.id)
+            ? 'claim-fast-workday-fallback'
+            : 'claim-existing-workday',
+          incarnation_id: 'incarnation-existing-workday',
+          incarnation_supported: true,
+          message_ids: messageIds,
+        });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        return Promise.resolve({
+          claim_id: 'claim-fast-protocol-failure',
+          owner: 'fast',
+          message_ids: [fastMessage.id],
+          envelope,
+        });
+      }
+      if (url.endsWith('/conversation/turns/abandon')) {
+        return Promise.resolve({ status: 'abandoned', legacy_fallback_admissible: true });
+      }
+      if (body?.op === 'create_message') {
+        const covered = ((body.data as Record<string, unknown>).covered_message_ids ?? []) as string[];
+        replyCoveredIds.push(covered);
+        if (covered.includes(fastMessage.id)) {
+          fastReplyPersisted = true;
+          stopAfterFallback = true;
+        }
+      }
+      return Promise.resolve({});
+    });
+    typedFastMocks.dispatch.mockImplementation((receipt: unknown) => Promise.resolve({
+      receipt,
+      result: turnResult(),
+      completion: null,
+      workdayRequests: [],
+    }));
+
+    let resolveExistingWorkday!: (result: ResidentTurnResult) => void;
+    const existingWorkday = new Promise<ResidentTurnResult>((resolve) => {
+      resolveExistingWorkday = resolve;
+    });
+    const workday = makeSession(() => (
+      workday.sendTurn.mock.calls.length === 1
+        ? existingWorkday
+        : Promise.resolve(turnResult({
+          sentOperatorMessage: true,
+          resultText: 'Workday fallback completed.',
+        }))
+    ), () => true);
+    workday.interrupt.mockImplementation(() => {
+      resolveExistingWorkday(turnResult({ interrupted: true }));
+    });
+    mockStartSession.mockReturnValue(workday);
+
+    const done = run('fast-fallback-during-workday', {
+      ...qualifiedPayload(),
+      strategic_session_idle_tick_seconds: 1,
+      strategic_session_message_poll_seconds: 0.001,
+    });
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(2);
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(workday.interrupt).not.toHaveBeenCalled();
+
+    resolveExistingWorkday(turnResult({
+      sentOperatorMessage: true,
+      resultText: 'Existing Workday reply completed.',
+    }));
+    await vi.advanceTimersByTimeAsync(5_000);
+    await done;
+
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(2);
+    expect(workday.sendTurn).toHaveBeenCalledTimes(2);
+    expect(replyCoveredIds).toContainEqual([fastMessage.id]);
+  });
 });
 
 describe('handleStrategicResident — operator-turn compaction includes settled decision and drops answered message', () => {
