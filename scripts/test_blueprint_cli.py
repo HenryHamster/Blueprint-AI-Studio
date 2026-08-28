@@ -7595,6 +7595,202 @@ def test_compute_launch_structured_preview_exposes_full_operator_contract(
     assert body["spawn_followup"] is False
 
 
+def test_compute_launch_contract_file_forwards_full_backend_contract(
+    mock_api, monkeypatch, tmp_path
+):
+    predecessor = "11111111-1111-4111-8111-111111111111"
+    contract_file = tmp_path / "compute-contract.json"
+    contract_file.write_text(
+        json.dumps(
+            {
+                "command": "python3 evaluate.py",
+                "declared_metric": "resume_ok",
+                "spend_cap_usd": 1.25,
+                "deadline_seconds": 900,
+                "success_criterion": {
+                    "metric": "resume_ok",
+                    "operator": ">=",
+                    "threshold": 1,
+                },
+                "accelerator": "RTX 5080",
+                "machine_type": "e2-standard-2",
+                "cwd": "benchmarks",
+                "env": {"TRIAL": "operator"},
+                "experiment": "resume-evaluation",
+                "benchmark": "resume-handoff-v1",
+                "hypothesis": "A hydrated checkpoint produces resume_ok=1.",
+                "metric": "resume_ok",
+                "work_class": "confirmatory",
+                "stop_or_pivot_condition": "Stop after one measured terminal run.",
+                "require_live_release": True,
+                "require_durable_artifact": True,
+                "provisioning_model": "STANDARD",
+                "container_image": "registry.example.com/eval@sha256:" + "a" * 64,
+                "container_registry_auth": {
+                    "server": "registry.example.com",
+                    "username": "runner",
+                    "password": "secret",
+                },
+                "setup_step": "echo prepared",
+                "no_progress_timeout_seconds": 180,
+                "input_artifact_job_id": predecessor,
+                "runner_target": {
+                    "runner_id": "22222222-2222-4222-8222-222222222222",
+                    "strict": True,
+                },
+                "spawn_followup": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = {
+        "api_url": "x",
+        "api_key": "y",
+        "default_repo": "owner/repo",
+        "default_base_branch": "main",
+    }
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: cfg)
+    monkeypatch.setattr(blueprint, "load_config", lambda: cfg)
+
+    rc = blueprint.main(
+        [
+            "compute",
+            "launch",
+            "--contract-file",
+            str(contract_file),
+            "--experiment",
+            "explicit-experiment",
+            "--runner-target",
+            "hamsterwheel",
+            "--preview",
+        ]
+    )
+
+    assert rc == 0
+    body = next(
+        body
+        for method, path, body in mock_api
+        if method == "POST" and path == "/api/admin/tasks/compute-experiment"
+    )
+    assert body["command"] == "python3 evaluate.py"
+    assert body["spend_cap_usd"] == 1.25
+    assert body["deadline_seconds"] == 900
+    assert body["input_artifact_job_id"] == predecessor
+    assert body["experiment"] == "explicit-experiment"
+    assert body["hypothesis"].startswith("A hydrated checkpoint")
+    assert body["env"] == {"TRIAL": "operator"}
+    assert body["container_registry_auth"]["password"] == "secret"
+    assert body["require_live_release"] is True
+    assert body["require_durable_artifact"] is True
+    assert body["runner_target_id"] == "hamsterwheel"
+    assert "runner_target" not in body
+    assert body["preview_only"] is True
+
+
+def test_compute_launch_explicit_resume_and_result_metadata_forwarded(
+    mock_api, monkeypatch
+):
+    cfg = {
+        "api_url": "x",
+        "api_key": "y",
+        "default_repo": "owner/repo",
+        "default_base_branch": "main",
+    }
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: cfg)
+    monkeypatch.setattr(blueprint, "load_config", lambda: cfg)
+    predecessor = "11111111-1111-4111-8111-111111111111"
+
+    rc = blueprint.main(
+        [
+            "compute",
+            "launch",
+            "--command",
+            "python3 evaluate.py",
+            "--declared-metric",
+            "resume_ok",
+            "--input-artifact-job-id",
+            predecessor,
+            "--no-progress-timeout",
+            "60",
+            "--experiment",
+            "resume-evaluation",
+            "--hypothesis",
+            "Hydration succeeds.",
+            "--benchmark",
+            "resume-v1",
+            "--experiment-metric",
+            "resume_ok",
+            "--work-class",
+            "confirmatory",
+            "--yes",
+        ]
+    )
+
+    assert rc == 0
+    body = next(
+        body
+        for method, path, body in mock_api
+        if method == "POST" and path == "/api/admin/tasks/compute-experiment"
+    )
+    assert body["input_artifact_job_id"] == predecessor
+    assert body["experiment"] == "resume-evaluation"
+    assert body["hypothesis"] == "Hydration succeeds."
+    assert body["benchmark"] == "resume-v1"
+    assert body["metric"] == "resume_ok"
+    assert body["work_class"] == "confirmatory"
+
+
+def test_compute_launch_contract_file_rejects_unknown_fields(
+    mock_api, monkeypatch, tmp_path, capsys
+):
+    contract_file = tmp_path / "compute-contract.json"
+    contract_file.write_text(
+        json.dumps({"command": "python3 run.py", "github_repo": "other/repo"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(
+            ["compute", "launch", "--contract-file", str(contract_file), "--preview"]
+        )
+
+    assert exc.value.code == 1
+    assert "unsupported field(s): github_repo" in capsys.readouterr().err
+    assert not any(
+        method == "POST" and "compute-experiment" in path
+        for method, path, _body in mock_api
+    )
+
+
+def test_compute_launch_contract_file_rejects_ambiguous_command_source(
+    mock_api, tmp_path, capsys
+):
+    contract_file = tmp_path / "compute-contract.json"
+    contract_file.write_text(
+        json.dumps({"command": "python3 from-file.py"}), encoding="utf-8"
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(
+            [
+                "compute",
+                "launch",
+                "--contract-file",
+                str(contract_file),
+                "--command",
+                "python3 explicit.py",
+                "--preview",
+            ]
+        )
+
+    assert exc.value.code == 1
+    assert "cannot be combined" in capsys.readouterr().err
+    assert not any(
+        method == "POST" and "compute-experiment" in path
+        for method, path, _body in mock_api
+    )
+
+
 def test_compute_launch_watch_polls_created_task_to_terminal(
     mock_api, monkeypatch, capsys
 ):

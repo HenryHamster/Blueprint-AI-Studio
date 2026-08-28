@@ -7919,6 +7919,255 @@ print(json.dumps(result))
 PYEOF"""
 
 
+_COMPUTE_LAUNCH_CONTRACT_FILE_FIELDS = frozenset(
+    {
+        "accelerator",
+        "arms",
+        "benchmark",
+        "command",
+        "container_image",
+        "container_registry_auth",
+        "cwd",
+        "deadline_seconds",
+        "declared_metric",
+        "env",
+        "experiment",
+        "hypothesis",
+        "input_artifact_job_id",
+        "machine_type",
+        "metric",
+        "no_progress_timeout_seconds",
+        "provisioning_model",
+        "require_durable_artifact",
+        "require_live_release",
+        "runner_target",
+        "runner_target_id",
+        "setup_step",
+        "spawn_followup",
+        "spend_cap_usd",
+        "stop_or_pivot_condition",
+        "success_criterion",
+        "work_class",
+    }
+)
+
+
+def _read_compute_json_file(path_value: str, option: str) -> object:
+    path = Path(path_value).expanduser()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        print(f"ERROR: cannot read {option} {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except UnicodeDecodeError as exc:
+        print(f"ERROR: {option} {path} is not valid UTF-8: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: {option} {path} is not valid JSON: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _normalize_compute_arms(raw_arms: object, option: str) -> list[dict[str, str]]:
+    if not isinstance(raw_arms, list) or not raw_arms:
+        print(
+            f"ERROR: {option} arms must be a non-empty JSON array of "
+            "{name, command} objects.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    arms: list[dict[str, str]] = []
+    for index, raw_arm in enumerate(raw_arms):
+        if not isinstance(raw_arm, dict) or set(raw_arm) != {"name", "command"}:
+            print(
+                f"ERROR: {option} arms[{index}] must contain exactly name and command.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        name = raw_arm.get("name")
+        command = raw_arm.get("command")
+        if not isinstance(name, str) or not name.strip():
+            print(
+                f"ERROR: {option} arms[{index}].name must be non-empty.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not isinstance(command, str) or not command.strip():
+            print(
+                f"ERROR: {option} arms[{index}].command must be non-empty.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        arms.append({"name": name.strip(), "command": command})
+    return arms
+
+
+def _load_compute_contract(path_value: str | None) -> dict:
+    """Load an allowlisted operator compute-launch contract.
+
+    Repository identity, title/prompt, idempotency, preview, and watch behavior
+    remain explicit CLI concerns. Everything the backend currently accepts as
+    execution-contract data may be supplied here without flattening nested JSON
+    (env, registry auth, success criterion, or soft runner target) into shell
+    syntax. The backend remains the authoritative semantic validator.
+    """
+    if not path_value:
+        return {}
+    parsed = _read_compute_json_file(path_value, "--contract-file")
+    if not isinstance(parsed, dict):
+        print("ERROR: --contract-file must contain a JSON object.", file=sys.stderr)
+        sys.exit(1)
+    unknown = sorted(set(parsed) - _COMPUTE_LAUNCH_CONTRACT_FILE_FIELDS)
+    if unknown:
+        print(
+            "ERROR: --contract-file has unsupported field(s): " + ", ".join(unknown),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    contract = dict(parsed)
+    command = contract.get("command")
+    if command is not None and (
+        not isinstance(command, str) or not command.strip()
+    ):
+        print("ERROR: --contract-file command must be a non-empty string.", file=sys.stderr)
+        sys.exit(1)
+    if "arms" in contract:
+        contract["arms"] = _normalize_compute_arms(
+            contract["arms"], "--contract-file"
+        )
+    if command and contract.get("arms"):
+        print(
+            "ERROR: --contract-file command and arms are mutually exclusive.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    for field in ("spend_cap_usd",):
+        value = contract.get(field)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or value <= 0
+        ):
+            print(
+                f"ERROR: --contract-file {field} must be a positive number.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    for field in ("deadline_seconds", "no_progress_timeout_seconds"):
+        value = contract.get(field)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            print(
+                f"ERROR: --contract-file {field} must be a positive integer.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    if (
+        contract.get("deadline_seconds") is not None
+        and contract.get("no_progress_timeout_seconds") is not None
+        and contract["no_progress_timeout_seconds"] > contract["deadline_seconds"]
+    ):
+        print(
+            "ERROR: --contract-file no_progress_timeout_seconds must not exceed "
+            "deadline_seconds.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    for field in (
+        "require_durable_artifact",
+        "require_live_release",
+        "spawn_followup",
+    ):
+        if field in contract and not isinstance(contract[field], bool):
+            print(f"ERROR: --contract-file {field} must be boolean.", file=sys.stderr)
+            sys.exit(1)
+    for field in ("env", "container_registry_auth"):
+        value = contract.get(field)
+        if value is not None and (
+            not isinstance(value, dict)
+            or any(not isinstance(k, str) or not isinstance(v, str) for k, v in value.items())
+        ):
+            print(
+                f"ERROR: --contract-file {field} must be a JSON object of string values.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    registry_auth = contract.get("container_registry_auth")
+    if isinstance(registry_auth, dict):
+        unknown_auth = sorted(
+            set(registry_auth) - {"server", "username", "password"}
+        )
+        if unknown_auth:
+            print(
+                "ERROR: --contract-file container_registry_auth has unsupported "
+                "field(s): " + ", ".join(unknown_auth),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    if "success_criterion" in contract and not isinstance(
+        contract["success_criterion"], dict
+    ):
+        print(
+            "ERROR: --contract-file success_criterion must be a JSON object.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if "runner_target" in contract:
+        runner_target = contract["runner_target"]
+        if not isinstance(runner_target, dict):
+            print(
+                "ERROR: --contract-file runner_target must be a JSON object.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        unknown_target = sorted(set(runner_target) - {"runner_id", "strict"})
+        if unknown_target:
+            print(
+                "ERROR: --contract-file runner_target has unsupported field(s): "
+                + ", ".join(unknown_target),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not isinstance(runner_target.get("runner_id"), str) or not runner_target[
+            "runner_id"
+        ].strip():
+            print(
+                "ERROR: --contract-file runner_target.runner_id must be non-empty.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if "strict" in runner_target and not isinstance(runner_target["strict"], bool):
+            print(
+                "ERROR: --contract-file runner_target.strict must be boolean.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    if contract.get("runner_target") is not None and contract.get(
+        "runner_target_id"
+    ) is not None:
+        print(
+            "ERROR: --contract-file cannot combine soft runner_target with hard "
+            "runner_target_id.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    input_job_id = contract.get("input_artifact_job_id")
+    if input_job_id is not None:
+        try:
+            uuid.UUID(str(input_job_id))
+        except (TypeError, ValueError, AttributeError):
+            print(
+                "ERROR: --contract-file input_artifact_job_id must be a UUID string.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    return contract
+
+
 def _load_compute_arms(
     path_value: str | None,
 ) -> tuple[list[dict[str, str]] | None, str | None]:
@@ -7930,18 +8179,7 @@ def _load_compute_arms(
     """
     if not path_value:
         return None, None
-    path = Path(path_value).expanduser()
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        print(f"ERROR: cannot read --arms-file {path}: {exc}", file=sys.stderr)
-        sys.exit(1)
-    except UnicodeDecodeError as exc:
-        print(f"ERROR: --arms-file {path} is not valid UTF-8: {exc}", file=sys.stderr)
-        sys.exit(1)
-    except json.JSONDecodeError as exc:
-        print(f"ERROR: --arms-file {path} is not valid JSON: {exc}", file=sys.stderr)
-        sys.exit(1)
+    parsed = _read_compute_json_file(path_value, "--arms-file")
 
     declared_metric: str | None = None
     if isinstance(parsed, dict):
@@ -7955,36 +8193,7 @@ def _load_compute_arms(
             sys.exit(1)
         declared_metric = parsed.get("declared_metric")
         parsed = parsed.get("arms")
-    if not isinstance(parsed, list) or not parsed:
-        print(
-            "ERROR: --arms-file must contain a non-empty JSON array of "
-            "{name, command} objects.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    arms: list[dict[str, str]] = []
-    for index, raw_arm in enumerate(parsed):
-        if not isinstance(raw_arm, dict) or set(raw_arm) != {"name", "command"}:
-            print(
-                f"ERROR: --arms-file arms[{index}] must contain exactly name and command.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        name = raw_arm.get("name")
-        command = raw_arm.get("command")
-        if not isinstance(name, str) or not name.strip():
-            print(
-                f"ERROR: --arms-file arms[{index}].name must be non-empty.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        if not isinstance(command, str) or not command.strip():
-            print(
-                f"ERROR: --arms-file arms[{index}].command must be non-empty.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        arms.append({"name": name.strip(), "command": command})
+    arms = _normalize_compute_arms(parsed, "--arms-file")
     if declared_metric is not None and (
         not isinstance(declared_metric, str) or not declared_metric.strip()
     ):
@@ -8033,18 +8242,41 @@ def _compute_launch(args: argparse.Namespace) -> None:
     if not preview_only:
         _require_write_config("compute launch")
     dud = getattr(args, "dud", False)
+    contract = _load_compute_contract(getattr(args, "contract_file", None))
     arms, file_declared_metric = _load_compute_arms(
         getattr(args, "arms_file", None)
     )
-    command = _COMPUTE_DUD_COMMAND if dud else getattr(args, "experiment_command", None)
-    if arms is not None and (dud or command):
+    explicit_command = getattr(args, "experiment_command", None)
+    contract_has_command = bool(contract.get("command"))
+    contract_has_arms = bool(contract.get("arms"))
+    if (contract_has_command or contract_has_arms) and (
+        dud or explicit_command or arms is not None
+    ):
+        print(
+            "ERROR: --contract-file command/arms cannot be combined with --dud, "
+            "--command, or --arms-file.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    command = (
+        _COMPUTE_DUD_COMMAND
+        if dud
+        else explicit_command or contract.get("command")
+    )
+    if arms is None and contract_has_arms:
+        arms = contract["arms"]
+    if arms is not None and (dud or explicit_command):
         print(
             "ERROR: --arms-file cannot be combined with --dud or --command.",
             file=sys.stderr,
         )
         sys.exit(1)
     if not command and arms is None:
-        print("ERROR: provide --dud, --command, or --arms-file.", file=sys.stderr)
+        print(
+            "ERROR: provide --dud, --command, --arms-file, or a command/arms "
+            "in --contract-file.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     cfg = load_config()
     github_repo = getattr(args, "repo", None) or cfg.get("default_repo", "")
@@ -8054,14 +8286,22 @@ def _compute_launch(args: argparse.Namespace) -> None:
     title = getattr(args, "title", None) or ("operator substrate probe" if dud else "operator compute experiment")
     prompt = getattr(args, "prompt", None) or "Operator-launched compute_experiment."
     base_branch = getattr(args, "base_branch", None) or cfg.get("default_base_branch", "main")
-    spend_cap = getattr(args, "spend_cap", 0.50)
-    deadline = getattr(args, "deadline", 600)
+    spend_cap = getattr(args, "spend_cap", None)
+    if spend_cap is None:
+        spend_cap = contract.get("spend_cap_usd", 0.50)
+    deadline = getattr(args, "deadline", None)
+    if deadline is None:
+        deadline = contract.get("deadline_seconds", 600)
     raw_metric = getattr(args, "metric", None)
     metric = (raw_metric or "dud_ok") if dud else raw_metric
     operator = getattr(args, "operator", ">=")
     raw_threshold = getattr(args, "threshold", None)
     threshold = (raw_threshold if raw_threshold is not None else 1.0) if dud else raw_threshold
-    declared_metric = getattr(args, "declared_metric", None) or file_declared_metric
+    declared_metric = (
+        getattr(args, "declared_metric", None)
+        or file_declared_metric
+        or contract.get("declared_metric")
+    )
     if arms is not None and not declared_metric:
         print(
             "ERROR: multi-arm launch requires --declared-metric or declared_metric in --arms-file.",
@@ -8090,6 +8330,7 @@ def _compute_launch(args: argparse.Namespace) -> None:
         "title": title,
         "prompt": prompt,
         "base_branch": base_branch,
+        **contract,
         "spend_cap_usd": spend_cap,
         "deadline_seconds": deadline,
     }
@@ -8106,14 +8347,34 @@ def _compute_launch(args: argparse.Namespace) -> None:
             "operator": operator,
             "threshold": threshold,
         }
-    if getattr(args, "machine_type", None):
-        body["machine_type"] = args.machine_type
+    for arg_name, body_name in (
+        ("accelerator", "accelerator"),
+        ("machine_type", "machine_type"),
+        ("compute_cwd", "cwd"),
+        ("experiment", "experiment"),
+        ("benchmark", "benchmark"),
+        ("hypothesis", "hypothesis"),
+        ("experiment_metric", "metric"),
+        ("work_class", "work_class"),
+        ("provisioning_model", "provisioning_model"),
+        ("container_image", "container_image"),
+        ("setup_step", "setup_step"),
+        ("input_artifact_job_id", "input_artifact_job_id"),
+    ):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            body[body_name] = value
     if getattr(args, "runner_target", None):
         body["runner_target_id"] = args.runner_target
+        body.pop("runner_target", None)
     if getattr(args, "idempotency_key", None):
         body["idempotency_key"] = args.idempotency_key
-    if getattr(args, "require_durable_artifact", False):
-        body["require_durable_artifact"] = True
+    require_durable = getattr(args, "require_durable_artifact", None)
+    if require_durable is not None:
+        body["require_durable_artifact"] = require_durable
+    require_live_release = getattr(args, "require_live_release", None)
+    if require_live_release is not None:
+        body["require_live_release"] = require_live_release
     if getattr(args, "no_progress_timeout", None) is not None:
         body["no_progress_timeout_seconds"] = args.no_progress_timeout
     if getattr(args, "stop_condition", None):
@@ -9441,6 +9702,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--command", dest="experiment_command", default=None,
         help="Bash command string for the experiment (ignored when --dud).")
     p_compute_launch.add_argument(
+        "--contract-file", dest="contract_file", default=None, metavar="PATH",
+        help="Read an allowlisted UTF-8 JSON launch contract. Nested env, registry "
+             "auth, success-criterion, and runner-target objects remain structured; "
+             "explicit non-command flags override matching file values.")
+    p_compute_launch.add_argument(
         "--arms-file", dest="arms_file", default=None, metavar="PATH",
         help="Read a UTF-8 JSON multi-arm contract: either an array of "
              "{name, command} objects or {arms: [...], declared_metric: '...'}.")
@@ -9455,11 +9721,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--base-branch", dest="base_branch", default=None,
         help="Base branch (default: default_base_branch from config or 'main').")
     p_compute_launch.add_argument(
-        "--spend-cap", dest="spend_cap", type=float, default=0.50,
-        help="Spend cap in USD (default 0.50).")
+        "--spend-cap", dest="spend_cap", type=float, default=None,
+        help="Spend cap in USD (default: contract value, then 0.50).")
     p_compute_launch.add_argument(
-        "--deadline", type=int, default=600,
-        help="Deadline in seconds (default 600).")
+        "--deadline", type=int, default=None,
+        help="Deadline in seconds (default: contract value, then 600).")
     p_compute_launch.add_argument(
         "--metric", default=None,
         help="Success-criterion metric name (default 'dud_ok' for --dud).")
@@ -9473,6 +9739,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--machine-type", dest="machine_type", default=None,
         help="GCP machine type override (e.g. n1-standard-4).")
     p_compute_launch.add_argument(
+        "--accelerator", default=None,
+        help="Requested accelerator type (for example T4, L4, or a pinned-runner GPU).")
+    p_compute_launch.add_argument(
+        "--cwd", dest="compute_cwd", default=None,
+        help="Working directory within the checked-out experiment repository.")
+    p_compute_launch.add_argument(
+        "--experiment", default=None,
+        help="Stable experiment name recorded with the terminal result.")
+    p_compute_launch.add_argument(
+        "--benchmark", default=None,
+        help="Benchmark identity recorded with the terminal result.")
+    p_compute_launch.add_argument(
+        "--hypothesis", default=None,
+        help="Hypothesis or decision question forwarded to result consumers.")
+    p_compute_launch.add_argument(
+        "--experiment-metric", dest="experiment_metric", default=None, metavar="NAME",
+        help="Experiment metadata metric (distinct from --metric success criterion).")
+    p_compute_launch.add_argument(
+        "--work-class", choices=("exploratory", "confirmatory", "productization"),
+        default=None, help="Empirical work classification recorded in the contract.")
+    p_compute_launch.add_argument(
+        "--provisioning-model", choices=("STANDARD", "SPOT"), default=None,
+        help="Compute provisioning model.")
+    p_compute_launch.add_argument(
+        "--container-image", default=None,
+        help="Container image URI; use --contract-file for structured registry auth.")
+    p_compute_launch.add_argument(
+        "--setup-step", default=None,
+        help="Optional backend-dependent setup step recorded in the contract.")
+    p_compute_launch.add_argument(
+        "--input-artifact-job-id", default=None, metavar="UUID",
+        help="Resume from this terminal compute job's durable artifact bundle; also "
+             "requires --declared-metric and --no-progress-timeout.")
+    p_compute_launch.add_argument(
         "--runner-target", "--strict-runner-target",
         dest="runner_target", default=None,
         metavar="UUID_OR_HOST",
@@ -9481,8 +9781,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--idempotency-key", dest="idempotency_key", default=None, metavar="KEY",
         help="Project-scoped launch idempotency key for safe retries.")
     p_compute_launch.add_argument(
-        "--require-durable-artifact", action="store_true",
-        help="Fail completion unless a durable compute-result artifact is linked.")
+        "--require-durable-artifact", action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Require (or explicitly waive) a durable compute-result artifact.")
+    p_compute_launch.add_argument(
+        "--require-live-release", action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Require a promoted, serving-confirmed release before compute launch.")
     p_compute_launch.add_argument(
         "--no-progress-timeout", dest="no_progress_timeout", type=int, default=None,
         metavar="SECONDS",
