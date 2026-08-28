@@ -4184,6 +4184,7 @@ async def test_force_promote_current_version_skips_audit_and_promotes(
     assert create_mock.call_args.kwargs["base"] == "main"
     await db_session.refresh(version)
     assert version.status == "promoted"
+    assert version.candidate_sha == candidate
     assert version.last_qualification.get("forced_promote") is True
     assert version.last_qualification.get("forced_promote_by") == "operator-1"
 
@@ -4364,6 +4365,7 @@ async def test_hotfix_promote_accepts_machinery_diff_and_writes_audit_trail(
     # The promoted version records the hotfix provenance in its verdict blob.
     await db_session.refresh(version)
     assert version.status == "promoted"
+    assert version.candidate_sha == "facec0de" * 5
     assert version.last_qualification.get("hotfix_promote") is True
     assert version.last_qualification.get("hotfix_promote_by") == "operator-1"
     assert version.last_qualification.get("hotfix_promote_scope_modules") == [
