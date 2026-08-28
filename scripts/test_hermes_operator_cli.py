@@ -223,6 +223,12 @@ def test_coding_agent_scope_cannot_use_project_operator_write(monkeypatch, capsy
                 "The focused operator CLI tests pass",
                 "--idempotency-key",
                 "hermes-create-1",
+                "--base-branch",
+                "automain",
+                "--require-deps-landed-on",
+                "automain",
+                "--release-base-branch",
+                "automain",
                 "--yes",
             ],
             [
@@ -235,6 +241,9 @@ def test_coding_agent_scope_cannot_use_project_operator_write(monkeypatch, capsy
                         "prompt": "Implement the bounded regression coverage",
                         "task_type": "create",
                         "idempotency_key": "hermes-create-1",
+                        "base_branch": "automain",
+                        "require_deps_landed_on": "automain",
+                        "release_base_branch": "automain",
                         "acceptance_evidence": {
                             "kind": "observable_behavior",
                             "description": "The focused operator CLI tests pass",
@@ -632,12 +641,9 @@ def test_scoped_status_and_diagnostics_use_project_snapshot(monkeypatch, command
     "unsafe_args",
     [
         ["--repo", "owner/repo"],
-        ["--base-branch", "automain"],
         ["--model", "provider-model"],
         ["--effort", "high"],
         ["--hotfix"],
-        ["--require-deps-landed-on", "automain"],
-        ["--release-base-branch", "automain"],
         ["--acceptance-evidence-file", "local-secret.json"],
     ],
 )

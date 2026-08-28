@@ -4566,6 +4566,82 @@ class TestModifyTaskApplySeam:
         assert changes["context"] == "updated"
 
     @pytest.mark.asyncio
+    async def test_apply_simple_mutations_rejects_exact_criterion_authority_changes(
+        self, db_session
+    ):
+        from fastapi import HTTPException
+
+        from app.admin_task_mutations import _apply_simple_mutations
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id)
+        task.payloads = [
+            {
+                "type": "create",
+                "prompt": "bounded work",
+                "base_branch": "main",
+                "direction_id": "d-exact",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_exact.py",
+                },
+            }
+        ]
+        task.context = {
+            "direction_id": "d-exact",
+            "criterion_ids_explicit": True,
+            "criterion_release_version_id": "11111111-1111-4111-8111-111111111111",
+            "_operator_task_creation_authority": {
+                "direction_id": "d-exact",
+                "criterion_ids": ["c-exact"],
+                "criterion_ids_explicit": True,
+                "criterion_release_version_id": (
+                    "11111111-1111-4111-8111-111111111111"
+                ),
+                "depends_on": [],
+                "require_deps_landed_on": None,
+                "release_base_branch": None,
+            },
+        }
+
+        with pytest.raises(HTTPException) as context_error:
+            await _apply_simple_mutations(
+                task,
+                {
+                    "context": {
+                        "criterion_ids_explicit": False,
+                        "direction_id": "d-broader",
+                        "_operator_task_creation_authority": {},
+                    }
+                },
+                db_session,
+                {},
+            )
+        assert context_error.value.status_code == 400
+        assert "criterion_ids_explicit" in context_error.value.detail
+        assert task.context["criterion_ids_explicit"] is True
+        assert task.context["direction_id"] == "d-exact"
+
+        # Plan/research descendants preserve the exact marker without carrying
+        # an operator request snapshot. Their direction and proof contract are
+        # still immutable under the ordinary member PATCH surface.
+        task.context.pop("_operator_task_creation_authority")
+        changed_payload = [dict(task.first_payload)]
+        changed_payload[0]["acceptance_evidence"] = {
+            "kind": "observable_behavior",
+            "description": "weaker proof",
+        }
+        with pytest.raises(HTTPException) as payload_error:
+            await _apply_simple_mutations(
+                task,
+                {"payloads": changed_payload},
+                db_session,
+                {},
+            )
+        assert payload_error.value.status_code == 400
+        assert "acceptance_evidence" in payload_error.value.detail
+
+    @pytest.mark.asyncio
     async def test_apply_simple_mutations_no_op_when_keys_absent(self, db_session):
         """_apply_simple_mutations does nothing when payload has no recognised keys."""
         from app.admin_task_mutations import _apply_simple_mutations

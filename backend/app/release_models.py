@@ -1317,6 +1317,12 @@ class ModuleFindingChain(SQLModel, table=True):
             GUID(), ForeignKey("task.id", ondelete="SET NULL"), nullable=True, index=True
         ),
     )
+    escalation_version: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    escalation_state_fingerprint: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
     resolved_by_task_id: uuid.UUID | None = Field(
         default=None,
         sa_column=Column(

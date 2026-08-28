@@ -126,6 +126,20 @@ from app.admin_task_mutations import (
     modify_task_apply,
 )
 from app.admin_task_contracts import CreateTaskPayload
+from app.admin_task_admission import (
+    DIRECT_REVIEW_REUSE_AUTHORITY_REQUEST_FIELDS,
+    build_task_creation_authority_snapshot,
+    canonical_task_creation_request,
+    prepare_task_creation_authority,
+    reject_idempotent_task_authority_mismatch,
+    task_creation_authority_receipt,
+)
+from app.acceptance_criteria import (
+    CRITERION_RELEASE_VERSION_CONTEXT_KEY,
+    EXPLICIT_CRITERION_IDS_CONTEXT_KEY,
+    OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY,
+)
+from app.depends_on_provenance import remember_structural_depends_on
 from app.direct_research_spawn import enrich_direct_research_payload
 from app.discovery_admission import direction_authority_snapshot
 from app.task_blocked import reset_task_for_fresh_attempt
@@ -2838,6 +2852,8 @@ async def create_task_manually(
         task_payload["require_deps_landed_on"] = payload.require_deps_landed_on
     if payload.release_base_branch is not None:
         task_payload["release_base_branch"] = payload.release_base_branch
+    if payload.direction_id is not None:
+        task_payload["direction_id"] = payload.direction_id
     if payload.model is not None:
         task_payload["model"] = payload.model
     if payload.effort is not None:
@@ -2897,6 +2913,19 @@ async def create_task_manually(
             direction_id=None,
             direct_cycle=None,
             runtime_config=_runtime_config,
+        )
+
+    if payload.criterion_ids and (
+        not isinstance(payload.acceptance_evidence, dict)
+        or payload.acceptance_evidence.get("kind") != "named_test"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "criterion_ids require acceptance_evidence with kind "
+                "'named_test' so a merge can record proof for the exact "
+                "criterion assignment"
+            ),
         )
 
     # Reproduce-on-HEAD citation gate for investigation tasks spawned from a
@@ -2983,6 +3012,10 @@ async def create_task_manually(
         raise HTTPException(
             status_code=422, detail=format_payload_validation_error(exc)
         )
+    canonical_creation_request = canonical_task_creation_request(
+        payload,
+        resolved_base_branch=resolved_base_branch,
+    )
 
     # Idempotency check: if client supplied an idempotency_key, check for
     # existing active task with that key and return it instead of creating a duplicate.
@@ -3019,6 +3052,10 @@ async def create_task_manually(
             .first()
         )
         if existing:
+            reject_idempotent_task_authority_mismatch(
+                existing,
+                canonical_request=canonical_creation_request,
+            )
             return {
                 "id": str(existing.id),
                 "project_id": str(existing.project_id),
@@ -3027,6 +3064,7 @@ async def create_task_manually(
                 "task_type": _task_payload_dict(existing).get("type", "create"),
                 "vm_instance_id": existing.vm_instance_id,
                 "is_duplicate": True,
+                **task_creation_authority_receipt(existing),
             }
 
     # Guard: cap active tasks per project to prevent queue explosion. This is
@@ -3055,6 +3093,15 @@ async def create_task_manually(
         )
 
     new_task_id = uuid.uuid4()
+    creation_authority = await prepare_task_creation_authority(
+        session,
+        project=project,
+        direction_id=payload.direction_id,
+        criterion_ids=payload.criterion_ids,
+        depends_on=payload.depends_on,
+        base_branch=resolved_base_branch,
+        require_deps_landed_on=payload.require_deps_landed_on,
+    )
     direct_review_loop: dict | None = None
     if payload.task_type in (TaskType.fix, TaskType.review) and payload.pr_number is not None:
         from app.branch_cleanup import _get_project_github_token
@@ -3099,6 +3146,12 @@ async def create_task_manually(
             )
             if admission.existing_task is not None:
                 existing = admission.existing_task
+                reject_idempotent_task_authority_mismatch(
+                    existing,
+                    canonical_request=canonical_creation_request,
+                    conflict_label="active review reuse",
+                    comparison_fields=DIRECT_REVIEW_REUSE_AUTHORITY_REQUEST_FIELDS,
+                )
                 await session.commit()
                 return {
                     "id": str(existing.id),
@@ -3108,6 +3161,7 @@ async def create_task_manually(
                     "task_type": _task_payload_dict(existing).get("type", "review"),
                     "vm_instance_id": existing.vm_instance_id,
                     "is_duplicate": True,
+                    **task_creation_authority_receipt(existing),
                 }
             if admission.allowed and admission.review_target is not None:
                 direct_review_loop = {
@@ -3127,6 +3181,25 @@ async def create_task_manually(
                 ),
             )
 
+    authority_context: dict[str, Any] = {}
+    if creation_authority.direction_id is not None:
+        authority_context["direction_id"] = creation_authority.direction_id
+    if payload.criterion_ids is not None:
+        authority_context[EXPLICIT_CRITERION_IDS_CONTEXT_KEY] = True
+    if creation_authority.criterion_release_version_id is not None:
+        authority_context[CRITERION_RELEASE_VERSION_CONTEXT_KEY] = str(
+            creation_authority.criterion_release_version_id
+        )
+    authority_context[OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY] = (
+        build_task_creation_authority_snapshot(
+            creation_authority,
+            canonical_request=canonical_creation_request,
+            criterion_ids_explicit=payload.criterion_ids is not None,
+            require_deps_landed_on=payload.require_deps_landed_on,
+            release_base_branch=payload.release_base_branch,
+        )
+    )
+
     new_task = Task(
         id=new_task_id,
         project_id=project.id,
@@ -3140,9 +3213,12 @@ async def create_task_manually(
         launched_by_user_id=current_user["user_id"],
         requires_approval=False,
         idempotency_key=scoped_idempotency_key,
+        criterion_ids=creation_authority.criterion_ids,
+        depends_on=creation_authority.depends_on,
         **(
             {
                 "context": {
+                    **authority_context,
                     **(citation_task_context or {}),
                     **(
                         {"review_loop": direct_review_loop}
@@ -3151,10 +3227,14 @@ async def create_task_manually(
                     ),
                 }
             }
-            if citation_task_context is not None or direct_review_loop is not None
+            if authority_context
+            or citation_task_context is not None
+            or direct_review_loop is not None
             else {}
         ),
     )
+    if creation_authority.depends_on:
+        remember_structural_depends_on(new_task, creation_authority.depends_on)
     session.add(new_task)
     try:
         await session.commit()
@@ -3185,6 +3265,10 @@ async def create_task_manually(
                 .first()
             )
             if existing:
+                reject_idempotent_task_authority_mismatch(
+                    existing,
+                    canonical_request=canonical_creation_request,
+                )
                 return {
                     "id": str(existing.id),
                     "project_id": str(existing.project_id),
@@ -3193,6 +3277,7 @@ async def create_task_manually(
                     "task_type": _task_payload_dict(existing).get("type", "create"),
                     "vm_instance_id": existing.vm_instance_id,
                     "is_duplicate": True,
+                    **task_creation_authority_receipt(existing),
                 }
         raise
     await session.refresh(new_task)
@@ -3218,6 +3303,7 @@ async def create_task_manually(
         "status": new_task.status,
         "task_type": payload.task_type.value,
         "vm_instance_id": new_task.vm_instance_id,
+        **task_creation_authority_receipt(new_task),
     }
 
 

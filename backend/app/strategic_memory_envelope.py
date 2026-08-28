@@ -13,11 +13,13 @@ import inspect
 import json
 import logging
 import math
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse
 
 from pydantic import BaseModel
 from sqlalchemy import delete
@@ -64,6 +66,8 @@ MAX_RAW_SUFFIX_ROWS = 6
 MAX_TRANSCRIPT_CONTENT_BYTES = 2 * 1024
 MAX_TRANSCRIPT_CONTEXT_BYTES = 1024
 MAX_TRANSCRIPT_ROWS = 32
+MAX_TRANSCRIPT_ATTACHMENTS = 24
+MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
 
 # Only these non-content fields may be copied into a durable Workday packet.
 # The canonical bytes themselves remain in ``StrategicContextEnvelopeSnapshot``
@@ -143,6 +147,147 @@ def canonical_sha256(canonical_envelope: bytes) -> str:
     return hashlib.sha256(canonical_envelope).hexdigest()
 
 
+def _canonical_gcs_locator(value: object) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return None
+    bucket = ""
+    object_name = ""
+    if parsed.scheme == "gs" and parsed.netloc:
+        bucket = parsed.netloc.lower()
+        object_name = parsed.path.lstrip("/")
+    elif parsed.scheme == "https" and parsed.hostname:
+        hostname = parsed.hostname.lower()
+        if parsed.username or parsed.password or parsed.port is not None:
+            return None
+        if hostname == "storage.googleapis.com":
+            bucket, separator, object_name = parsed.path.lstrip("/").partition("/")
+            if not separator:
+                return None
+            bucket = bucket.lower()
+        elif hostname.endswith(".storage.googleapis.com"):
+            bucket = hostname[: -len(".storage.googleapis.com")]
+            object_name = parsed.path.lstrip("/")
+    if not bucket or not object_name:
+        return None
+    return f"gs://{bucket}/{object_name}"
+
+
+def _canonical_base64_bytes(value: object) -> bytes | None:
+    if not isinstance(value, str) or not value or len(value) % 4:
+        return None
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, TypeError):
+        return None
+    return decoded if base64.b64encode(decoded).decode("ascii") == value else None
+
+
+def canonical_attachment_manifest(
+    attachments: object,
+) -> list[dict[str, Any]]:
+    """Bind model-visible attachments without persisting credentials or bytes."""
+
+    if attachments is None:
+        return []
+    if not isinstance(attachments, Sequence) or isinstance(attachments, (str, bytes)):
+        raise ValueError("canonical attachments must be a sequence")
+    if len(attachments) > MAX_TRANSCRIPT_ATTACHMENTS:
+        raise ValueError("canonical attachment manifest exceeds item limit")
+
+    manifest: list[dict[str, Any]] = []
+    for position, attachment in enumerate(attachments):
+        if not isinstance(attachment, Mapping):
+            raise ValueError("canonical attachment entries must be mappings")
+        entry: dict[str, Any] = {"position": position}
+
+        identity_key = "position"
+        identity_value = str(position)
+        for candidate in ("artifact_ref_id", "attachment_id", "id"):
+            raw_identity = attachment.get(candidate)
+            if raw_identity is not None and str(raw_identity).strip():
+                identity_key = candidate
+                identity_value = str(raw_identity).strip()
+                break
+        entry["identity_sha256"] = canonical_sha256(
+            f"{identity_key}:{identity_value}".encode("utf-8")
+        )
+
+        attachment_type = str(
+            attachment.get("type") or attachment.get("kind") or "attachment"
+        ).strip().lower()
+        entry["type"] = attachment_type or "attachment"
+        mime_type = str(
+            attachment.get("mime_type") or attachment.get("media_type") or ""
+        ).strip().lower()
+        if mime_type:
+            entry["mime_type"] = mime_type
+        name = str(attachment.get("name") or attachment.get("filename") or "").strip()
+        if name:
+            entry["name_sha256"] = canonical_sha256(name.encode("utf-8"))
+
+        decoded_data = _canonical_base64_bytes(attachment.get("data"))
+        raw_size = attachment.get("size_bytes")
+        if raw_size is not None:
+            if (
+                isinstance(raw_size, bool)
+                or not isinstance(raw_size, int)
+                or raw_size < 0
+                or raw_size > MAX_SAFE_JSON_INTEGER
+            ):
+                raise ValueError("canonical attachment size must be a nonnegative integer")
+            entry["size_bytes"] = raw_size
+        elif decoded_data is not None:
+            entry["size_bytes"] = len(decoded_data)
+
+        supplied_content_sha = str(
+            attachment.get("image_checksum") or attachment.get("sha256") or ""
+        ).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", supplied_content_sha):
+            entry["content_sha256"] = supplied_content_sha
+        elif decoded_data is not None:
+            entry["content_sha256"] = canonical_sha256(decoded_data)
+
+        revision_checksum = str(attachment.get("checksum") or "").strip().lower()
+        if revision_checksum:
+            if re.fullmatch(r"[0-9a-f]{64}", revision_checksum):
+                entry["revision_checksum"] = revision_checksum
+            else:
+                entry["revision_checksum_sha256"] = canonical_sha256(
+                    revision_checksum.encode("utf-8")
+                )
+
+        locator = _canonical_gcs_locator(
+            attachment.get("storage_uri") or attachment.get("url")
+        )
+        if locator:
+            entry["locator_sha256"] = canonical_sha256(locator.encode("utf-8"))
+        if attachment.get("required") is True:
+            entry["required"] = True
+        if isinstance(attachment.get("truncated"), bool):
+            entry["truncated"] = attachment["truncated"]
+        for count_field in ("snapshot_char_count", "original_char_count"):
+            count_value = attachment.get(count_field)
+            if count_value is None:
+                continue
+            if (
+                isinstance(count_value, bool)
+                or not isinstance(count_value, int)
+                or count_value < 0
+                or count_value > MAX_SAFE_JSON_INTEGER
+            ):
+                raise ValueError(f"canonical attachment {count_field} is invalid")
+            entry[count_field] = count_value
+
+        entry["descriptor_sha256"] = canonical_sha256(canonical_envelope_bytes(entry))
+        manifest.append(entry)
+    return manifest
+
+
 def _truncate_utf8(value: str, max_bytes: int) -> tuple[str, bool]:
     """Keep a valid UTF-8 prefix without splitting a codepoint."""
 
@@ -195,6 +340,8 @@ def _message_value(message: ProjectMessage | Mapping[str, Any], name: str) -> An
 
 def canonical_transcript_suffix(
     messages: Sequence[ProjectMessage | Mapping[str, Any]],
+    *,
+    attachment_manifests: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Project canonical conversation rows into stable, complete core records.
 
@@ -234,18 +381,21 @@ def canonical_transcript_suffix(
         content_preview, content_truncated = _truncate_utf8(
             content, MAX_TRANSCRIPT_CONTENT_BYTES
         )
-        normalized.append(
-            {
-                "sequence": int(sequence),
-                "message_id": str(message_id),
-                "from_type": str(_message_value(message, "from_type") or ""),
-                "content": content_preview,
-                "content_sha256": canonical_sha256(content.encode("utf-8")),
-                "content_bytes": len(content.encode("utf-8")),
-                "content_truncated": content_truncated,
-                "context": projected_context,
-            }
-        )
+        row = {
+            "sequence": int(sequence),
+            "message_id": str(message_id),
+            "from_type": str(_message_value(message, "from_type") or ""),
+            "content": content_preview,
+            "content_sha256": canonical_sha256(content.encode("utf-8")),
+            "content_bytes": len(content.encode("utf-8")),
+            "content_truncated": content_truncated,
+            "context": projected_context,
+        }
+        if attachment_manifests is not None and str(message_id) in attachment_manifests:
+            row["attachment_manifest"] = [
+                dict(item) for item in attachment_manifests[str(message_id)]
+            ]
+        normalized.append(row)
     return sorted(normalized, key=lambda row: (row["sequence"], row["message_id"]))
 
 
@@ -384,6 +534,7 @@ def build_canonical_envelope_core(
     decision_authority: Mapping[str, Any] | None,
     memory: Sequence[Mapping[str, Any]] | None,
     transcript_suffix: Sequence[ProjectMessage | Mapping[str, Any]],
+    attachment_manifests: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     retrieval: Mapping[str, Any] | None = None,
 ) -> CanonicalEnvelopeCore:
     """Build the one persisted envelope core; never serialize it per consumer."""
@@ -398,7 +549,10 @@ def build_canonical_envelope_core(
     )
     memory_projection = canonical_memory_projection(memory)
     retrieval_projection = canonical_retrieval_projection(retrieval)
-    transcript_rows = canonical_transcript_suffix(transcript_suffix)
+    transcript_rows = canonical_transcript_suffix(
+        transcript_suffix,
+        attachment_manifests=attachment_manifests,
+    )
 
     def _assemble(
         rows: list[dict[str, Any]],
@@ -812,6 +966,7 @@ async def build_and_store_context_envelope_snapshot(
     expected_privacy_generation: int | None = None,
     retrieval_trace: Mapping[str, Any] | None = None,
     memory_query: str | None = None,
+    attachment_manifests: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     expires_at: datetime | None = None,
     transcript_limit: int = DEFAULT_TRANSCRIPT_SUFFIX_LIMIT,
     _after_project_lock: (
@@ -930,6 +1085,7 @@ async def build_and_store_context_envelope_snapshot(
         decision_authority=decision_authority,
         memory=[item for item in memory if isinstance(item, Mapping)],
         transcript_suffix=transcript,
+        attachment_manifests=attachment_manifests,
         retrieval=retrieval_payload,
     )
     snapshot = await store_context_envelope_snapshot(
@@ -1172,6 +1328,7 @@ __all__ = [
     "build_canonical_envelope_core",
     "bump_context_authority_generation",
     "bump_privacy_generation_and_purge_context_envelopes",
+    "canonical_attachment_manifest",
     "canonical_envelope_bytes",
     "canonical_memory_projection",
     "canonical_sha256",

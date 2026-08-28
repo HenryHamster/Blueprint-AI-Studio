@@ -1443,6 +1443,7 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     - 0763 removes untouched implicit authorship contracts
     - 0764 adds the version goal-authoring compliance ledger
     - 0765 persists force-promote provenance on qualification verdicts
+    - 0766 fences guard-suppression escalation versions on their chain row
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1579,6 +1580,9 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     force_promote_provenance = (
         versions_dir / "0765_qualificationverdict_force_promote_provenance.py"
     ).read_text()
+    escalation_fence = (
+        versions_dir / "0766_module_finding_chain_escalation_fence.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1688,10 +1692,13 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     assert '"forced_promote_by"' in force_promote_provenance
     assert '"forced_promote_at"' in force_promote_provenance
     assert '"forced_promote_reason"' in force_promote_provenance
+    assert parse_revision_identifiers(escalation_fence) == ("0766", "0765")
+    assert '"escalation_version"' in escalation_fence
+    assert '"escalation_state_fingerprint"' in escalation_fence
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0765", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0765', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0766", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0766', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

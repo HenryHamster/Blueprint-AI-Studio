@@ -4116,24 +4116,47 @@ async def _handle_research_completion(
     # Best-effort: a lookup failure leaves that direction absent from the cache.
     _direction_criterion_cache: dict[str, list[str]] = {}
     from app.acceptance_criteria import (
+        EXPLICIT_CRITERION_IDS_CONTEXT_KEY as _EXPLICIT_CRITERION_IDS_KEY,
         direction_criterion_release_version_id as _direction_criterion_version,
+        filter_active_criterion_keys as _filter_active,
         resolve_task_criterion_release_version_id as _resolve_criterion_version,
         task_criterion_release_version_id as _task_criterion_version,
     )
 
+    _research_criteria_are_explicit = (
+        (task.context or {}).get(_EXPLICIT_CRITERION_IDS_KEY) is True
+    )
     _criterion_release_version_id = _task_criterion_version(task)
     _criterion_version_was_explicit = _criterion_release_version_id is not None
     if _criterion_release_version_id is None:
         _criterion_release_version_id = await _resolve_criterion_version(
             session, task, task.project_id
         )
+    _explicit_parent_criterion_ids = list(task.criterion_ids or [])
+    if (
+        _research_criteria_are_explicit
+        and _criterion_release_version_id is not None
+    ):
+        try:
+            _explicit_parent_criterion_ids = await _filter_active(
+                session,
+                task.project_id,
+                list(task.criterion_ids or []),
+                release_version_id=_criterion_release_version_id,
+            )
+        except Exception:  # noqa: BLE001, TRY400 - preserve admitted exact scope
+            logger.debug(
+                "[RESEARCH] explicit criterion_ids filtering failed for task %s",
+                task.id,
+            )
     _dirs_to_prefetch: set[str] = set()
-    if _parent_direction_id:
+    if _parent_direction_id and not _research_criteria_are_explicit:
         _dirs_to_prefetch.add(_parent_direction_id)
-    for _, _pf_finding, _ in deduplicated:
-        _pf_did = _pf_finding.get("direction_id")
-        if _pf_did and isinstance(_pf_did, str):
-            _dirs_to_prefetch.add(_pf_did)
+    if not _research_criteria_are_explicit:
+        for _, _pf_finding, _ in deduplicated:
+            _pf_did = _pf_finding.get("direction_id")
+            if _pf_did and isinstance(_pf_did, str):
+                _dirs_to_prefetch.add(_pf_did)
     if _dirs_to_prefetch:
         try:
             from app.directions_repo import get_direction_rows as _get_dir_rows
@@ -4157,9 +4180,6 @@ async def _handle_research_completion(
                             )
                         )
                     ):
-                        from app.acceptance_criteria import (
-                            filter_active_criterion_keys as _filter_active,
-                        )
                         _active_keys = await _filter_active(
                             session,
                             task.project_id,
@@ -4613,6 +4633,11 @@ async def _handle_research_completion(
         needs_approval = _budget_requires_approval or _compute_requires_approval
 
         direction_id = finding.get("direction_id")
+        if _research_criteria_are_explicit:
+            # Exact criterion authority belongs to the parent's direction.
+            # A finding cannot relabel that immutable scope onto another
+            # direction while inheriting the parent's criterion IDs.
+            direction_id = _parent_direction_id
 
         # Knowledge-commission dedup guard (web_research / design only).
         # Skip the finding when a knowledge document for the same direction AND
@@ -5113,8 +5138,10 @@ async def _handle_research_completion(
         # agent unknowingly omits the evidence field and the spawn loop rejects
         # the finding, wasting one full research cycle per occurrence.
         _suffix_crit_dir_id = direction_id or _parent_direction_id
-        _suffix_criterion_ids = _direction_criterion_cache.get(
-            _suffix_crit_dir_id or "", []
+        _suffix_criterion_ids = (
+            _explicit_parent_criterion_ids
+            if _research_criteria_are_explicit
+            else _direction_criterion_cache.get(_suffix_crit_dir_id or "", [])
         )
         if _suffix_criterion_ids:
             _criterion_suffix = (
@@ -5218,8 +5245,10 @@ async def _handle_research_completion(
         # legal evidence kind; requiring named_test here would discard valid
         # visual, coverage, behavior, and downstream-artifact routes.
         _crit_eff_dir_id = direction_id or parent_direction_id
-        _crit_criterion_ids = _direction_criterion_cache.get(
-            _crit_eff_dir_id or "", []
+        _crit_criterion_ids = (
+            _explicit_parent_criterion_ids
+            if _research_criteria_are_explicit
+            else _direction_criterion_cache.get(_crit_eff_dir_id or "", [])
         )
         if _crit_criterion_ids and _payload_acceptance_evidence is None:
             _criterion_evidence_rejected.append(finding)
@@ -5401,12 +5430,14 @@ async def _handle_research_completion(
             )
             if isinstance(v, str) and v.strip()
         }
-        # Inherit criterion_ids from the direction this task works on (best-effort).
-        # The cache was pre-fetched for the parent direction before the loop; a
-        # finding-level direction_id falls back to the parent direction's criteria.
+        # Inherit direction criteria for ordinary research. Explicitly scoped
+        # research instead retains the parent's bounded criterion assignment
+        # and parent direction, regardless of a finding-level direction hint.
         _spawn_effective_dir_id = direction_id or parent_direction_id
-        _spawn_criterion_ids = _direction_criterion_cache.get(
-            _spawn_effective_dir_id or "", []
+        _spawn_criterion_ids = (
+            _explicit_parent_criterion_ids
+            if _research_criteria_are_explicit
+            else _direction_criterion_cache.get(_spawn_effective_dir_id or "", [])
         )
         # Fall back to the parent task's own criterion_ids when the direction
         # cache has no entry (e.g. corroboration tasks that carry criterion_ids
@@ -5414,7 +5445,11 @@ async def _handle_research_completion(
         # fallback, research children spawned from a corroboration task would
         # inherit empty criterion_ids and record_task_merge_evidence would
         # produce no evidence, defeating the attestation->covered upgrade.
-        if not _spawn_criterion_ids and task.criterion_ids:
+        if (
+            not _research_criteria_are_explicit
+            and not _spawn_criterion_ids
+            and task.criterion_ids
+        ):
             _spawn_criterion_ids = list(task.criterion_ids)
         new_task = Task(
             project_id=task.project_id,
@@ -5495,6 +5530,11 @@ async def _handle_research_completion(
                         )
                     }
                     if _criterion_release_version_id is not None
+                    else {}
+                ),
+                **(
+                    {_EXPLICIT_CRITERION_IDS_KEY: True}
+                    if _research_criteria_are_explicit
                     else {}
                 ),
                 **(
