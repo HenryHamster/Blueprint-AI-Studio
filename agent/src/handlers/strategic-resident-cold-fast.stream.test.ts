@@ -43,7 +43,6 @@ vi.mock('../providers/foreground-resident.js', async (importOriginal) => ({
 
 vi.mock('./strategic-context-envelope.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./strategic-context-envelope.js')>()),
-  buildFastResidentContextFrame: () => 'CONTEXT',
   verifyStrategicContextEnvelope: (envelope: { transcript_sequence: number }) => ({ envelope }),
 }));
 
@@ -68,6 +67,7 @@ vi.mock('./typed-fast-resident.js', async (importOriginal) => ({
 import {
   assertSelectedMessagesMatchEnvelope,
   buildTypedFastDispatchPrompt,
+  canonicalAttachmentManifest,
   runCheckoutIndependentFastStartup,
 } from './strategic-resident-cold-fast.js';
 
@@ -91,9 +91,11 @@ const envelope = {
   recent_conversation: [{
     sequence: 7,
     message_id: MESSAGE_ID,
+    from_type: 'user',
     content: 'hi',
     content_bytes: 2,
     content_sha256: createHash('sha256').update('hi').digest('hex'),
+    attachment_manifest: [],
   }],
 };
 
@@ -167,14 +169,17 @@ describe('typed Fast active-input integrity', () => {
   const row = (id: string, sequence: number, content: string) => ({
     sequence,
     message_id: id,
+    from_type: 'user',
     content: content.slice(0, 2_048),
     content_truncated: content.length > 2_048,
     content_bytes: Buffer.byteLength(content, 'utf8'),
     content_sha256: createHash('sha256').update(content, 'utf8').digest('hex'),
+    attachment_manifest: [],
   });
-  const verified = (rows: Array<Record<string, unknown>>, sequence: number) => ({
-    envelope: { recent_conversation: rows, transcript_sequence: sequence },
-  }) as never;
+  const verified = (rows: Array<Record<string, unknown>>, sequence: number) => {
+    const canonical = { recent_conversation: rows, transcript_sequence: sequence };
+    return { envelope: canonical, canonicalText: JSON.stringify(canonical) } as never;
+  };
 
   it('delivers an API-sized claimed message in full after verifying its bounded envelope row', async () => {
     const tail = 'TASK-2-TAIL';
@@ -215,9 +220,149 @@ describe('typed Fast active-input integrity', () => {
       [{ id: 'different-id', content, from_type: 'user' }],
     )).toThrow('not bound exactly once');
   });
+
+  it('rejects empty input and duplicate canonical bindings', () => {
+    expect(() => assertSelectedMessagesMatchEnvelope(verified([], 0), []))
+      .toThrow('at least one message');
+    const message = { id: 'duplicate', content: 'exact', from_type: 'user' };
+    const bound = row(message.id, 1, message.content);
+    expect(() => assertSelectedMessagesMatchEnvelope(
+      verified([bound, { ...bound }], 1),
+      [message],
+    )).toThrow('not bound exactly once');
+    expect(() => assertSelectedMessagesMatchEnvelope(
+      verified([{ ...bound, from_type: 'agent' }], 1),
+      [message],
+    )).toThrow('canonical user row');
+  });
+
+  it('rejects a correctly hashed earlier row that is not the terminal turn', () => {
+    const message = { id: 'earlier', content: 'old input', from_type: 'user' };
+    expect(() => assertSelectedMessagesMatchEnvelope(
+      verified([
+        row(message.id, 40, message.content),
+        row('terminal', 41, 'new input'),
+      ], 41),
+      [message],
+    )).toThrow('not the terminal');
+  });
+
+  it('uses UTF-8 byte counts rather than character counts', () => {
+    const message = { id: 'unicode', content: 'task 🚀 café', from_type: 'user' };
+    expect(() => assertSelectedMessagesMatchEnvelope(
+      verified([row(message.id, 5, message.content)], 5),
+      [message],
+    )).not.toThrow();
+    expect(() => assertSelectedMessagesMatchEnvelope(
+      verified([{ ...row(message.id, 5, message.content), content_bytes: message.content.length }], 5),
+      [message],
+    )).toThrow('content does not match');
+  });
+
+  it('binds stable attachment identity while excluding expiring URL signatures', () => {
+    const attachment = {
+      attachment_id: '11111111-1111-4111-8111-111111111111',
+      type: 'image',
+      mime_type: 'image/png',
+      name: 'diagram.png',
+      size_bytes: 42,
+      checksum: 'a'.repeat(64),
+      url: 'https://storage.googleapis.com/private-bucket/diagram.png?X-Goog-Signature=first',
+    };
+    const message = {
+      id: 'with-attachment', content: 'inspect', from_type: 'user',
+      context: { attachments: [attachment] },
+    };
+    const bound = {
+      ...row(message.id, 9, message.content),
+      attachment_manifest: canonicalAttachmentManifest([{ ...attachment, url: `${attachment.url}2` }]),
+    };
+    expect(canonicalAttachmentManifest([{
+      ...attachment,
+      url: attachment.url.replace('/private-bucket/', '/PRIVATE-BUCKET/'),
+    }])).toEqual(canonicalAttachmentManifest([attachment]));
+    expect(canonicalAttachmentManifest([attachment])[0]?.locator_sha256).toBe(
+      createHash('sha256').update('gs://private-bucket/diagram.png').digest('hex'),
+    );
+    expect(canonicalAttachmentManifest([attachment])[0]?.descriptor_sha256).toBe(
+      '78521219af06448fd59b3516b671b66aecb691308562f5096b90412c8e10cf80',
+    );
+    expect(() => assertSelectedMessagesMatchEnvelope(verified([bound], 9), [message]))
+      .not.toThrow();
+    expect(() => assertSelectedMessagesMatchEnvelope(verified([bound], 9), [{
+      ...message,
+      context: { attachments: [{
+        ...attachment,
+        url: 'https://storage.googleapis.com/private-bucket/other.png?X-Goog-Signature=first',
+      }] },
+    }])).toThrow('attachments do not match');
+    expect(() => canonicalAttachmentManifest([{
+      ...attachment,
+      size_bytes: Number.MAX_SAFE_INTEGER + 1,
+    }])).toThrow('size is invalid');
+    expect(() => canonicalAttachmentManifest([{
+      ...attachment,
+      original_char_count: Number.MAX_SAFE_INTEGER + 1,
+    }])).toThrow('original_char_count is invalid');
+  });
+
+  it.each([
+    ['restart', 0, 'short active text'],
+    ['normal', 40, 'short active text'],
+    ['restart-long', 0, `${'x'.repeat(8_000)}TAIL`],
+    ['normal-long', 40, `${'y'.repeat(8_000)}TAIL`],
+  ])('renders the full active turn exactly once on %s input', async (_name, cursor, content) => {
+    const message = { id: `message-${cursor}-${content.length}`, content, from_type: 'user' };
+    const prompt = await buildTypedFastDispatchPrompt(
+      verified([row(message.id, 41, content)], 41),
+      [message],
+      cursor,
+    );
+    expect(JSON.stringify(prompt).split(content)).toHaveLength(2);
+  });
 });
 
 describe('cold-start Fast lane — live strategic_session stream', () => {
+  it('abandons a nonterminal signed input without dispatching it', async () => {
+    const nonterminalEnvelope = {
+      ...envelope,
+      transcript_sequence: 8,
+      recent_conversation: [
+        ...envelope.recent_conversation,
+        {
+          sequence: 8,
+          message_id: 'newer-message',
+          from_type: 'user',
+          content: 'newer',
+          content_bytes: 5,
+          content_sha256: createHash('sha256').update('newer').digest('hex'),
+          attachment_manifest: [],
+        },
+      ],
+    };
+    mocks.apiPost.mockImplementation((url: string) => {
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({ acquired: true, lease: { lease_id: 'lease-1', generation: 1 } });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        return Promise.resolve({
+          claim_id: 'claim-nonterminal', owner: 'fast', message_ids: [MESSAGE_ID],
+          envelope: nonterminalEnvelope,
+        });
+      }
+      if (url.endsWith('/conversation/turns/abandon')) {
+        return Promise.resolve({ status: 'abandoned', legacy_fallback_admissible: true });
+      }
+      return Promise.resolve({});
+    });
+
+    await runCheckoutIndependentFastStartup(startOptions({}));
+
+    expect(mocks.dispatch).not.toHaveBeenCalled();
+    expect(mocks.apiPost.mock.calls.filter(([url]) =>
+      String(url).endsWith('/conversation/turns/abandon'))).toHaveLength(1);
+  });
+
   it('coalesces typed deltas into bounded conversation-message chunks', async () => {
     vi.useFakeTimers();
     const streamer = new ConversationMessageStreamer(

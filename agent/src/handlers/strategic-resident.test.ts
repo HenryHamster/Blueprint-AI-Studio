@@ -219,6 +219,7 @@ import {
   ATTACHMENT_FETCH_TIMEOUT_MS,
   MAX_IMAGES_PER_TURN,
 } from './strategic-resident-lib.js';
+import { canonicalAttachmentManifest } from './strategic-resident-cold-fast.js';
 import { HEARTBEAT_API_TIMEOUT } from '../constants.js';
 
 // The coalescing drain emits at most one frame per this window (see
@@ -530,6 +531,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     content: string,
     sequence: number,
     messageId = `message-${sequence}`,
+    attachments?: unknown,
   ) => {
     const canonicalEnvelope = {
       version: 2,
@@ -544,9 +546,11 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       recent_conversation: [{
         sequence,
         message_id: messageId,
+        from_type: 'user',
         content,
         content_bytes: Buffer.byteLength(content, 'utf8'),
         content_sha256: createHash('sha256').update(content, 'utf8').digest('hex'),
+        attachment_manifest: canonicalAttachmentManifest(attachments),
       }],
     };
     const canonicalBytes = Buffer.from(JSON.stringify(canonicalEnvelope), 'utf8');
@@ -561,15 +565,23 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       expires_at: '2035-01-01T00:00:00.000Z',
     };
   };
+  const messageAttachments = (message: unknown): unknown => {
+    if (message === null || typeof message !== 'object' || Array.isArray(message)) return undefined;
+    const context = (message as Record<string, unknown>).context;
+    if (context === null || typeof context !== 'object' || Array.isArray(context)) return undefined;
+    return (context as Record<string, unknown>).attachments;
+  };
   const boundConversationRow = (
-    message: { id: string; content: string },
+    message: { id: string; content: string; context?: Record<string, unknown> },
     sequence: number,
   ) => ({
     sequence,
     message_id: message.id,
+    from_type: 'user',
     content: message.content,
     content_bytes: Buffer.byteLength(message.content, 'utf8'),
     content_sha256: createHash('sha256').update(message.content, 'utf8').digest('hex'),
+    attachment_manifest: canonicalAttachmentManifest(messageAttachments(message)),
   });
   const bindSessionWithPrivateRuntime = (workday: MockSession) => {
     const runtime = {
@@ -670,6 +682,88 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await done;
     return activityHeartbeats;
   };
+
+  it('abandons a nonterminal normal Fast claim without provider dispatch', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'normal-fast-nonterminal',
+      content: 'Do not answer an earlier signed row.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    const baseEnvelope = typedEnvelope(operatorMessage.content, 40, operatorMessage.id);
+    const canonical = JSON.parse(
+      Buffer.from(baseEnvelope.canonical_envelope_b64, 'base64').toString('utf8'),
+    ) as Record<string, unknown>;
+    canonical.transcript_sequence = 41;
+    canonical.recent_conversation = [
+      ...(canonical.recent_conversation as unknown[]),
+      boundConversationRow({ id: 'normal-fast-newer', content: 'newer input' }, 41),
+    ];
+    const canonicalBytes = Buffer.from(JSON.stringify(canonical), 'utf8');
+    const nonterminalEnvelope = {
+      ...baseEnvelope,
+      canonical_envelope_b64: canonicalBytes.toString('base64'),
+      canonical_sha256: createHash('sha256').update(canonicalBytes).digest('hex'),
+      transcript_sequence: 41,
+    };
+    let workdayStarted = false;
+    let messageOpen = true;
+    let workdayAlive = true;
+    mockApiGet.mockImplementation((url: string) => Promise.resolve(
+      url.includes('/messages?') && workdayStarted && messageOpen
+        ? { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] }
+        : { messages: [], fast_message_ids: [] },
+    ));
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+          conversation_claim_held: true,
+          stop_requested: false,
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true,
+          lease: { lease_id: 'normal-nonterminal-lease', generation: 1 },
+        });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        return Promise.resolve({
+          claim_id: 'normal-nonterminal-claim', owner: 'fast',
+          message_ids: [operatorMessage.id], envelope: nonterminalEnvelope,
+        });
+      }
+      if (url.endsWith('/conversation/turns/abandon')) {
+        messageOpen = false;
+        workdayAlive = false;
+        return Promise.resolve({ status: 'abandoned', legacy_fallback_admissible: true });
+      }
+      if (url.endsWith('/typed-fast-lease/release')) {
+        return Promise.resolve({ released: true });
+      }
+      return Promise.resolve({});
+    });
+    const workday = makeSession(() => turnResult(), () => workdayAlive);
+    mockStartSession.mockImplementation(() => {
+      workdayStarted = true;
+      return workday;
+    });
+
+    const done = run('normal-fast-nonterminal-task', {
+      ...qualifiedPayload(),
+      strategic_session_message_poll_seconds: 0.001,
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await done;
+
+    expect(typedFastMocks.dispatch).not.toHaveBeenCalled();
+    expect(workday.sendTurn).not.toHaveBeenCalled();
+    expect(mockApiPost.mock.calls.filter(([url]) =>
+      url.endsWith('/conversation/turns/abandon'))).toHaveLength(1);
+  });
 
   it('publishes a ready waiting state before entering the conversational loop', async () => {
     mockApiGet.mockResolvedValue({ messages: [] });
@@ -844,7 +938,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'settled-workspace-fast-claim',
           owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 311, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 311, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/complete')) {
@@ -978,7 +1072,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'cold-fast-claim',
           owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 301, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 301, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/complete')) {
@@ -1074,7 +1168,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         return Promise.resolve({
           claim_id: 'warm-stream-claim', owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 401, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 401, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/complete')) {
@@ -1182,7 +1276,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'cold-clone-ready-claim',
           owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 302, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 302, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/complete')) {
@@ -1369,7 +1463,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'cold-failure-claim',
           owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 302, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 302, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/abandon')) {
@@ -1453,7 +1547,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'cold-artifact-claim',
           owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 304, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 304, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/abandon')) {
@@ -1534,7 +1628,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'cold-slow-claim',
           owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 305, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 305, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/abandon')) {
@@ -1599,7 +1693,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     const workspace = new Promise<void>((resolve) => { resolveWorkspace = resolve; });
     mockPrepareWorkspaceForRole.mockImplementationOnce(() => workspace);
     const invalidEnvelope = {
-      ...typedEnvelope(operatorMessage.content, 306, operatorMessage.id),
+      ...typedEnvelope(operatorMessage.content, 306, operatorMessage.id, messageAttachments(operatorMessage)),
       canonical_sha256: '00'.repeat(32),
     };
     mockApiGet.mockImplementation((url: string) => Promise.resolve(
@@ -1714,7 +1808,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'cold-cancel-claim',
           owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 303, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 303, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/abandon')) {
@@ -1789,7 +1883,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'cold-unsafe-claim',
           owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 305, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 305, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/abandon')) {
@@ -2452,7 +2546,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         return Promise.resolve({
           claim_id: 'claim-missing-once', owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 201, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 201, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/complete')) {
@@ -2541,7 +2635,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'claim-process-gone-once',
           owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 211, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 211, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/complete')) {
@@ -2627,7 +2721,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         return Promise.resolve({
           claim_id: 'claim-missing-twice', owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 202, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 202, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/abandon')) {
@@ -2693,7 +2787,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         return Promise.resolve({
           claim_id: 'claim-invalid-once', owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 203, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 203, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/complete')) {
@@ -2768,7 +2862,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         return Promise.resolve({
           claim_id: 'claim-invalid-twice', owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 204, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 204, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/abandon')) {
@@ -3745,7 +3839,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'standard-prompt-fence-claim',
           owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 84, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 84, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/abandon')) {
@@ -4169,7 +4263,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'claim-fast-active-autonomy',
           owner: 'fast',
           message_ids: [operatorMessage.id],
-          envelope: typedEnvelope(operatorMessage.content, 85, operatorMessage.id),
+          envelope: typedEnvelope(operatorMessage.content, 85, operatorMessage.id, messageAttachments(operatorMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/complete')) {
@@ -4265,7 +4359,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     });
 
     const lifecycle: string[] = [];
-    const consultationEnvelope = typedEnvelope(operatorMessage.content, 86, operatorMessage.id);
+    const consultationEnvelope = typedEnvelope(operatorMessage.content, 86, operatorMessage.id, messageAttachments(operatorMessage));
     const firedWatchId = 'watch-fast-preempt-autonomy';
     const firedBarrierId = 'barrier-fast-preempt-autonomy';
     const heartbeatBodies: Array<Record<string, unknown>> = [];
@@ -4475,7 +4569,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     });
 
     const lifecycle: string[] = [];
-    const consultationEnvelope = typedEnvelope(operatorMessage.content, 87, operatorMessage.id);
+    const consultationEnvelope = typedEnvelope(operatorMessage.content, 87, operatorMessage.id, messageAttachments(operatorMessage));
     let consultationAvailable = false;
     let consultationClaimed = false;
     let alive = true;
@@ -4697,7 +4791,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           claim_id: 'claim-autonomous-status-overlap',
           owner: 'fast',
           message_ids: [fastMessage.id],
-          envelope: typedEnvelope(fastMessage.content, 83, fastMessage.id),
+          envelope: typedEnvelope(fastMessage.content, 83, fastMessage.id, messageAttachments(fastMessage)),
         });
       }
       if (url.endsWith('/conversation/turns/complete')) {

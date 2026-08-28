@@ -33,6 +33,7 @@ from app.routers.agent_strategic_messages import (
     _RESIDENT_POLL_EXPECTED_PER_MINUTE,
     _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE,
     _RESIDENT_POLL_REPLACEMENT_OVERLAP,
+    _ordered_delivery_attachments,
     _resident_poll_rate_limit_key,
     WorkdayArtifactBatchLimit,
     agent_poll_messages,
@@ -41,6 +42,7 @@ from app.routers.agent_strategic_messages import (
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.strategic_memory_envelope import (
+    canonical_attachment_manifest,
     context_envelope_reference,
     get_or_create_project_memory_state,
     purge_expired_context_envelope_snapshots,
@@ -65,6 +67,29 @@ _POLL_PATH = "/api/agent/projects/{project_id}/messages"
 
 if not any(getattr(r, "path", None) == _POLL_PATH for r in app.routes):
     app.include_router(_messages_router)
+
+
+def test_delivery_attachment_order_matches_signed_manifest_and_degradation():
+    ordinary = [{"attachment_id": "ordinary-1"}, {"attachment_id": "ordinary-2"}]
+    artifacts = [{"artifact_ref_id": "artifact-1"}, {"artifact_ref_id": "artifact-2"}]
+
+    delivered = _ordered_delivery_attachments(
+        {"attachments": ordinary},
+        artifacts,
+        degraded=False,
+    )
+
+    assert delivered == ordinary + artifacts
+    assert canonical_attachment_manifest(delivered) == canonical_attachment_manifest(
+        ordinary + artifacts
+    )
+    degraded = _ordered_delivery_attachments(
+        {"attachments": ordinary},
+        artifacts,
+        degraded=True,
+    )
+    assert degraded == []
+    assert canonical_attachment_manifest(degraded) == []
 
 
 async def _make_project_task(db_session, *, vm="agent-vm-msgpoll"):
@@ -1179,6 +1204,22 @@ async def test_typed_fast_claim_replay_completion_fences_and_abandon(
     db_session.add(continuous_workbench)
     await db_session.commit()
     inbound = await _add_typed_fast_input(db_session, project)
+    bound_attachment = {
+        "attachment_id": "22222222-2222-4222-8222-222222222222",
+        "type": "attachment",
+        "mime_type": "text/plain",
+        "name": "evidence.txt",
+        "size_bytes": 12,
+        "checksum": "b" * 64,
+        "storage_uri": "gs://private-bucket/evidence.txt",
+    }
+    inbound.context = {
+        **(inbound.context or {}),
+        "attachments": [bound_attachment],
+    }
+    flag_modified(inbound, "context")
+    db_session.add(inbound)
+    await db_session.commit()
     client_claim_id = str(uuid.uuid4())
     claim_payload = _typed_fast_claim_payload(
         task, incarnation, inbound.id, client_claim_id=client_claim_id
@@ -1194,6 +1235,15 @@ async def test_typed_fast_claim_replay_completion_fences_and_abandon(
     canonical = json.loads(base64.b64decode(
         claimed.json()["envelope"]["canonical_envelope_b64"]
     ))
+    claimed_row = next(
+        row
+        for row in canonical["recent_conversation"]
+        if row["message_id"] == str(inbound.id)
+    )
+    assert claimed_row["attachment_manifest"] == canonical_attachment_manifest(
+        [bound_attachment]
+    )
+    assert "private-bucket" not in json.dumps(claimed_row["attachment_manifest"])
     assert canonical["decisions"]["role_contract"] == {
         "public_reply_owner": "fast",
         "workday_request_receipt": "private_consultation_only",
@@ -2386,7 +2436,7 @@ async def test_stale_fast_claim_group_degrades_artifacts_without_losing_membersh
     assert body["fast_claim_groups"][0]["complete"] is True
     assert body["fast_claim_groups"][0]["artifacts_degraded"] is True
     for row in body["messages"]:
-        assert "System recovery notice" in row["content"]
+        assert "System recovery notice" not in row["content"]
         assert row["context"]["_artifact_delivery_deferred"] is True
         assert "attachments" not in row["context"]
 
