@@ -16049,6 +16049,7 @@
   "testing/test_release_drift_sentinel_inherited_tree.py::test_exact_qualified_tree_inheritance_skips_dispatch_and_retires_incidents[cancelled]": 0.5642481000395492,
   "testing/test_release_drift_sentinel_inherited_tree.py::test_exact_qualified_tree_inheritance_skips_dispatch_and_retires_incidents[no_signal]": 0.7348703999305144,
   "testing/test_release_drift_sentinel_inherited_tree.py::test_inherited_receipt_is_not_reused_after_repository_repoint": 0.5339862999389879,
+  "testing/test_release_drift_sentinel_inherited_tree.py::test_inherited_receipt_persist_failure_fails_closed_to_full_ci_dispatch": 0.621514699945692,
   "testing/test_release_drift_sentinel_inherited_tree.py::test_missing_canonical_promotion_ci_receipt_fails_closed_to_dispatch": 0.42779219994554296,
   "testing/test_release_drift_sentinel_inherited_tree.py::test_promotion_api_ambiguity_fails_closed_to_full_ci_dispatch": 0.3528891999158077,
   "testing/test_release_drift_sentinel_inherited_tree.py::test_wrong_backmerge_lineage_fails_closed_to_full_ci_dispatch": 0.5152812000014819,
