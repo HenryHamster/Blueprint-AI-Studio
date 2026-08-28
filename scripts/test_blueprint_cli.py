@@ -9022,6 +9022,154 @@ def test_projects_bare_still_lists(monkeypatch, capsys):
     assert parsed["projects"][0]["id"] == "p-1"
 
 
+# ── projects pause/resume ─────────────────────────────────────────────────
+
+PAUSE_PROJECT_ID = "99999999-2222-3333-4444-555555555555"
+
+
+@pytest.fixture
+def project_pause_api(monkeypatch):
+    """Record pause-state PATCHes and preserve the independent autonomy bit."""
+    calls = []
+    state = {"paused": False, "autonomous_enabled": True}
+
+    monkeypatch.setattr(blueprint, "validate_project_id", lambda _project_id: None)
+    monkeypatch.setattr(
+        blueprint,
+        "resolve_project_id_by_name",
+        lambda name: PAUSE_PROJECT_ID
+        if name == "Pause Target"
+        else pytest.fail(f"unexpected project name: {name}"),
+    )
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        expected_path = f"/api/admin/projects/{PAUSE_PROJECT_ID}/pause"
+        if method == "PATCH" and path == expected_path:
+            state["paused"] = body["paused"]
+            return {
+                "paused": state["paused"],
+                "resident_wakeup_state": None,
+            }
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    return SimpleNamespace(calls=calls, state=state)
+
+
+def test_projects_pause_requires_explicit_project_selection(
+    monkeypatch, capsys
+):
+    """An ambient project default cannot target a broad scheduling mutation."""
+    monkeypatch.setenv("BLUEPRINT_PROJECT_ID", PAUSE_PROJECT_ID)
+    monkeypatch.setattr(
+        blueprint,
+        "api",
+        lambda *args, **kwargs: pytest.fail("missing selection must not call api()"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["projects", "pause", "--yes"])
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "explicit --project-id or --project" in err
+    assert "defaults are not used" in err
+
+
+def test_projects_pause_requires_write_config(
+    project_pause_api, monkeypatch, capsys
+):
+    """A read-only coding-agent config is rejected before the PATCH."""
+    monkeypatch.setattr(
+        blueprint, "load_config", lambda: {"api_key": "test-key", "read_only": True}
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(
+            ["projects", "pause", "--project-id", PAUSE_PROJECT_ID, "--yes"]
+        )
+
+    assert exc.value.code == 1
+    assert "read-only" in capsys.readouterr().err
+    assert project_pause_api.calls == []
+
+
+def test_projects_pause_json_reports_exact_server_readback(
+    project_pause_api, capsys
+):
+    """Pause targets the canonical endpoint and emits stable machine output."""
+    rc = blueprint.main(
+        [
+            "projects",
+            "pause",
+            "--project-id",
+            PAUSE_PROJECT_ID,
+            "--yes",
+            "--json",
+        ]
+    )
+
+    assert rc == 0
+    assert project_pause_api.calls == [
+        (
+            "PATCH",
+            f"/api/admin/projects/{PAUSE_PROJECT_ID}/pause",
+            {"paused": True},
+        )
+    ]
+    assert json.loads(capsys.readouterr().out) == {
+        "project_id": PAUSE_PROJECT_ID,
+        "paused": True,
+        "resident_wakeup_state": None,
+    }
+
+
+def test_projects_resume_sends_only_paused_and_preserves_autonomy(
+    project_pause_api, capsys
+):
+    """Resume composes with server autonomy by never writing that field."""
+    project_pause_api.state["paused"] = True
+
+    rc = blueprint.main(
+        ["projects", "resume", "--project", "Pause Target", "--yes"]
+    )
+
+    assert rc == 0
+    assert project_pause_api.calls == [
+        (
+            "PATCH",
+            f"/api/admin/projects/{PAUSE_PROJECT_ID}/pause",
+            {"paused": False},
+        )
+    ]
+    assert project_pause_api.state == {
+        "paused": False,
+        "autonomous_enabled": True,
+    }
+    out = capsys.readouterr().out
+    assert f"project_id:             {PAUSE_PROJECT_ID}" in out
+    assert "paused:                 false" in out
+    assert "resident_wakeup_state:  null" in out
+
+
+def test_projects_pause_confirms_before_patch(
+    project_pause_api, monkeypatch, capsys
+):
+    """Without --yes, non-interactive execution aborts before mutation."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    rc = blueprint.main(
+        ["projects", "pause", "--project-id", PAUSE_PROJECT_ID]
+    )
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "Aborted." in captured.out
+    assert "Refusing to mutate without --yes" in captured.err
+    assert project_pause_api.calls == []
+
+
 # ── fleet runner <-> project bindings ────────────────────────────────────────
 
 ENROLLMENT_PID = "aaaaaaaa-0000-0000-0000-000000000001"
