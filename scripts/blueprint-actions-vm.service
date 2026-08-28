@@ -1,0 +1,21 @@
+[Unit]
+Description=Blueprint GitHub Actions KVM guest
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=%h/.blueprint/github-actions-vm-control.env
+ExecStart=/usr/bin/env bash ${BLUEPRINT_ACTIONS_VM_LAUNCHER} recover
+ExecStop=/usr/bin/env bash ${BLUEPRINT_ACTIONS_VM_LAUNCHER} stop
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=180
+TimeoutStopSec=150
+UMask=0077
+
+[Install]
+WantedBy=default.target

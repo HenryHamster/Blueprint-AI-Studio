@@ -4,6 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ASSET_DIR="$SCRIPT_DIR/github-actions-vm"
 MANAGER="$SCRIPT_DIR/github_actions_vm.py"
+CONTROL_UNIT_SOURCE="$SCRIPT_DIR/blueprint-actions-vm.service"
+CONTROL_ENV_PATH="$HOME/.blueprint/github-actions-vm-control.env"
+CONTROL_UNIT_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/blueprint-actions-vm.service"
 
 : "${BLUEPRINT_ACTIONS_VM_STATE:=$HOME/.blueprint/github-actions-vm}"
 : "${BLUEPRINT_ACTIONS_VM_CPUS:=12}"
@@ -13,6 +16,7 @@ MANAGER="$SCRIPT_DIR/github_actions_vm.py"
 : "${BLUEPRINT_ACTIONS_VM_SSH_PORT:=2222}"
 : "${BLUEPRINT_ACTIONS_VM_SSH_KEY:=$HOME/.ssh/id_ed25519.pub}"
 : "${BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY:=${BLUEPRINT_ACTIONS_VM_SSH_KEY%.pub}}"
+: "${BLUEPRINT_ACTIONS_VM_KVM_DEVICE:=/dev/kvm}"
 
 HOST_IMAGE="blueprint/github-actions-kvm:24.04"
 FIREWALL_CONTAINER="blueprint-actions-vm-net"
@@ -41,20 +45,38 @@ validate_configuration() {
   [[ "$BLUEPRINT_ACTIONS_VM_STATE" = /* ]] || die "BLUEPRINT_ACTIONS_VM_STATE must be absolute"
   [[ "$BLUEPRINT_ACTIONS_VM_STATE" != *".."* ]] || die "state path may not contain '..'"
   [[ "$BLUEPRINT_ACTIONS_VM_STATE" != *[[:space:]]* ]] || die "state path may not contain whitespace"
+  [[ "$BLUEPRINT_ACTIONS_VM_SSH_KEY" = /* ]] || die "BLUEPRINT_ACTIONS_VM_SSH_KEY must be absolute"
+  [[ "$BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY" = /* ]] \
+    || die "BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY must be absolute"
+  [[ "$BLUEPRINT_ACTIONS_VM_KVM_DEVICE" = /* ]] || die "BLUEPRINT_ACTIONS_VM_KVM_DEVICE must be absolute"
   validate_uint cpus "$BLUEPRINT_ACTIONS_VM_CPUS" 2 64
   validate_uint memory "$BLUEPRINT_ACTIONS_VM_MEMORY_MIB" 4096 131072
   validate_uint disk "$BLUEPRINT_ACTIONS_VM_DISK_GIB" 24 2048
   validate_uint runners "$BLUEPRINT_ACTIONS_VM_RUNNERS" 1 16
   validate_uint ssh_port "$BLUEPRINT_ACTIONS_VM_SSH_PORT" 1024 65535
-  [[ -f "$MANAGER" && -d "$ASSET_DIR" ]] || die "run this command from a complete Blueprint checkout"
+  [[ -f "$MANAGER" && -d "$ASSET_DIR" && -f "$CONTROL_UNIT_SOURCE" ]] \
+    || die "run this command from a complete Blueprint checkout"
 }
 
-ssh_arguments() {
+validate_control_path() {
+  local name="$1" value="$2"
+  [[ "$value" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    || die "$name must be an absolute path containing only letters, digits, '.', '_', '-', and '/'"
+  [[ "$value" != *".."* ]] || die "$name may not contain '..'"
+}
+
+validate_ssh_key_files() {
+  [[ -f "$BLUEPRINT_ACTIONS_VM_SSH_KEY" && ! -L "$BLUEPRINT_ACTIONS_VM_SSH_KEY" ]] \
+    || die "SSH public key is missing or symlinked: $BLUEPRINT_ACTIONS_VM_SSH_KEY"
   [[ -f "$BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY" && ! -L "$BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY" ]] \
     || die "SSH private key is missing or symlinked: $BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY"
   local key_mode
   key_mode="$(stat -c %a "$BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY")"
   [[ "$key_mode" == "600" || "$key_mode" == "400" ]] || die "SSH private key mode must be 0600 or 0400"
+}
+
+ssh_arguments() {
+  validate_ssh_key_files
   [[ "$BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY" != *","* ]] \
     || die "SSH private key path may not contain commas"
   if [[ ! -e "$BLUEPRINT_ACTIONS_VM_STATE/known_hosts" ]]; then
@@ -206,7 +228,10 @@ prepare() {
 }
 
 verify_prestart() {
-  [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || die "/dev/kvm is not usable"
+  [[ -c "$BLUEPRINT_ACTIONS_VM_KVM_DEVICE" \
+      && -r "$BLUEPRINT_ACTIONS_VM_KVM_DEVICE" \
+      && -w "$BLUEPRINT_ACTIONS_VM_KVM_DEVICE" ]] \
+    || die "$BLUEPRINT_ACTIONS_VM_KVM_DEVICE is not usable"
   [[ -f "$BLUEPRINT_ACTIONS_VM_STATE/overlay.qcow2" && ! -L "$BLUEPRINT_ACTIONS_VM_STATE/overlay.qcow2" ]] \
     || die "overlay is missing or symlinked"
   [[ -f "$BLUEPRINT_ACTIONS_VM_STATE/seed.img" && ! -L "$BLUEPRINT_ACTIONS_VM_STATE/seed.img" ]] \
@@ -256,12 +281,12 @@ start() {
   if ! docker run --detach \
     --name "$QEMU_CONTAINER" \
     --network "container:$FIREWALL_CONTAINER" \
-    --device /dev/kvm \
+    --device "$BLUEPRINT_ACTIONS_VM_KVM_DEVICE:/dev/kvm" \
     --cap-drop ALL \
     --security-opt no-new-privileges \
     --read-only \
     --user "$(id -u):$(id -g)" \
-    --group-add "$(stat -c %g /dev/kvm)" \
+    --group-add "$(stat -c %g "$BLUEPRINT_ACTIONS_VM_KVM_DEVICE")" \
     --pids-limit 256 \
     --memory "$((BLUEPRINT_ACTIONS_VM_MEMORY_MIB + 4096))m" \
     --cpus "$BLUEPRINT_ACTIONS_VM_CPUS" \
@@ -287,6 +312,101 @@ status() {
     docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} memory={{.MemUsage}} pids={{.PIDs}}' \
       "$FIREWALL_CONTAINER" "$QEMU_CONTAINER"
   fi
+}
+
+container_status() {
+  docker inspect --format '{{.State.Status}}' "$1" 2>/dev/null || printf 'absent\n'
+}
+
+container_is_stopped() {
+  case "$1" in
+    absent|created|exited|dead) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+recover() {
+  ensure_state_root
+  verify_prestart
+
+  local firewall_status qemu_status
+  firewall_status="$(container_status "$FIREWALL_CONTAINER")"
+  qemu_status="$(container_status "$QEMU_CONTAINER")"
+
+  if [[ "$firewall_status" == running && "$qemu_status" == running ]]; then
+    printf 'KVM guest and firewall are already running.\n'
+    return 0
+  fi
+  if [[ "$qemu_status" == running ]]; then
+    die "refusing recovery: KVM guest is running while firewall state is $firewall_status"
+  fi
+  container_is_stopped "$qemu_status" \
+    || die "refusing recovery from ambiguous KVM guest state: $qemu_status"
+  if [[ "$firewall_status" != running ]]; then
+    container_is_stopped "$firewall_status" \
+      || die "refusing recovery from ambiguous firewall state: $firewall_status"
+  fi
+
+  if [[ "$qemu_status" != absent ]]; then
+    docker rm "$QEMU_CONTAINER" >/dev/null
+  fi
+  if [[ "$firewall_status" == running ]]; then
+    docker stop --timeout 10 "$FIREWALL_CONTAINER" >/dev/null
+    firewall_status="$(container_status "$FIREWALL_CONTAINER")"
+    container_is_stopped "$firewall_status" \
+      || die "firewall did not reach a stopped state during recovery: $firewall_status"
+  fi
+  if [[ "$firewall_status" != absent ]]; then
+    docker rm "$FIREWALL_CONTAINER" >/dev/null
+  fi
+  start
+}
+
+install_control() {
+  ensure_state_root
+  verify_prestart
+  validate_ssh_key_files
+  validate_control_path BLUEPRINT_ACTIONS_VM_STATE "$BLUEPRINT_ACTIONS_VM_STATE"
+  validate_control_path BLUEPRINT_ACTIONS_VM_SSH_KEY "$BLUEPRINT_ACTIONS_VM_SSH_KEY"
+  validate_control_path BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY "$BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY"
+  validate_control_path BLUEPRINT_ACTIONS_VM_KVM_DEVICE "$BLUEPRINT_ACTIONS_VM_KVM_DEVICE"
+  validate_control_path launcher "$SCRIPT_DIR/install-github-actions-vm.sh"
+  validate_control_path control_environment "$CONTROL_ENV_PATH"
+  validate_control_path control_unit "$CONTROL_UNIT_PATH"
+  require_command systemctl
+
+  [[ ! -L "$CONTROL_ENV_PATH" ]] || die "refusing symlinked control environment file"
+  [[ ! -L "$CONTROL_UNIT_PATH" ]] || die "refusing symlinked control unit"
+  install -d -m 0700 "$(dirname -- "$CONTROL_ENV_PATH")"
+  install -d -m 0700 "$(dirname -- "$CONTROL_UNIT_PATH")"
+
+  local temporary_environment temporary_unit
+  temporary_environment="$(mktemp "${CONTROL_ENV_PATH}.tmp.XXXXXX")"
+  temporary_unit="$(mktemp "${CONTROL_UNIT_PATH}.tmp.XXXXXX")"
+  trap 'rm -f -- "$temporary_environment" "$temporary_unit"' RETURN
+  {
+    printf '# Written by install-github-actions-vm.sh install-control. Mode 0600; do not commit.\n'
+    printf 'BLUEPRINT_ACTIONS_VM_LAUNCHER=%s\n' "$SCRIPT_DIR/install-github-actions-vm.sh"
+    printf 'BLUEPRINT_ACTIONS_VM_STATE=%s\n' "$BLUEPRINT_ACTIONS_VM_STATE"
+    printf 'BLUEPRINT_ACTIONS_VM_CPUS=%s\n' "$BLUEPRINT_ACTIONS_VM_CPUS"
+    printf 'BLUEPRINT_ACTIONS_VM_MEMORY_MIB=%s\n' "$BLUEPRINT_ACTIONS_VM_MEMORY_MIB"
+    printf 'BLUEPRINT_ACTIONS_VM_DISK_GIB=%s\n' "$BLUEPRINT_ACTIONS_VM_DISK_GIB"
+    printf 'BLUEPRINT_ACTIONS_VM_RUNNERS=%s\n' "$BLUEPRINT_ACTIONS_VM_RUNNERS"
+    printf 'BLUEPRINT_ACTIONS_VM_SSH_PORT=%s\n' "$BLUEPRINT_ACTIONS_VM_SSH_PORT"
+    printf 'BLUEPRINT_ACTIONS_VM_SSH_KEY=%s\n' "$BLUEPRINT_ACTIONS_VM_SSH_KEY"
+    printf 'BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY=%s\n' "$BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY"
+    printf 'BLUEPRINT_ACTIONS_VM_KVM_DEVICE=%s\n' "$BLUEPRINT_ACTIONS_VM_KVM_DEVICE"
+  } > "$temporary_environment"
+  chmod 0600 "$temporary_environment"
+  install -m 0644 "$CONTROL_UNIT_SOURCE" "$temporary_unit"
+  mv -f "$temporary_environment" "$CONTROL_ENV_PATH"
+  mv -f "$temporary_unit" "$CONTROL_UNIT_PATH"
+  trap - RETURN
+
+  systemctl --user daemon-reload
+  systemctl --user enable blueprint-actions-vm.service
+  printf 'Installed durable Actions VM control without starting it.\n'
+  printf 'Start with: systemctl --user start blueprint-actions-vm.service\n'
 }
 
 guest_status() {
@@ -350,18 +470,45 @@ maintenance_status() {
 }
 
 stop() {
-  if container_exists "$QEMU_CONTAINER"; then
+  local qemu_status firewall_status
+  qemu_status="$(container_status "$QEMU_CONTAINER")"
+  firewall_status="$(container_status "$FIREWALL_CONTAINER")"
+
+  case "$qemu_status" in
+    running|absent|created|exited|dead) ;;
+    *) die "refusing stop from ambiguous KVM guest state: $qemu_status" ;;
+  esac
+  case "$firewall_status" in
+    running|absent|created|exited|dead) ;;
+    *) die "refusing stop from ambiguous firewall state: $firewall_status" ;;
+  esac
+  if [[ "$qemu_status" == running && "$firewall_status" != running ]]; then
+    die "refusing stop: KVM guest is running while firewall state is $firewall_status"
+  fi
+
+  if [[ "$qemu_status" == running ]]; then
     docker stop --timeout 120 "$QEMU_CONTAINER"
+  fi
+  qemu_status="$(container_status "$QEMU_CONTAINER")"
+  container_is_stopped "$qemu_status" \
+    || die "KVM guest did not reach a stopped state: $qemu_status"
+  if [[ "$qemu_status" != absent ]]; then
     docker rm "$QEMU_CONTAINER"
   fi
-  if container_exists "$FIREWALL_CONTAINER"; then
+  firewall_status="$(container_status "$FIREWALL_CONTAINER")"
+  if [[ "$firewall_status" == running ]]; then
     docker stop --timeout 10 "$FIREWALL_CONTAINER"
+  fi
+  firewall_status="$(container_status "$FIREWALL_CONTAINER")"
+  container_is_stopped "$firewall_status" \
+    || die "firewall did not reach a stopped state: $firewall_status"
+  if [[ "$firewall_status" != absent ]]; then
     docker rm "$FIREWALL_CONTAINER"
   fi
 }
 
 usage() {
-  printf 'Usage: %s {plan|prepare|start|status|guest-status|register|install-maintenance|maintenance-status|stop}\n' "$0"
+  printf 'Usage: %s {plan|prepare|start|recover|status|guest-status|register|install-maintenance|maintenance-status|install-control|stop}\n' "$0"
 }
 
 validate_configuration
@@ -378,11 +525,13 @@ case "${1:-}" in
     ;;
   prepare) prepare ;;
   start) start ;;
+  recover) recover ;;
   status) status ;;
   guest-status) guest_status ;;
   register) register_runners ;;
   install-maintenance) install_maintenance ;;
   maintenance-status) maintenance_status ;;
+  install-control) install_control ;;
   stop) stop ;;
   *) usage; exit 2 ;;
 esac
