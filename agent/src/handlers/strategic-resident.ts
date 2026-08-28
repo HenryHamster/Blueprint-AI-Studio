@@ -4903,13 +4903,23 @@ export async function handleStrategicResident(
   ): Promise<'stop' | 'continue'> => {
     const partition = partitionInboundMessages(msgs);
     const fastMessages = partition.fast;
+    const freshFastMessages = fastMessages.filter((message) => (
+      typeof message.id !== 'string'
+      || !pendingTypedFastFallbackMessageIds.has(message.id.trim())
+    ));
     // Fast is the typed public-reply owner.  Do not silently fall through to
     // the ordinary Workday reply path if it is unavailable or needs research:
     // that would reintroduce two competing conversational owners.
-    const typedOutcome = fastMessages.length > 0
-      ? hasPendingTypedFastFallback(fastMessages)
+    // A fallback handoff is exact to the abandoned claim's message ids. If a
+    // newer canonical row joined the poll while Workday was busy, dispatch only
+    // that fresh subset through Fast first; the completed-row path below rolls
+    // admission back so the older fallback is re-polled on its own. Treating an
+    // existential match as permission for the whole page would silently hand a
+    // never-abandoned Fast row to Workday.
+    const typedOutcome = freshFastMessages.length > 0
+      ? await tryHandleTypedFastTurn(freshFastMessages)
+      : fastMessages.length > 0
         ? 'fallback_admissible'
-        : await tryHandleTypedFastTurn(fastMessages)
       : 'not_available';
     // Once Coordinator confirms the exact Fast claim was abandoned and legacy
     // fallback is admissible, there is no competing public owner. Hand the

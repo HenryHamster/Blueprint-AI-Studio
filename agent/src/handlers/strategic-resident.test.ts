@@ -2516,7 +2516,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
   });
 
-  it('recycles Fast once and completes the same claim when the first child omits completion', async () => {
+  it('recycles Fast once and completes the same claim when the first child exits', async () => {
     const operatorMessage = {
       id: 'typed-fast-missing-completion-once', content: 'Can you respond?',
       created_at: new Date().toISOString(), from_type: 'user',
@@ -2561,7 +2561,9 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       dispatchStatuses.push(statusRef.value);
       return Promise.resolve({
         receipt,
-        result: turnResult(),
+        result: turnResult({
+          processGone: typedFastMocks.dispatch.mock.calls.length === 1,
+        }),
         completion: typedFastMocks.dispatch.mock.calls.length === 1
           ? null
           : { receipt, content: 'Yes — I am here.' },
@@ -5337,7 +5339,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await runOrdinaryWorkdayOverlapCase(true);
   });
 
-  it('queues confirmed Fast fallback behind an active Workday reply without redispatching Fast', async () => {
+  it('queues an exact Fast fallback behind active Workday and keeps a newer Fast row on Fast', async () => {
     vi.useFakeTimers();
     const legacyMessage = {
       id: 'legacy-before-fast-fallback',
@@ -5351,8 +5353,15 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       created_at: new Date().toISOString(),
       from_type: 'user',
     };
+    const newerFastMessage = {
+      id: 'newer-fast-during-fallback-wait',
+      content: 'Keep this newer row on its Fast owner.',
+      created_at: new Date(Date.now() + 1_000).toISOString(),
+      from_type: 'user',
+    };
     let messagePolls = 0;
     let fastReplyPersisted = false;
+    let newerFastReplyPersisted = false;
     mockApiGet.mockImplementation((url: string) => {
       if (!url.includes('/messages?')) return Promise.resolve(null);
       messagePolls += 1;
@@ -5365,8 +5374,13 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         });
       }
       if (!fastReplyPersisted) {
+        const messages = messagePolls === 3 || newerFastReplyPersisted
+          ? [fastMessage]
+          : [fastMessage, newerFastMessage];
         return Promise.resolve({
-          messages: [fastMessage], fast_message_ids: [fastMessage.id], claim_required: true,
+          messages,
+          fast_message_ids: messages.map(message => message.id),
+          claim_required: true,
         });
       }
       return Promise.resolve({ messages: [], fast_message_ids: [], claim_required: true });
@@ -5395,6 +5409,19 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       ledger_revision: 0,
       expires_at: '2035-01-01T00:00:00.000Z',
     };
+    const newerCanonicalEnvelope = {
+      ...canonicalEnvelope,
+      transcript_sequence: 84,
+      recent_conversation: [boundConversationRow(newerFastMessage, 84)],
+    };
+    const newerCanonicalBytes = Buffer.from(JSON.stringify(newerCanonicalEnvelope), 'utf8');
+    const newerEnvelope = {
+      ...envelope,
+      snapshot_id: 'snapshot-newer-fast-during-fallback',
+      canonical_envelope_b64: newerCanonicalBytes.toString('base64'),
+      canonical_sha256: createHash('sha256').update(newerCanonicalBytes).digest('hex'),
+      transcript_sequence: 84,
+    };
     let stopAfterFallback = false;
     const replyCoveredIds: string[][] = [];
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
@@ -5412,7 +5439,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         });
       }
       if (url.endsWith('/messages/claim')) {
-        const messageIds = body.message_ids as string[];
+        const messageIds = body?.message_ids as string[];
         return Promise.resolve({
           claim_id: messageIds.includes(fastMessage.id)
             ? 'claim-fast-workday-fallback'
@@ -5423,12 +5450,18 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         });
       }
       if (url.endsWith('/conversation/turns/claim')) {
+        const messageIds = body?.message_ids as string[];
+        const newer = messageIds.includes(newerFastMessage.id);
         return Promise.resolve({
-          claim_id: 'claim-fast-protocol-failure',
+          claim_id: newer ? 'claim-newer-fast' : 'claim-fast-protocol-failure',
           owner: 'fast',
-          message_ids: [fastMessage.id],
-          envelope,
+          message_ids: messageIds,
+          envelope: newer ? newerEnvelope : envelope,
         });
+      }
+      if (url.endsWith('/conversation/turns/complete')) {
+        newerFastReplyPersisted = true;
+        return Promise.resolve({ status: 'completed' });
       }
       if (url.endsWith('/conversation/turns/abandon')) {
         return Promise.resolve({ status: 'abandoned', legacy_fallback_admissible: true });
@@ -5443,10 +5476,12 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       }
       return Promise.resolve({});
     });
-    typedFastMocks.dispatch.mockImplementation((receipt: unknown) => Promise.resolve({
+    typedFastMocks.dispatch.mockImplementation((receipt: { message_ids: string[] }) => Promise.resolve({
       receipt,
       result: turnResult(),
-      completion: null,
+      completion: receipt.message_ids.includes(fastMessage.id)
+        ? null
+        : { receipt, content: 'Fast retained and answered the newer row.' },
       workdayRequests: [],
     }));
 
@@ -5485,9 +5520,13 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await vi.advanceTimersByTimeAsync(5_000);
     await done;
 
-    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(2);
+    expect(typedFastMocks.dispatch.mock.calls[1]?.[0]).toEqual(expect.objectContaining({
+      message_ids: [newerFastMessage.id],
+    }));
     expect(workday.sendTurn).toHaveBeenCalledTimes(2);
     expect(replyCoveredIds).toContainEqual([fastMessage.id]);
+    expect(replyCoveredIds.flat()).not.toContain(newerFastMessage.id);
   });
 });
 
