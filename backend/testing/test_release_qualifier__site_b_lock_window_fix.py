@@ -2818,6 +2818,102 @@ async def test_full_suite_drift_sentinel_sweep_uses_build_config(db_session, moc
 
 
 @pytest.mark.asyncio
+async def test_full_suite_drift_sentinel_skips_paused_project(db_session, mocker):
+    """A project pause prevents the sentinel from issuing GitHub work."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel  # noqa: PLC0415
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.paused = True
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(),
+    )
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    gate_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_full_suite_drift_sentinel_skips_archived_project(db_session, mocker):
+    """An archived project cannot issue standing sentinel GitHub work."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel  # noqa: PLC0415
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.archived = True
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(),
+    )
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    gate_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_full_suite_drift_sentinel_resumes_after_unpause(db_session, mocker):
+    """Resuming restores lookup and dispatch without sentinel reconfiguration."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel  # noqa: PLC0415
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.paused = True
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            side_effect=[
+                {"gate_state": "no_signal", "head_sha": "aabbccdd" * 5},
+                {
+                    "gate_state": "dispatched",
+                    "head_sha": "aabbccdd" * 5,
+                    "run_id": 42,
+                },
+            ]
+        ),
+    )
+
+    paused_result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert paused_result is False
+    gate_mock.assert_not_awaited()
+
+    project.paused = False
+    db_session.add(project)
+    await db_session.commit()
+
+    resumed_result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert resumed_result is True
+    assert gate_mock.await_count == 2
+    assert gate_mock.await_args_list[0].kwargs["dispatch"] is False
+    assert gate_mock.await_args_list[1].kwargs["dispatch"] is True
+
+
+@pytest.mark.asyncio
 async def test_record_v22_live_verification_evidence_records_evidence_row(db_session):
     """Integration coverage: record_v22_live_verification_evidence writes a
     CriterionEvidence row for criterion c-dd953d8c on a v22 version.

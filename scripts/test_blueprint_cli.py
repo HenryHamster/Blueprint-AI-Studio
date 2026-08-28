@@ -7030,6 +7030,7 @@ def test_tasks_create_posts_task(mock_api, monkeypatch, capsys):
     assert body["github_repo"] == "owner/repo"
     assert body["project_id"] == "proj-1"
     assert body["task_type"] == "create"
+    assert body["priority"] == 50
     assert "base_branch" not in body
     assert body["acceptance_evidence"] == {
         "kind": "named_test",
@@ -7062,6 +7063,8 @@ def test_tasks_create_posts_atomic_authority_fields(mock_api, monkeypatch):
             "Implement the bounded contract.",
             "--direction-id",
             "d-exact",
+            "--priority",
+            "100",
             "--criterion-id",
             "c-duration",
             "--criterion-id",
@@ -7085,6 +7088,7 @@ def test_tasks_create_posts_atomic_authority_fields(mock_api, monkeypatch):
         if method == "POST" and path == "/api/admin/tasks"
     )
     assert body["direction_id"] == "d-exact"
+    assert body["priority"] == 100
     assert body["criterion_ids"] == ["c-duration", "c-retention"]
     assert body["depends_on"] == [prerequisite]
     assert body["require_deps_landed_on"] == "automain"
@@ -7140,6 +7144,8 @@ def test_scoped_tasks_create_sends_explicit_integration_base(monkeypatch):
             "The requested behavior is present.",
             "--base-branch",
             "automain",
+            "--priority",
+            "100",
             "--yes",
         ]
     )
@@ -7152,8 +7158,26 @@ def test_scoped_tasks_create_sends_explicit_integration_base(monkeypatch):
         and path == f"/api/operator-access/v1/projects/{project_id}/tasks"
     )
     assert create_body["base_branch"] == "automain"
+    assert create_body["priority"] == 100
     assert "github_repo" not in create_body
     assert "project_id" not in create_body
+
+
+@pytest.mark.parametrize("priority", ["-1", "101"])
+def test_tasks_create_rejects_out_of_range_priority(priority):
+    with pytest.raises(SystemExit) as exc:
+        blueprint.build_parser().parse_args(
+            [
+                "tasks",
+                "create",
+                "Invalid priority",
+                "Do not launch.",
+                "--priority",
+                priority,
+            ]
+        )
+
+    assert exc.value.code == 2
 
 
 def test_tasks_create_criterion_id_requires_named_test(
@@ -8521,6 +8545,63 @@ def test_fetch_deploy_manifest_accepts_abbreviated_sha(monkeypatch):
     assert calls[0][:2] == ("run", "list")
 
 
+def test_deploy_temp_directory_uses_source_tree_on_windows(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    script = repo / "scripts" / "blueprint.py"
+    script.parent.mkdir(parents=True)
+    script.touch()
+    monkeypatch.setattr(blueprint.sys, "platform", "win32")
+    monkeypatch.setattr(blueprint, "__file__", str(script))
+
+    with blueprint._deploy_temporary_directory() as temporary:
+        temp_path = Path(temporary)
+        assert temp_path.parent == repo
+        (temp_path / "child-process-artifact").write_text("ok", encoding="utf-8")
+
+    assert not temp_path.exists()
+
+
+def test_windows_cli_resolution_uses_standard_install_locations(
+    monkeypatch, tmp_path
+):
+    program_files = tmp_path / "Program Files"
+    system_root = tmp_path / "Windows"
+    gh = program_files / "GitHub CLI" / "gh.exe"
+    ssh = system_root / "System32" / "OpenSSH" / "ssh.exe"
+    gh.parent.mkdir(parents=True)
+    ssh.parent.mkdir(parents=True)
+    gh.touch()
+    ssh.touch()
+    monkeypatch.setattr(blueprint.sys, "platform", "win32")
+    monkeypatch.setattr(blueprint.shutil, "which", lambda _name: None)
+    monkeypatch.setenv("ProgramFiles", str(program_files))
+    monkeypatch.setenv("SystemRoot", str(system_root))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+
+    assert blueprint._resolve_windows_cli("gh") == str(gh)
+    assert blueprint._resolve_windows_cli("ssh") == str(ssh)
+
+
+@pytest.mark.parametrize("local_app_data", [None, "relative-local-app-data"])
+def test_windows_cli_resolution_never_uses_cwd_for_local_app_data(
+    monkeypatch, tmp_path, local_app_data
+):
+    checkout_executable = tmp_path / "Programs" / "GitHub CLI" / "gh.exe"
+    checkout_executable.parent.mkdir(parents=True)
+    checkout_executable.touch()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(blueprint.sys, "platform", "win32")
+    monkeypatch.setattr(blueprint.shutil, "which", lambda _name: None)
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "MissingProgramFiles"))
+    if local_app_data is None:
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    else:
+        monkeypatch.setenv("LOCALAPPDATA", local_app_data)
+
+    with pytest.raises(blueprint.APIError, match="gh executable not found"):
+        blueprint._resolve_windows_cli("gh")
+
+
 def _deploy_api_fake(calls, *, promoted=None, post_failure=None):
     """Fake blueprint.api for deploy: promoted-version lookup + receipt POST."""
     if promoted is None:
@@ -8583,6 +8664,7 @@ def _deploy_env(
         lambda: {"api_url": "http://orchestrator", "api_key": "k", "read_only": False},
     )
     monkeypatch.setattr(blueprint, "_require_write_config", lambda action: None)
+    monkeypatch.setattr(blueprint, "_resolve_windows_cli", lambda name: name)
 
     def fake_run(cmd, **kwargs):
         class R:
@@ -9067,6 +9149,7 @@ def test_invoke_release_shim_remote_exit_codes(monkeypatch, capsys):
     0 = completed, 3 = accepted-but-unverified (parked, no receipt), else error."""
     digest = "sha256:" + "a" * 64
     revision = "b" * 40
+    monkeypatch.setattr(blueprint, "_resolve_windows_cli", lambda name: name)
 
     def run_with(code):
         return lambda command, **kwargs: type("R", (), {"returncode": code})()
@@ -9730,6 +9813,174 @@ def test_projects_bare_still_lists(monkeypatch, capsys):
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["total"] == 1
     assert parsed["projects"][0]["id"] == "p-1"
+
+
+# ── projects pause/resume ─────────────────────────────────────────────────
+
+PAUSE_PROJECT_ID = "99999999-2222-3333-4444-555555555555"
+
+
+@pytest.fixture
+def project_pause_api(monkeypatch):
+    """Record pause-state PATCHes and preserve the independent autonomy bit."""
+    calls = []
+    state = {"paused": False, "autonomous_enabled": True}
+
+    monkeypatch.setattr(blueprint, "validate_project_id", lambda _project_id: None)
+    monkeypatch.setattr(
+        blueprint,
+        "resolve_project_id_by_name",
+        lambda name: PAUSE_PROJECT_ID
+        if name == "Pause Target"
+        else pytest.fail(f"unexpected project name: {name}"),
+    )
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        expected_path = f"/api/admin/projects/{PAUSE_PROJECT_ID}/pause"
+        if method == "PATCH" and path == expected_path:
+            state["paused"] = body["paused"]
+            return {
+                "paused": state["paused"],
+                "resident_wakeup_state": None,
+            }
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    return SimpleNamespace(calls=calls, state=state)
+
+
+def test_projects_pause_requires_explicit_project_selection(
+    monkeypatch, capsys
+):
+    """An ambient project default cannot target a broad scheduling mutation."""
+    monkeypatch.setenv("BLUEPRINT_PROJECT_ID", PAUSE_PROJECT_ID)
+    monkeypatch.setattr(
+        blueprint,
+        "api",
+        lambda *args, **kwargs: pytest.fail("missing selection must not call api()"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["projects", "pause", "--yes"])
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "explicit --project-id or --project" in err
+    assert "defaults are not used" in err
+
+
+def test_projects_pause_requires_write_config(
+    project_pause_api, monkeypatch, capsys
+):
+    """A read-only coding-agent config is rejected before the PATCH."""
+    monkeypatch.setattr(
+        blueprint, "load_config", lambda: {"api_key": "test-key", "read_only": True}
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(
+            ["projects", "pause", "--project-id", PAUSE_PROJECT_ID, "--yes"]
+        )
+
+    assert exc.value.code == 1
+    assert "read-only" in capsys.readouterr().err
+    assert project_pause_api.calls == []
+
+
+def test_projects_pause_json_reports_exact_server_readback(
+    project_pause_api, capsys
+):
+    """Pause targets the canonical endpoint and emits stable machine output."""
+    rc = blueprint.main(
+        [
+            "projects",
+            "pause",
+            "--project-id",
+            PAUSE_PROJECT_ID,
+            "--yes",
+            "--json",
+        ]
+    )
+
+    assert rc == 0
+    assert project_pause_api.calls == [
+        (
+            "PATCH",
+            f"/api/admin/projects/{PAUSE_PROJECT_ID}/pause",
+            {"paused": True},
+        )
+    ]
+    assert json.loads(capsys.readouterr().out) == {
+        "project_id": PAUSE_PROJECT_ID,
+        "paused": True,
+        "resident_wakeup_state": None,
+    }
+
+
+def test_projects_resume_sends_only_paused_and_preserves_autonomy(
+    project_pause_api, capsys
+):
+    """Resume composes with server autonomy by never writing that field."""
+    project_pause_api.state["paused"] = True
+
+    rc = blueprint.main(
+        ["projects", "resume", "--project", "Pause Target", "--yes"]
+    )
+
+    assert rc == 0
+    assert project_pause_api.calls == [
+        (
+            "PATCH",
+            f"/api/admin/projects/{PAUSE_PROJECT_ID}/pause",
+            {"paused": False},
+        )
+    ]
+    assert project_pause_api.state == {
+        "paused": False,
+        "autonomous_enabled": True,
+    }
+    out = capsys.readouterr().out
+    assert f"project_id:             {PAUSE_PROJECT_ID}" in out
+    assert "paused:                 false" in out
+    assert "resident_wakeup_state:  null" in out
+
+
+@pytest.mark.parametrize(
+    "readback",
+    [None, {}, {"paused": False}, {"paused": 1}],
+    ids=["non-dict", "missing", "contradictory", "non-boolean"],
+)
+def test_projects_pause_rejects_unverified_server_readback(
+    project_pause_api, monkeypatch, capsys, readback
+):
+    monkeypatch.setattr(blueprint, "api", lambda *_args, **_kwargs: readback)
+
+    rc = blueprint.main(
+        ["projects", "pause", "--project-id", PAUSE_PROJECT_ID, "--yes"]
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "server did not confirm projects pause" in err
+    assert "expected paused=true" in err
+
+
+def test_projects_pause_confirms_before_patch(
+    project_pause_api, monkeypatch, capsys
+):
+    """Without --yes, non-interactive execution aborts before mutation."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    rc = blueprint.main(
+        ["projects", "pause", "--project-id", PAUSE_PROJECT_ID]
+    )
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "Aborted." in captured.out
+    assert "Refusing to mutate without --yes" in captured.err
+    assert project_pause_api.calls == []
 
 
 # ── fleet runner <-> project bindings ────────────────────────────────────────

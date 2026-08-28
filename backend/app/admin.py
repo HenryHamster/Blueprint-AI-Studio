@@ -3220,6 +3220,7 @@ async def create_task_manually(
         payloads=[task_payload],
         vm_instance_id=vm_name,
         status=TaskStatus.QUEUED,
+        priority=payload.priority,
         created_by="USER",
         origination=TASK_ORIGINATION_USER,
         launched_by_user_id=current_user["user_id"],
