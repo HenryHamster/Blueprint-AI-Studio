@@ -126,6 +126,8 @@
         "test_strategic_conversation_endpoint_enforces_member_access",
         "test_strategic_conversation_endpoint_passes_include_message_id",
         "test_message_after_workday_lease_lapse_rearms_once_and_rebinds_exact_input",
+        "test_paused_project_send_adopts_exact_active_resident_without_restart",
+        "test_paused_project_send_cannot_replace_terminal_resident",
         "test_chat_send_does_not_bind_active_resident_left_by_mode_leave",
         "test_continuous_send_replaces_terminal_active_resident_task",
         "test_message_after_explicit_stop_does_not_rearm_chat_mode",
@@ -133,7 +135,7 @@
         "test_post_lapse_exact_message_replay_never_restarts_workday",
         "test_post_lapse_rearm_does_not_migrate_from_offline_preferred_runner"
       ],
-      "test_count": 174
+      "test_count": 176
     },
     {
       "path": "backend/testing/test_admin_routers__messages.py",
