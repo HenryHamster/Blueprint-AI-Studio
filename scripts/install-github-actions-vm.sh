@@ -76,13 +76,13 @@ validate_ssh_key_files() {
 }
 
 verify_user_lingering() {
-  local linger_state user_name
-  user_name="$(id -un)"
-  if ! linger_state="$(loginctl show-user "$user_name" --property=Linger --value 2>/dev/null)"; then
-    die "unable to verify systemd user lingering; run 'sudo loginctl enable-linger $user_name' and retry"
+  local linger_state user_id
+  user_id="$(id -u)"
+  if ! linger_state="$(loginctl show-user "$user_id" --property=Linger --value 2>/dev/null)"; then
+    die "unable to verify systemd user lingering; run 'sudo loginctl enable-linger $user_id' and retry"
   fi
   [[ "$linger_state" == yes ]] \
-    || die "systemd user lingering is $linger_state; run 'sudo loginctl enable-linger $user_name' and retry"
+    || die "systemd user lingering is $linger_state; run 'sudo loginctl enable-linger $user_id' and retry"
 }
 
 ssh_arguments() {
