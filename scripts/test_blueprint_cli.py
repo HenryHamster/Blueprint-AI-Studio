@@ -8729,6 +8729,33 @@ def test_deploy_local_submits_directly_to_release_socket(monkeypatch):
     }]
 
 
+def test_deploy_ambiguous_local_handoff_is_nonzero_and_never_retried(
+    monkeypatch, capsys
+):
+    """A lost socket verdict is an evidence-reconciliation boundary."""
+    calls = []
+    api_fake = _deploy_api_fake(calls)
+    _deploy_env(monkeypatch, api_fake)
+    socket_calls = []
+    monkeypatch.setattr(
+        blueprint,
+        "_request_release_socket",
+        lambda digest, revision: socket_calls.append((digest, revision)) or False,
+    )
+
+    rc = blueprint.main(["deploy", "--local", "--host", "hamsterwheel", "--yes"])
+
+    assert rc == 1
+    assert len(socket_calls) == 1
+    assert not any(
+        method == "POST" and path.endswith("/activation-receipt")
+        for method, path, _body in calls
+    )
+    err = capsys.readouterr().err
+    assert "acceptance is ambiguous" in err
+    assert "do not retry activation" in err
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="asserts POSIX chmod(0o600) permission bits, which Windows/NTFS does not enforce",

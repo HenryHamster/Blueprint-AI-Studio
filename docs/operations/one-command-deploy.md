@@ -32,6 +32,12 @@ and activation-receipt stages. Do not use `--local` from a development machine;
 the command must run as an account admitted by the release socket ACL on the
 actual control-plane host.
 
+If the socket request is sent but its verdict is not observed, the manual CLI
+returns nonzero and labels acceptance ambiguous. Do not rerun the activation.
+Reconcile the root executor journal and durable receipt, the local/public
+`/api/version`, health, and the active image digest before deciding whether only
+the activation receipt remains to be recorded.
+
 ## Host-side shim and root release service (one-time install)
 
 The local-app bootstrap installs the shim root-owned together with an
