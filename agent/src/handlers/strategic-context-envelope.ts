@@ -215,6 +215,30 @@ export function buildCanonicalResidentContextFrame(
 }
 
 /**
+ * Surface the latest canonical operator message for continuation turns.
+ *
+ * The complete verified transcript remains the authority. This small projection
+ * keeps the request's stopping conditions salient when a long private result is
+ * formatted later by a fresh foreground turn.
+ */
+export function latestCanonicalOperatorRequest(
+  verified: VerifiedStrategicContextEnvelope,
+): string | null {
+  let latest: { sequence: number; content: string } | null = null;
+  for (const item of verified.envelope.recent_conversation) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    if (row.from_type !== 'user' && row.from_type !== 'operator') continue;
+    if (!Number.isSafeInteger(row.sequence) || typeof row.content !== 'string') continue;
+    const content = row.content.trim();
+    if (!content) continue;
+    const sequence = Number(row.sequence);
+    if (latest === null || sequence > latest.sequence) latest = { sequence, content };
+  }
+  return latest?.content ?? null;
+}
+
+/**
  * The foreground role is conversational, not a second coding agent. It may
  * request a durable Workday consultation while continuing the public turn.
  */
