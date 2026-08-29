@@ -678,6 +678,7 @@
         "handleStrategicResident \u2014 typed Fast lease lifecycle > abandons an exact cold Fast claim when required attachment materialization fails before dispatch",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > acquires the fenced slot before readiness and releases it on normal shutdown",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > answers server fast-marked rows through the legacy Workday path when typed Fast is not activated",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > bounds Fast preparation and uses coordinator-confirmed fallback for the exact input",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > closes a lease-lost Fast controller without giving its next tagged message to Workday",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > completes Fast with autonomous authority lapsed while workspace preparation is unresolved",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > completes a preserved Fast turn after resolved workspace prep before Workday identity launch fails",
@@ -746,7 +747,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 142
+      "test_count": 143
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
