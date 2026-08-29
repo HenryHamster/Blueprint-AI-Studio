@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from fastapi import HTTPException
@@ -35,7 +35,7 @@ WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY = (
 WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY = (
     "_workday_consultation_mutation_receipts_has_more"
 )
-WORKDAY_MUTATION_RECEIPT_LIMIT = 8
+WORKDAY_MUTATION_RECEIPT_LIMIT = 64
 WORKDAY_OPERATION_LEDGER_CONTEXT_KEY = "_workday_consultation_operation_ledger"
 WORKDAY_OPERATION_LEDGER_LIMIT = 64
 _PROBLEM_MODEL_OPS = frozenset(
@@ -73,6 +73,7 @@ _ENTITY_OPS = frozenset(
         "reset_iteration_cap",
         "set_task_priority",
         "unhold_direction",
+        "create_acceptance_criterion",
     }
 )
 _ENTITY_KINDS = frozenset(
@@ -83,11 +84,14 @@ _ENTITY_KINDS = frozenset(
         "knowledge_document",
         "task_watch",
         "completion_debt",
+        "acceptance_criterion",
     }
 )
 _STATE_OP_TARGET_KINDS = {
     "set_vision": "vision",
     "set_running_update": "running_update",
+    "set_version_goal": "version_goal",
+    "set_version_phase": "version_phase",
 }
 WORKDAY_RECEIPT_BOUND_OPS = frozenset(
     _PROBLEM_MODEL_OPS | _ENTITY_OPS | set(_STATE_OP_TARGET_KINDS)
@@ -165,6 +169,71 @@ class BoundWorkdayOperation:
             op=self.op,
             problem_model=problem_model,
             operation_fingerprint=self.fingerprint,
+        )
+
+    def _child_binding(self, *, op: str, key: str, value: object) -> tuple[
+        WorkdayConsultationOperationBinding | None, str
+    ]:
+        fingerprint = workday_operation_fingerprint(op, value)
+        if self.binding is None:
+            return None, fingerprint
+        return (
+            replace(
+                self.binding,
+                operation_id=uuid.uuid5(self.binding.operation_id, f"{op}:{key}"),
+            ),
+            fingerprint,
+        )
+
+    async def record_child_entity(
+        self,
+        *,
+        op: str,
+        key: str,
+        entity_kind: str,
+        entity_id: str,
+        effect: str,
+    ) -> None:
+        binding, fingerprint = self._child_binding(
+            op=op,
+            key=key,
+            value={
+                "entity_kind": entity_kind,
+                "entity_id": entity_id,
+                "effect": effect,
+            },
+        )
+        await record_workday_consultation_operation(
+            self.session,
+            binding=binding,
+            project=self.project,
+            task=self.task,
+            op=op,
+            entity_kind=entity_kind,
+            entity_id=entity_id,
+            effect=effect,
+            operation_fingerprint=fingerprint,
+        )
+
+    async def record_child_state(
+        self,
+        *,
+        op: str,
+        key: str,
+        target_revision: str | int,
+        value: object,
+    ) -> None:
+        binding, fingerprint = self._child_binding(op=op, key=key, value=value)
+        await record_workday_consultation_operation(
+            self.session,
+            binding=binding,
+            project=self.project,
+            task=self.task,
+            op=op,
+            target_kind=_STATE_OP_TARGET_KINDS[op],
+            target_revision=target_revision,
+            target_sha256=workday_state_sha256(value),
+            operation_fingerprint=fingerprint,
         )
 
 
@@ -392,29 +461,50 @@ def find_workday_operation_replay(
     ledger_context = {
         WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: raw_ledger
     }
-    receipts = bounded_workday_mutation_receipts(
+    all_receipts = bounded_workday_mutation_receipts(
         ledger_context,
         packet_id=binding.packet_id,
-        workday_claim_id=binding.workday_claim_id,
-        operation_id=binding.operation_id,
         task_id=binding.task_id,
         resident_session_id=binding.resident_session_id,
         worker_generation=binding.worker_generation,
-        worker_incarnation=binding.worker_incarnation,
         limit=WORKDAY_OPERATION_LEDGER_LIMIT,
     )
-    if not receipts:
+    exact_id = [
+        receipt for receipt in all_receipts
+        if receipt["operation_id"] == str(binding.operation_id)
+    ]
+    if exact_id:
+        receipt = exact_id[-1]
+        if (
+            receipt["op"] != op
+            or receipt["operation_fingerprint"] != operation_fingerprint
+        ):
+            raise _conflict(
+                "workday_operation_id was already used for a different operation"
+            )
+        return receipt
+    # A new provider attempt naturally mints a new client operation UUID. The
+    # packet ledger is the durable authority: an exact op+fingerprint already
+    # recorded by an earlier claim is an idempotent replay, not permission to
+    # repeat an ambiguous mutation.
+    semantic = [
+        receipt for receipt in all_receipts
+        if receipt["op"] == op
+        and receipt["operation_fingerprint"] == operation_fingerprint
+    ]
+    if semantic:
+        return semantic[-1]
+    if not all_receipts:
         if len(raw_ledger) >= WORKDAY_OPERATION_LEDGER_LIMIT:
             raise _conflict(
                 "Workday operation capacity is exhausted for this consultation"
             )
         return None
-    receipt = receipts[-1]
-    if receipt["op"] != op or receipt["operation_fingerprint"] != operation_fingerprint:
+    if len(raw_ledger) >= WORKDAY_OPERATION_LEDGER_LIMIT:
         raise _conflict(
-            "workday_operation_id was already used for a different operation"
+            "Workday operation capacity is exhausted for this consultation"
         )
-    return receipt
+    return None
 
 
 async def prepare_workday_consultation_operation_binding(
@@ -616,6 +706,7 @@ def workday_operation_replay_response(receipt: Mapping[str, Any]) -> dict[str, A
         "knowledge_document": "doc_id",
         "task_watch": "watch_id",
         "completion_debt": "debt_id",
+        "acceptance_criterion": "criterion_key",
     }.get(str(receipt.get("entity_kind")))
     if receipt.get("op") == "cancel_task" and entity_key == "task_id":
         entity_key = "target_task_id"
@@ -754,14 +845,17 @@ async def record_workday_consultation_operation(
         snapshot_id = pinned.snapshot_id
         context["envelope"] = context_envelope_reference(pinned)
 
+    raw_ledger = context.get(WORKDAY_OPERATION_LEDGER_CONTEXT_KEY)
+    ledger = list(raw_ledger) if isinstance(raw_ledger, list) else []
+    if any(_bounded_receipt(item) is None for item in ledger):
+        raise _conflict("Workday operation history is invalid")
     prior = bounded_workday_mutation_receipts(
-        context,
+        {WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: ledger},
         packet_id=binding.packet_id,
-        workday_claim_id=binding.workday_claim_id,
         task_id=binding.task_id,
         resident_session_id=binding.resident_session_id,
         worker_generation=binding.worker_generation,
-        worker_incarnation=binding.worker_incarnation,
+        limit=WORKDAY_OPERATION_LEDGER_LIMIT,
     )
     receipt: dict[str, Any] = {
         "version": 1,
@@ -802,10 +896,6 @@ async def record_workday_consultation_operation(
         workday_mutation_receipts_have_more(context)
         or len(combined) > WORKDAY_MUTATION_RECEIPT_LIMIT
     )
-    raw_ledger = context.get(WORKDAY_OPERATION_LEDGER_CONTEXT_KEY)
-    ledger = list(raw_ledger) if isinstance(raw_ledger, list) else []
-    if any(_bounded_receipt(item) is None for item in ledger):
-        raise _conflict("Workday operation history is invalid")
     if any(
         item.get("operation_id") == str(binding.operation_id) for item in ledger
     ):

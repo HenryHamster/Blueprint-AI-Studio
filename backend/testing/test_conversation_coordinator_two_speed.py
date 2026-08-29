@@ -65,7 +65,6 @@ async def _envelope(db_session, project: Project, claim):
     from app.strategic_memory_envelope import (
         build_and_store_context_envelope_snapshot,
     )
-
     row = claim.rows[0]
     sequence = max(int(candidate.sequence or 0) for candidate in claim.rows)
     return await build_and_store_context_envelope_snapshot(
@@ -81,6 +80,35 @@ async def _envelope(db_session, project: Project, claim):
         ledger_revision=0,
     )
 
+
+def _attempt_diagnostic(
+    delivery,
+    outcome: str,
+    *,
+    predicate: str = "provider_result",
+    tool_calls: int = 0,
+) -> dict:
+    started = datetime.now(timezone.utc)
+    ended = started + timedelta(milliseconds=10)
+    return {
+        "attempt": delivery.attempt,
+        "workday_claim_id": str(delivery.workday_claim_id),
+        "outcome": outcome,
+        "terminal_predicate": predicate,
+        "provider_terminal_reason": "success" if outcome == "completed" else None,
+        "provider_output_tail": None,
+        "started_at": started.isoformat(),
+        "ended_at": ended.isoformat(),
+        "turn_ms": 10,
+        "ttft_ms": 1,
+        "tool_call_count": tool_calls,
+        "tool_call_duration_ms": 0,
+        "result_chars": 12 if outcome == "completed" else 0,
+        "trace": [
+            {"elapsed_ms": 10, "kind": "result", "label": predicate}
+        ],
+        "trace_truncated": False,
+    }
 
 @pytest.mark.asyncio
 async def test_fast_claim_fences_other_public_owner(db_session):
@@ -498,6 +526,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     )
     assert duplicate_delivery is not None
     assert duplicate_delivery.workday_claim_id == delivery.workday_claim_id
+    completed_diagnostic = _attempt_diagnostic(delivery, "completed")
     duplicate_ack = await acknowledge_workday_consultation_packet(
         db_session,
         project_id=project.id,
@@ -509,6 +538,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
         workday_claim_id=delivery.workday_claim_id,
         outcome="completed",
         result_summary="The exact evidence supports the proposed derivation.",
+        attempt_diagnostic=completed_diagnostic,
     )
     assert not duplicate_ack
     await db_session.commit()
@@ -524,6 +554,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
         workday_claim_id=delivery.workday_claim_id,
         outcome="completed",
         result_summary="The exact evidence supports the proposed derivation.",
+        attempt_diagnostic=completed_diagnostic,
     )
     assert retry_ack
     assert await claim_next_workday_consultation_packet(
@@ -658,6 +689,9 @@ async def test_workday_empty_result_retries_once_then_creates_terminal_failure(d
             resident_session_id="session",
             workday_claim_id=first.workday_claim_id,
             outcome="failed",
+            attempt_diagnostic=_attempt_diagnostic(
+                first, "failed", predicate="empty_provider_result"
+            ),
         )
     await acknowledge_workday_consultation_packet(
         db_session,
@@ -669,6 +703,9 @@ async def test_workday_empty_result_retries_once_then_creates_terminal_failure(d
         resident_session_id="session",
         workday_claim_id=first.workday_claim_id,
         outcome="abandoned",
+        attempt_diagnostic=_attempt_diagnostic(
+            first, "abandoned", predicate="empty_provider_result"
+        ),
     )
     await db_session.commit()
     second = await claim_next_workday_consultation_packet(
@@ -680,6 +717,9 @@ async def test_workday_empty_result_retries_once_then_creates_terminal_failure(d
         resident_session_id="session",
     )
     assert second is not None and second.attempt == 2
+    failed_diagnostic = _attempt_diagnostic(
+        second, "failed", predicate="empty_provider_result"
+    )
     assert not await acknowledge_workday_consultation_packet(
         db_session,
         project_id=project.id,
@@ -690,6 +730,7 @@ async def test_workday_empty_result_retries_once_then_creates_terminal_failure(d
         resident_session_id="session",
         workday_claim_id=second.workday_claim_id,
         outcome="failed",
+        attempt_diagnostic=failed_diagnostic,
     )
     await db_session.commit()
     assert await acknowledge_workday_consultation_packet(
@@ -702,6 +743,7 @@ async def test_workday_empty_result_retries_once_then_creates_terminal_failure(d
         resident_session_id="session",
         workday_claim_id=second.workday_claim_id,
         outcome="failed",
+        attempt_diagnostic=failed_diagnostic,
     )
     assert await claim_next_workday_consultation_packet(
         db_session,
@@ -722,6 +764,10 @@ async def test_workday_empty_result_retries_once_then_creates_terminal_failure(d
     assert continuation is not None
     assert continuation.message.context["result_state"] == "failed"
     assert "failure notice itself does not verify" in continuation.message.content
+    assert [
+        item["terminal_predicate"]
+        for item in continuation.message.context["_workday_consultation_attempts"]
+    ] == ["empty_provider_result", "empty_provider_result"]
 
 
 @pytest.mark.asyncio
@@ -891,6 +937,7 @@ async def test_expired_workday_packet_cannot_ack_or_renew_and_is_reclaimable(db_
             workday_claim_id=workday_claim_id,
             outcome="completed",
             result_summary="Late result",
+            attempt_diagnostic=_attempt_diagnostic(delivery, "completed"),
         )
     await db_session.rollback()
     reclaimed = await claim_next_workday_consultation_packet(

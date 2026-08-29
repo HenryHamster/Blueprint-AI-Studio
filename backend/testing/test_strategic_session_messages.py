@@ -28,6 +28,7 @@ from app.models import (
     StrategicContextEnvelopeSnapshot,
     Task,
     TaskStatus,
+    VersionAcceptanceCriterion,
 )
 from app.routers.agent_strategic_messages import (
     _RESIDENT_POLL_EXPECTED_PER_MINUTE,
@@ -1858,6 +1859,14 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
         },
     )
     assert renewed_packet.status_code == 200, renewed_packet.text
+    receipt_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=56,
+        status="open",
+        phase="build",
+    )
+    db_session.add(receipt_version)
+    await db_session.commit()
     problem_model_op = {
         "task_id": str(task.id),
         "resident_incarnation_id": incarnation,
@@ -1869,6 +1878,15 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
             },
             "capabilities": [],
             "gaps": [],
+            "version_phase_decision": {
+                "phase": "stabilize",
+                "reasoning": "The receipt-completeness probe is bounded.",
+            },
+            "new_version_goal": "Prove complete private Workday provenance.",
+            "new_acceptance_criteria": [
+                "Every private mutation has a visible receipt.",
+                "A retry never repeats a receipt-bound mutation.",
+            ],
         },
     }
     workday_operation_id = str(uuid.uuid4())
@@ -1907,6 +1925,35 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
     )
     assert problem_model_write.status_code == 200, problem_model_write.text
     problem_model_revision = problem_model_write.json()["revision"]
+    durable_packet = await db_session.get(ProjectMessage, uuid.UUID(packet_id))
+    assert durable_packet is not None
+    receipt_ops = [
+        item["op"]
+        for item in durable_packet.context[
+            "_workday_consultation_operation_ledger"
+        ]
+    ]
+    assert receipt_ops == [
+        "set_version_phase",
+        "set_version_goal",
+        "create_acceptance_criterion",
+        "create_acceptance_criterion",
+        "set_problem_model",
+    ]
+    await db_session.refresh(receipt_version)
+    assert receipt_version.phase == "stabilize"
+    assert receipt_version.goal == "Prove complete private Workday provenance."
+    criteria = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.release_version_id == receipt_version.id
+            )
+        )
+    ).scalars().all()
+    assert {criterion.text for criterion in criteria} == {
+        "Every private mutation has a visible receipt.",
+        "A retry never repeats a receipt-bound mutation.",
+    }
     replayed_problem_model_write = await client.post(
         "/api/agent/strategic",
         headers=_headers(task, vm="agent-vm-resident-poll"),
@@ -2048,6 +2095,7 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
         [correlated_document, foreign_document, served_release_artifact]
     )
     await db_session.commit()
+    attempt_started = datetime.now(timezone.utc)
     acknowledged = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/{packet_id}/ack",
         headers=_headers(task, vm="agent-vm-resident-poll"),
@@ -2055,6 +2103,26 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
             **identity,
             "workday_claim_id": packet["workday_claim_id"],
             "outcome": "completed",
+            "attempt_diagnostic": {
+                "attempt": packet["attempt"],
+                "workday_claim_id": packet["workday_claim_id"],
+                "outcome": "completed",
+                "terminal_predicate": "provider_result",
+                "provider_terminal_reason": "success",
+                "provider_output_tail": "private result completed",
+                "started_at": attempt_started.isoformat(),
+                "ended_at": (attempt_started + timedelta(seconds=1)).isoformat(),
+                "turn_ms": 1_000,
+                "ttft_ms": 10,
+                "tool_call_count": 1,
+                "tool_call_duration_ms": 20,
+                "result_chars": 500,
+                "trace": [
+                    {"elapsed_ms": 20, "kind": "tool", "label": "Bash"},
+                    {"elapsed_ms": 1_000, "kind": "result", "label": "success"},
+                ],
+                "trace_truncated": False,
+            },
             "result_summary": (
                 f"Task {correlated_terminal_task.id} completed; "
                 f"task {foreign_task.id} from another project also completed; "
@@ -2188,8 +2256,11 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
     ] == {"returned_count": 1, "has_more": False}
     assert unsupported_served_sha not in json.dumps(correlated_releases)
     mutation_receipts = current_authority["consultation_mutation_receipts"]
-    assert len(mutation_receipts) == 1
-    mutation_receipt = mutation_receipts[0]
+    assert [receipt["op"] for receipt in mutation_receipts] == receipt_ops
+    mutation_receipt = next(
+        receipt for receipt in mutation_receipts
+        if receipt["op"] == "set_problem_model"
+    )
     assert mutation_receipt["packet_id"] == packet_id
     assert mutation_receipt["workday_claim_id"] == packet["workday_claim_id"]
     assert mutation_receipt["operation_id"] == workday_operation_id
@@ -2205,7 +2276,7 @@ async def test_typed_workday_packet_and_continuation_routes_are_receipt_bound(
     )
     assert current_authority["collection_metadata"][
         "consultation_mutation_receipts"
-    ] == {"returned_count": 1, "has_more": False}
+    ] == {"returned_count": 5, "has_more": False}
     result_packet_id = continuation["result_packet_id"]
     renewed_continuation = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/continuations/{result_packet_id}/renew",

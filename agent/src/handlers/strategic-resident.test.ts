@@ -463,11 +463,14 @@ function makeSession(
   alive: () => boolean,
 ) {
   let cb: ((ev: ResidentSessionEvent) => void) | null = null;
+  let progress: { startedAtMs: number; lastActivityAtMs: number; toolCallCount: number } | null = null;
   return {
     // A confirmed native reply tool result has already written a receipt-bound
     // staging file before Claude returns its top-level result. Model that
     // protocol here; tests that need a missing tool explicitly return false.
     sendTurn: vi.fn(async (text: string | Array<Record<string, unknown>>) => {
+      const now = Date.now();
+      progress = { startedAtMs: now, lastActivityAtMs: now, toolCallCount: 0 };
       const result = await sendTurn(text);
       const operatorReply = result.operatorReply ?? (result.sentOperatorMessage ? {
         type: 'NOTE', content: result.resultText || 'native reply',
@@ -491,17 +494,28 @@ function makeSession(
           // must then keep the operator message open rather than invent a reply.
         }
       }
+      progress = null;
       return protocolResult;
     }),
     interrupt: vi.fn(),
     onEvent: vi.fn((fn: (ev: ResidentSessionEvent) => void) => { cb = fn; }),
     touch: vi.fn(),
     waitForIdle: vi.fn(() => Promise.resolve()),
+    activeTurnProgress: vi.fn(() => progress),
     close: vi.fn(),
     sessionId: vi.fn(() => 'cli-sess'),
     isAlive: vi.fn(alive),
     exitCode: vi.fn(() => 0),
-    _emit: (ev: ResidentSessionEvent) => { if (cb) cb(ev); },
+    _emit: (ev: ResidentSessionEvent) => {
+      if (progress && ['text', 'tool', 'error', 'activity'].includes(ev.kind)) {
+        progress.lastActivityAtMs = Date.now();
+        if (ev.kind === 'tool') progress.toolCallCount += 1;
+      }
+      if (cb) cb(ev);
+    },
+    _setProgressAt: (lastActivityAtMs: number) => {
+      if (progress) progress.lastActivityAtMs = lastActivityAtMs;
+    },
   };
 }
 
@@ -2993,6 +3007,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     const leaseReleaseBodies: Array<Record<string, unknown> | undefined> = [];
     const continuationReleaseBodies: Array<Record<string, unknown> | undefined> = [];
     const continuationCompleteBodies: Array<Record<string, unknown> | undefined> = [];
+    const privateClaimOrder: string[] = [];
 
     mockApiGet.mockImplementation((url: string) => Promise.resolve(
       url.includes('/messages?')
@@ -3019,9 +3034,11 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         return Promise.resolve({ released: true });
       }
       if (url.endsWith('/workday-consultations/claim-next')) {
+        privateClaimOrder.push('consultation');
         return Promise.resolve({ status: 'empty' });
       }
       if (url.endsWith('/workday-consultations/continuations/claim-next')) {
+        privateClaimOrder.push('continuation');
         if (packetCompleted) return Promise.resolve({ status: 'empty' });
         continuationClaimCount += 1;
         return Promise.resolve({
@@ -3188,6 +3205,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     ]));
     expect(continuationClaimCount).toBe(2);
     expect(continuationReleaseBodies).toHaveLength(1);
+    expect(privateClaimOrder[0]).toBe('continuation');
     expect(continuationCompleteBodies).toEqual([
       expect.objectContaining({
         continuation_claim_id: 'continuation-claim-2',
@@ -3769,9 +3787,9 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       session_id: 'legacy-workday-conflict-session',
       task_id: 'legacy-workday-conflict-task',
       worker_generation: 1,
-      resident_incarnation_id: expect.any(String),
       progress: false,
     }));
+    expect(typeof heartbeatBodies.at(-1)?.resident_incarnation_id).toBe('string');
     expect(workday.touch).toHaveBeenCalled();
     expect(workday.sendTurn).not.toHaveBeenCalled();
   });
@@ -5041,7 +5059,9 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       expires_at: '2035-01-01T00:00:00.000Z',
     };
     let consultationClaims = 0;
-    mockApiPost.mockImplementation((url: string) => {
+    let alive = true;
+    const consultationAcks: Array<Record<string, unknown> | undefined> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (url.includes('/strategic-session/heartbeat')) {
         return Promise.resolve({ authority_held: true });
       }
@@ -5069,6 +5089,8 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         });
       }
       if (url.endsWith('/workday-consultations/packet-private-workday/ack')) {
+        consultationAcks.push(body);
+        alive = false;
         return Promise.resolve({ status: 'completed' });
       }
       return Promise.resolve({});
@@ -5078,7 +5100,6 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     const privateTurn = new Promise<ResidentTurnResult>((resolve) => {
       resolvePrivate = resolve;
     });
-    let alive = true;
     let capabilityRevokedAtTurnStart = false;
     let privateMarkerKindAtTurnStart = '';
     let framesAtPrivateTurnStart = 0;
@@ -5144,13 +5165,34 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       expect.stringContaining('sendTurn called while a turn is already active'),
     );
 
-    resolvePrivate(turnResult({ resultText: 'Private investigation complete.' }));
+    // Cross the old absolute six-minute boundary while the provider keeps
+    // making meaningful progress. The consultation must remain live and keep
+    // renewing rather than interrupting the whole warm process.
+    for (let minute = 1; minute <= 7; minute += 1) {
+      await vi.advanceTimersByTimeAsync(60_000);
+      workday._emit({ kind: 'tool', toolName: 'Read', text: `bounded-progress-${minute}` });
+    }
+    expect(workday.interrupt).not.toHaveBeenCalled();
+    resolvePrivate(turnResult({
+      resultText: 'Private investigation complete.',
+      sentOperatorMessage: false,
+      providerTerminalReason: 'success',
+      providerOutputTail: 'Private investigation complete.',
+      toolCallCount: 7,
+      trace: [{ elapsedMs: 420_000, kind: 'result', label: 'success' }],
+    }));
     await vi.advanceTimersByTimeAsync(4_000);
     await done;
-    expect(workday.sendTurn).toHaveBeenCalledTimes(2);
-    expect(sentPrompts[1]).toContain('# Resident session state — P');
-    expect(sentPrompts[1]).not.toContain('private, durable typed-Fast consultation');
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
     expect(() => fs.lstatSync(privateTurnMarkerPath)).toThrow();
+    expect(consultationAcks).toHaveLength(1);
+    expect(consultationAcks[0]?.attempt_diagnostic).toMatchObject({
+      attempt: 1,
+      outcome: 'completed',
+      terminal_predicate: 'provider_result',
+      provider_terminal_reason: 'success',
+      tool_call_count: 7,
+    });
   });
 
   it('keeps a consultation-restart checkpoint out of the private retry and delivers it to the next ordinary turn', async () => {
@@ -5209,6 +5251,16 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
             continuation_key: 'continuation-private-restart',
             question: 'Retry the exact bounded private operation.',
             envelope,
+            ...(consultationClaims === 2 ? {
+              prior_attempts: [{
+                attempt: 1,
+                terminal_predicate: 'consultation_lease_renewal_failed',
+              }],
+              prior_receipts: [{
+                op: 'set_running_update',
+                target_revision: 7,
+              }],
+            } : {}),
           },
         });
       }
@@ -5326,6 +5378,9 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(mockStartSession).toHaveBeenCalledTimes(2);
     expect(secondPrompts).toHaveLength(2);
     expect(secondPrompts[0]).toContain('Retry the exact bounded private operation.');
+    expect(secondPrompts[0]).toContain('Durable prior-attempt reconciliation');
+    expect(secondPrompts[0]).toContain('consultation_lease_renewal_failed');
+    expect(secondPrompts[0]).toContain('set_running_update');
     expect(secondPrompts[0]).not.toContain('# Resident session state —');
     expect(secondPrompts[0]).not.toContain('# Session checkpoint — compaction restart');
     expect(secondPrompts[1]).toContain('# Resident session state — P');
@@ -5333,6 +5388,12 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(secondPrompts[1]).not.toContain('Retry the exact bounded private operation.');
     expect(secondPrompts[1]).toContain('Continue with the ordinary Workday conversation.');
     expect(ackBodies.map(body => body?.outcome)).toEqual(['abandoned', 'completed']);
+    expect(ackBodies.map(body => (
+      body?.attempt_diagnostic as { terminal_predicate?: string } | undefined
+    )?.terminal_predicate)).toEqual([
+      'consultation_lease_renewal_failed',
+      'provider_result',
+    ]);
   });
 
   const runOrdinaryWorkdayOverlapCase = async (

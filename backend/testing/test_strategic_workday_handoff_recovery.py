@@ -167,6 +167,25 @@ async def test_stale_workday_result_is_replaced_by_neutral_terminal_result(
             "workday_claim_id": claimed_packet["workday_claim_id"],
             "outcome": "completed",
             "result_summary": "private stale result that must never be surfaced",
+            "attempt_diagnostic": {
+                "attempt": claimed_packet["attempt"],
+                "workday_claim_id": claimed_packet["workday_claim_id"],
+                "outcome": "completed",
+                "terminal_predicate": "provider_result",
+                "provider_terminal_reason": "success",
+                "provider_output_tail": "private stale result completed",
+                "started_at": "2026-08-29T18:00:00+00:00",
+                "ended_at": "2026-08-29T18:00:00.010000+00:00",
+                "turn_ms": 10,
+                "ttft_ms": 1,
+                "tool_call_count": 0,
+                "tool_call_duration_ms": 0,
+                "result_chars": 50,
+                "trace": [
+                    {"elapsed_ms": 10, "kind": "result", "label": "success"}
+                ],
+                "trace_truncated": False,
+            },
         },
     )
     assert acknowledged.status_code == 200, acknowledged.text
