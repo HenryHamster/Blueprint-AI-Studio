@@ -944,14 +944,17 @@ def _workday_claim_expiry(value: Any) -> datetime | None:
 def _is_workday_consultation_packet(
     row: ProjectMessage,
     *,
-    resident_session_id: str,
+    resident_session_id: str | None,
 ) -> bool:
     context = row.context if isinstance(row.context, dict) else {}
     return bool(
         row.from_type == "system"
         and row.surface == MessageSurface.CONVERSATION
         and row.status == "open"
-        and row.resident_session_id == resident_session_id
+        and (
+            resident_session_id is None
+            or row.resident_session_id == resident_session_id
+        )
         and context.get(_CONSULTATION_PACKET_CONTEXT_KEY) is True
         and context.get("audience") == STRATEGIST_INTERNAL
         and context.get("message_role") == "workday_consultation"
@@ -968,14 +971,17 @@ def _is_workday_consultation_packet(
 def _is_workday_consultation_result(
     row: ProjectMessage,
     *,
-    resident_session_id: str,
+    resident_session_id: str | None,
 ) -> bool:
     context = row.context if isinstance(row.context, dict) else {}
     return bool(
         row.from_type == "system"
         and row.surface == MessageSurface.CONVERSATION
         and row.status == "open"
-        and row.resident_session_id == resident_session_id
+        and (
+            resident_session_id is None
+            or row.resident_session_id == resident_session_id
+        )
         and context.get(_CONSULTATION_RESULT_CONTEXT_KEY) is True
         and context.get("audience") == STRATEGIST_INTERNAL
         and context.get("message_role") == "workday_consultation_result"
@@ -1431,7 +1437,9 @@ async def claim_next_workday_consultation_packet(
                     ProjectMessage.handling_state.in_(
                         (MessageHandlingState.PENDING, MessageHandlingState.CLAIMED)
                     ),
-                    ProjectMessage.resident_session_id == resident_session_id,
+                    ProjectMessage.context[_CONSULTATION_PACKET_CONTEXT_KEY]
+                    .as_boolean()
+                    .is_(True),
                 )
                 .order_by(*_message_ordering())
                 .with_for_update()
@@ -1441,9 +1449,7 @@ async def claim_next_workday_consultation_packet(
         .all()
     )
     for row in rows:
-        if not _is_workday_consultation_packet(
-            row, resident_session_id=resident_session_id
-        ):
+        if not _is_workday_consultation_packet(row, resident_session_id=None):
             continue
         context = dict(row.context or {})
         prior_claim_id_raw = context.get(_WORKDAY_CLAIM_ID_CONTEXT_KEY)
@@ -1454,6 +1460,7 @@ async def claim_next_workday_consultation_packet(
         prior_incarnation = context.get(_WORKDAY_CLAIM_INCARNATION_CONTEXT_KEY)
         same_owner = (
             row.handling_state == MessageHandlingState.CLAIMED
+            and row.resident_session_id == resident_session_id
             and row.handled_by_task_id == task_id
             and prior_generation == worker_generation
             and str(prior_incarnation) == str(worker_incarnation)
@@ -1570,6 +1577,18 @@ async def claim_next_workday_consultation_packet(
                 ),
             }
         )
+        if row.resident_session_id != resident_session_id:
+            from app.session_message_handoff import (
+                RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
+            )
+
+            prior_session_id = str(row.resident_session_id or "").strip()
+            if prior_session_id:
+                context.setdefault(
+                    RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
+                    prior_session_id,
+                )
+            row.resident_session_id = resident_session_id
         row.context = context
         row.handling_state = MessageHandlingState.CLAIMED
         row.handled_by_task_id = task_id
@@ -1821,7 +1840,9 @@ async def claim_next_workday_consultation_continuation(
                     ProjectMessage.handling_state.in_(
                         (MessageHandlingState.PENDING, MessageHandlingState.CLAIMED)
                     ),
-                    ProjectMessage.resident_session_id == resident_session_id,
+                    ProjectMessage.context[_CONSULTATION_RESULT_CONTEXT_KEY]
+                    .as_boolean()
+                    .is_(True),
                 )
                 .order_by(*_message_ordering())
                 .with_for_update()
@@ -1831,9 +1852,7 @@ async def claim_next_workday_consultation_continuation(
         .all()
     )
     for row in rows:
-        if not _is_workday_consultation_result(
-            row, resident_session_id=resident_session_id
-        ):
+        if not _is_workday_consultation_result(row, resident_session_id=None):
             continue
         context = dict(row.context or {})
         prior_claim_id = context.get(_CONTINUATION_CLAIM_ID_CONTEXT_KEY)
@@ -1842,6 +1861,7 @@ async def claim_next_workday_consultation_continuation(
         )
         same_owner = (
             row.handling_state == MessageHandlingState.CLAIMED
+            and row.resident_session_id == resident_session_id
             and row.handled_by_task_id == task_id
             and context.get(_CONTINUATION_CLAIM_GENERATION_CONTEXT_KEY)
             == worker_generation
@@ -1875,6 +1895,18 @@ async def claim_next_workday_consultation_continuation(
                 _CONTINUATION_CLAIM_ATTEMPT_CONTEXT_KEY: attempt,
             }
         )
+        if row.resident_session_id != resident_session_id:
+            from app.session_message_handoff import (
+                RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
+            )
+
+            prior_session_id = str(row.resident_session_id or "").strip()
+            if prior_session_id:
+                context.setdefault(
+                    RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
+                    prior_session_id,
+                )
+            row.resident_session_id = resident_session_id
         row.context = context
         row.handling_state = MessageHandlingState.CLAIMED
         row.handled_by_task_id = task_id

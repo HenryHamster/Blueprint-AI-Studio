@@ -2034,11 +2034,28 @@ async def claim_next_workday_continuation(
                     continue
             break
         try:
-            _, resolved_envelope = await _resolve_message_context_envelope(
-                session,
-                project_id=project_id,
-                message_id=claim.message.id,
+            from app.session_message_handoff import (
+                RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
             )
+
+            claim_context = dict(claim.message.context or {})
+            if claim_context.get(RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY):
+                resolved_envelope = (
+                    await _rebind_private_packet_envelope_to_current_worker(
+                        session,
+                        project_id=project_id,
+                        row=claim.message,
+                        session_id=payload.session_id,
+                        worker_generation=payload.worker_generation,
+                        worker_incarnation=accepted_incarnation,
+                    )
+                )
+            else:
+                _, resolved_envelope = await _resolve_message_context_envelope(
+                    session,
+                    project_id=project_id,
+                    message_id=claim.message.id,
+                )
         except HTTPException as exc:
             if exc.status_code != 409:
                 raise

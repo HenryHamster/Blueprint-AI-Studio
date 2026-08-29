@@ -161,6 +161,74 @@ async def test_preupgrade_ack_without_diagnostic_drains_and_is_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_retired_session_packet_and_result_rebind_to_current_resident(
+    client: AsyncClient, db_session
+):
+    """A private handoff cannot disappear behind its originating session.
+
+    The normal stop/start handoff eagerly rebinds immediate-predecessor rows,
+    but a packet can predate that predecessor after multiple stopped Residents.
+    Claiming must discover the durable server-authored row project-wide, then
+    rebind both its packet and result to the exact current worker before
+    renew/ack or public continuation delivery.
+    """
+
+    project, task, _incarnation, identity, source, packet = (
+        await _start_workday_request(client, db_session, key="retired-session")
+    )
+    packet.resident_session_id = "retired-resident-session"
+    db_session.add(packet)
+    await db_session.commit()
+
+    packet_claim = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/claim-next",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=_claim_body(identity),
+    )
+    assert packet_claim.status_code == 200, packet_claim.text
+    claimed = packet_claim.json()["packet"]
+    assert packet_claim.json()["status"] == "claimed"
+    assert claimed["packet_id"] == str(packet.id)
+    await db_session.refresh(packet)
+    assert packet.resident_session_id == identity["session_id"]
+
+    acknowledged = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/{packet.id}/ack",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **identity,
+            "workday_claim_id": claimed["workday_claim_id"],
+            "outcome": "completed",
+            "result_summary": "durable result from the rebound packet",
+        },
+    )
+    assert acknowledged.status_code == 200, acknowledged.text
+
+    result = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.context["_workday_consultation_result"]
+                .as_boolean()
+                .is_(True),
+            )
+        )
+    ).scalars().one()
+    result.resident_session_id = "retired-resident-session"
+    db_session.add(result)
+    await db_session.commit()
+
+    continuation = await _claim_continuation(client, project, task, identity)
+    assert continuation.status_code == 200, continuation.text
+    body = continuation.json()["continuation"]
+    assert continuation.json()["status"] == "claimed"
+    assert body["result_packet_id"] == str(result.id)
+    assert body["consultation_id"] == str(source.id)
+    await db_session.refresh(result)
+    assert result.resident_session_id == identity["session_id"]
+
+
+@pytest.mark.asyncio
 async def test_stale_workday_packet_settles_source_once_without_private_leak(
     client: AsyncClient, db_session
 ):
