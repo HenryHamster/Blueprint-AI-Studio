@@ -3478,6 +3478,25 @@ export async function handleStrategicResident(
     consultation_id?: string | null;
     question: string;
     envelope: StrategicContextEnvelopeTransport;
+    prior_attempts?: Array<Record<string, unknown>>;
+    prior_receipts?: Array<Record<string, unknown>>;
+  };
+  type TypedConsultationAttemptDiagnostic = {
+    attempt: number;
+    workday_claim_id: string;
+    outcome: 'completed' | 'abandoned' | 'failed';
+    terminal_predicate: string;
+    provider_terminal_reason: string | null;
+    provider_output_tail: string | null;
+    started_at: string;
+    ended_at: string;
+    turn_ms: number;
+    ttft_ms: number | null;
+    tool_call_count: number;
+    tool_call_duration_ms: number;
+    result_chars: number;
+    trace: Array<Record<string, unknown>>;
+    trace_truncated: boolean;
   };
   type ClaimedTypedContinuation = {
     result_packet_id: string;
@@ -3500,6 +3519,7 @@ export async function handleStrategicResident(
   const ackTypedConsultation = async (
     packet: ClaimedTypedConsultation,
     outcome: 'completed' | 'abandoned' | 'failed',
+    attemptDiagnostic: TypedConsultationAttemptDiagnostic,
     resultSummary?: string,
   ): Promise<void> => {
     await apiPost(
@@ -3511,6 +3531,7 @@ export async function handleStrategicResident(
         incarnation_id: residentProcessIncarnation,
         workday_claim_id: packet.workday_claim_id,
         outcome,
+        attempt_diagnostic: attemptDiagnostic,
         ...(resultSummary ? { result_summary: resultSummary } : {}),
       },
     );
@@ -3543,18 +3564,22 @@ export async function handleStrategicResident(
   const awaitTypedConsultationTurn = async (
     packet: ClaimedTypedConsultation,
     turn: Promise<ResidentTurnResult>,
-  ): Promise<{ result: ResidentTurnResult; leaseHeld: boolean }> => {
-    // Derived from the server's configured autonomous turn timeout (floor
-    // 240s), not hardcoded: the client must never abandon a turn the server
-    // still considers live. See consultationAbandonDeadlineMs for why.
-    const deadlineAt = Date.now() + consultationAbandonDeadlineMs(cfg.autonomousTurnTimeoutMs);
+  ): Promise<{ result: ResidentTurnResult; leaseHeld: boolean; terminalPredicate: string }> => {
+    // This is an INACTIVITY budget, not an absolute turn budget. The provider
+    // session independently retains its hard safety ceiling. A long private
+    // turn that keeps making meaningful text/tool progress must not be killed
+    // at the old deterministic six-minute wall-clock boundary.
+    const inactivityBudgetMs = consultationAbandonDeadlineMs(cfg.autonomousTurnTimeoutMs);
+    const startedAtMs = Date.now();
     // A fresh call means the session is currently alive, so any stale flag
     // from a prior cycle (e.g. an interrupt that did not end up killing the
     // process) no longer describes the current state.
     consultationAbandonInterruptPending = false;
     const completed = turn.then(() => 'done' as const);
     for (;;) {
-      const remaining = deadlineAt - Date.now();
+      const progress = session.activeTurnProgress?.();
+      const lastActivityAtMs = progress?.lastActivityAtMs ?? startedAtMs;
+      const remaining = inactivityBudgetMs - (Date.now() - lastActivityAtMs);
       if (remaining <= 0) {
         // session.interrupt() sends SIGINT, which exits the ENTIRE Claude Code
         // child process (not just this turn) — flag it before calling so the
@@ -3562,7 +3587,11 @@ export async function handleStrategicResident(
         // correctly instead of misreporting a generic crash.
         consultationAbandonInterruptPending = true;
         session.interrupt();
-        return { result: await turn, leaseHeld: false };
+        return {
+          result: await turn,
+          leaseHeld: false,
+          terminalPredicate: 'consultation_inactivity_timeout',
+        };
       }
       const next = await Promise.race([
         completed,
@@ -3572,7 +3601,19 @@ export async function handleStrategicResident(
         // The session survived a full consultation cycle without needing an
         // abandon-interrupt; a prior consecutive-exit streak no longer applies.
         consultationAbandonExitCount = 0;
-        return { result: await turn, leaseHeld: true };
+        const result = await turn;
+        const terminalPredicate = result.hardTimedOut
+          ? 'session_hard_timeout'
+          : result.timedOut
+            ? 'session_stall_timeout'
+            : result.providerFailed
+              ? 'provider_failed'
+              : result.processGone
+                ? 'provider_process_exit'
+                : result.interrupted
+                  ? 'provider_interrupted'
+                  : 'provider_result';
+        return { result, leaseHeld: true, terminalPredicate };
       }
       try {
         if (await renewTypedConsultation(packet)) continue;
@@ -3584,7 +3625,11 @@ export async function handleStrategicResident(
       }
       consultationAbandonInterruptPending = true;
       session.interrupt();
-      return { result: await turn, leaseHeld: false };
+      return {
+        result: await turn,
+        leaseHeld: false,
+        terminalPredicate: 'consultation_lease_renewal_failed',
+      };
     }
   };
 
@@ -3599,6 +3644,10 @@ export async function handleStrategicResident(
           packet.attempt >= 2 ? 'failed' : 'abandoned'
         );
         let resultSummary: string | undefined;
+        let result: ResidentTurnResult | undefined;
+        let terminalPredicate = 'turn_setup_failed';
+        let turnExceptionDetail: string | null = null;
+        const attemptStartedAtMs = Date.now();
         try {
           const verified = verifyStrategicContextEnvelope(packet.envelope, {
             contextAuthorityGeneration: packet.envelope.context_authority_generation,
@@ -3619,6 +3668,16 @@ export async function handleStrategicResident(
               `Fast turn claim: ${packet.claim_id}`,
               `Delivery key: ${packet.delivery_key}`,
               `Continuation: ${packet.continuation_key}`,
+              ...(packet.attempt > 1 ? [
+                '',
+                '## Durable prior-attempt reconciliation',
+                'The server has projected the prior attempts and every recorded mutation receipt below.',
+                'Treat matching receipts as already applied. Re-read canonical state and continue only missing work; never replay an ambiguous or already-receipted mutation.',
+                JSON.stringify({
+                  attempts: packet.prior_attempts ?? [],
+                  receipts: packet.prior_receipts ?? [],
+                }),
+              ] : []),
               '',
               buildPrivateWorkdayContextFrame(verified),
               '',
@@ -3628,7 +3687,10 @@ export async function handleStrategicResident(
             packetId: packet.packet_id,
             workdayClaimId: packet.workday_claim_id,
           });
-          const { result, leaseHeld } = await awaitTypedConsultationTurn(packet, workdayTurn);
+          const awaited = await awaitTypedConsultationTurn(packet, workdayTurn);
+          result = awaited.result;
+          terminalPredicate = awaited.terminalPredicate;
+          const { leaseHeld } = awaited;
           resultSummary = result.resultText.trim().slice(0, 20_000) || undefined;
           const usableResult = leaseHeld
             && resultSummary !== undefined
@@ -3636,6 +3698,13 @@ export async function handleStrategicResident(
             && !result.timedOut
             && !result.hardTimedOut
             && !result.sentOperatorMessage;
+          if (leaseHeld && !usableResult) {
+            if (result.sentOperatorMessage) {
+              terminalPredicate = 'private_reply_capability_violation';
+            } else if (resultSummary === undefined) {
+              terminalPredicate = 'empty_provider_result';
+            }
+          }
           // Escalate to 'failed' by attempt count alone, regardless of
           // leaseHeld: an abandon caused by session.interrupt() (deadline
           // expiry or a failed renewal) always reports leaseHeld:false, which
@@ -3645,11 +3714,39 @@ export async function handleStrategicResident(
             ? 'completed'
             : (packet.attempt >= 2 ? 'failed' : 'abandoned');
         } catch (error) {
+          terminalPredicate = 'turn_exception';
+          turnExceptionDetail = sanitize(String(error)).slice(-2_000);
           sendLog(
             ws,
             `[resident] typed Workday consultation failed: ${sanitize(String(error))}\n`,
           );
         }
+
+        const attemptEndedAtMs = Date.now();
+        const attemptDiagnostic: TypedConsultationAttemptDiagnostic = {
+          attempt: packet.attempt,
+          workday_claim_id: packet.workday_claim_id,
+          outcome,
+          terminal_predicate: terminalPredicate,
+          provider_terminal_reason: result?.providerTerminalReason ?? null,
+          provider_output_tail: result?.providerOutputTail
+            ?? result?.failureDetail
+            ?? turnExceptionDetail,
+          started_at: new Date(attemptStartedAtMs).toISOString(),
+          ended_at: new Date(attemptEndedAtMs).toISOString(),
+          turn_ms: result?.turnMs ?? Math.max(0, attemptEndedAtMs - attemptStartedAtMs),
+          ttft_ms: result?.ttftMs ?? null,
+          tool_call_count: result?.toolCallCount ?? 0,
+          tool_call_duration_ms: result?.totalToolCallDurationMs ?? 0,
+          result_chars: resultSummary?.length ?? 0,
+          trace: (result?.trace ?? []).map((event) => ({
+            elapsed_ms: event.elapsedMs,
+            kind: event.kind,
+            ...(event.label ? { label: event.label } : {}),
+            ...(event.isError !== undefined ? { is_error: event.isError } : {}),
+          })),
+          trace_truncated: result?.traceTruncated ?? false,
+        };
 
         // Persist a non-running delivery state before the ack can create the
         // private result packet which Fast will later turn into a public
@@ -3680,6 +3777,7 @@ export async function handleStrategicResident(
             await ackTypedConsultation(
               packet,
               outcome,
+              attemptDiagnostic,
               outcome === 'completed' ? resultSummary : undefined,
             );
             break;
@@ -5579,41 +5677,6 @@ export async function handleStrategicResident(
         continue;
       }
 
-      // Durable Fast consultations are private Workday turns. Claim at most one
-      // at a time and keep the main loop cycling so a new operator message can
-      // still be picked up by the independent foreground child immediately.
-      if (await maybeClaimTypedConsultation()) {
-        // Publish the structured transition immediately. A consultation claim
-        // is infrequent, and waiting for the ordinary one-minute liveness cap
-        // would make a real running consultation look generically idle.
-        const hb = await livenessHeartbeat();
-        if (hb?.stop_requested) break;
-        await sleep(cfg.messagePollMs);
-        continue;
-      }
-
-      // The completion endpoint proved that a consultation packet exists, but
-      // claim-next may have hit a transient transport failure. Keep Fast polling
-      // and liveness moving without starting another turn on the shared Workday
-      // subprocess. An explicit empty response clears this bounded handoff hint.
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- set by the foreground Fast callback while the main loop is suspended in watchTurn/watchOperatorTurn.
-      if (typedConsultationAwaitingClaim) {
-        const activityChanged = setResidentActivity(
-          'waiting',
-          'Private Workday consultation is queued',
-          null,
-          'consultation_queued',
-          'consultation_queued',
-          typedConsultationDelivery.consultationId,
-        );
-        if (activityChanged || livenessHeartbeatDue()) {
-          const hb = await livenessHeartbeat();
-          if (hb?.stop_requested) break;
-        }
-        await sleep(cfg.messagePollMs);
-        continue;
-      }
-
       // The private consultation chain and the ordinary loop share the same
       // persistent Workday subprocess. Keep Fast responsive in its independent
       // foreground child, but never start a continuation, legacy reply, compact,
@@ -5680,6 +5743,38 @@ export async function handleStrategicResident(
           typedConsultationDelivery.consultationId,
         );
         if (livenessHeartbeatDue()) {
+          const hb = await livenessHeartbeat();
+          if (hb?.stop_requested) break;
+        }
+        await sleep(cfg.messagePollMs);
+        continue;
+      }
+
+      // Settle already-durable results before claiming newer consultation
+      // work. This keeps a failed/completed packet's public continuation live
+      // even when another consultation is queued behind it.
+      if (await maybeClaimTypedConsultation()) {
+        const hb = await livenessHeartbeat();
+        if (hb?.stop_requested) break;
+        await sleep(cfg.messagePollMs);
+        continue;
+      }
+
+      // The completion endpoint proved that a consultation packet exists, but
+      // claim-next may have hit a transient transport failure. Keep Fast polling
+      // and liveness moving without starting another turn on the shared Workday
+      // subprocess. An explicit empty response clears this bounded handoff hint.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- set by the foreground Fast callback while the main loop is suspended in watchTurn/watchOperatorTurn.
+      if (typedConsultationAwaitingClaim) {
+        const activityChanged = setResidentActivity(
+          'waiting',
+          'Private Workday consultation is queued',
+          null,
+          'consultation_queued',
+          'consultation_queued',
+          typedConsultationDelivery.consultationId,
+        );
+        if (activityChanged || livenessHeartbeatDue()) {
           const hb = await livenessHeartbeat();
           if (hb?.stop_requested) break;
         }

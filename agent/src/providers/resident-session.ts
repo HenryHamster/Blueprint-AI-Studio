@@ -101,6 +101,19 @@ export interface ResidentOperatorReply {
   content: string;
 }
 
+export interface ResidentTurnTraceEvent {
+  elapsedMs: number;
+  kind: 'text' | 'tool' | 'tool_result' | 'error' | 'result';
+  label?: string;
+  isError?: boolean;
+}
+
+export interface ResidentTurnProgress {
+  startedAtMs: number;
+  lastActivityAtMs: number;
+  toolCallCount: number;
+}
+
 function parseOperatorReplyInput(input: unknown): ResidentOperatorReply | null {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) return null;
   const raw = input as Record<string, unknown>;
@@ -162,6 +175,13 @@ export interface ResidentTurnResult {
    * resident handler can retain a useful terminal diagnostic across an in-place
    * child restart. */
   failureDetail?: string | null;
+  /** Provider-declared terminal predicate from the top-level result. */
+  providerTerminalReason?: string | null;
+  /** Bounded, sanitized terminal provider evidence. */
+  providerOutputTail?: string | null;
+  /** Bounded semantic execution trace. Private text and command bodies are omitted. */
+  trace?: ResidentTurnTraceEvent[];
+  traceTruncated?: boolean;
 }
 
 export interface ResidentSessionEvent {
@@ -195,6 +215,8 @@ export interface ResidentSession {
   touch(): void;
   /** Resolve when no turn is active (immediately if idle). */
   waitForIdle(): Promise<void>;
+  /** Current meaningful turn progress, used by callers with renewable leases. */
+  activeTurnProgress?(): ResidentTurnProgress | null;
   /** Tear the session down (end stdin, SIGTERM→SIGKILL the process group). */
   close(): void;
   /** The CLI session id captured from the init/system/result events (for --resume). */
@@ -289,6 +311,11 @@ interface ActiveTurn {
   /** inclusive input token count reported by the turn's top-level `result` event;
    *  zero when no usage block was reported (interrupted / pre-result child exit). */
   inputTokens: number;
+  lastActivityAtMs: number;
+  providerTerminalReason: string | null;
+  providerOutputTail: string | null;
+  trace: ResidentTurnTraceEvent[];
+  traceTruncated: boolean;
 }
 
 /**
@@ -508,8 +535,39 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       providerFailed: t.providerFailed,
       failureCategory: t.failureCategory,
       failureDetail: t.failureDetail,
+      providerTerminalReason: t.providerTerminalReason,
+      providerOutputTail: t.providerOutputTail,
+      trace: t.trace,
+      traceTruncated: t.traceTruncated,
     });
     resolveIdleWaiters();
+  };
+
+  const traceTurn = (
+    t: ActiveTurn,
+    kind: ResidentTurnTraceEvent['kind'],
+    label?: string,
+    isError?: boolean,
+  ): void => {
+    t.lastActivityAtMs = Date.now();
+    const event: ResidentTurnTraceEvent = {
+      elapsedMs: t.lastActivityAtMs - t.startedAtMs,
+      kind,
+      ...(label ? { label: label.slice(0, 80) } : {}),
+      ...(isError !== undefined ? { isError } : {}),
+    };
+    if (t.trace.length >= 128) {
+      // Preserve the first 32 events (startup/first mutation evidence) and the
+      // most recent 95 events (terminal lead-up) instead of allowing a long
+      // turn's tail to erase its beginning entirely.
+      t.trace.splice(32, 1);
+      t.traceTruncated = true;
+    }
+    t.trace.push(event);
+  };
+
+  const noteTurnActivity = (t: ActiveTurn): void => {
+    t.lastActivityAtMs = Date.now();
   };
 
   const armTurnStall = (): void => {
@@ -620,6 +678,13 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       case 'text': {
         if (!ev.text) break;
         const t = activeTurn;
+        if (t) {
+          noteTurnActivity(t);
+          // Streaming deltas can number in the thousands and would crowd every
+          // tool event out of the bounded trace. Retain only finalized message
+          // boundaries; live progress still updates on every delta above.
+          if (ev.isAssistantMessage) traceTurn(t, 'text', 'assistant_message');
+        }
         if (ev.isAssistantMessage) {
           // Finalized assistant block. Suppress if we already streamed its deltas
           // live (avoid showing the reply twice); otherwise surface it.
@@ -662,6 +727,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         });
         const t = activeTurn;
         if (t) {
+          traceTurn(t, 'tool', ev.toolName ?? ev.activityKind ?? 'tool');
           t.sawToolUse = true;
           t.toolCallCount += 1;
           // Record the tool call start timestamp for per-tool latency tracking.
@@ -684,6 +750,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         // confirms success. This guards against a tool call that failed to write
         // the receipt-bound staging file.
         const t = activeTurn;
+        if (t) traceTurn(t, 'tool_result', ev.activityKind ?? 'tool_result', ev.isError === true);
         if (t && ev.toolUseId) {
           const reply = t.pendingOperatorReplies.get(ev.toolUseId);
           t.pendingOperatorReplies.delete(ev.toolUseId);
@@ -711,6 +778,15 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       }
       case 'result': {
         if (!ev.isTurnResult) break;
+        if (activeTurn) {
+          traceTurn(activeTurn, 'result', ev.terminalReason ?? (ev.isError ? 'error' : 'completed'), ev.isError === true);
+          activeTurn.providerTerminalReason = ev.terminalReason ?? (ev.isError ? 'error' : 'completed');
+          const terminalEvidence = sanitize([
+            structuredFailureDiagnostic(ev),
+            ev.isError ? failureTextTail : '',
+          ].filter(Boolean).join('\n')).trim();
+          activeTurn.providerOutputTail = terminalEvidence.slice(-2_000) || null;
+        }
         // Claude's OAuth usage-limit banner is sometimes delivered as a
         // successful-looking top-level result (rather than an error event or
         // stderr) and then the CLI stays alive. Treat that exact provider
@@ -791,6 +867,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         break;
       }
       case 'error': {
+        if (activeTurn) traceTurn(activeTurn, 'error', ev.terminalReason ?? 'provider_error', true);
         emit({ kind: 'error', text: ev.text });
         break;
       }
@@ -923,6 +1000,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         processGone: true, ttftMs: null, turnMs: 0, toolCallCount: 0,
         totalToolCallDurationMs: 0, meanInterTokenMs: null, inputTokens: 0,
         providerFailed: false, failureCategory: terminalFailureCategory,
+        providerTerminalReason: null, providerOutputTail: null, trace: [], traceTruncated: false,
       });
     }
     if (activeTurn) {
@@ -956,6 +1034,11 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         failureDetail: null,
         toolCallStartTimes: new Map(), lastTokenAtMs: null, interTokenIntervalsMs: [],
         inputTokens: 0,
+        lastActivityAtMs: startedAtMs,
+        providerTerminalReason: null,
+        providerOutputTail: null,
+        trace: [],
+        traceTruncated: false,
       };
       activeTurn = turn;
       try {
@@ -974,6 +1057,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           processGone: !alive, ttftMs: null, turnMs: Date.now() - startedAtMs, toolCallCount: 0,
           totalToolCallDurationMs: 0, meanInterTokenMs: null, inputTokens: 0,
           providerFailed: false, failureCategory: terminalFailureCategory,
+          providerTerminalReason: null, providerOutputTail: null, trace: [], traceTruncated: false,
         });
         return;
       }
@@ -989,6 +1073,11 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     onEvent: (cb) => { listeners.push(cb); },
     touch: () => { if (alive && !closed) armIdleCeiling(); },
     waitForIdle: () => (activeTurn ? new Promise<void>((res) => { idleWaiters.push(res); }) : Promise.resolve()),
+    activeTurnProgress: () => activeTurn ? {
+      startedAtMs: activeTurn.startedAtMs,
+      lastActivityAtMs: activeTurn.lastActivityAtMs,
+      toolCallCount: activeTurn.toolCallCount,
+    } : null,
     sessionId: () => sessionId,
     isAlive: () => alive && !closed,
     exitCode: () => exitCodeVal,

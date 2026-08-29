@@ -293,6 +293,31 @@ class ClaimNextWorkdayConsultation(BaseModel):
     lease_seconds: int = Field(default=45, ge=15, le=300)
 
 
+class WorkdayConsultationTraceEvent(BaseModel):
+    elapsed_ms: int = Field(..., ge=0)
+    kind: Literal["text", "tool", "tool_result", "error", "result"]
+    label: str | None = Field(default=None, max_length=80)
+    is_error: bool | None = None
+
+
+class WorkdayConsultationAttemptDiagnostic(BaseModel):
+    attempt: int = Field(..., ge=1, le=8)
+    workday_claim_id: uuid.UUID
+    outcome: Literal["completed", "abandoned", "failed"]
+    terminal_predicate: str = Field(..., min_length=1, max_length=80)
+    provider_terminal_reason: str | None = Field(default=None, max_length=255)
+    provider_output_tail: str | None = Field(default=None, max_length=2_000)
+    started_at: datetime
+    ended_at: datetime
+    turn_ms: int = Field(..., ge=0)
+    ttft_ms: int | None = Field(default=None, ge=0)
+    tool_call_count: int = Field(..., ge=0)
+    tool_call_duration_ms: int = Field(..., ge=0)
+    result_chars: int = Field(..., ge=0)
+    trace: list[WorkdayConsultationTraceEvent] = Field(default_factory=list, max_length=128)
+    trace_truncated: bool = False
+
+
 class AcknowledgeWorkdayConsultation(BaseModel):
     """Close or deliberately release one exact internal delivery."""
 
@@ -303,6 +328,7 @@ class AcknowledgeWorkdayConsultation(BaseModel):
     workday_claim_id: uuid.UUID
     outcome: Literal["completed", "abandoned", "failed"]
     result_summary: str | None = Field(default=None, max_length=20_000)
+    attempt_diagnostic: WorkdayConsultationAttemptDiagnostic
 
 
 class RenewWorkdayConsultation(BaseModel):
@@ -1553,6 +1579,19 @@ def _workday_consultation_packet_response(
 ) -> dict[str, Any]:
     """Project only server-created packet fields to the authenticated Resident."""
     context = packet.context if isinstance(packet.context, dict) else {}
+    from app.conversation_coordinator import bounded_workday_consultation_attempts
+    from app.strategic_workday_mutation_rebind import (
+        WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY,
+        WORKDAY_OPERATION_LEDGER_CONTEXT_KEY,
+        WORKDAY_OPERATION_LEDGER_LIMIT,
+        bounded_workday_mutation_receipts,
+    )
+    ledger = context.get(WORKDAY_OPERATION_LEDGER_CONTEXT_KEY)
+    ledger_context = {
+        WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: ledger
+        if isinstance(ledger, list)
+        else []
+    }
     return {
         "packet_id": str(packet.id),
         "workday_claim_id": str(workday_claim_id),
@@ -1564,6 +1603,12 @@ def _workday_consultation_packet_response(
         "consultation_id": context.get("_workday_consultation_atomic_reply_id"),
         "question": packet.content,
         "envelope": envelope.model_dump(mode="json"),
+        "prior_attempts": bounded_workday_consultation_attempts(context),
+        "prior_receipts": bounded_workday_mutation_receipts(
+            ledger_context,
+            packet_id=packet.id,
+            limit=WORKDAY_OPERATION_LEDGER_LIMIT,
+        ),
     }
 
 
@@ -1759,6 +1804,7 @@ async def acknowledge_workday_consultation(
             workday_claim_id=payload.workday_claim_id,
             outcome=payload.outcome,
             result_summary=payload.result_summary,
+            attempt_diagnostic=payload.attempt_diagnostic.model_dump(mode="json"),
         )
     except ValueError as exc:
         await session.rollback()

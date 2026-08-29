@@ -5153,7 +5153,7 @@ async def strategic_operation(
         # connection until Cloud SQL closed it, poisoning the commit. It is
         # applied post-commit on a fresh session below (see
         # _apply_qualify_request_post_commit).
-        await _apply_version_phase_decision(
+        _phase_applied = await _apply_version_phase_decision(
             version_phase_decision, task, project, session, path="api_inline"
         )
         _qr_task_id = task.id
@@ -5165,7 +5165,7 @@ async def strategic_operation(
         _nvg_applied = await _apply_new_version_goal(
             new_version_goal, task, project, session, path="api_inline"
         )
-        await _apply_new_acceptance_criteria(
+        _created_criteria = await _apply_new_acceptance_criteria(
             new_acceptance_criteria, task, project, session, path="api_inline"
         )
         # Pop the context keys now that they have been applied so
@@ -5180,6 +5180,46 @@ async def strategic_operation(
             new_ctx.pop(_applied_key, None)
         task.context = new_ctx
         flag_modified(task, "context")
+        if workday_operation.binding is not None and (
+            _phase_applied or _nvg_applied or _created_criteria
+        ):
+            from app.release_version import current_open_version as _current_open_version
+
+            _receipt_version = await _current_open_version(session, project.id)
+            if _receipt_version is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Open release version disappeared before Workday receipt recording",
+                )
+            if _phase_applied:
+                await workday_operation.record_child_state(
+                    op="set_version_phase",
+                    key=str(_receipt_version.id),
+                    target_revision=_receipt_version.version_number,
+                    value={
+                        "release_version_id": str(_receipt_version.id),
+                        "phase": _receipt_version.phase,
+                        "reasoning": _receipt_version.phase_reasoning,
+                    },
+                )
+            if _nvg_applied:
+                await workday_operation.record_child_state(
+                    op="set_version_goal",
+                    key=str(_receipt_version.id),
+                    target_revision=_receipt_version.version_number,
+                    value={
+                        "release_version_id": str(_receipt_version.id),
+                        "goal": _receipt_version.goal,
+                    },
+                )
+            for _criterion in _created_criteria:
+                await workday_operation.record_child_entity(
+                    op="create_acceptance_criterion",
+                    key=str(_criterion.criterion_key),
+                    entity_kind="acceptance_criterion",
+                    entity_id=str(_criterion.criterion_key),
+                    effect="created",
+                )
         await workday_operation.record_problem_model(new_pm_raw)
         await session.commit()
         await _emit_updated(

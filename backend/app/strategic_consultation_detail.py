@@ -33,7 +33,10 @@ from typing import Any, Mapping
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.conversation_coordinator import _workday_claim_expiry
+from app.conversation_coordinator import (
+    _workday_claim_expiry,
+    bounded_workday_consultation_attempts,
+)
 from app.message_audience import PIPELINE_LOG, STRATEGIST_INTERNAL
 from app.models import (
     MessageHandlingState,
@@ -222,18 +225,46 @@ def _claim_view(
     }
 
 
-def _last_failure(context: Mapping[str, Any]) -> dict[str, Any] | None:
+def _last_failure(
+    context: Mapping[str, Any], attempts: list[dict[str, Any]]
+) -> dict[str, Any] | None:
     """Carry the recorded gate rejection forward, not a bare unexplained 409."""
     raw = context.get(_LAST_FAILURE)
-    if not isinstance(raw, Mapping):
+    if isinstance(raw, Mapping):
+        gate = raw.get("gate")
+        detail = raw.get("detail")
+        recorded_at = raw.get("recorded_at")
+        return {
+            "gate": gate[:64] if isinstance(gate, str) else None,
+            "detail": detail[:2000] if isinstance(detail, str) else None,
+            "recorded_at": recorded_at[:64] if isinstance(recorded_at, str) else None,
+        }
+    latest = next(
+        (
+            attempt
+            for attempt in reversed(attempts)
+            if attempt.get("outcome") != "completed"
+        ),
+        None,
+    )
+    if latest is None:
         return None
-    gate = raw.get("gate")
-    detail = raw.get("detail")
-    recorded_at = raw.get("recorded_at")
+    predicate = str(latest.get("terminal_predicate") or "attempt_failed")
+    reason = latest.get("provider_terminal_reason")
+    output_tail = latest.get("provider_output_tail")
+    detail = "; ".join(
+        part
+        for part in (
+            f"attempt {latest.get('attempt')}: {predicate}",
+            f"provider_terminal_reason={reason}" if reason else "",
+            f"provider_output_tail={output_tail}" if output_tail else "",
+        )
+        if part
+    )
     return {
-        "gate": gate[:64] if isinstance(gate, str) else None,
-        "detail": detail[:2000] if isinstance(detail, str) else None,
-        "recorded_at": recorded_at[:64] if isinstance(recorded_at, str) else None,
+        "gate": f"attempt:{predicate}"[:64],
+        "detail": detail[:2000],
+        "recorded_at": str(latest.get("ended_at") or "")[:64] or None,
     }
 
 
@@ -286,6 +317,9 @@ def _detail_payload(
         packet_context, WORKDAY_OPERATION_LEDGER_CONTEXT_KEY, CONSULTATION_STEP_LIMIT
     )
     receipts, receipts_have_more = _bounded_receipts(result_context)
+    attempts = bounded_workday_consultation_attempts(packet_context)
+    if not attempts:
+        attempts = bounded_workday_consultation_attempts(result_context)
     outcome = result_context.get(_RESULT_STATE)
     continuation_key = packet_context.get(_CONTINUATION_KEY)
     return {
@@ -318,7 +352,8 @@ def _detail_payload(
         "claim": claim,
         "steps": steps,
         "steps_truncated": steps_truncated,
-        "last_failure": _last_failure(packet_context),
+        "attempts": attempts,
+        "last_failure": _last_failure(packet_context, attempts),
         "result": (
             {
                 "id": str(result.id),

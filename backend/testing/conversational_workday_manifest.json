@@ -62,9 +62,25 @@
       "path": "backend/testing/test_strategic_workday_mutation_rebind.py",
       "reason": "Protects full per-packet Workday operation idempotency beyond the bounded Fast receipt projection, including old replay, fingerprint conflict, capacity rejection, and a fresh next-consultation ledger.",
       "test_ids": [
-        "test_workday_operation_replay_survives_projection_window_and_is_packet_scoped"
+        "test_workday_operation_replay_survives_projection_window_and_is_packet_scoped",
+        "test_completion_debt_replay_projects_the_exact_debt_id",
+        "test_retry_with_new_claim_incarnation_and_operation_id_replays_exact_semantics",
+        "test_version_and_acceptance_criterion_receipts_are_bounded_and_projectable"
       ],
-      "test_count": 2
+      "test_count": 4
+    },
+    {
+      "path": "backend/testing/test_strategic_consultation_detail.py",
+      "reason": "Protects the bounded operator-readable private consultation lifecycle, complete per-attempt terminal diagnostics, useful receipt/trace projection, and strategist-internal privacy boundary.",
+      "test_ids": [
+        "test_state_walks_the_whole_consultation_lifecycle",
+        "test_failed_outcome_is_reported_alongside_delivery_position",
+        "test_every_attempt_and_terminal_predicate_survive_failed_delivery",
+        "test_operation_ledger_is_projected_without_identity_fields",
+        "test_result_receipts_and_have_more_flag_are_carried",
+        "test_recorded_gate_failure_travels_with_the_consultation"
+      ],
+      "test_count": 16
     },
     {
       "path": "backend/testing/test_strategic_workday_handoff_recovery.py",
@@ -323,9 +339,10 @@
         "startResidentClaudeSession > appends --input-format stream-json and keeps stdin piped",
         "startResidentClaudeSession > sendTurn writes a user NDJSON line and resolves on the top-level result",
         "startResidentClaudeSession > classifies provider rate limits from bounded stderr evidence",
-        "startResidentClaudeSession > allows foreground Fast without append support while identity-bound Workday stays fail-closed"
+        "startResidentClaudeSession > allows foreground Fast without append support while identity-bound Workday stays fail-closed",
+        "startResidentClaudeSession > exposes meaningful progress and retains bounded head-plus-tail terminal trace evidence"
       ],
-      "test_count": 48
+      "test_count": 49
     },
     {
       "path": "scripts/test_runner_isolation.py",
