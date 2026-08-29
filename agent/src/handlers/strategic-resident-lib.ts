@@ -848,12 +848,13 @@ ${ctx.autonomousState.trim()}`);
     if (ctx.groundingRefreshed) {
       const note = `> **Refreshed note:** The data below was re-fetched from current project
 > state at compaction time. If in doubt you can still confirm via
-> \`./fetch problem-model\`, \`./fetch direction <id>\`, and \`./fetch message\`.`;
+> \`./fetch problem-model\`, \`./fetch running-update\`, \`./fetch direction <id>\`,
+> and \`./fetch message\`.`;
       sections.push(`## Self-model grounding (refreshed at compaction)\n${note}\n\n${grounding.join('\n\n')}`);
     } else {
       const note = `> **Snapshot note:** The data below was captured when the session started
 > and may not reflect current project state. Use \`./fetch problem-model\`,
-> \`./fetch direction <id>\`, and \`./fetch message\` to retrieve
+> \`./fetch running-update\`, \`./fetch direction <id>\`, and \`./fetch message\` to retrieve
 > the latest state.`;
       sections.push(`## Self-model grounding (session-start snapshot)\n${note}\n\n${grounding.join('\n\n')}`);
     }

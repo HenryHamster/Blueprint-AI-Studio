@@ -384,7 +384,7 @@ echo ""
 // /api/agent/projects/{project_id}/... — all share the standard agent auth and
 // are callable by any of the project's agent tokens, so the helper works for
 // every task type, not just strategic-cycle agents.
-export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'compute-job' | 'compute-limits' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'fleet-sizing' | 'capability-trials' | 'sections' | 'task' | 'tasks' | 'completion-debt' | 'ui-load-timing' | 'skills' | 'tools' | 'attention' | 'task-census' | 'autonomy-debug' | 'alerts' | 'deploy-state';
+export type FetchVerb = 'problem-model' | 'running-update' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'compute-job' | 'compute-limits' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'fleet-sizing' | 'capability-trials' | 'sections' | 'task' | 'tasks' | 'completion-debt' | 'ui-load-timing' | 'skills' | 'tools' | 'attention' | 'task-census' | 'autonomy-debug' | 'alerts' | 'deploy-state';
 
 // Canonical order of the full vocabulary. STRATEGIC provisions all of these.
 // `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
@@ -393,7 +393,7 @@ export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'me
 // of the pipeline itself rather than the caller's own lineage, and every one of
 // them returns a byte-bounded projection (see backend app/agent_read_budget.py).
 export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
-  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'compute-job', 'compute-limits', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'fleet-sizing', 'capability-trials', 'sections', 'task', 'tasks', 'completion-debt', 'ui-load-timing', 'skills', 'tools', 'attention', 'task-census', 'autonomy-debug', 'alerts', 'deploy-state',
+  'problem-model', 'running-update', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'compute-job', 'compute-limits', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'fleet-sizing', 'capability-trials', 'sections', 'task', 'tasks', 'completion-debt', 'ui-load-timing', 'skills', 'tools', 'attention', 'task-census', 'autonomy-debug', 'alerts', 'deploy-state',
 ];
 
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
@@ -412,6 +412,7 @@ export const DESIGN_DOC_FETCH_VERBS: FetchVerb[] = ['direction', 'section', 'pla
 // query filters, no project path) and gets a self-contained arm below.
 const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'problem-model': 'problem-model) PATH_SUFFIX="problem-model"',
+  'running-update': 'running-update) PATH_SUFFIX="running-update"',
   'direction':     'direction)  PATH_SUFFIX="directions${ID:+/$ID}"',
   'playbook':      'playbook)   PATH_SUFFIX="playbook/$ID"',
   'gap':           'gap)        PATH_SUFFIX="gaps/$ID"',
@@ -484,6 +485,7 @@ const KNOWLEDGE_FETCH_CASE = `  knowledge)
 // One-line description of what each verb resolves, for the prompt guidance block.
 export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'problem-model': '`./fetch problem-model` — the full current problem model (no id)',
+  'running-update': '`./fetch running-update` — the exact current running-update document, byte count, and SHA-256 digest for precondition reads and same-target readback (no id)',
   'direction':     '`./fetch direction [id]` — compact listing of all directions (no id), or full detail for one direction by id',
   'playbook':      '`./fetch playbook <key>` — a full playbook entry',
   'gap':           '`./fetch gap <id>` — a full gap record',
@@ -578,7 +580,7 @@ _load_agent_token || exit 1
 PROJECT="${projectId}"
 [ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; ./fetch is unavailable in this workspace" >&2; exit 1; }
 
-# problem-model, compute-sweeps, compute-limits, qualification, version-phase, vm-cost, efficiency-snapshot,
+# problem-model, running-update, compute-sweeps, compute-limits, qualification, version-phase, vm-cost, efficiency-snapshot,
 # ci-compliance, and fleet-sizing take no id; everything else requires one. compute-sweeps accepts an
 # optional sweep_id. For "message" the id may be a short
 # ref (first 8+ hex chars of the message UUID — the same ref operators see in
@@ -588,7 +590,7 @@ case "$KIND" in
 ${caseBody}
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "compute-limits" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "fleet-sizing" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ "$KIND" != "tasks" ] && [ "$KIND" != "completion-debt" ] && [ "$KIND" != "ui-load-timing" ] && [ "$KIND" != "skills" ] && [ "$KIND" != "tools" ] && [ "$KIND" != "attention" ] && [ "$KIND" != "task-census" ] && [ "$KIND" != "autonomy-debug" ] && [ "$KIND" != "alerts" ] && [ "$KIND" != "deploy-state" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "running-update" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "compute-limits" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "fleet-sizing" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ "$KIND" != "tasks" ] && [ "$KIND" != "completion-debt" ] && [ "$KIND" != "ui-load-timing" ] && [ "$KIND" != "skills" ] && [ "$KIND" != "tools" ] && [ "$KIND" != "attention" ] && [ "$KIND" != "task-census" ] && [ "$KIND" != "autonomy-debug" ] && [ "$KIND" != "alerts" ] && [ "$KIND" != "deploy-state" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi

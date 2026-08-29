@@ -583,11 +583,13 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     content_sha256: createHash('sha256').update(message.content, 'utf8').digest('hex'),
     attachment_manifest: canonicalAttachmentManifest(messageAttachments(message)),
   });
-  const bindSessionWithPrivateRuntime = (workday: MockSession) => {
+  const bindSessionWithPrivateRuntime = (workday: MockSession | MockSession[]) => {
     const runtime = {
       replyPaths: [] as string[],
       markerPath: '',
     };
+    const sessions = Array.isArray(workday) ? [...workday] : [workday];
+    const fallbackSession = sessions.at(-1) as MockSession;
     vi.mocked(fs.existsSync).mockImplementation((candidate) => {
       const candidatePath = String(candidate);
       if (
@@ -613,7 +615,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
         fs.writeFileSync(artifactPath, 'stale-public-reply-capability');
       }
-      return workday;
+      return sessions.shift() ?? fallbackSession;
     });
     return runtime;
   };
@@ -4559,16 +4561,18 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       lifecycle.push('autonomous-settled');
       return result;
     });
-    const workday = makeSession((prompt) => {
+    const autonomousWorkday = makeSession((prompt) => {
       activeWorkdayTurns += 1;
       expect(activeWorkdayTurns).toBe(1);
-      if (workday.sendTurn.mock.calls.length === 1) {
-        autonomousStarted = true;
-        lifecycle.push('autonomous-start');
-        expect(JSON.stringify(prompt)).toContain(firedWatchId);
-        expect(JSON.stringify(prompt)).toContain(firedBarrierId);
-        return autonomousTurn;
-      }
+      autonomousStarted = true;
+      lifecycle.push('autonomous-start');
+      expect(JSON.stringify(prompt)).toContain(firedWatchId);
+      expect(JSON.stringify(prompt)).toContain(firedBarrierId);
+      return autonomousTurn;
+    }, () => true);
+    const consultationWorkday = makeSession((prompt) => {
+      activeWorkdayTurns += 1;
+      expect(activeWorkdayTurns).toBe(1);
       lifecycle.push('consultation-start');
       expect(autonomousSettled).toBe(true);
       const promptText = JSON.stringify(prompt);
@@ -4578,13 +4582,15 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       expect(promptText).toContain('apply the exact requested mutation through ./strategic');
       expect(promptText).toContain('matching canonical readback');
       expect(promptText).not.toContain('inspect existing directions and tasks first');
+      expect(promptText).not.toContain('Session checkpoint');
+      expect(promptText).not.toContain('You are Blueprint\'s Strategic Resident');
       activeWorkdayTurns -= 1;
       return Promise.resolve(turnResult({
         sentOperatorMessage: false,
         resultText: 'Private repository investigation complete.',
       }));
     }, () => alive);
-    workday.interrupt.mockImplementation(() => {
+    autonomousWorkday.interrupt.mockImplementation(() => {
       lifecycle.push('autonomous-interrupt');
       resolveAutonomous(turnResult({
         interrupted: true,
@@ -4592,7 +4598,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         sawToolUse: false,
       }));
     });
-    bindSessionWithPrivateRuntime(workday);
+    bindSessionWithPrivateRuntime([autonomousWorkday, consultationWorkday]);
 
     const done = run('typed-fast-preempts-autonomy-for-consultation', {
       ...qualifiedPayload(),
@@ -4608,8 +4614,12 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await vi.advanceTimersByTimeAsync(1_000);
     await done;
 
-    expect(workday.sendTurn).toHaveBeenCalledTimes(2);
-    expect(workday.interrupt).toHaveBeenCalledTimes(1);
+    expect(mockStartSession).toHaveBeenCalledTimes(2);
+    expect(autonomousWorkday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(autonomousWorkday.interrupt).toHaveBeenCalledTimes(1);
+    expect(autonomousWorkday.close).toHaveBeenCalledTimes(1);
+    expect(consultationWorkday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(consultationWorkday.interrupt).not.toHaveBeenCalled();
     expect(mockApiPost.mock.calls.filter(([url]) =>
       url.endsWith('/conversation/turns/complete'))).toHaveLength(1);
     expect(heartbeatBodies.every((body) => (
