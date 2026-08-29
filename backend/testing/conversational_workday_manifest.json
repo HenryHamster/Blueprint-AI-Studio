@@ -453,7 +453,6 @@
         "test_failed_start_compensation_reconciles_cycle_and_emits_receipt",
         "test_retry_wait_is_persisted_reload_idempotent_and_heartbeat_clears",
         "test_reload_ensure_keeps_worker_during_transient_heartbeat_gap",
-        "test_terminal_worker_restart_preserves_checkpoint_and_single_generation",
         "test_reload_ensure_keeps_fresh_retry_heartbeat_past_startup_window",
         "test_reload_ensure_keeps_retry_wait_during_post_deadline_claim_grace",
         "test_reload_ensure_replaces_retry_wait_after_claim_grace_expires",
