@@ -990,6 +990,7 @@ _PROJECT_OPERATOR_WRITE_COMMANDS = frozenset(
         ("tasks", "cancel"),
         ("tasks", "requeue"),
         ("tasks", "request-changes"),
+        ("criteria", "rewrite"),
         ("directions", "add"),
         ("directions", "update"),
         ("directions", "retarget"),
@@ -1022,6 +1023,7 @@ def _scoped_command_key(args: argparse.Namespace) -> tuple[str, str | None]:
         "agent-access": "agent_access_cmd",
         "projects": "projects_cmd",
         "tasks": "tasks_cmd",
+        "criteria": "criteria_cmd",
         "directions": "directions_cmd",
         "messages": "messages_cmd",
         "strategic": "strategic_cmd",
@@ -1099,7 +1101,7 @@ def _enforce_scoped_cli_command(args: argparse.Namespace) -> None:
         print(
             f"ERROR: scoped ServiceCredential command not permitted: {label}. "
             "The project-operator profile exposes only exact project task, "
-            "direction, message, and Strategic actions; platform admin, bulk, "
+            "criterion, direction, message, and Strategic actions; platform admin, bulk, "
             "deploy, migrate, provider/fleet/runner, and host commands are denied.",
             file=sys.stderr,
         )
@@ -1900,6 +1902,155 @@ def _tasks_create(args: argparse.Namespace) -> None:
         f"  task {'reused' if r.get('is_duplicate') else 'created'}: "
         f"{r.get('id', '?')}  [{r.get('task_type', '?')}]  {r.get('title', '')}"
     ))
+
+
+# ── acceptance criteria ────────────────────────────────────────────────────
+
+_CRITERION_TEXT_OPERATOR_MAX_CHARS = 20_000
+
+
+def _read_exact_criterion_text(
+    args: argparse.Namespace, *, value_attr: str, file_attr: str, label: str
+) -> str:
+    value = getattr(args, value_attr, None)
+    file_name = getattr(args, file_attr, None)
+    if file_name:
+        path = Path(file_name).expanduser()
+        try:
+            # Text mode performs universal-newline translation, including on
+            # Windows. Decode bytes explicitly so an exact CRLF compare fence
+            # and replacement remain byte-for-byte stable after UTF-8 decode.
+            value = path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            print(f"ERROR: cannot read {label} file {path}: {exc}", file=sys.stderr)
+            raise APIError(f"cannot read {label} file") from exc
+    if not isinstance(value, str) or not value.strip():
+        print(f"ERROR: {label} must be non-blank", file=sys.stderr)
+        raise APIError(f"{label} must be non-blank")
+    if len(value) > _CRITERION_TEXT_OPERATOR_MAX_CHARS:
+        print(
+            f"ERROR: {label} is {len(value)} characters; maximum is "
+            f"{_CRITERION_TEXT_OPERATOR_MAX_CHARS}",
+            file=sys.stderr,
+        )
+        raise APIError(f"{label} exceeds maximum length")
+    return value
+
+
+def _validate_criterion_rewrite_receipt(
+    result: object,
+    *,
+    criterion_key: str,
+    expected_text: str,
+    replacement_text: str,
+) -> dict:
+    if not isinstance(result, dict):
+        print(
+            "ERROR: criterion rewrite returned a non-object receipt",
+            file=sys.stderr,
+        )
+        raise APIError("criterion rewrite returned a non-object receipt")
+    lineage = result.get("lineage")
+    expected_sha256 = hashlib.sha256(expected_text.encode("utf-8")).hexdigest()
+    replacement_sha256 = hashlib.sha256(replacement_text.encode("utf-8")).hexdigest()
+    changed = result.get("changed")
+    compare_state = result.get("compare_state")
+    previous_sha256 = result.get("previous_text_sha256")
+    try:
+        uuid.UUID(str(result.get("release_version_id") or ""))
+        uuid.UUID(str((lineage or {}).get("criterion_id") or ""))
+        valid_ids = True
+    except (TypeError, ValueError):
+        valid_ids = False
+    valid = (
+        result.get("status") == "ok"
+        and result.get("criterion_key") == criterion_key
+        and result.get("text") == replacement_text
+        and result.get("expected_text_sha256") == expected_sha256
+        and result.get("text_sha256") == replacement_sha256
+        and isinstance(previous_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", previous_sha256) is not None
+        and valid_ids
+        and isinstance(lineage, dict)
+        and isinstance(changed, bool)
+        and compare_state in {"expected", "replacement"}
+        and (
+            (
+                changed
+                and compare_state == "expected"
+                and previous_sha256 == expected_sha256
+            )
+            or (
+                not changed
+                and compare_state == "replacement"
+                and previous_sha256 == replacement_sha256
+            )
+        )
+    )
+    if not valid:
+        print(
+            "ERROR: criterion rewrite returned an ambiguous or contradictory receipt",
+            file=sys.stderr,
+        )
+        raise APIError("criterion rewrite returned an ambiguous or contradictory receipt")
+    return result
+
+
+def cmd_criteria(args: argparse.Namespace) -> None:
+    """Rewrite one open-version acceptance criterion under an exact-text CAS."""
+    if getattr(args, "criteria_cmd", None) != "rewrite":
+        raise APIError("criteria requires the rewrite subcommand")
+    pid = get_project_id(getattr(args, "project_id", None))
+    criterion_key = str(args.criterion_key)
+    expected_text = _read_exact_criterion_text(
+        args,
+        value_attr="expected_text",
+        file_attr="expected_text_file",
+        label="expected text",
+    )
+    replacement_text = _read_exact_criterion_text(
+        args,
+        value_attr="replacement_text",
+        file_attr="replacement_text_file",
+        label="replacement text",
+    )
+    if expected_text == replacement_text:
+        print("ERROR: expected and replacement text must differ", file=sys.stderr)
+        raise APIError("expected and replacement text must differ")
+    replacement_sha256 = hashlib.sha256(replacement_text.encode("utf-8")).hexdigest()
+    if not _confirm(
+        f"Rewrite criterion {criterion_key} to sha256:{replacement_sha256[:12]}?",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+
+    scoped = _using_scoped_service_credential()
+    route_prefix = "/api/operator-access/v1" if scoped else "/api/admin"
+    route = (
+        f"{route_prefix}/projects/{pid}/acceptance-criteria/"
+        f"{criterion_key}/text"
+    )
+    result = api(
+        "PATCH",
+        route,
+        {"expected_text": expected_text, "text": replacement_text},
+    )
+    receipt = _validate_criterion_rewrite_receipt(
+        result,
+        criterion_key=criterion_key,
+        expected_text=expected_text,
+        replacement_text=replacement_text,
+    )
+    _emit(
+        args,
+        receipt,
+        lambda r: print(
+            f"  criterion {r['criterion_key']} "
+            f"{'rewritten' if r['changed'] else 'already matched'}: "
+            f"row {r['lineage']['criterion_id']}  sha256:{r['text_sha256'][:12]}"
+        ),
+    )
 
 
 # ── versions ──────────────────────────────────────────────────────────────--
@@ -8488,6 +8639,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_tasks_create.add_argument("--yes", action="store_true",
                                 help="Skip the confirmation prompt.")
 
+    # acceptance criteria
+    p_criteria = sub.add_parser(
+        "criteria", parents=[common],
+        help="Apply an exact compare-and-set rewrite to an acceptance criterion.")
+    criteria_sub = p_criteria.add_subparsers(dest="criteria_cmd")
+    p_criteria_rewrite = criteria_sub.add_parser(
+        "rewrite", parents=[common],
+        help="Rewrite one active open-version criterion while preserving its key.")
+    p_criteria_rewrite.add_argument(
+        "criterion_key", help="Exact criterion key (for example c-1a2b3c4d).")
+    expected_group = p_criteria_rewrite.add_mutually_exclusive_group(required=True)
+    expected_group.add_argument(
+        "--expected-text", default=None,
+        help="Exact current criterion text used as the compare fence.")
+    expected_group.add_argument(
+        "--expected-text-file", default=None, metavar="FILE",
+        help="Read the exact current text as raw UTF-8 from FILE.")
+    replacement_group = p_criteria_rewrite.add_mutually_exclusive_group(required=True)
+    replacement_group.add_argument(
+        "--text", dest="replacement_text", default=None,
+        help="Exact replacement criterion text.")
+    replacement_group.add_argument(
+        "--text-file", dest="replacement_text_file", default=None, metavar="FILE",
+        help="Read the exact replacement text as raw UTF-8 from FILE.")
+    p_criteria_rewrite.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt.")
+
     # versions
     p_versions = sub.add_parser("versions", parents=[common],
                                 help="List release versions or show a summary.",
@@ -10625,6 +10803,7 @@ _DISPATCH = {
     "diagnostics": cmd_diagnostics,
     "ops": cmd_ops,
     "tasks": cmd_tasks,
+    "criteria": cmd_criteria,
     "versions": cmd_versions,
     "system": cmd_system,
     "monitor": cmd_monitor,

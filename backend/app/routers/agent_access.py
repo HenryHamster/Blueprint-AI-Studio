@@ -66,6 +66,7 @@ _CAPABILITIES_BY_SCOPE = {
         "tasks.requeue",
         "tasks.cancel",
         "tasks.request_changes",
+        "acceptance_criteria.rewrite",
         "messages.list",
         "messages.send",
         "messages.answer",
