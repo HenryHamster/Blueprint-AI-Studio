@@ -86,6 +86,81 @@ async def _claim_continuation(client, project, task, identity):
 
 
 @pytest.mark.asyncio
+async def test_preupgrade_ack_without_diagnostic_drains_and_is_idempotent(
+    client: AsyncClient, db_session
+):
+    """An in-flight old Agent can ack after the API schema rolls forward.
+
+    The server must expose that provider diagnostics were unavailable, while a
+    lost-response retry remains an exact duplicate rather than creating a
+    second attempt or trapping the runner in a 422 retry loop.
+    """
+
+    project, task, _incarnation, identity, _source, packet = (
+        await _start_workday_request(client, db_session, key="legacy-ack")
+    )
+    packet_claim = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/claim-next",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=_claim_body(identity),
+    )
+    assert packet_claim.status_code == 200, packet_claim.text
+    claimed = packet_claim.json()["packet"]
+    endpoint = (
+        f"/api/agent/projects/{project.id}/workday-consultations/{packet.id}/ack"
+    )
+    payload = {
+        **identity,
+        "workday_claim_id": claimed["workday_claim_id"],
+        "outcome": "completed",
+        "result_summary": "legacy private result",
+    }
+
+    acknowledged = await client.post(
+        endpoint,
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    replay = await client.post(
+        endpoint,
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=payload,
+    )
+    assert acknowledged.status_code == replay.status_code == 200
+    assert acknowledged.json()["status"] == "acknowledged"
+    assert replay.json()["status"] == "duplicate"
+
+    refreshed_packet = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == packet.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().one()
+    attempts = refreshed_packet.context["_workday_consultation_attempts"]
+    assert len(attempts) == 1
+    diagnostic = attempts[0]
+    assert diagnostic["attempt"] == claimed["attempt"]
+    assert diagnostic["workday_claim_id"] == claimed["workday_claim_id"]
+    assert diagnostic["outcome"] == "completed"
+    assert diagnostic["terminal_predicate"] == (
+        "legacy_runner_ack_without_diagnostic"
+    )
+    assert diagnostic["provider_terminal_reason"] is None
+    assert diagnostic["provider_output_tail"] is None
+    assert diagnostic["result_chars"] == len("legacy private result")
+    assert diagnostic["trace"] == [
+        {
+            "elapsed_ms": diagnostic["turn_ms"],
+            "kind": "error",
+            "label": "legacy_diagnostic_unavailable",
+            "is_error": True,
+        }
+    ]
+    assert diagnostic["trace_truncated"] is True
+
+
+@pytest.mark.asyncio
 async def test_stale_workday_packet_settles_source_once_without_private_leak(
     client: AsyncClient, db_session
 ):

@@ -328,7 +328,12 @@ class AcknowledgeWorkdayConsultation(BaseModel):
     workday_claim_id: uuid.UUID
     outcome: Literal["completed", "abandoned", "failed"]
     result_summary: str | None = Field(default=None, max_length=20_000)
-    attempt_diagnostic: WorkdayConsultationAttemptDiagnostic
+    # Rolling-release compatibility: a Resident that was already inside a
+    # provider turn when the diagnostic contract deployed cannot add this
+    # field until it drains and auto-updates.  The coordinator records an
+    # explicit bounded legacy diagnostic for that exact claim instead of
+    # returning 422 forever and preventing the runner from draining.
+    attempt_diagnostic: WorkdayConsultationAttemptDiagnostic | None = None
 
 
 class RenewWorkdayConsultation(BaseModel):
@@ -1804,7 +1809,11 @@ async def acknowledge_workday_consultation(
             workday_claim_id=payload.workday_claim_id,
             outcome=payload.outcome,
             result_summary=payload.result_summary,
-            attempt_diagnostic=payload.attempt_diagnostic.model_dump(mode="json"),
+            attempt_diagnostic=(
+                payload.attempt_diagnostic.model_dump(mode="json")
+                if payload.attempt_diagnostic is not None
+                else None
+            ),
         )
     except ValueError as exc:
         await session.rollback()
