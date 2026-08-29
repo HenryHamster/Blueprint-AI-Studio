@@ -119,6 +119,9 @@ _CONSULTATION_REQUESTED_CONTEXT_KEY = "_workday_consultation_requested"
 # incident carries its own diagnosis instead of a bare, unexplained 409. See
 # record_workday_consultation_gate_failure.
 _WORKDAY_LAST_FAILURE_CONTEXT_KEY = "_workday_consultation_last_failure"
+_WORKDAY_ATTEMPTS_CONTEXT_KEY = "_workday_consultation_attempts"
+_WORKDAY_ATTEMPT_LIMIT = 8
+_WORKDAY_CLAIM_STARTED_CONTEXT_KEY = "_workday_consultation_claim_started_at"
 # A packet reclaimed this many times without a terminal ack is parked
 # (finalized as 'failed') at claim time instead of being requeued forever. A
 # live worker is expected to self-escalate to a 'failed' ack by attempt 2
@@ -998,6 +1001,150 @@ def _workday_consultation_parked_reason(attempt: int, context: dict[str, Any]) -
     )
 
 
+def _normalize_workday_attempt_diagnostic(value: object) -> dict[str, Any]:
+    """Validate the bounded durable evidence for one exact private attempt."""
+
+    if not isinstance(value, dict):
+        raise ValueError("consultation attempt diagnostic is invalid")
+    attempt = value.get("attempt")
+    claim_id = value.get("workday_claim_id")
+    outcome = value.get("outcome")
+    predicate = value.get("terminal_predicate")
+    try:
+        normalized_claim_id = str(uuid.UUID(str(claim_id)))
+    except (TypeError, ValueError, AttributeError):
+        raise ValueError("consultation attempt diagnostic claim is invalid") from None
+    if (
+        not isinstance(attempt, int)
+        or isinstance(attempt, bool)
+        or not 1 <= attempt <= _WORKDAY_ATTEMPT_LIMIT
+        or outcome not in {"completed", "abandoned", "failed"}
+        or not isinstance(predicate, str)
+        or not predicate.strip()
+        or len(predicate) > 80
+    ):
+        raise ValueError("consultation attempt diagnostic identity is invalid")
+    started_at = _workday_claim_expiry(value.get("started_at"))
+    ended_at = _workday_claim_expiry(value.get("ended_at"))
+    if started_at is None or ended_at is None or ended_at < started_at:
+        raise ValueError("consultation attempt diagnostic timing is invalid")
+
+    def _bounded_optional_text(key: str, limit: int) -> str | None:
+        raw = value.get(key)
+        if raw is None:
+            return None
+        if not isinstance(raw, str) or len(raw) > limit:
+            raise ValueError(f"consultation attempt diagnostic {key} is invalid")
+        return raw
+
+    def _nonnegative_int(key: str, maximum: int) -> int:
+        raw = value.get(key)
+        if (
+            not isinstance(raw, int)
+            or isinstance(raw, bool)
+            or raw < 0
+            or raw > maximum
+        ):
+            raise ValueError(f"consultation attempt diagnostic {key} is invalid")
+        return raw
+
+    ttft_ms = value.get("ttft_ms")
+    if ttft_ms is not None and (
+        not isinstance(ttft_ms, int)
+        or isinstance(ttft_ms, bool)
+        or not 0 <= ttft_ms <= 86_400_000
+    ):
+        raise ValueError("consultation attempt diagnostic ttft_ms is invalid")
+    raw_trace = value.get("trace")
+    if not isinstance(raw_trace, list) or len(raw_trace) > 128:
+        raise ValueError("consultation attempt diagnostic trace is invalid")
+    trace: list[dict[str, Any]] = []
+    for raw_event in raw_trace:
+        if not isinstance(raw_event, dict):
+            raise ValueError("consultation attempt trace event is invalid")
+        elapsed_ms = raw_event.get("elapsed_ms")
+        kind = raw_event.get("kind")
+        label = raw_event.get("label")
+        is_error = raw_event.get("is_error")
+        if (
+            not isinstance(elapsed_ms, int)
+            or isinstance(elapsed_ms, bool)
+            or not 0 <= elapsed_ms <= 86_400_000
+            or kind not in {"text", "tool", "tool_result", "error", "result"}
+            or (label is not None and (not isinstance(label, str) or len(label) > 80))
+            or (is_error is not None and not isinstance(is_error, bool))
+        ):
+            raise ValueError("consultation attempt trace event is invalid")
+        trace.append(
+            {
+                "elapsed_ms": elapsed_ms,
+                "kind": kind,
+                **({"label": label} if label else {}),
+                **({"is_error": is_error} if is_error is not None else {}),
+            }
+        )
+    trace_truncated = value.get("trace_truncated", False)
+    if not isinstance(trace_truncated, bool):
+        raise ValueError("consultation attempt diagnostic trace_truncated is invalid")
+    return {
+        "attempt": attempt,
+        "workday_claim_id": normalized_claim_id,
+        "outcome": outcome,
+        "terminal_predicate": predicate.strip(),
+        "provider_terminal_reason": _bounded_optional_text(
+            "provider_terminal_reason", 255
+        ),
+        "provider_output_tail": _bounded_optional_text("provider_output_tail", 2_000),
+        "started_at": started_at.replace(tzinfo=timezone.utc).isoformat(),
+        "ended_at": ended_at.replace(tzinfo=timezone.utc).isoformat(),
+        "turn_ms": _nonnegative_int("turn_ms", 86_400_000),
+        "ttft_ms": ttft_ms,
+        "tool_call_count": _nonnegative_int("tool_call_count", 100_000),
+        "tool_call_duration_ms": _nonnegative_int(
+            "tool_call_duration_ms", 86_400_000
+        ),
+        "result_chars": _nonnegative_int("result_chars", 20_000),
+        "trace": trace,
+        "trace_truncated": trace_truncated,
+    }
+
+
+def _append_workday_attempt(
+    context: dict[str, Any], diagnostic: dict[str, Any]
+) -> None:
+    raw_attempts = context.get(_WORKDAY_ATTEMPTS_CONTEXT_KEY)
+    attempts = list(raw_attempts) if isinstance(raw_attempts, list) else []
+    if any(not isinstance(item, dict) for item in attempts):
+        raise ValueError("consultation attempt history is invalid")
+    prior = next(
+        (
+            item
+            for item in attempts
+            if item.get("workday_claim_id") == diagnostic["workday_claim_id"]
+        ),
+        None,
+    )
+    if prior is not None and prior != diagnostic:
+        raise ValueError("consultation attempt diagnostic conflicts with prior acknowledgement")
+    if prior is None:
+        attempts.append(diagnostic)
+    context[_WORKDAY_ATTEMPTS_CONTEXT_KEY] = attempts[-_WORKDAY_ATTEMPT_LIMIT:]
+
+
+def bounded_workday_consultation_attempts(context: object) -> list[dict[str, Any]]:
+    if not isinstance(context, dict):
+        return []
+    raw = context.get(_WORKDAY_ATTEMPTS_CONTEXT_KEY)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("consultation attempt history is invalid")
+    return [
+        _normalize_workday_attempt_diagnostic(item)
+        for item in raw[-_WORKDAY_ATTEMPT_LIMIT:]
+    ]
+
+
 async def _finalize_workday_consultation_packet(
     session: AsyncSession,
     *,
@@ -1028,14 +1175,15 @@ async def _finalize_workday_consultation_packet(
         workday_mutation_receipts_have_more,
     )
 
+    # A retry is a continuation of the same packet, so its result must expose
+    # every durable receipt, not only writes made under the final claim id.
     mutation_receipts = bounded_workday_mutation_receipts(
         context,
         packet_id=packet_id,
-        workday_claim_id=workday_claim_id,
         task_id=task_id,
         resident_session_id=resident_session_id,
         worker_generation=worker_generation,
-        worker_incarnation=worker_incarnation,
+        limit=64,
     )
     mutation_receipts_have_more = workday_mutation_receipts_have_more(context)
     result_key = f"workday-consultation-result:{packet_id}:{workday_claim_id}"
@@ -1061,6 +1209,9 @@ async def _finalize_workday_consultation_packet(
             "message_role": "workday_consultation_result",
             "public_reply_owner": ConversationPublicReplyOwner.FAST.value,
             "envelope": context.get("envelope"),
+            _WORKDAY_ATTEMPTS_CONTEXT_KEY: bounded_workday_consultation_attempts(
+                context
+            ),
             **(
                 {
                     WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: mutation_receipts,
@@ -1256,7 +1407,43 @@ async def claim_next_workday_consultation_packet(
         except (TypeError, ValueError, AttributeError):
             workday_claim_id = uuid.uuid4()
             same_owner = False
-        attempt = int(context.get(_WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY) or 0)
+        prior_attempt = int(context.get(_WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY) or 0)
+        if not same_owner and prior_claim_id_raw is not None and prior_attempt >= 1:
+            # A dead worker cannot send an ack. Preserve that attempt explicitly
+            # at the reclaim boundary instead of letting it disappear behind the
+            # next claim's generic failure summary.
+            prior_started_at = _workday_claim_expiry(
+                context.get(_WORKDAY_CLAIM_STARTED_CONTEXT_KEY)
+            ) or now
+            elapsed_ms = max(0, int((now - prior_started_at).total_seconds() * 1000))
+            try:
+                expired_diagnostic = _normalize_workday_attempt_diagnostic(
+                    {
+                        "attempt": prior_attempt,
+                        "workday_claim_id": str(uuid.UUID(str(prior_claim_id_raw))),
+                        "outcome": "abandoned",
+                        "terminal_predicate": "claim_lease_expired_without_ack",
+                        "provider_terminal_reason": None,
+                        "provider_output_tail": None,
+                        "started_at": prior_started_at.isoformat(),
+                        "ended_at": now.isoformat(),
+                        "turn_ms": min(elapsed_ms, 86_400_000),
+                        "ttft_ms": None,
+                        "tool_call_count": 0,
+                        "tool_call_duration_ms": 0,
+                        "result_chars": 0,
+                        "trace": [],
+                        "trace_truncated": False,
+                    }
+                )
+                _append_workday_attempt(context, expired_diagnostic)
+            except ValueError:
+                logger.exception(
+                    "failed to retain expired consultation attempt: packet=%s claim=%s",
+                    row.id,
+                    prior_claim_id_raw,
+                )
+        attempt = prior_attempt
         if not same_owner:
             attempt += 1
         attempt = max(1, attempt)
@@ -1267,6 +1454,26 @@ async def claim_next_workday_consultation_packet(
             # it again would repeat the same failure indefinitely (the churn
             # this cap exists to break); park it as a terminal 'failed' result
             # instead so Fast sees an explicit, explained outcome.
+            parked_diagnostic = _normalize_workday_attempt_diagnostic(
+                {
+                    "attempt": attempt,
+                    "workday_claim_id": str(workday_claim_id),
+                    "outcome": "failed",
+                    "terminal_predicate": "server_claim_attempt_cap",
+                    "provider_terminal_reason": None,
+                    "provider_output_tail": None,
+                    "started_at": now.isoformat(),
+                    "ended_at": now.isoformat(),
+                    "turn_ms": 0,
+                    "ttft_ms": None,
+                    "tool_call_count": 0,
+                    "tool_call_duration_ms": 0,
+                    "result_chars": 0,
+                    "trace": [],
+                    "trace_truncated": False,
+                }
+            )
+            _append_workday_attempt(context, parked_diagnostic)
             await _finalize_workday_consultation_packet(
                 session,
                 project_id=project_id,
@@ -1292,6 +1499,11 @@ async def claim_next_workday_consultation_packet(
                 _WORKDAY_CLAIM_INCARNATION_CONTEXT_KEY: str(worker_incarnation),
                 _WORKDAY_CLAIM_EXPIRES_CONTEXT_KEY: expires_at.isoformat(),
                 _WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY: attempt,
+                _WORKDAY_CLAIM_STARTED_CONTEXT_KEY: (
+                    context.get(_WORKDAY_CLAIM_STARTED_CONTEXT_KEY)
+                    if same_owner
+                    else now.isoformat()
+                ),
             }
         )
         row.context = context
@@ -1383,6 +1595,7 @@ async def acknowledge_workday_consultation_packet(
     workday_claim_id: uuid.UUID,
     outcome: str,
     result_summary: str | None = None,
+    attempt_diagnostic: dict[str, Any] | None = None,
 ) -> bool:
     """Ack one exact delivery; ``True`` means a retry of an already-completed ack."""
     row = (
@@ -1401,6 +1614,14 @@ async def acknowledge_workday_consultation_packet(
     normalized_result_summary = (result_summary or "").strip()
     if len(normalized_result_summary) > 20_000:
         raise ValueError("consultation result_summary exceeds 20000 characters")
+    if attempt_diagnostic is None:
+        raise ValueError("consultation acknowledgement requires attempt diagnostics")
+    diagnostic = _normalize_workday_attempt_diagnostic(attempt_diagnostic)
+    if (
+        diagnostic["workday_claim_id"] != str(workday_claim_id)
+        or diagnostic["outcome"] != outcome
+    ):
+        raise ValueError("consultation attempt diagnostics do not match the claim")
     if not _is_workday_consultation_packet(
         row, resident_session_id=resident_session_id
     ):
@@ -1429,6 +1650,9 @@ async def acknowledge_workday_consultation_packet(
                 != normalized_result_summary
             ):
                 raise ValueError("completed consultation result_summary conflicts")
+            attempts = context.get(_WORKDAY_ATTEMPTS_CONTEXT_KEY)
+            if not isinstance(attempts, list) or diagnostic not in attempts:
+                raise ValueError("completed consultation attempt diagnostic conflicts")
             return True
         raise ValueError("consultation packet is unavailable")
     if outcome not in {"completed", "abandoned", "failed"}:
@@ -1454,6 +1678,12 @@ async def acknowledge_workday_consultation_packet(
     )
     if expires_at is None or expires_at <= now:
         raise ValueError("consultation packet lease is expired")
+    if (
+        diagnostic["attempt"]
+        != int(context.get(_WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY) or 0)
+    ):
+        raise ValueError("consultation attempt diagnostics do not match the claim")
+    _append_workday_attempt(context, diagnostic)
     if outcome in {"completed", "failed"}:
         await _finalize_workday_consultation_packet(
             session,
@@ -1477,6 +1707,7 @@ async def acknowledge_workday_consultation_packet(
         _WORKDAY_CLAIM_GENERATION_CONTEXT_KEY,
         _WORKDAY_CLAIM_INCARNATION_CONTEXT_KEY,
         _WORKDAY_CLAIM_EXPIRES_CONTEXT_KEY,
+        _WORKDAY_CLAIM_STARTED_CONTEXT_KEY,
     ):
         context.pop(key, None)
     row.context = context

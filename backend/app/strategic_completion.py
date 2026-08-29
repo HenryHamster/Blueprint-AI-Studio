@@ -1457,17 +1457,20 @@ async def _apply_new_acceptance_criteria(
     session: AsyncSession,
     *,
     path: str,
-) -> None:
+) -> list[Any]:
     """Apply optional ``new_acceptance_criteria`` from the strategic agent.
 
     ``criteria_texts`` is the raw value from
     ``task.context[NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY]`` — a list of strings.
     For each text, creates a new VersionAcceptanceCriterion on the open version,
     skipping duplicates (same text already exists). Errors are swallowed so a
-    bad criteria list never blocks vision/direction writes.
+    bad criteria list never blocks vision/direction writes. Returns the exact
+    rows created by this call so receipt-bound callers can record complete
+    mutation provenance in the same transaction.
     """
     if not isinstance(criteria_texts, list) or not criteria_texts:
-        return
+        return []
+    created_rows: list[Any] = []
     try:
         from app import acceptance_criteria as _ac
         from app.release_version import current_open_version as _cur_open_version
@@ -1481,7 +1484,7 @@ async def _apply_new_acceptance_criteria(
                 path,
                 project.id,
             )
-            return
+            return []
         existing = await _ac.get_criteria_for_version(session, _open_ver.id)
         existing_texts = {c.text for c in existing}
         active_count = sum(
@@ -1512,13 +1515,14 @@ async def _apply_new_acceptance_criteria(
             if created_count >= headroom:
                 skipped_over_cap += 1
                 continue
-            await _ac.stage_criterion(
+            criterion = await _ac.stage_criterion(
                 session,
                 project_id=project.id,
                 release_version_id=_open_ver.id,
                 text=cleaned,
                 created_by="strategist",
             )
+            created_rows.append(criterion)
             existing_texts.add(cleaned)
             created_count += 1
         if created_count > 0:
@@ -1548,12 +1552,19 @@ async def _apply_new_acceptance_criteria(
                 project.id,
                 _open_ver.version_number,
             )
+        return created_rows
     except Exception:
         logger.exception(
             "[STRATEGIC] Task %s (%s path): failed to apply new_acceptance_criteria (non-fatal)",
             task.id,
             path,
         )
+        # If a later non-database step failed after one or more rows were
+        # staged, return those exact rows so a receipt-bound caller cannot
+        # commit a partially applied criterion set without provenance. A real
+        # database error still leaves the transaction failed and the caller's
+        # commit will roll it back.
+        return created_rows
 
 
 async def _apply_version_phase_decision(
@@ -1563,7 +1574,7 @@ async def _apply_version_phase_decision(
     session: AsyncSession,
     *,
     path: str,
-) -> None:
+) -> bool:
     """Parse and apply an optional ``version_phase_decision`` from the strategic agent.
 
     ``decision`` is the raw value from either:
@@ -1588,7 +1599,7 @@ async def _apply_version_phase_decision(
     block vision/direction writes.
     """
     if not decision or not isinstance(decision, dict):
-        return
+        return False
     phase = _normalize_version_phase(decision.get("phase"))
     if not phase:
         raw = decision.get("phase")
@@ -1599,7 +1610,7 @@ async def _apply_version_phase_decision(
             path,
             raw,
         )
-        return
+        return False
     reasoning_raw = decision.get("reasoning")
     reasoning: str | None = (
         reasoning_raw.strip() or None if isinstance(reasoning_raw, str) else None
@@ -1616,7 +1627,7 @@ async def _apply_version_phase_decision(
                 path,
                 project.id,
             )
-            return
+            return False
         _rv.set_version_phase(open_ver, phase, reasoning=reasoning)
         session.add(open_ver)
         logger.info(
@@ -1628,6 +1639,7 @@ async def _apply_version_phase_decision(
             project.id,
             open_ver.version_number,
         )
+        return True
     except Exception:
         logger.exception(
             "[STRATEGIC] Task %s (%s path): failed to apply version_phase_decision "
@@ -1635,6 +1647,7 @@ async def _apply_version_phase_decision(
             task.id,
             path,
         )
+        return False
 
 
 async def _apply_qualify_request(

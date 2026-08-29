@@ -198,6 +198,36 @@ def _ledger_entry(op: str, entity_id: str, *, effect: str = "created") -> dict:
     }
 
 
+def _attempt(
+    attempt: int,
+    outcome: str,
+    predicate: str,
+    *,
+    output_tail: str | None = None,
+) -> dict:
+    started = _utcnow() - timedelta(seconds=attempt)
+    return {
+        "attempt": attempt,
+        "workday_claim_id": str(uuid.uuid4()),
+        "outcome": outcome,
+        "terminal_predicate": predicate,
+        "provider_terminal_reason": "aborted_streaming",
+        "provider_output_tail": output_tail,
+        "started_at": started.isoformat(),
+        "ended_at": (started + timedelta(milliseconds=250)).isoformat(),
+        "turn_ms": 250,
+        "ttft_ms": 20,
+        "tool_call_count": attempt,
+        "tool_call_duration_ms": 100,
+        "result_chars": 0,
+        "trace": [
+            {"elapsed_ms": 10, "kind": "tool", "label": "Read"},
+            {"elapsed_ms": 250, "kind": "result", "label": predicate},
+        ],
+        "trace_truncated": False,
+    }
+
+
 # ── lifecycle ─────────────────────────────────────────────────────────────────
 
 
@@ -309,6 +339,50 @@ async def test_failed_outcome_is_reported_alongside_delivery_position(db_session
     # back to the operator, and collapsing them hides whether it arrived.
     assert detail["state"] == "delivering"
     assert detail["outcome"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_every_attempt_and_terminal_predicate_survive_failed_delivery(db_session):
+    project = await _make_project(db_session)
+    request = _public_request(project.id)
+    attempts = [
+        _attempt(1, "abandoned", "consultation_inactivity_timeout"),
+        _attempt(
+            2,
+            "failed",
+            "provider_failed",
+            output_tail="terminal_reason=aborted_streaming",
+        ),
+    ]
+    packet = _packet(
+        project.id,
+        request.id,
+        context={"_workday_consultation_attempts": attempts},
+    )
+    packet.handling_state = MessageHandlingState.RESPONDED
+    packet.status = "handled"
+    result = _result(
+        project.id,
+        request.id,
+        content="Generic bounded failure summary.",
+        context={
+            "result_state": "failed",
+            "_workday_consultation_attempts": attempts,
+        },
+    )
+    db_session.add_all([request, packet, result])
+    await db_session.commit()
+
+    detail = await project_consultation_detail(
+        db_session, project_id=project.id, consultation_id=request.id
+    )
+    assert [item["attempt"] for item in detail["attempts"]] == [1, 2]
+    assert detail["attempts"][0]["terminal_predicate"] == (
+        "consultation_inactivity_timeout"
+    )
+    assert detail["attempts"][1]["trace"][-1]["label"] == "provider_failed"
+    assert detail["last_failure"]["gate"] == "attempt:provider_failed"
+    assert "aborted_streaming" in detail["last_failure"]["detail"]
 
 
 # ── what the expanded view actually shows ─────────────────────────────────────

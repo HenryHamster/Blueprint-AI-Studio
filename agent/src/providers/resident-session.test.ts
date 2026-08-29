@@ -895,6 +895,54 @@ describe('startResidentClaudeSession', () => {
     expect(killSpy.mock.calls.some(([p]) => p === -4242)).toBe(true);
   });
 
+  it('exposes meaningful progress and retains bounded head-plus-tail terminal trace evidence', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({ hardTurnTimeoutMs: 15 * 60_000 });
+    const turn = session.sendTurn('long private consultation');
+    const started = session.activeTurnProgress?.();
+    expect(started).toMatchObject({ toolCallCount: 0 });
+
+    for (let index = 0; index < 140; index += 1) {
+      await vi.advanceTimersByTimeAsync(10);
+      ctl.pushLine({
+        type: 'assistant',
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: `tool-${index}`,
+            name: `Tool${index}`,
+            input: {},
+          }],
+        },
+      });
+    }
+    const progressed = session.activeTurnProgress?.();
+    expect(progressed?.toolCallCount).toBe(140);
+    expect(progressed?.lastActivityAtMs).toBeGreaterThan(started?.lastActivityAtMs ?? 0);
+
+    ctl.pushLine({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      terminal_reason: 'aborted_streaming',
+      result: 'bounded provider output tail',
+    });
+    const result = await turn;
+    expect(result.providerTerminalReason).toBe('aborted_streaming');
+    expect(result.providerOutputTail).toContain('terminal_reason=aborted_streaming');
+    expect(result.traceTruncated).toBe(true);
+    expect(result.trace).toHaveLength(128);
+    expect(result.trace?.[0]?.label).toBe('Tool0');
+    expect(result.trace?.[31]?.label).toBe('Tool31');
+    expect(result.trace?.at(-1)).toMatchObject({
+      kind: 'result',
+      label: 'aborted_streaming',
+      isError: true,
+    });
+    session.close();
+  });
+
 
   it('honors a per-turn hard deadline despite continuous streamed output', async () => {
     const ctl = makeControllableChild();

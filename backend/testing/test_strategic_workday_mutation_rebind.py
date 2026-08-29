@@ -8,9 +8,11 @@ from fastapi import HTTPException
 
 from app.models import MessageSurface, MessageType, ProjectMessage, Task
 from app.strategic_workday_mutation_rebind import (
+    WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY,
     WORKDAY_OPERATION_LEDGER_CONTEXT_KEY,
     WORKDAY_OPERATION_LEDGER_LIMIT,
     WorkdayConsultationOperationBinding,
+    bounded_workday_mutation_receipts,
     find_workday_operation_replay,
     workday_operation_replay_response,
 )
@@ -146,3 +148,68 @@ def test_completion_debt_replay_projects_the_exact_debt_id():
         "idempotent_replay": True,
         "debt_id": "00000000-0000-0000-0000-000000000123",
     }
+
+
+def test_retry_with_new_claim_incarnation_and_operation_id_replays_exact_semantics():
+    project_id = uuid.uuid4()
+    task = Task(id=uuid.uuid4(), project_id=project_id, payloads=[{}])
+    packet_id = uuid.uuid4()
+    receipt = _receipt(index=1, packet_id=packet_id, task_id=task.id)
+    packet = ProjectMessage(
+        id=packet_id,
+        project_id=project_id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="private retry",
+        context={WORKDAY_OPERATION_LEDGER_CONTEXT_KEY: [receipt]},
+    )
+    retry = _binding(packet=packet, task=task, operation_id=uuid.uuid4())
+    retry = WorkdayConsultationOperationBinding(
+        **{
+            **retry.__dict__,
+            "workday_claim_id": uuid.uuid4(),
+            "worker_incarnation": uuid.uuid4(),
+        }
+    )
+
+    assert find_workday_operation_replay(
+        retry,
+        op=receipt["op"],
+        operation_fingerprint=receipt["operation_fingerprint"],
+    ) == receipt
+    assert find_workday_operation_replay(
+        retry,
+        op=receipt["op"],
+        operation_fingerprint="a" * 64,
+    ) is None
+
+
+def test_version_and_acceptance_criterion_receipts_are_bounded_and_projectable():
+    packet_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    goal = _receipt(index=2, packet_id=packet_id, task_id=task_id)
+    goal.update(
+        op="set_version_goal",
+        target_kind="version_goal",
+        target_revision=56,
+        target_sha256="b" * 64,
+    )
+    for key in ("entity_kind", "entity_id", "effect", "accepted_at"):
+        goal.pop(key)
+    criterion = _receipt(index=3, packet_id=packet_id, task_id=task_id)
+    criterion.update(
+        op="create_acceptance_criterion",
+        entity_kind="acceptance_criterion",
+        entity_id="ac-criterion-key",
+    )
+    context = {WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: [goal, criterion]}
+
+    assert bounded_workday_mutation_receipts(context, packet_id=packet_id) == [
+        goal,
+        criterion,
+    ]
+    assert workday_operation_replay_response(criterion)["criterion_key"] == (
+        "ac-criterion-key"
+    )
