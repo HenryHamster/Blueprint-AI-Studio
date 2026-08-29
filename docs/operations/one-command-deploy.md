@@ -12,6 +12,7 @@ python scripts/blueprint.py deploy --dry-run   # show what would ship
 python scripts/blueprint.py deploy             # confirm interactively
 python scripts/blueprint.py deploy --yes       # scripted
 python scripts/blueprint.py deploy --sha 74bf87c  # a specific main build
+python scripts/blueprint.py deploy --local --yes  # when already on hamsterwheel
 ```
 
 The client finds the newest successful "Deploy Blueprint" run on `main`,
@@ -22,6 +23,20 @@ socket by piping `scripts/release_socket_submit.py` over SSH to the host's
 grant exists, the bootstrap removes the legacy one). This remains the
 supported manual/emergency path: `--sha`, `--force`, `--dry-run`, and
 interactive confirmation keep their existing behavior.
+
+When the operator CLI itself is running on the control-plane host, pass
+`--local` to submit to `/run/blueprint-release.sock` directly. This is the
+laptop-independent Hamsterwheel path: it changes only the transport and keeps
+the same artifact verification, promotion binding, confirmation, root executor,
+and activation-receipt stages. Do not use `--local` from a development machine;
+the command must run as an account admitted by the release socket ACL on the
+actual control-plane host.
+
+If the socket request is sent but its verdict is not observed, the manual CLI
+returns nonzero and labels acceptance ambiguous. Do not rerun the activation.
+Reconcile the root executor journal and durable receipt, the local/public
+`/api/version`, health, and the active image digest before deciding whether only
+the activation receipt remains to be recorded.
 
 ## Host-side shim and root release service (one-time install)
 
