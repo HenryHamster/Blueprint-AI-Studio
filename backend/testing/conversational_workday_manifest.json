@@ -387,6 +387,8 @@
         "test_workday_retry_wait_is_legible_in_cheap_availability",
         "test_active_workday_message_never_arms_one_shot_cadence",
         "test_resident_fresh_attempt_restores_actual_runner_columns",
+        "test_resident_retry_waits_for_predecessor_incarnation_lease",
+        "test_resident_retry_preserves_longer_existing_wait",
         "test_retry_wait_projection_failure_keeps_durable_retry",
         "test_cheap_and_full_resident_reads_use_authoritative_snapshot",
         "test_all_three_fresh_attempt_paths_reapply_resident_binding",
@@ -417,7 +419,7 @@
         "test_unworked_continuation_still_lapses_and_releases_the_local_pin",
         "test_fence_renewal_is_paced_at_the_call_site_not_only_in_the_helper"
       ],
-      "test_count": 38
+      "test_count": 40
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",
