@@ -401,13 +401,16 @@ async def _lock_dispatchable_task_for_mutation(
     session: AsyncSession,
     task_id: uuid.UUID,
 ) -> Task | None:
-    """Lock a QUEUED task only if its project is still unpaused and unarchived.
+    """Lock a QUEUED task only if its project may still dispatch it.
 
     The candidate scan and queued-task refresh both prefilter paused/archived
     projects, but an operator can pause or archive a project in the narrow
     window before the final dispatch claim. Re-check both flags in the same
     ``SELECT .. FOR UPDATE SKIP LOCKED`` that acquires the task row so the
-    task cannot leave QUEUED after pause/archive lands.
+    task cannot leave QUEUED after pause/archive lands. The sole pause
+    exception is the server-stamped Resident session: an explicit operator
+    start is supported while paused, and a retry of that same long-lived task
+    must not strand merely because its worker returned to QUEUED.
     """
     stmt = (
         select(Task)
@@ -416,7 +419,10 @@ async def _lock_dispatchable_task_for_mutation(
             Task.id == task_id,
             Task.status == TaskStatus.QUEUED,
             _agent_executed_task_type_filter(),
-            Project.paused.is_(False),
+            (
+                Project.paused.is_(False)
+                | _resident_session_dispatch_predicate()
+            ),
             Project.not_archived(),
         )
         # of=Task: lock ONLY the Task row. The Project join is a pause/archive
@@ -752,6 +758,21 @@ ACTIVE_TASKS_LIGHT_COLUMNS = (
 )
 
 
+def _resident_session_dispatch_predicate():
+    """SQL predicate for the only task allowed to dispatch under pause.
+
+    The context marker alone is not authority: require the server-owned
+    creator and exact Strategic task type as well, so an ordinary agent task
+    cannot manufacture a pause bypass by copying ``_resident_session``.
+    """
+
+    return (
+        (Task.created_by == "ORCHESTRATOR")
+        & (Task.payloads[0]["type"].as_string() == "strategic_review")
+        & (Task.context["_resident_session"].as_boolean().is_(True))
+    )
+
+
 def _is_resident_session_row(row) -> bool:
     """True only when an active-task row is the strategic resident session.
 
@@ -811,6 +832,7 @@ def _candidate_task_statement(slots_available: int):
     """Build the bounded candidate scan with qualifier gates admitted first."""
 
     per_project_cap = max(slots_available * 2, 20)
+    unarchived_project_ids = select(Project.id).where(Project.not_archived())
     active_project_ids = select(Project.id).where(
         Project.not_archived(),
         Project.paused.is_(False),
@@ -819,7 +841,11 @@ def _candidate_task_statement(slots_available: int):
         Task.status == TaskStatus.QUEUED,
         Task.requires_approval.is_(False),
         _agent_executed_task_type_filter(),
-        Task.project_id.in_(active_project_ids),
+        Task.project_id.in_(unarchived_project_ids),
+        (
+            Task.project_id.in_(active_project_ids)
+            | _resident_session_dispatch_predicate()
+        ),
     )
     qualifier_gate_rank = _case(
         (

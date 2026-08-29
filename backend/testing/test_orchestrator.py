@@ -10402,6 +10402,105 @@ class TestWarmVMSkipProvision:
             )
 
     @pytest.mark.asyncio
+    async def test_paused_project_candidate_scan_admits_only_server_resident(
+        self, db_session
+    ):
+        """A requeued Resident remains dispatchable under pause without opening
+        that boundary to ordinary or context-forged work."""
+        from app.orchestrator import _candidate_task_statement
+
+        project = make_project(
+            name="Paused-Resident-Candidates", user_id=_TEST_USER, paused=True
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        resident = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "strategic_review"}],
+            context={"_resident_session": True},
+            created_by="ORCHESTRATOR",
+        )
+        ordinary = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "fix"}],
+            context={},
+            created_by="ORCHESTRATOR",
+        )
+        forged = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "strategic_review"}],
+            context={"_resident_session": True},
+            created_by="AGENT",
+        )
+        db_session.add_all([resident, ordinary, forged])
+        await db_session.commit()
+        db_session.expire_all()
+
+        candidates = (
+            (await db_session.execute(_candidate_task_statement(slots_available=1)))
+            .scalars()
+            .all()
+        )
+
+        assert {task.id for task in candidates} == {resident.id}
+
+    @pytest.mark.asyncio
+    async def test_paused_project_final_lock_allows_only_server_resident(
+        self, db_session
+    ):
+        """The final row-lock fence preserves the same narrow pause exception."""
+        from app.orchestrator import _lock_dispatchable_task_for_mutation
+
+        project = make_project(
+            name="Paused-Resident-Final-Lock", user_id=_TEST_USER, paused=True
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        resident = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "strategic_review"}],
+            context={"_resident_session": True},
+            created_by="ORCHESTRATOR",
+        )
+        ordinary = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "fix"}],
+            context={},
+            created_by="ORCHESTRATOR",
+        )
+        forged = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "strategic_review"}],
+            context={"_resident_session": True},
+            created_by="AGENT",
+        )
+        db_session.add_all([resident, ordinary, forged])
+        await db_session.commit()
+
+        locked = await _lock_dispatchable_task_for_mutation(db_session, resident.id)
+        assert locked is not None
+        assert locked.id == resident.id
+        await db_session.commit()
+
+        assert (
+            await _lock_dispatchable_task_for_mutation(db_session, ordinary.id)
+            is None
+        )
+        await db_session.commit()
+        assert (
+            await _lock_dispatchable_task_for_mutation(db_session, forged.id)
+            is None
+        )
+
+    @pytest.mark.asyncio
     async def test_project_paused_after_candidate_scan_not_dispatched(
         self, orch_warm_db, mocker
     ):
@@ -18027,7 +18126,6 @@ async def test_inherited_image_gates_on_container_capability(db_session, mocker)
     would otherwise go looking for a ``container_image`` in a payload that does
     not contain one.
     """
-    from types import SimpleNamespace
     from app.orchestrator_runner_dispatch import (
         _dispatch_compute_experiment_directly,
         RunnerDispatchSnapshot,
