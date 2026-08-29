@@ -84,13 +84,14 @@
     },
     {
       "path": "backend/testing/test_strategic_workday_handoff_recovery.py",
-      "reason": "Protects privacy-safe exactly-once settlement when typed Workday packets or results are stale, revoked, or missing, while forbidding recovery after the canonical public source is deleted.",
+      "reason": "Protects privacy-safe exactly-once settlement when typed Workday packets or results are stale, revoked, missing, or acknowledged by a rolling pre-upgrade runner, while forbidding recovery after the canonical public source is deleted.",
       "test_ids": [
+        "test_preupgrade_ack_without_diagnostic_drains_and_is_idempotent",
         "test_stale_workday_packet_settles_source_once_without_private_leak",
         "test_stale_workday_result_is_replaced_by_neutral_terminal_result",
         "test_missing_handoff_recovers_but_deleted_source_publishes_nothing"
       ],
-      "test_count": 4
+      "test_count": 5
     },
     {
       "path": "backend/testing/test_conversation_coordinator_two_speed.py",
@@ -678,6 +679,7 @@
         "handleStrategicResident \u2014 typed Fast lease lifecycle > abandons an exact cold Fast claim when required attachment materialization fails before dispatch",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > acquires the fenced slot before readiness and releases it on normal shutdown",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > answers server fast-marked rows through the legacy Workday path when typed Fast is not activated",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > bounds Fast preparation and uses coordinator-confirmed fallback for the exact input",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > closes a lease-lost Fast controller without giving its next tagged message to Workday",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > completes Fast with autonomous authority lapsed while workspace preparation is unresolved",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > completes a preserved Fast turn after resolved workspace prep before Workday identity launch fails",
@@ -746,7 +748,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 142
+      "test_count": 143
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",

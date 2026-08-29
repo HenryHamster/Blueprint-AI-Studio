@@ -1131,6 +1131,70 @@ def _append_workday_attempt(
     context[_WORKDAY_ATTEMPTS_CONTEXT_KEY] = attempts[-_WORKDAY_ATTEMPT_LIMIT:]
 
 
+def _legacy_workday_attempt_diagnostic(
+    context: dict[str, Any],
+    *,
+    workday_claim_id: uuid.UUID,
+    outcome: str,
+    result_chars: int,
+    now: datetime,
+) -> dict[str, Any]:
+    """Project an explicit diagnostic for an ack from a pre-upgrade runner.
+
+    The first API release that required ``attempt_diagnostic`` can overlap an
+    Agent already inside a provider turn.  Such an Agent cannot manufacture the
+    new field, and rejecting its ack prevents it from draining into the runner
+    auto-update.  Preserve the facts the server actually knows (claim identity,
+    outcome, claim-to-ack timing), mark the unavailable trace as truncated, and
+    deliberately leave provider-only fields null rather than inventing them.
+
+    A lost-response retry after the first ack must reuse the byte-identical
+    stored projection.  Look up that exact claim before synthesizing a new row.
+    """
+
+    for prior in reversed(bounded_workday_consultation_attempts(context)):
+        if (
+            prior.get("workday_claim_id") == str(workday_claim_id)
+            and prior.get("outcome") == outcome
+        ):
+            return prior
+
+    attempt = int(context.get(_WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY) or 0)
+    started_at = _workday_claim_expiry(
+        context.get(_WORKDAY_CLAIM_STARTED_CONTEXT_KEY)
+    ) or now
+    elapsed_ms = min(
+        86_400_000,
+        max(0, int((now - started_at).total_seconds() * 1_000)),
+    )
+    return _normalize_workday_attempt_diagnostic(
+        {
+            "attempt": attempt,
+            "workday_claim_id": str(workday_claim_id),
+            "outcome": outcome,
+            "terminal_predicate": "legacy_runner_ack_without_diagnostic",
+            "provider_terminal_reason": None,
+            "provider_output_tail": None,
+            "started_at": started_at.isoformat(),
+            "ended_at": now.isoformat(),
+            "turn_ms": elapsed_ms,
+            "ttft_ms": None,
+            "tool_call_count": 0,
+            "tool_call_duration_ms": 0,
+            "result_chars": result_chars,
+            "trace": [
+                {
+                    "elapsed_ms": elapsed_ms,
+                    "kind": "error",
+                    "label": "legacy_diagnostic_unavailable",
+                    "is_error": True,
+                }
+            ],
+            "trace_truncated": True,
+        }
+    )
+
+
 def bounded_workday_consultation_attempts(context: object) -> list[dict[str, Any]]:
     if not isinstance(context, dict):
         return []
@@ -1614,9 +1678,18 @@ async def acknowledge_workday_consultation_packet(
     normalized_result_summary = (result_summary or "").strip()
     if len(normalized_result_summary) > 20_000:
         raise ValueError("consultation result_summary exceeds 20000 characters")
-    if attempt_diagnostic is None:
-        raise ValueError("consultation acknowledgement requires attempt diagnostics")
-    diagnostic = _normalize_workday_attempt_diagnostic(attempt_diagnostic)
+    now = _utcnow()
+    diagnostic = (
+        _normalize_workday_attempt_diagnostic(attempt_diagnostic)
+        if attempt_diagnostic is not None
+        else _legacy_workday_attempt_diagnostic(
+            context,
+            workday_claim_id=workday_claim_id,
+            outcome=outcome,
+            result_chars=len(normalized_result_summary),
+            now=now,
+        )
+    )
     if (
         diagnostic["workday_claim_id"] != str(workday_claim_id)
         or diagnostic["outcome"] != outcome
@@ -1672,7 +1745,6 @@ async def acknowledge_workday_consultation_packet(
         != str(worker_incarnation)
     ):
         raise ValueError("consultation packet is owned by another worker")
-    now = _utcnow()
     expires_at = _workday_claim_expiry(
         context.get(_WORKDAY_CLAIM_EXPIRES_CONTEXT_KEY)
     )

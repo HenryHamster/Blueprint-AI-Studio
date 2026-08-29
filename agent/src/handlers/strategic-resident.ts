@@ -1160,6 +1160,11 @@ export async function handleStrategicResident(
     clientClaimId: string;
     idempotencyKey: string;
     messageIds: string[];
+    // Readiness is deliberately outside the provider turn, but it is still
+    // part of the operator's wait. Preserve the first-observed instant with
+    // the stable claim identifiers so repeated polls cannot restart the
+    // preparation budget indefinitely.
+    preparationStartedAtMs: number;
     // Set only at the exact boundary where a receipt-bound completion carrying
     // a staged Workday request is posted. If that response is lost and abandon
     // proves the claim is already completed, the atomically-created packet is
@@ -4694,7 +4699,6 @@ export async function handleStrategicResident(
         statusRef.value = typedFastPendingStatus;
       }
     }
-    if (Date.now() < typedFastCircuitOpenUntil) return 'not_available';
     const pendingClaimRequest = pendingTypedFastClaimRequest;
     // A claim POST can time out after the coordinator commits M1, while a
     // later poll contains M1 + M2. Retry *only* M1 with its stable client
@@ -4712,31 +4716,39 @@ export async function handleStrategicResident(
       .map(message => typeof message.id === 'string' ? message.id.trim() : '')
       .filter(Boolean);
     if (messageIds.length !== selectedMessages.length || messageIds.length === 0) return 'deferred';
-    if (!pendingClaimRequest) {
-      if (Date.now() < typedFastCircuitOpenUntil) return 'not_available';
-      if (
-        !typedFastReady || foregroundTyped === null || typedFastLease === null
-        || !foregroundTyped.isAlive()
-      ) {
-        if (foregroundTyped !== null && !foregroundTyped.isAlive()) {
-          typedFastReady = false;
-          foregroundTyped.close();
-          foregroundTyped = null;
-          await releaseTypedFastLease('foreground_process_gone');
-        }
-        kickTypedFastProvisioning();
-        return 'not_available';
-      }
-    }
     const claimRequest = pendingClaimRequest ?? {
       clientClaimId: randomUUID(),
       idempotencyKey: `typed-fast-claim:${randomUUID()}`,
       messageIds: [...messageIds],
       messages: [...selectedMessages],
+      preparationStartedAtMs: Date.now(),
       completionExpectedWorkdayRequest: false,
     };
     if (!pendingClaimRequest) lastTypedFastCompletedMessageIds = [];
     pendingTypedFastClaimRequest = claimRequest;
+    const preparationDeadlineExpired = (): boolean => (
+      Date.now() - claimRequest.preparationStartedAtMs >= cfg.turnTimeoutMs
+    );
+    if (!preparationDeadlineExpired() && Date.now() < typedFastCircuitOpenUntil) {
+      return 'not_available';
+    }
+    if (
+      !typedFastReady || foregroundTyped === null || typedFastLease === null
+      || !foregroundTyped.isAlive()
+    ) {
+      if (foregroundTyped !== null && !foregroundTyped.isAlive()) {
+        typedFastReady = false;
+        foregroundTyped.close();
+        foregroundTyped = null;
+        await releaseTypedFastLease('foreground_process_gone');
+      }
+      kickTypedFastProvisioning();
+      // Readiness is normally allowed to settle independently while polling
+      // and heartbeats continue. Once the configured operator budget expires,
+      // continue with the SAME stable claim request: Coordinator must first
+      // fence that exact input and explicitly authorize legacy fallback.
+      if (!preparationDeadlineExpired()) return 'not_available';
+    }
     typedFastDispatching = true;
     let claimId = '';
     let claimReleased = false;
@@ -4794,6 +4806,13 @@ export async function handleStrategicResident(
         }
         if (disposition === 'fallback') {
           clearTypedConversationClaim(false);
+          if (preparationDeadlineExpired()) {
+            for (const messageId of claimRequest.messageIds) {
+              pendingTypedFastFallbackMessageIds.add(messageId);
+            }
+            typedFastPreviousStatus = null;
+            return 'fallback_admissible';
+          }
           return 'not_available';
         }
         return 'deferred';
