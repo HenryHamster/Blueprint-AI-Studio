@@ -84,13 +84,14 @@
     },
     {
       "path": "backend/testing/test_strategic_workday_handoff_recovery.py",
-      "reason": "Protects privacy-safe exactly-once settlement when typed Workday packets or results are stale, revoked, or missing, while forbidding recovery after the canonical public source is deleted.",
+      "reason": "Protects privacy-safe exactly-once settlement when typed Workday packets or results are stale, revoked, missing, or acknowledged by a rolling pre-upgrade runner, while forbidding recovery after the canonical public source is deleted.",
       "test_ids": [
+        "test_preupgrade_ack_without_diagnostic_drains_and_is_idempotent",
         "test_stale_workday_packet_settles_source_once_without_private_leak",
         "test_stale_workday_result_is_replaced_by_neutral_terminal_result",
         "test_missing_handoff_recovers_but_deleted_source_publishes_nothing"
       ],
-      "test_count": 4
+      "test_count": 5
     },
     {
       "path": "backend/testing/test_conversation_coordinator_two_speed.py",
