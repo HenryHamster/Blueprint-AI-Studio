@@ -440,6 +440,44 @@ class AssetSecurityTests(unittest.TestCase):
             self.assertNotRegex(docker_calls, r"(?m)^(run|stop|rm) ")
 
     @unittest.skipIf(os.name == "nt", "requires POSIX file modes and Bash")
+    def test_install_control_accepts_numeric_uid_without_passwd_entry(self):
+        installer = Path(__file__).parent / "install-github-actions-vm.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, docker_log, _systemctl_log, _state_root = (
+                self._host_control_harness(
+                    temporary, firewall_status="absent", qemu_status="absent"
+                )
+            )
+            numeric_id = Path(temporary) / "bin" / "id"
+            numeric_id.write_text(
+                textwrap.dedent(
+                    """
+                    #!/usr/bin/env bash
+                    case "${1:-}" in
+                      -u) printf '995\n' ;;
+                      -un) exit 1 ;;
+                      *) exec /usr/bin/id "$@" ;;
+                    esac
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            numeric_id.chmod(0o755)
+            environment["BLUEPRINT_TEST_LINGER_STATE"] = "yes"
+
+            result = subprocess.run(
+                ["bash", str(installer), "install-control"],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            docker_calls = docker_log.read_text(encoding="utf-8")
+            self.assertNotRegex(docker_calls, r"(?m)^(run|stop|rm) ")
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX file modes and Bash")
     def test_install_control_requires_verified_user_lingering(self):
         installer = Path(__file__).parent / "install-github-actions-vm.sh"
         for linger_state, expected_error in (
