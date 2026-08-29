@@ -2247,6 +2247,118 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(statusChanges).not.toContain('Responding to operator...');
   });
 
+  it('bounds Fast preparation and uses coordinator-confirmed fallback for the exact input', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'typed-fast-preparation-deadline', content: 'Answer after bounded preparation.',
+      created_at: new Date().toISOString(), from_type: 'user',
+    };
+    let messageOpen = true;
+    let workdayAlive = true;
+    let workdayStarted = false;
+    const fastClaimBodies: Array<Record<string, unknown> | undefined> = [];
+    const abandonBodies: Array<Record<string, unknown> | undefined> = [];
+    mockApiGet.mockImplementation((url: string) => Promise.resolve(
+      url.includes('/messages?') && workdayStarted && messageOpen
+        ? { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] }
+        : { messages: [], fast_message_ids: [] },
+    ));
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+          conversation_claim_held: true,
+          stop_requested: false,
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true, lease: { lease_id: 'lease-preparation-deadline', generation: 1 },
+        });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        fastClaimBodies.push(body);
+        return Promise.resolve({
+          claim_id: 'claim-preparation-deadline', owner: 'fast',
+          message_ids: [operatorMessage.id],
+          envelope: typedEnvelope(operatorMessage.content, 71, operatorMessage.id),
+        });
+      }
+      if (url.endsWith('/conversation/turns/abandon')) {
+        abandonBodies.push(body);
+        return Promise.resolve({ status: 'abandoned', legacy_fallback_admissible: true });
+      }
+      if (url.endsWith('/messages/claim')) {
+        return Promise.resolve({
+          claim_id: 'workday-claim-after-fast-preparation',
+          incarnation_id: 'workday-incarnation-after-fast-preparation',
+          incarnation_supported: true,
+          message_ids: [operatorMessage.id],
+        });
+      }
+      if (body?.op === 'create_message') {
+        messageOpen = false;
+        return Promise.resolve({});
+      }
+      if (url.endsWith('/typed-fast-lease/release')) return Promise.resolve({ released: true });
+      return Promise.resolve({});
+    });
+    let finishReadiness: (() => void) | null = null;
+    typedFastMocks.ensureReady.mockImplementation(() => new Promise<void>((resolve) => {
+      finishReadiness = resolve;
+    }));
+    typedFastMocks.close.mockImplementation(() => { finishReadiness?.(); });
+    const workday = makeSession(
+      () => {
+        workdayAlive = false;
+        return Promise.resolve(turnResult({
+          resultText: 'Workday answered after the exact Fast claim was released.',
+          sentOperatorMessage: true,
+        }));
+      },
+      () => workdayAlive,
+    );
+    mockStartSession.mockImplementation(() => {
+      workdayStarted = true;
+      return workday;
+    });
+    const statusRef = { value: '' };
+
+    const done = run('typed-fast-preparation-deadline-task', {
+      ...qualifiedPayload(),
+      strategic_session_turn_timeout_seconds: 0.001,
+      strategic_session_idle_tick_seconds: 1,
+      strategic_session_message_poll_seconds: 0.001,
+    }, statusRef);
+    for (
+      let i = 0;
+      i < 20 && statusRef.value !== 'Operator message received — preparing response';
+      i += 1
+    ) {
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(statusRef.value).toBe('Operator message received — preparing response');
+    await vi.advanceTimersByTimeAsync(14_000);
+    expect(fastClaimBodies).toHaveLength(0);
+    expect(workday.sendTurn).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(fastClaimBodies).toHaveLength(1);
+    expect(abandonBodies).toHaveLength(1);
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await done;
+
+    expect(fastClaimBodies[0]?.message_ids).toEqual([operatorMessage.id]);
+    expect(abandonBodies[0]?.claim_id).toBe('claim-preparation-deadline');
+    expect(typedFastMocks.dispatch).not.toHaveBeenCalled();
+    expect(workday.sendTurn).toHaveBeenCalledWith(expect.anything(), {
+      stallTimeoutMs: 300_000,
+      hardTimeoutMs: 360_000,
+    });
+  });
+
   it('ignores a stale heartbeat response sent before the Fast lease was acquired', async () => {
     vi.useFakeTimers();
     const operatorMessage = {
