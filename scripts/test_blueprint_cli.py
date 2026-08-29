@@ -8692,6 +8692,43 @@ def test_deploy_defaults_to_promoted_version(monkeypatch, capsys):
     assert body["host"] == "hamsterwheel"
 
 
+def test_deploy_local_submits_directly_to_release_socket(monkeypatch):
+    """A host-resident operator can deploy without an SSH credential.
+
+    The local mode preserves every manifest, promotion, and receipt guard; it
+    changes only the transport used to reach the same root-owned socket.
+    """
+    calls = []
+    api_fake = _deploy_api_fake(calls)
+    _deploy_env(monkeypatch, api_fake)
+    socket_calls = []
+
+    monkeypatch.setattr(
+        blueprint,
+        "_request_release_socket",
+        lambda digest, revision: socket_calls.append((digest, revision)) or True,
+    )
+    monkeypatch.setattr(
+        blueprint.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("--local must not invoke SSH"),
+    )
+
+    rc = blueprint.main(["deploy", "--local", "--host", "hamsterwheel", "--yes"])
+
+    assert rc == 0
+    assert socket_calls == [("sha256:" + "0" * 64, _DEPLOY_REV)]
+    receipts = [
+        body for method, path, body in calls
+        if method == "POST" and path.endswith("/activation-receipt")
+    ]
+    assert receipts == [{
+        "version_number": 7,
+        "revision": _DEPLOY_REV,
+        "host": "hamsterwheel",
+    }]
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="asserts POSIX chmod(0o600) permission bits, which Windows/NTFS does not enforce",

@@ -9710,6 +9710,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_deploy.add_argument(
         "--host", default="hamsterwheel",
         help="SSH host running the control plane (default: hamsterwheel).")
+    p_deploy.add_argument(
+        "--local", action="store_true",
+        help="Submit directly to the release socket on this machine instead of "
+             "using SSH (control-plane host only).")
     p_deploy.add_argument("--dry-run", action="store_true",
                           help="Show what would be deployed without deploying.")
     p_deploy.add_argument("--yes", action="store_true",
@@ -11564,7 +11568,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         if answer not in ("y", "yes"):
             print("Aborted.")
             return
-    _execute_deploy(args, revision, digest, promoted)
+    _execute_deploy(args, revision, digest, promoted, inplace=args.local)
 
 
 _DISPATCH = {
