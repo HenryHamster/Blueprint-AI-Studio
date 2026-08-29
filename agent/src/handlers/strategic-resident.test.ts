@@ -4957,7 +4957,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     }
   });
 
-  it('keeps the first private Workday turn bounded and reserves bootstrap for the next ordinary turn', async () => {
+  it('keeps the shared private Workday boundary replyless, silent, and serialized', async () => {
     vi.useFakeTimers();
     mockApiGet.mockResolvedValue({ messages: [], fast_message_ids: [], claim_required: true });
 
