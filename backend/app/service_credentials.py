@@ -68,6 +68,7 @@ def hash_service_token(token: str) -> str:
 # Path segments shared by the project-scoped allowlist regexes.
 _UUID_PATH_SEGMENT = r"[0-9a-fA-F-]{36}"
 _DIRECTION_PATH_SEGMENT = r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}"
+_CRITERION_KEY_PATH_SEGMENT = r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}"
 
 _BOUNDED_AGENT_READ_RULES: list[tuple[str, re.Pattern]] = [
     ("GET", re.compile(r"^/api/agent-access/v1/me$")),
@@ -142,6 +143,12 @@ SCOPE_DEFINITIONS: dict[str, list[tuple[str, re.Pattern]]] = {
             "POST",
             re.compile(
                 rf"^/api/operator-access/v1/projects/{_UUID_PATH_SEGMENT}/tasks$"
+            ),
+        ),
+        (
+            "PATCH",
+            re.compile(
+                rf"^/api/operator-access/v1/projects/{_UUID_PATH_SEGMENT}/acceptance-criteria/{_CRITERION_KEY_PATH_SEGMENT}/text$"
             ),
         ),
         (

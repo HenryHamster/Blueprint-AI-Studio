@@ -40,6 +40,10 @@ from app.database import get_session
 from app.models import Project, ProjectMessage, Task, TaskHistory, TaskStatus
 from app.payload_schemas import AcceptanceEvidence, TaskType
 from app.routers.admin_notifications import _MessageResolve, resolve_message
+from app.routers.admin_acceptance_criteria import (
+    RewriteCriterionTextRequest,
+    _rewrite_acceptance_criterion_text_impl,
+)
 from app.routers.admin_project_strategic_session import (
     StrategicResidentSessionStart,
     StrategicSessionMessageCreate,
@@ -96,6 +100,15 @@ _DirectionId = Annotated[
         strip_whitespace=True,
         min_length=1,
         max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    ),
+]
+_CriterionKey = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=64,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
     ),
 ]
@@ -636,6 +649,27 @@ async def request_operator_task_changes(
         payload=RequestChangesPayload(**payload.model_dump()),
         session=session,
         current_user=current_user,
+    )
+
+
+@router.patch(
+    "/projects/{project_id}/acceptance-criteria/{criterion_key}/text"
+)
+async def rewrite_operator_acceptance_criterion_text(
+    project_id: uuid.UUID,
+    criterion_key: _CriterionKey,
+    payload: RewriteCriterionTextRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    project = await _member_project(project_id, current_user, session)
+    _ensure_project_accepts_work(project)
+    return await _rewrite_acceptance_criterion_text_impl(
+        project_id=project_id,
+        criterion_key=criterion_key,
+        body=payload,
+        current_user=current_user,
+        session=session,
     )
 
 
