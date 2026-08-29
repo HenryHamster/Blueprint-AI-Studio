@@ -675,6 +675,7 @@
         "handleStrategicResident \u2014 typed Fast lease lifecycle > ignores a stale heartbeat response sent before the Fast lease was acquired",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > interrupts and abandons once when cold-start cancellation arrives during dispatch",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > interrupts and abandons once when workspace preparation fails during a cold Fast turn",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > keeps a consultation-restart checkpoint out of the private retry and delivers it to the next ordinary turn",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > keeps Activity private while Fast replies and Continuous Workday stays autonomous",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > keeps Chat mode Workday on demand when typed Fast owns the foreground",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > keeps Workday fenced when Fast abandonment is not confirmed fallback-admissible",
@@ -727,7 +728,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 141
+      "test_count": 142
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
