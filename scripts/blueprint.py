@@ -9710,6 +9710,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_deploy.add_argument(
         "--host", default="hamsterwheel",
         help="SSH host running the control plane (default: hamsterwheel).")
+    p_deploy.add_argument(
+        "--local", action="store_true",
+        help="Submit directly to the release socket on this machine instead of "
+             "using SSH (control-plane host only).")
     p_deploy.add_argument("--dry-run", action="store_true",
                           help="Show what would be deployed without deploying.")
     p_deploy.add_argument("--yes", action="store_true",
@@ -10819,11 +10823,12 @@ def _execute_deploy(
     release_completed = _execute_deploy_shim(args, revision, digest, inplace=inplace)
     if release_completed is False:
         print(
-            "Release is still running; activation receipt will be retried by "
-            "the deploy agent.",
+            "Release handoff acceptance is ambiguous; do not retry activation. "
+            "Reconcile the root executor receipt and served revision before "
+            "recording an activation receipt.",
             file=sys.stderr,
         )
-        return
+        raise APIError("release handoff acceptance is ambiguous")
     print("Release activated. Runners self-update on their next heartbeat.")
     _post_activation_receipt(args, promoted, revision)
 
@@ -11534,9 +11539,10 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     run for --sha), download its integrity-checked local-app-release manifest,
     bind the built revision to the project's latest promoted release version
     (SHA-or-descendant via the GitHub compare API; --force bypasses), then
-    invoke the root-owned zero-argument-trust shim on the control-plane host
-    over SSH. After activation, POST an activation receipt so the backend
-    records the served revision and closes the serving-confirmation loop.
+    invoke the root-owned zero-argument-trust shim through the control-plane
+    host's release socket, either directly with ``--local`` or over SSH. After
+    activation, POST an activation receipt so the backend records the served
+    revision and closes the serving-confirmation loop.
 
     The shim (scripts/blueprint_release.py, installed as
     /usr/local/sbin/blueprint-release) re-validates both values against strict
@@ -11564,7 +11570,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         if answer not in ("y", "yes"):
             print("Aborted.")
             return
-    _execute_deploy(args, revision, digest, promoted)
+    _execute_deploy(args, revision, digest, promoted, inplace=args.local)
 
 
 _DISPATCH = {
