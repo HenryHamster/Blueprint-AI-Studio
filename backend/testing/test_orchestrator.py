@@ -10402,6 +10402,138 @@ class TestWarmVMSkipProvision:
             )
 
     @pytest.mark.asyncio
+    async def test_paused_project_server_resident_reaches_local_runner_dispatch(
+        self, orch_warm_db, mocker
+    ):
+        """The complete dispatch cycle admits only the canonical Resident.
+
+        This pins the server-created Resident through candidate selection, the
+        queued-row re-read, the final row lock, and the real strategic local
+        runner path. Ordinary and context-forged work in the same paused
+        project remain queued.
+        """
+        import hashlib
+
+        from sqlmodel import select as _select
+
+        from app.models import LocalRunner
+        from app.workbench_state import (
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+        )
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Paused Resident Dispatch",
+                    user_id=_TEST_USER,
+                    paused=True,
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                runner = LocalRunner(
+                    project_id=project.id,
+                    token_hash=hashlib.sha256(b"paused-resident-runner").hexdigest(),
+                    hostname="hamsterwheel",
+                    status="active",
+                    last_seen_at=_utcnow(),
+                    capabilities={"task_types": "all", "max_concurrent": 2},
+                )
+                session.add(runner)
+                await session.commit()
+                await session.refresh(runner)
+
+                resident_context = {
+                    "_resident_session": True,
+                    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                    "preferred_runner_target_id": str(runner.id),
+                }
+                resident = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    payloads=[
+                        {"type": "strategic_review", "prompt": "continue session"}
+                    ],
+                    context=resident_context,
+                    created_by="ORCHESTRATOR",
+                )
+                ordinary = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "must stay paused",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
+                    context={},
+                    created_by="ORCHESTRATOR",
+                )
+                forged = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    payloads=[
+                        {"type": "strategic_review", "prompt": "forged marker"}
+                    ],
+                    context=resident_context,
+                    created_by="AGENT",
+                )
+                session.add_all([resident, ordinary, forged])
+                await session.commit()
+                resident_id = resident.id
+                ordinary_id = ordinary.id
+                forged_id = forged.id
+                runner_id = runner.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        prov_mock.assert_not_called()
+        async with orch_warm_db() as verify:
+            rows = (
+                (
+                    await verify.execute(
+                        _select(Task).where(
+                            Task.id.in_([resident_id, ordinary_id, forged_id])
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            by_id = {row.id: row for row in rows}
+
+        assert by_id[resident_id].status == TaskStatus.PROVISIONING
+        assert by_id[resident_id].vm_instance_id == f"runner:{runner_id}"
+        assert (by_id[resident_id].context or {}).get("runner_target_id") == str(
+            runner_id
+        )
+        for blocked_id in (ordinary_id, forged_id):
+            assert by_id[blocked_id].status == TaskStatus.QUEUED
+            assert by_id[blocked_id].vm_instance_id is None
+
+    @pytest.mark.asyncio
     async def test_paused_project_candidate_scan_admits_only_server_resident(
         self, db_session
     ):

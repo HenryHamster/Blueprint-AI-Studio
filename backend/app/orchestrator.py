@@ -3108,7 +3108,10 @@ async def orchestrator_worker():
                             Task.id.in_(eligible_ids),
                             Task.status == TaskStatus.QUEUED,
                             _agent_executed_task_type_filter(),
-                            Project.paused.is_(False),
+                            (
+                                Project.paused.is_(False)
+                                | _resident_session_dispatch_predicate()
+                            ),
                             Project.not_archived(),
                         )
                         .options(
