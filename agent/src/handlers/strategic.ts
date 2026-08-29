@@ -815,6 +815,7 @@ export async function handleStrategic(
     // Maps each strategic payload key to the ./fetch command that recovers it.
     const PAYLOAD_KEY_FETCH_VERB: Record<string, string> = {
       'problem_model':              './fetch problem-model',
+      'running_update':             './fetch running-update',
       'directions_summary':         './fetch direction',
       'staged_directions':          './fetch direction',
       'open_messages':              './fetch message',
