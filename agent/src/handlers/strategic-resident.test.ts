@@ -3145,6 +3145,12 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       'Do not add alternatives, choices, blockers, recommendations, or requests for an operator decision',
     );
     expect(continuationPrompt).toContain(
+      'An ellipsis, prefix/suffix shorthand, rounded value, or prose summary does not satisfy an exact-value request.',
+    );
+    expect(continuationPrompt).toContain(
+      'audit the public continuation against the operator request',
+    );
+    expect(continuationPrompt).toContain(
       'A terminal instruction such as "no operator decision is needed", "do not retry", or "abandon the immutable version and open a fresh version after the head is frozen" stays terminal.',
     );
     expect(continuationPrompt).toContain(
