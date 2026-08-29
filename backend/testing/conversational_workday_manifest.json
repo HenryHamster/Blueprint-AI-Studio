@@ -517,6 +517,7 @@
         "test_typed_fast_lease_is_fenced_renewed_and_released",
         "test_explicit_runner_change_rejects_active_session",
         "test_explicit_runner_replaces_a_genuinely_stale_active_worker",
+        "test_terminal_worker_restart_preserves_checkpoint_and_single_generation",
         "test_first_agent_heartbeat_reanchors_born_stale_session",
         "test_post_claim_quiet_heartbeat_renews_continuous_liveness",
         "test_autonomous_turn_survives_operator_silence_with_exact_heartbeat",

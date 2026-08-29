@@ -137,6 +137,7 @@ def test_project_operator_scope_has_exact_positive_and_negative_matrix():
     task_id = str(uuid.uuid4())
     message_id = str(uuid.uuid4())
     direction_id = "d-operator_1"
+    criterion_key = "c-operator_1"
 
     allowed = {
         ("GET", f"{AGENT_URL}/me"),
@@ -155,6 +156,11 @@ def test_project_operator_scope_has_exact_positive_and_negative_matrix():
         ("POST", f"{OPERATOR_URL}/tasks/{task_id}/requeue"),
         ("POST", f"{OPERATOR_URL}/tasks/{task_id}/cancel"),
         ("POST", f"{OPERATOR_URL}/tasks/{task_id}/request-changes"),
+        (
+            "PATCH",
+            f"{OPERATOR_URL}/projects/{project_id}/acceptance-criteria/"
+            f"{criterion_key}/text",
+        ),
         ("POST", f"{OPERATOR_URL}/projects/{project_id}/directions"),
         (
             "PATCH",
@@ -198,8 +204,18 @@ def test_project_operator_scope_has_exact_positive_and_negative_matrix():
         ("POST", "/api/admin/runners"),
         ("PUT", f"/api/admin/projects/{project_id}/directions"),
         ("PATCH", f"/api/admin/projects/{project_id}/directions/{direction_id}"),
+        (
+            "PATCH",
+            f"/api/admin/projects/{project_id}/acceptance-criteria/"
+            f"{criterion_key}/text",
+        ),
         ("POST", f"/api/admin/projects/{project_id}/strategic-session/start"),
         ("POST", f"{OPERATOR_URL}/tasks/{task_id}/complete"),
+        (
+            "POST",
+            f"{OPERATOR_URL}/projects/{project_id}/acceptance-criteria/"
+            f"{criterion_key}/text",
+        ),
         ("PATCH", f"{OPERATOR_URL}/tasks/{task_id}/requeue"),
         ("DELETE", f"{OPERATOR_URL}/projects/{project_id}/directions/{direction_id}"),
         ("POST", f"{OPERATOR_URL}/projects/not-a-uuid/tasks"),
@@ -518,6 +534,160 @@ async def test_task_create_priority_is_exact_idempotency_authority(
             select(func.count(Task.id)).where(Task.project_id == project.id)
         )
     ).scalar_one() == 1
+
+
+@pytest.mark.asyncio
+async def test_project_operator_rewrites_criterion_under_exact_cas_without_losing_lineage(
+    override_get_session, db_session, caplog
+):
+    project = await _persist_project(db_session, name="Criterion CAS")
+    version = ReleaseVersion(
+        project_id=project.id, version_number=54, status="open", phase="build"
+    )
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-cas-proof",
+        text="Old exact criterion",
+        status="active",
+        created_by="strategist",
+        evidence_contract={
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 0},
+        },
+    )
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-cas-proof",
+        status="active",
+        data={
+            "id": "d-cas-proof",
+            "status": "active",
+            "criterion_release_version_id": str(version.id),
+        },
+        criterion_keys=[criterion.criterion_key, "c-other"],
+    )
+    db_session.add_all([version, criterion, direction])
+    await db_session.commit()
+    original_id = criterion.id
+    original_created_at = criterion.created_at
+    original_contract = criterion.evidence_contract
+    _credential, token = await _seed_operator(db_session, project)
+    url = (
+        f"{OPERATOR_URL}/projects/{project.id}/acceptance-criteria/"
+        f"{criterion.criterion_key}/text"
+    )
+
+    with caplog.at_level("INFO", logger="app.routers.admin_acceptance_criteria"):
+        async with _real_auth_client() as client:
+            rewritten = await client.patch(
+                url,
+                json={
+                    "expected_text": "Old exact criterion",
+                    "text": "Corrected exact criterion",
+                },
+                headers=_auth(token),
+            )
+            replayed = await client.patch(
+                url,
+                json={
+                    "expected_text": "Old exact criterion",
+                    "text": "Corrected exact criterion",
+                },
+                headers=_auth(token),
+            )
+            stale = await client.patch(
+                url,
+                json={
+                    "expected_text": "Old exact criterion",
+                    "text": "Conflicting correction",
+                },
+                headers=_auth(token),
+            )
+            extra_authority = await client.patch(
+                url,
+                json={
+                    "expected_text": "Corrected exact criterion",
+                    "text": "Another correction",
+                    "criterion_key": "c-attacker-selected",
+                },
+                headers=_auth(token),
+            )
+
+    assert rewritten.status_code == 200, rewritten.text
+    receipt = rewritten.json()
+    assert receipt["criterion_key"] == criterion.criterion_key
+    assert receipt["text"] == "Corrected exact criterion"
+    assert receipt["changed"] is True
+    assert receipt["compare_state"] == "expected"
+    assert receipt["lineage"]["criterion_id"] == str(original_id)
+    assert receipt["lineage"]["created_by"] == "strategist"
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["changed"] is False
+    assert replayed.json()["compare_state"] == "replacement"
+    assert stale.status_code == 409
+    assert stale.json()["error"]["message"]["error"] == "criterion_text_changed"
+    assert extra_authority.status_code == 422
+
+    await db_session.refresh(criterion)
+    await db_session.refresh(direction)
+    assert criterion.id == original_id
+    assert criterion.created_at == original_created_at
+    assert criterion.created_by == "strategist"
+    assert criterion.evidence_contract == original_contract
+    assert criterion.text == "Corrected exact criterion"
+    assert direction.criterion_keys == [criterion.criterion_key, "c-other"]
+    assert any(
+        "action=criterion_text_compare_and_set" in record.message
+        and _credential.principal_user_id in record.message
+        and str(_credential.id) in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_operator_criterion_rewrite_is_member_scoped(
+    override_get_session, db_session
+):
+    authorized = await _persist_project(db_session, name="Criterion authorized")
+    foreign = await _persist_project(
+        db_session, name="Criterion foreign", owner="foreign-owner"
+    )
+    version = ReleaseVersion(
+        project_id=foreign.id, version_number=54, status="open", phase="build"
+    )
+    criterion = VersionAcceptanceCriterion(
+        project_id=foreign.id,
+        release_version_id=version.id,
+        criterion_key="c-foreign-cas",
+        text="Foreign exact text",
+        status="active",
+        created_by="strategist",
+    )
+    db_session.add_all([version, criterion])
+    await db_session.commit()
+    _member_credential, member_token = await _seed_operator(db_session, authorized)
+    _viewer_credential, viewer_token = await _seed_operator(
+        db_session, foreign, role="viewer"
+    )
+    url = (
+        f"{OPERATOR_URL}/projects/{foreign.id}/acceptance-criteria/"
+        f"{criterion.criterion_key}/text"
+    )
+    body = {"expected_text": criterion.text, "text": "Unauthorized correction"}
+
+    async with _real_auth_client() as client:
+        foreign_denied = await client.patch(
+            url, json=body, headers=_auth(member_token)
+        )
+        viewer_denied = await client.patch(
+            url, json=body, headers=_auth(viewer_token)
+        )
+
+    assert foreign_denied.status_code == 404, foreign_denied.text
+    assert viewer_denied.status_code == 403, viewer_denied.text
+    await db_session.refresh(criterion)
+    assert criterion.text == "Foreign exact text"
 
 
 @pytest.mark.asyncio
