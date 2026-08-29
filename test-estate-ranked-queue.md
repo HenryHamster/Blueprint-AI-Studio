@@ -214,7 +214,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P5 | backend | `backend/testing/test_artifact_refs.py` | 1,546 | 29 | moderate (1500–2999 LOC) | 0.036s measured | — |
 | P5 | agent | `agent/src/prompts/thinker.test.ts` | 1,904 | 101 | moderate (1500–2999 LOC) | 0.032s measured | — |
 | P5 | agent | `agent/src/prompt.format.test.ts` | 1,512 | 102 | moderate (1500–2999 LOC) | 0.029s measured | — |
-| P5 | agent | `agent/src/prompts/pr-helper.test.ts` | 2,669 | 45 | moderate (1500–2999 LOC) | 0.025s measured | — |
+| P5 | agent | `agent/src/prompts/pr-helper.test.ts` | 2,673 | 45 | moderate (1500–2999 LOC) | 0.025s measured | — |
 | G | backend | `backend/testing/test_scripts_test_lane.py` | 389 | 3 | under 1500 LOC | 208.064s measured | — |
 | G | backend | `backend/testing/test_task_outcomes.py` | 1,375 | 108 | under 1500 LOC | 187.368s measured | — |
 | G | backend | `backend/testing/test_task_evaluators.py` | 1,172 | 79 | under 1500 LOC | 153.388s measured | — |

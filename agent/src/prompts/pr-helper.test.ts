@@ -631,10 +631,14 @@ esac
     // and short-lived vitest/bash/curl processes can genuinely collide on
     // `process.pid` across two jobs that share a /tmp — or an orphaned bash
     // backoff `sleep` from a previously killed run can wake up later and fire
-    // one more POST against a reused PID's path. Either way that reads as "one
-    // extra POST" here. Mixing in a random UUID makes the path collision-proof
-    // regardless of PID reuse.
-    const taskId = `task-retry-${process.pid}-${randomUUID()}`;
+    // one more POST against a reused PID's path. A restored KVM runner can also
+    // replay both the PID and a snapshotted userspace RNG state, so randomUUID
+    // alone is not a cross-job identity. GitHub's externally assigned run ID
+    // and attempt distinguish those restores; the UUID still isolates local
+    // and same-run executions. The exactly-two-POST assertion below remains
+    // the production retry contract.
+    const ciRun = `${process.env.GITHUB_RUN_ID ?? 'local'}-${process.env.GITHUB_RUN_ATTEMPT ?? '0'}`;
+    const taskId = `task-retry-${ciRun}-${process.pid}-${randomUUID()}`;
     const workBranch = `blueprint/${taskId}`;
     const attemptsPath = `/tmp/pr_attempts_${taskId}`;
     const urlPath = `/tmp/pr_url_${taskId}`;
