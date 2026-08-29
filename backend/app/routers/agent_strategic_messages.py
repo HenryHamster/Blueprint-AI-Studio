@@ -590,6 +590,51 @@ async def _resolve_message_context_envelope(
     return row, envelope
 
 
+async def _rebind_private_packet_envelope_to_current_worker(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    row: ProjectMessage,
+    session_id: str,
+    worker_generation: int,
+    worker_incarnation: uuid.UUID,
+):
+    """Make a restart-surviving Workday packet writable by its live claimant."""
+
+    context = dict(row.context or {})
+    try:
+        fast_claim_id = uuid.UUID(str(context.get("claim_id")))
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(
+            status_code=409,
+            detail="Private Workday packet Fast claim identity is invalid",
+        ) from None
+    from app.strategic_memory_envelope import (
+        context_envelope_reference,
+        rebind_fenced_context_envelope_for_worker,
+    )
+
+    rebound = await rebind_fenced_context_envelope_for_worker(
+        session,
+        project_id=project_id,
+        reference=context.get("envelope"),
+        session_id=session_id,
+        claim_id=fast_claim_id,
+        worker_generation=worker_generation,
+        worker_incarnation=worker_incarnation,
+    )
+    if rebound is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Strategic context envelope is stale, expired, or revoked",
+        )
+    context["envelope"] = context_envelope_reference(rebound)
+    row.context = context
+    session.add(row)
+    await session.flush()
+    return rebound
+
+
 @router.post("/projects/{project_id}/strategic-call/finalized-transcript")
 @limiter.limit("60/minute")
 async def create_finalized_call_transcript(
@@ -1576,10 +1621,18 @@ async def claim_next_workday_consultation(
         if packet_claim is None:
             break
         try:
-            _, resolved_envelope = await _resolve_message_context_envelope(
+            packet_row, _ = await _resolve_message_context_envelope(
                 session,
                 project_id=project_id,
                 message_id=packet_claim.message.id,
+            )
+            resolved_envelope = await _rebind_private_packet_envelope_to_current_worker(
+                session,
+                project_id=project_id,
+                row=packet_row,
+                session_id=payload.session_id,
+                worker_generation=payload.worker_generation,
+                worker_incarnation=accepted_incarnation,
             )
         except HTTPException as exc:
             if exc.status_code != 409:
