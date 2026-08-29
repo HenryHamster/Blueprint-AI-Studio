@@ -129,7 +129,8 @@ def test_workday_retry_wait_is_legible_in_cheap_availability():
                 "stop_requested": False,
                 "worker_state": "retry_wait",
                 "worker_retry_until": (
-                    datetime.utcnow() + timedelta(minutes=10)
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    + timedelta(minutes=10)
                 ).isoformat(),
                 "worker_retry_reason": "Rate limited; waiting for recovery",
             }
@@ -435,7 +436,7 @@ async def test_resident_fresh_attempt_restores_actual_runner_columns(db_session)
     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
     task.vm_provisioned_at = None
 
-    before = datetime.utcnow()
+    before = datetime.now(timezone.utc).replace(tzinfo=None)
     assert await _restore_resident_retry_binding(
         task, db_session, prior_context
     ) is True
@@ -451,6 +452,71 @@ async def test_resident_fresh_attempt_restores_actual_runner_columns(db_session)
         assert fresh.context["runner_target_id"] == runner_id
         assert fresh.context["preferred_runner_target_id"] == runner_id
         assert fresh.context["_resident_session"] is True
+
+
+@pytest.mark.asyncio
+async def test_resident_retry_waits_for_predecessor_incarnation_lease(db_session):
+    project, task, runner_id = await _make_resident_record(
+        db_session, task_status=TaskStatus.FAILED
+    )
+    prior_context = dict(task.context or {})
+    incarnation_expires_at = datetime.now(timezone.utc).replace(
+        tzinfo=None
+    ) + timedelta(minutes=2)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["worker_incarnation_id"] = str(uuid.uuid4())
+    blob["worker_incarnation_expires_at"] = incarnation_expires_at.isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    db_session.add(project)
+    await db_session.commit()
+
+    reset_task_for_fresh_attempt(task)
+    task.status = TaskStatus.QUEUED
+    task.retry_after_until = datetime.now(timezone.utc).replace(
+        tzinfo=None
+    ) + timedelta(seconds=30)
+
+    assert await _restore_resident_retry_binding(
+        task, db_session, prior_context
+    ) is True
+    await db_session.commit()
+
+    factory = _test_session_factory(db_session)
+    async with factory() as verify:
+        fresh = await verify.get(Task, task.id)
+        assert fresh.status == TaskStatus.PROVISIONING
+        assert fresh.vm_instance_id == f"runner:{runner_id}"
+        assert fresh.retry_after_until == incarnation_expires_at
+
+
+@pytest.mark.asyncio
+async def test_resident_retry_preserves_longer_existing_wait(db_session):
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.FAILED
+    )
+    prior_context = dict(task.context or {})
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    incarnation_expires_at = now + timedelta(minutes=2)
+    longer_retry_after = now + timedelta(minutes=10)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["worker_incarnation_id"] = str(uuid.uuid4())
+    blob["worker_incarnation_expires_at"] = incarnation_expires_at.isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    db_session.add(project)
+    await db_session.commit()
+
+    reset_task_for_fresh_attempt(task)
+    task.status = TaskStatus.QUEUED
+    task.retry_after_until = longer_retry_after
+
+    assert await _restore_resident_retry_binding(
+        task, db_session, prior_context
+    ) is True
+    assert task.retry_after_until == longer_retry_after
 
 
 @pytest.mark.asyncio
@@ -484,7 +550,9 @@ async def test_retry_wait_projection_failure_keeps_durable_retry(
     )
     prior_context = dict(task.context or {})
     reset_task_for_fresh_attempt(task)
-    task.retry_after_until = datetime.utcnow() + timedelta(minutes=10)
+    task.retry_after_until = datetime.now(timezone.utc).replace(
+        tzinfo=None
+    ) + timedelta(minutes=10)
     task.latest_status_message = "Rate limited; deliberate retry wait"
     assert await _restore_resident_retry_binding(
         task, db_session, prior_context
@@ -507,7 +575,9 @@ async def test_retry_wait_projection_failure_keeps_durable_retry(
         assert fresh.status == TaskStatus.PROVISIONING
         assert fresh.vm_instance_id == f"runner:{runner_id}"
         assert fresh.retry_after_until is not None
-        assert fresh.retry_after_until > datetime.utcnow()
+        assert fresh.retry_after_until > datetime.now(timezone.utc).replace(
+            tzinfo=None
+        )
         assert fresh.context["_resident_session"] is True
         # The durable Task is authoritative even when the best-effort Project
         # projection failed: cheap/full reads must still report a healthy wait.
