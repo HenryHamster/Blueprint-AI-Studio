@@ -6300,6 +6300,380 @@ async def test_create_compute_job_reuses_matching_active_job_for_task(db_session
 
 
 @pytest.mark.asyncio
+async def test_create_compute_job_reuses_registry_authenticated_image_job(db_session):
+    project = Project(name="Registry Auth Idempotent Create", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    launch_args = {
+        "command": "echo idempotent",
+        "machine_type": "e2-standard-2",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "backend_name": compute_jobs.RUNNER_SUBPROCESS_BACKEND_NAME,
+        "container_image": "registry.example.com/train:1",
+        "container_registry_auth": {
+            "server": "registry.example.com",
+            "username": "runner",
+            "password": "secret",
+        },
+    }
+
+    first = await compute_jobs.create_compute_job(db_session, task, **launch_args)
+    second = await compute_jobs.create_compute_job(db_session, task, **launch_args)
+
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert second.id == first.id
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_registry_auth_without_image(db_session):
+    project = Project(name="Registry Auth Requires Image", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with pytest.raises(ValueError, match="container_registry_auth requires container_image"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo invalid",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            container_registry_auth={"server": "registry.example.com"},
+        )
+
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_reuses_old_persisted_fingerprint(db_session):
+    """An exact populated legacy retry is verified and upgraded in place."""
+    project = Project(name="Legacy Compute Fingerprint", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    launch_args = {
+        "command": "echo legacy-idempotent",
+        "machine_type": "e2-standard-2",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "backend_name": compute_jobs.RUNNER_SUBPROCESS_BACKEND_NAME,
+        "container_image": "registry.example.com/train:1",
+        "container_registry_auth": {
+            "server": "registry.example.com",
+            "username": "runner",
+            "password": "secret",
+        },
+        "setup_step": "pip install package==1.0",
+        "declared_metric": "eval/accuracy",
+        "allow_host_fallback": True,
+    }
+    first = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        **launch_args,
+    )
+    fingerprint_args = {
+        **launch_args,
+        "backend_name": first.backend,
+        "provisioning_model": "STANDARD",
+        "cwd": None,
+        "env": None,
+    }
+    current_fingerprint = compute_jobs._build_launch_request_fingerprint(
+        **fingerprint_args
+    )
+    legacy_fingerprint = compute_jobs._build_launch_request_fingerprint(
+        **fingerprint_args,
+        _include_rollout_fields=False,
+    )
+    assert current_fingerprint != legacy_fingerprint
+    first_meta = dict(first.polling_metadata or {})
+    first_meta["launch_request_fingerprint"] = legacy_fingerprint
+    first.polling_metadata = first_meta
+    db_session.add(first)
+    await db_session.commit()
+
+    retried = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        **launch_args,
+    )
+
+    assert retried.id == first.id
+    assert (retried.polling_metadata or {}).get(
+        "launch_request_fingerprint"
+    ) == current_fingerprint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changed_key", "changed_value"),
+    [
+        ("setup_step", "pip install package==2.0"),
+        ("declared_metric", "eval/loss"),
+        (
+            "container_registry_auth",
+            {
+                "server": "registry.example.com",
+                "username": "runner",
+                "password": "different-secret",
+            },
+        ),
+        ("allow_host_fallback", False),
+    ],
+)
+async def test_old_fingerprint_rejects_changed_populated_semantics(
+    db_session, changed_key, changed_value
+):
+    project = Project(
+        name=f"Legacy Fingerprint Changed {changed_key}", user_id="test-user"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    launch_args = {
+        "command": "echo legacy-idempotent",
+        "machine_type": "e2-standard-2",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "backend_name": compute_jobs.RUNNER_SUBPROCESS_BACKEND_NAME,
+        "container_image": "registry.example.com/train:1",
+        "container_registry_auth": {
+            "server": "registry.example.com",
+            "username": "runner",
+            "password": "secret",
+        },
+        "setup_step": "pip install package==1.0",
+        "declared_metric": "eval/accuracy",
+        "allow_host_fallback": True,
+    }
+    first = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        **launch_args,
+    )
+    fingerprint_args = {
+        **launch_args,
+        "backend_name": first.backend,
+        "provisioning_model": "STANDARD",
+        "cwd": None,
+        "env": None,
+    }
+    legacy_fingerprint = compute_jobs._build_launch_request_fingerprint(
+        **fingerprint_args,
+        _include_rollout_fields=False,
+    )
+    first_meta = dict(first.polling_metadata or {})
+    first_meta["launch_request_fingerprint"] = legacy_fingerprint
+    first.polling_metadata = first_meta
+    db_session.add(first)
+    await db_session.commit()
+
+    changed_args = {**launch_args, changed_key: changed_value}
+    with pytest.raises(ValueError, match="already has an active compute job"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            **changed_args,
+        )
+
+    await db_session.refresh(first)
+    assert (first.polling_metadata or {}).get(
+        "launch_request_fingerprint"
+    ) == legacy_fingerprint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("original_fields", "retry_fields"),
+    [
+        ({"setup_step": "pip install package==1.0"}, {"setup_step": None}),
+        ({"declared_metric": "eval/accuracy"}, {"declared_metric": None}),
+        (
+            {
+                "container_image": "registry.example.com/train:1",
+                "container_registry_auth": {
+                    "server": "registry.example.com",
+                    "username": "runner",
+                    "password": "secret",
+                },
+            },
+            {
+                "container_image": "registry.example.com/train:1",
+                "container_registry_auth": None,
+            },
+        ),
+        ({"allow_host_fallback": True}, {"allow_host_fallback": False}),
+    ],
+)
+async def test_old_fingerprint_rejects_removed_sole_rollout_semantic(
+    db_session, original_fields, retry_fields
+):
+    project = Project(name="Legacy Fingerprint Removed Field", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    base_args = {
+        "command": "echo legacy-idempotent",
+        "machine_type": "e2-standard-2",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "backend_name": compute_jobs.RUNNER_SUBPROCESS_BACKEND_NAME,
+    }
+    launch_args = {**base_args, **original_fields}
+    first = await compute_jobs.create_compute_job(db_session, task, **launch_args)
+    legacy_fingerprint = compute_jobs._build_launch_request_fingerprint(
+        **launch_args,
+        provisioning_model="STANDARD",
+        cwd=None,
+        env=None,
+        _include_rollout_fields=False,
+    )
+    first_meta = dict(first.polling_metadata or {})
+    first_meta["launch_request_fingerprint"] = legacy_fingerprint
+    first.polling_metadata = first_meta
+    db_session.add(first)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="already has an active compute job"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            **{**base_args, **retry_fields},
+        )
+
+    await db_session.refresh(first)
+    assert (first.polling_metadata or {}).get(
+        "launch_request_fingerprint"
+    ) == legacy_fingerprint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("retry_allow_host_fallback", "accepted"), [(True, True), (False, False)])
+async def test_pre_host_fallback_fingerprint_requires_persisted_semantic_match(
+    db_session, retry_allow_host_fallback, accepted
+):
+    project = Project(name="Pre Host Fallback Fingerprint", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    launch_args = {
+        "command": "echo host-fallback-idempotent",
+        "machine_type": "e2-standard-2",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "backend_name": compute_jobs.RUNNER_SUBPROCESS_BACKEND_NAME,
+        "setup_step": "pip install package==1.0",
+        "declared_metric": "eval/accuracy",
+        "allow_host_fallback": True,
+    }
+    first = await compute_jobs.create_compute_job(db_session, task, **launch_args)
+    fingerprint_args = {
+        **launch_args,
+        "provisioning_model": "STANDARD",
+        "cwd": None,
+        "env": None,
+    }
+    current_fingerprint = compute_jobs._build_launch_request_fingerprint(
+        **fingerprint_args
+    )
+    prior_fingerprint = compute_jobs._build_launch_request_fingerprint(
+        **fingerprint_args,
+        _include_host_fallback=False,
+    )
+    assert prior_fingerprint != current_fingerprint
+    first_meta = dict(first.polling_metadata or {})
+    first_meta["launch_request_fingerprint"] = prior_fingerprint
+    first.polling_metadata = first_meta
+    db_session.add(first)
+    await db_session.commit()
+
+    retry_args = {
+        **launch_args,
+        "allow_host_fallback": retry_allow_host_fallback,
+    }
+    if accepted:
+        retried = await compute_jobs.create_compute_job(db_session, task, **retry_args)
+        assert retried.id == first.id
+        assert (retried.polling_metadata or {}).get(
+            "launch_request_fingerprint"
+        ) == current_fingerprint
+    else:
+        with pytest.raises(ValueError, match="already has an active compute job"):
+            await compute_jobs.create_compute_job(db_session, task, **retry_args)
+        await db_session.refresh(first)
+        assert (first.polling_metadata or {}).get(
+            "launch_request_fingerprint"
+        ) == prior_fingerprint
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"setup_step": "pip install package==1.0"},
+        {"declared_metric": "eval/accuracy"},
+        {
+            "container_registry_auth": {
+                "server": "registry.example.com",
+                "username": "runner",
+                "password": "secret",
+            }
+        },
+        {"allow_host_fallback": True},
+    ],
+)
+def test_launch_request_fingerprint_covers_execution_semantics(changed):
+    base = {
+        "command": "python train.py",
+        "machine_type": "e2-standard-2",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "cwd": None,
+        "env": None,
+        "backend_name": "runner-subprocess",
+        "provisioning_model": "STANDARD",
+    }
+
+    original = compute_jobs._build_launch_request_fingerprint(**base)
+    modified = compute_jobs._build_launch_request_fingerprint(**base, **changed)
+
+    assert modified != original
+
+
+@pytest.mark.asyncio
 async def test_live_proof_compute_job_requires_promoted_release(db_session):
     project = Project(name="Live Proof No Promotion", user_id="test-user")
     db_session.add(project)

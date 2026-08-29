@@ -295,6 +295,16 @@ async def test_task_create_is_explicit_member_scoped_strict_and_never_creates_sh
             json=_operator_task_body(),
             headers=headers,
         )
+        invalid_low_priority = await client.post(
+            f"{OPERATOR_URL}/projects/{authorized.id}/tasks",
+            json=_operator_task_body(priority=-1),
+            headers=headers,
+        )
+        invalid_high_priority = await client.post(
+            f"{OPERATOR_URL}/projects/{authorized.id}/tasks",
+            json=_operator_task_body(priority=101),
+            headers=headers,
+        )
         forbidden_body = await client.post(
             f"{OPERATOR_URL}/projects/{authorized.id}/tasks",
             json=_operator_task_body(
@@ -336,7 +346,10 @@ async def test_task_create_is_explicit_member_scoped_strict_and_never_creates_sh
     assert created_task is not None
     assert created_task.project_id == authorized.id
     assert created_task.created_by == "USER"
+    assert created_task.priority == 50
     assert created_task.launched_by_user_id == credential.principal_user_id
+    assert invalid_low_priority.status_code == 422, invalid_low_priority.text
+    assert invalid_high_priority.status_code == 422, invalid_high_priority.text
     assert forbidden_body.status_code == 422, forbidden_body.text
     assert research_fields_on_plan.status_code == 422, research_fields_on_plan.text
     assert incomplete_review.status_code == 422, incomplete_review.text
@@ -409,6 +422,7 @@ async def test_task_create_can_atomically_stage_exact_authority_while_paused(
             f"{OPERATOR_URL}/projects/{project.id}/tasks",
             json=_operator_task_body(
                 task_type="create",
+                priority=100,
                 prompt="Implement only the bounded budget consumers.",
                 base_branch="automain",
                 direction_id="d-exact",
@@ -446,6 +460,8 @@ async def test_task_create_can_atomically_stage_exact_authority_while_paused(
     assert response.json()["criterion_ids"] == criterion_ids
     assert response.json()["criterion_ids_explicit"] is True
     assert response.json()["criterion_release_version_id"] == str(version.id)
+    assert response.json()["creation_priority"] == 100
+    assert response.json()["priority"] == 100
     assert response.json()["base_branch"] == "automain"
     assert response.json()["depends_on"] == [str(predecessor.id)]
     assert response.json()["require_deps_landed_on"] == "automain"
@@ -453,10 +469,15 @@ async def test_task_create_can_atomically_stage_exact_authority_while_paused(
     created = await db_session.get(Task, uuid.UUID(response.json()["id"]))
     assert created is not None
     assert created.status == TaskStatus.QUEUED
+    assert created.priority == 100
     assert created.criterion_ids == criterion_ids
     assert created.depends_on == [str(predecessor.id)]
     assert created.context["direction_id"] == "d-exact"
     assert created.context["criterion_ids_explicit"] is True
+    assert (
+        created.context["_operator_task_creation_authority"]["creation_priority"]
+        == 100
+    )
     assert created.context["_operator_task_creation_authority"]["base_branch"] == (
         "automain"
     )
@@ -464,6 +485,55 @@ async def test_task_create_can_atomically_stage_exact_authority_while_paused(
     assert created.first_payload["require_deps_landed_on"] == "automain"
     await db_session.refresh(project)
     assert project.paused is True
+
+
+@pytest.mark.asyncio
+async def test_task_create_priority_is_exact_idempotency_authority(
+    override_get_session, db_session
+):
+    project = await _persist_project(db_session, name="Priority replay")
+    _credential, token = await _seed_operator(db_session, project)
+    body = _operator_task_body(
+        priority=100,
+        idempotency_key="operator-priority-replay",
+    )
+
+    async with _real_auth_client() as client:
+        created = await client.post(
+            f"{OPERATOR_URL}/projects/{project.id}/tasks",
+            json=body,
+            headers=_auth(token),
+        )
+        created_task = await db_session.get(Task, uuid.UUID(created.json()["id"]))
+        assert created_task is not None
+        # This is the live-row mutation performed by set_task_priority.
+        created_task.priority = 0
+        await db_session.commit()
+        duplicate = await client.post(
+            f"{OPERATOR_URL}/projects/{project.id}/tasks",
+            json=body,
+            headers=_auth(token),
+        )
+        mismatch = await client.post(
+            f"{OPERATOR_URL}/projects/{project.id}/tasks",
+            json={**body, "priority": 50},
+            headers=_auth(token),
+        )
+
+    assert created.status_code == 201, created.text
+    assert created.json()["creation_priority"] == 100
+    assert created.json()["priority"] == 100
+    assert duplicate.status_code == 201, duplicate.text
+    assert duplicate.json()["is_duplicate"] is True
+    assert duplicate.json()["creation_priority"] == 100
+    assert duplicate.json()["priority"] == 0
+    assert mismatch.status_code == 409, mismatch.text
+    assert "priority" in mismatch.text
+    assert (
+        await db_session.execute(
+            select(func.count(Task.id)).where(Task.project_id == project.id)
+        )
+    ).scalar_one() == 1
 
 
 @pytest.mark.asyncio

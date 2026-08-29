@@ -1350,6 +1350,95 @@ async def test_next_compute_job_delivers_repo_clone_from_launch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raise_token_error", [False, True])
+async def test_repo_intent_survives_token_failure_until_runner_claim(
+    client, db_session, monkeypatch, raise_token_error
+):
+    """A launch-time token outage must not turn a repo job into a bare command."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(
+        name="Repo Token Failure",
+        user_id="u",
+        github_owner="acme",
+        github_repo="private-ml",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "experiment/ref"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    async def _token_unavailable(project, session):
+        if raise_token_error:
+            raise RuntimeError("installation token service unavailable")
+        return None
+
+    import app.branch_cleanup as branch_cleanup_mod
+
+    monkeypatch.setattr(
+        branch_cleanup_mod, "_get_project_github_token", _token_unavailable
+    )
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+
+    expected_repo = {
+        "owner": "acme",
+        "repo": "private-ml",
+        "ref": "experiment/ref",
+    }
+    assert (job.polling_metadata or {}).get("repo_clone") == expected_repo
+
+    resp = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["repo_clone"] == expected_repo
+    assert body["repo_token"] is None
+
+
+@pytest.mark.asyncio
 async def test_next_compute_job_scoped_to_pinned_runner(client, db_session, monkeypatch):
     """Within ONE project, a job pinned (polling_metadata['runner_target_id']) to
     runner A must NOT be claimable by a different runner B — even a second poll by
@@ -1528,6 +1617,8 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
     await db_session.commit()
     await db_session.refresh(task)
 
+    predecessor_id = uuid.uuid4()
+
     job = ComputeJob(
         project_id=project.id,
         task_id=task.id,
@@ -1535,7 +1626,13 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
         status=ComputeJobStatus.RUNNING,
         machine_type="e2-standard-2",
         spend_cap_usd=1.0,
-        polling_metadata={"command": "python train.py", "env": {}, "runtime_deadline_seconds": 300, "runner_target_id": str(runner.id)},
+        polling_metadata={
+            "command": "python train.py",
+            "env": {},
+            "runtime_deadline_seconds": 300,
+            "runner_target_id": str(runner.id),
+            "input_artifact_job_id": str(predecessor_id),
+        },
     )
     db_session.add(job)
     await db_session.commit()
@@ -1548,6 +1645,16 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
             "exit_code": 0,
             "result_metrics": {"accuracy": 0.99, "loss": 0.01},
             "command_log": {"text": "Training complete", "truncated": False},
+            "progress": {
+                "records": [{"metric": "accuracy", "value": 0.99, "step": 1}],
+                "count": 1,
+            },
+            "resume_hydration": {
+                "resumed_from_job_id": str(predecessor_id),
+                "ok": True,
+                "file_count": 2,
+                "bytes": 64,
+            },
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -1567,6 +1674,43 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
         "source": "runner",
     }
     assert meta.get("runner_finished_at") is not None
+    assert "runner_terminal_reason" not in meta
+    assert "artifact_delivery" not in meta
+
+    # A same-outcome replay may enrich fields the first terminal report omitted.
+    enrichment = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "succeeded",
+            "terminal_reason": "command completed",
+            "artifact_delivery": {
+                "status": "delivered",
+                "protocol": "direct",
+                "command_exec_status": "succeeded",
+                "verified": True,
+                "file_count": 2,
+                "total_bytes": 64,
+                "archive_size": 80,
+                "crc32c": "AAAAAA==",
+                "generation": "7",
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert enrichment.status_code == 200
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    assert meta.get("runner_terminal_reason") == "command completed"
+
+    immutable_terminal_fields = {
+        key: json.loads(json.dumps(meta[key]))
+        for key in (
+            "runner_command_log",
+            "progress",
+            "resume_provenance",
+            "artifact_delivery",
+        )
+    }
 
     # poll_status must now return SUCCEEDED so the monitor can finalize.
     backend = RunnerSubprocessBackend()
@@ -1577,6 +1721,91 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
     # message must be non-null so terminal_reason does not fall back to the
     # stale initial "queued for compute-job launch" status_message.
     assert status_result.message == "compute job succeeded"
+
+    # A same-outcome replay may fill fields omitted by the first terminal report,
+    # but it cannot replace already-recorded execution evidence with conflicts.
+    finished_at = meta["runner_finished_at"]
+    replay = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "succeeded",
+            "exit_code": 17,
+            "result_metrics": {"accuracy": 0.2},
+            "command_log": {"text": "conflicting terminal log", "truncated": True},
+            "terminal_reason": "conflicting reason",
+            "progress": {
+                "records": [{"metric": "accuracy", "value": 0.2, "step": 2}],
+                "count": 2,
+            },
+            "resume_hydration": {
+                "resumed_from_job_id": str(predecessor_id),
+                "ok": False,
+                "file_count": 0,
+                "bytes": 0,
+                "reason": "conflicting replay",
+            },
+            "artifact_delivery": {
+                "status": "failed",
+                "protocol": "legacy",
+                "command_exec_status": "failed",
+                "reason": "conflicting replay",
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert replay.status_code == 200
+
+    # An opposite terminal outcome is wholly conflicting and cannot enrich even
+    # a missing terminal field.
+    conflict = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "failed",
+            "exit_code": 1,
+            "result_metrics": {"accuracy": 0.0},
+            "command_log": {"text": "opposite outcome", "truncated": False},
+            "terminal_reason": "opposite outcome",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert conflict.status_code == 200
+
+    # The runner's heartbeat thread may have prepared a ``running`` report
+    # before the command thread sent its terminal outcome. Receiving that stale
+    # heartbeat after success must not mutate live/progress evidence either.
+    stale = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "running",
+            "exit_code": 99,
+            "result_metrics": {"accuracy": 0.1},
+            "command_log": {"text": "stale live tail", "truncated": False},
+            "progress": {
+                "records": [{"metric": "accuracy", "value": 0.1, "step": 3}],
+                "count": 3,
+            },
+            "viewable_omissions": {"size_cap": 9},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert stale.status_code == 200
+
+    await db_session.refresh(job)
+    latched_meta = job.polling_metadata or {}
+    assert latched_meta["runner_exec_status"] == "succeeded"
+    assert latched_meta["runner_exit_code"] == 0
+    assert latched_meta["runner_result_metrics"] == {
+        "accuracy": 0.99,
+        "loss": 0.01,
+    }
+    assert latched_meta["runner_finished_at"] == finished_at
+    assert latched_meta["runner_terminal_reason"] == "command completed"
+    for key, original_value in immutable_terminal_fields.items():
+        assert latched_meta[key] == original_value
+    assert "live_output" not in latched_meta
+    assert "viewable_live_omissions" not in latched_meta
+    latched_status = await backend.poll_status(job)
+    assert latched_status.status == ComputeJobStatus.SUCCEEDED
 
 
 @pytest.mark.asyncio

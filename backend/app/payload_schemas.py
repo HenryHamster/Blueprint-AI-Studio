@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import uuid
 from typing import Any, Literal
@@ -1076,6 +1077,8 @@ class ComputeSuccessCriterion(BaseModel):
 
     @model_validator(mode="after")
     def _check_kind_fields(self) -> ComputeSuccessCriterion:
+        if self.threshold is not None and not math.isfinite(self.threshold):
+            raise ValueError("threshold must be finite")
         if self.kind == "metric":
             if not isinstance(self.metric, str) or not self.metric.strip():
                 raise ValueError("metric is required and non-empty when kind='metric'")

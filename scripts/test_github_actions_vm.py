@@ -100,6 +100,7 @@ class AssetSecurityTests(unittest.TestCase):
     def test_actions_vm_deployment_assets_use_lf(self):
         deployment_assets = [
             Path(__file__).parent / "install-github-actions-vm.sh",
+            Path(__file__).parent / "blueprint-actions-vm.service",
             *ASSET_DIR.glob("*.sh"),
             *ASSET_DIR.glob("*.service"),
             *ASSET_DIR.glob("*.timer"),
@@ -107,6 +108,431 @@ class AssetSecurityTests(unittest.TestCase):
         self.assertTrue(deployment_assets)
         for asset in deployment_assets:
             self.assertNotIn(b"\r", asset.read_bytes(), asset)
+
+    def test_host_control_is_persisted_but_not_started_by_install(self):
+        scripts = Path(__file__).parent
+        installer = (scripts / "install-github-actions-vm.sh").read_text(
+            encoding="utf-8"
+        )
+        unit = (scripts / "blueprint-actions-vm.service").read_text(encoding="utf-8")
+
+        install_control = installer.split("install_control() {", 1)[1].split(
+            "guest_status() {", 1
+        )[0]
+        self.assertIn("verify_prestart", install_control)
+        self.assertIn("validate_ssh_key_files", install_control)
+        self.assertIn("chmod 0600", install_control)
+        self.assertIn("systemctl --user daemon-reload", install_control)
+        self.assertIn(
+            "systemctl --user enable blueprint-actions-vm.service", install_control
+        )
+        self.assertNotRegex(
+            install_control,
+            r"(?m)^\s*systemctl --user (?:start|restart|enable --now)",
+        )
+
+        self.assertIn(
+            "EnvironmentFile=%h/.blueprint/github-actions-vm-control.env", unit
+        )
+        self.assertIn("${BLUEPRINT_ACTIONS_VM_LAUNCHER} recover", unit)
+        self.assertIn("${BLUEPRINT_ACTIONS_VM_LAUNCHER} stop", unit)
+        self.assertIn("RemainAfterExit=yes", unit)
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn("WantedBy=default.target", unit)
+
+    @staticmethod
+    def _host_control_harness(
+        temporary: str, *, firewall_status: str, qemu_status: str
+    ) -> tuple[dict[str, str], Path, Path, Path]:
+        root = Path(temporary)
+        state_root = root / "canonical-state"
+        mock_bin = root / "bin"
+        docker_state = root / "docker-state"
+        docker_log = root / "docker.log"
+        systemctl_log = root / "systemctl.log"
+        for path in (state_root, mock_bin, docker_state, root / ".ssh"):
+            path.mkdir(parents=True, exist_ok=True)
+        state_root.chmod(0o700)
+
+        for name in (
+            "overlay.qcow2",
+            "seed.img",
+            "ubuntu-24.04-amd64.img",
+            "known_hosts",
+        ):
+            path = state_root / name
+            path.write_bytes(b"test\n")
+            path.chmod(0o600)
+        (state_root / "host-image-id").write_text("sha256:test\n", encoding="utf-8")
+        (state_root / "host-image-id").chmod(0o600)
+
+        public_key = root / ".ssh" / "blueprint-actions-vm.pub"
+        private_key = root / ".ssh" / "blueprint-actions-vm"
+        public_key.write_text("ssh-ed25519 AAAA test\n", encoding="utf-8")
+        private_key.write_text("test-private-key\n", encoding="utf-8")
+        public_key.chmod(0o644)
+        private_key.chmod(0o600)
+
+        (docker_state / "blueprint-actions-vm-net").write_text(
+            firewall_status + "\n", encoding="utf-8"
+        )
+        (docker_state / "blueprint-actions-vm").write_text(
+            qemu_status + "\n", encoding="utf-8"
+        )
+        docker = mock_bin / "docker"
+        docker.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env bash
+                set -euo pipefail
+                printf '%s\n' "$*" >> "$BLUEPRINT_TEST_DOCKER_LOG"
+                if [[ "${BLUEPRINT_TEST_DOCKER_UNAVAILABLE:-0}" == 1 ]] \
+                    && { [[ "${1:-}" == inspect ]] \
+                      || [[ "${1:-} ${2:-}" == "container ls" ]]; }; then
+                  exit 125
+                fi
+                state_of() {
+                  local path="$BLUEPRINT_TEST_DOCKER_STATE/$1"
+                  if [[ -f "$path" ]]; then cat "$path"; else printf 'absent\n'; fi
+                }
+                set_state() {
+                  printf '%s\n' "$2" > "$BLUEPRINT_TEST_DOCKER_STATE/$1"
+                }
+                case "${1:-}" in
+                  image)
+                    [[ "${2:-}" == inspect ]] || exit 2
+                    printf 'sha256:test\n'
+                    ;;
+                  container)
+                    case "${2:-}" in
+                      inspect)
+                        name="${@: -1}"
+                        [[ "$(state_of "$name")" != absent ]]
+                        ;;
+                      ls)
+                        for path in "$BLUEPRINT_TEST_DOCKER_STATE"/*; do
+                          [[ -f "$path" ]] || continue
+                          name="$(basename -- "$path")"
+                          [[ "$(state_of "$name")" == absent ]] || printf '%s\n' "$name"
+                        done
+                        ;;
+                      *) exit 2 ;;
+                    esac
+                    ;;
+                  inspect)
+                    name="${@: -1}"
+                    state="$(state_of "$name")"
+                    [[ "$state" != absent ]] || exit 1
+                    if [[ "$*" == *'.State.Running'* ]]; then
+                      [[ "$state" == running ]] && printf 'true\n' || printf 'false\n'
+                    else
+                      printf '%s\n' "$state"
+                    fi
+                    ;;
+                  run)
+                    name=''
+                    previous=''
+                    for argument in "$@"; do
+                      if [[ "$previous" == --name ]]; then name="$argument"; break; fi
+                      previous="$argument"
+                    done
+                    [[ -n "$name" ]] || exit 2
+                    set_state "$name" running
+                    printf '%s-id\n' "$name"
+                    ;;
+                  exec)
+                    exit 0
+                    ;;
+                  stop)
+                    name="${@: -1}"
+                    set_state "$name" exited
+                    printf '%s\n' "$name"
+                    ;;
+                  rm)
+                    name="${@: -1}"
+                    set_state "$name" absent
+                    printf '%s\n' "$name"
+                    ;;
+                  *) exit 2 ;;
+                esac
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        docker.chmod(0o755)
+
+        systemctl = mock_bin / "systemctl"
+        systemctl.write_text(
+            '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "$BLUEPRINT_TEST_SYSTEMCTL_LOG"\n',
+            encoding="utf-8",
+        )
+        systemctl.chmod(0o755)
+        loginctl = mock_bin / "loginctl"
+        loginctl.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env bash
+                [[ "${1:-}" == show-user ]] || exit 2
+                [[ "${BLUEPRINT_TEST_LINGER_STATE:-yes}" != unavailable ]] || exit 1
+                printf '%s\n' "${BLUEPRINT_TEST_LINGER_STATE:-yes}"
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        loginctl.chmod(0o755)
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HOME": str(root),
+                "PATH": f"{mock_bin}:{environment['PATH']}",
+                "BLUEPRINT_ACTIONS_VM_STATE": str(state_root),
+                "BLUEPRINT_ACTIONS_VM_SSH_KEY": str(public_key),
+                "BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY": str(private_key),
+                "BLUEPRINT_ACTIONS_VM_KVM_DEVICE": "/dev/null",
+                "BLUEPRINT_TEST_DOCKER_STATE": str(docker_state),
+                "BLUEPRINT_TEST_DOCKER_LOG": str(docker_log),
+                "BLUEPRINT_TEST_SYSTEMCTL_LOG": str(systemctl_log),
+            }
+        )
+        return environment, docker_log, systemctl_log, state_root
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX file modes and Bash")
+    def test_recover_reuses_running_pair_and_recreates_only_stopped_guest(self):
+        installer = Path(__file__).parent / "install-github-actions-vm.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, docker_log, _systemctl_log, state_root = (
+                self._host_control_harness(
+                    temporary, firewall_status="running", qemu_status="running"
+                )
+            )
+            result = subprocess.run(
+                ["bash", str(installer), "recover"],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("already running", result.stdout)
+            mutations = [
+                line
+                for line in docker_log.read_text(encoding="utf-8").splitlines()
+                if line.startswith(("run ", "stop ", "rm "))
+            ]
+            self.assertEqual(mutations, [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, docker_log, _systemctl_log, state_root = (
+                self._host_control_harness(
+                    temporary, firewall_status="running", qemu_status="exited"
+                )
+            )
+            result = subprocess.run(
+                ["bash", str(installer), "recover"],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = docker_log.read_text(encoding="utf-8")
+            self.assertIn("rm blueprint-actions-vm", calls)
+            self.assertIn("stop --timeout 10 blueprint-actions-vm-net", calls)
+            self.assertIn("rm blueprint-actions-vm-net", calls)
+            self.assertIn(f"src={state_root / 'overlay.qcow2'}", calls)
+            self.assertIn(f"src={state_root / 'seed.img'}", calls)
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX file modes and Bash")
+    def test_recover_and_stop_fail_closed_on_ambiguous_container_state(self):
+        installer = Path(__file__).parent / "install-github-actions-vm.sh"
+        for command, firewall_status, qemu_status in (
+            ("recover", "exited", "running"),
+            ("recover", "running", "paused"),
+            ("stop", "running", "restarting"),
+            ("stop", "paused", "running"),
+        ):
+            with tempfile.TemporaryDirectory() as temporary:
+                environment, docker_log, _systemctl_log, _state_root = (
+                    self._host_control_harness(
+                        temporary,
+                        firewall_status=firewall_status,
+                        qemu_status=qemu_status,
+                    )
+                )
+                result = subprocess.run(
+                    ["bash", str(installer), command],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("refusing", result.stderr)
+                calls = docker_log.read_text(encoding="utf-8")
+                self.assertNotRegex(calls, r"(?m)^(run|stop|rm) ")
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX file modes and Bash")
+    def test_recover_and_stop_fail_closed_when_docker_state_probe_is_unavailable(self):
+        installer = Path(__file__).parent / "install-github-actions-vm.sh"
+        for command in ("recover", "stop"):
+            with tempfile.TemporaryDirectory() as temporary:
+                environment, docker_log, _systemctl_log, _state_root = (
+                    self._host_control_harness(
+                        temporary, firewall_status="running", qemu_status="running"
+                    )
+                )
+                environment["BLUEPRINT_TEST_DOCKER_UNAVAILABLE"] = "1"
+                result = subprocess.run(
+                    ["bash", str(installer), command],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unable to list containers", result.stderr)
+                calls = docker_log.read_text(encoding="utf-8")
+                self.assertNotRegex(calls, r"(?m)^(run|stop|rm) ")
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX file modes and Bash")
+    def test_install_control_persists_exact_profile_without_starting(self):
+        installer = Path(__file__).parent / "install-github-actions-vm.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, docker_log, systemctl_log, state_root = (
+                self._host_control_harness(
+                    temporary, firewall_status="absent", qemu_status="absent"
+                )
+            )
+            environment["BLUEPRINT_TEST_LINGER_STATE"] = "yes"
+            result = subprocess.run(
+                ["bash", str(installer), "install-control"],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            control_env = (
+                Path(temporary) / ".blueprint" / "github-actions-vm-control.env"
+            )
+            control_unit = (
+                Path(temporary)
+                / ".config"
+                / "systemd"
+                / "user"
+                / "blueprint-actions-vm.service"
+            )
+            self.assertEqual(stat.S_IMODE(control_env.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(control_unit.stat().st_mode), 0o644)
+            profile = control_env.read_text(encoding="utf-8")
+            self.assertIn(f"BLUEPRINT_ACTIONS_VM_STATE={state_root}\n", profile)
+            self.assertIn(
+                f"BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY={temporary}/.ssh/blueprint-actions-vm\n",
+                profile,
+            )
+            systemctl_calls = systemctl_log.read_text(encoding="utf-8")
+            self.assertIn("--user daemon-reload", systemctl_calls)
+            self.assertIn("--user enable blueprint-actions-vm.service", systemctl_calls)
+            self.assertNotIn("--now", systemctl_calls)
+            self.assertNotIn(" start ", f" {systemctl_calls} ")
+            docker_calls = docker_log.read_text(encoding="utf-8")
+            self.assertNotRegex(docker_calls, r"(?m)^(run|stop|rm) ")
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX file modes and Bash")
+    def test_install_control_accepts_numeric_uid_without_passwd_entry(self):
+        installer = Path(__file__).parent / "install-github-actions-vm.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, docker_log, _systemctl_log, _state_root = (
+                self._host_control_harness(
+                    temporary, firewall_status="absent", qemu_status="absent"
+                )
+            )
+            numeric_id = Path(temporary) / "bin" / "id"
+            numeric_id.write_text(
+                textwrap.dedent(
+                    """
+                    #!/usr/bin/env bash
+                    case "${1:-}" in
+                      -u) printf '995\n' ;;
+                      -un) exit 1 ;;
+                      *) exec /usr/bin/id "$@" ;;
+                    esac
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            numeric_id.chmod(0o755)
+            environment["BLUEPRINT_TEST_LINGER_STATE"] = "yes"
+
+            result = subprocess.run(
+                ["bash", str(installer), "install-control"],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            docker_calls = docker_log.read_text(encoding="utf-8")
+            self.assertNotRegex(docker_calls, r"(?m)^(run|stop|rm) ")
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX file modes and Bash")
+    def test_install_control_requires_verified_user_lingering(self):
+        installer = Path(__file__).parent / "install-github-actions-vm.sh"
+        for linger_state, expected_error in (
+            ("no", "systemd user lingering is no"),
+            ("unavailable", "unable to verify systemd user lingering"),
+        ):
+            with tempfile.TemporaryDirectory() as temporary:
+                environment, docker_log, systemctl_log, _state_root = (
+                    self._host_control_harness(
+                        temporary, firewall_status="absent", qemu_status="absent"
+                    )
+                )
+                environment["BLUEPRINT_TEST_LINGER_STATE"] = linger_state
+                result = subprocess.run(
+                    ["bash", str(installer), "install-control"],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertIn("sudo loginctl enable-linger", result.stderr)
+                self.assertFalse(systemctl_log.exists())
+                docker_calls = docker_log.read_text(encoding="utf-8")
+                self.assertNotRegex(docker_calls, r"(?m)^(run|stop|rm) ")
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX symlink semantics and Bash")
+    def test_install_control_rejects_symlinked_profile_destination(self):
+        installer = Path(__file__).parent / "install-github-actions-vm.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, docker_log, systemctl_log, _state_root = (
+                self._host_control_harness(
+                    temporary, firewall_status="absent", qemu_status="absent"
+                )
+            )
+            profile_dir = Path(temporary) / ".blueprint"
+            profile_dir.mkdir(exist_ok=True)
+            external = Path(temporary) / "external.env"
+            external.write_text("unchanged\n", encoding="utf-8")
+            (profile_dir / "github-actions-vm-control.env").symlink_to(external)
+
+            result = subprocess.run(
+                ["bash", str(installer), "install-control"],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("refusing symlinked control environment file", result.stderr)
+            self.assertEqual(external.read_text(encoding="utf-8"), "unchanged\n")
+            self.assertFalse(systemctl_log.exists())
+            docker_calls = docker_log.read_text(encoding="utf-8")
+            self.assertNotRegex(docker_calls, r"(?m)^(run|stop|rm) ")
 
     def _volume_gc_harness(self, temporary: str, *, freezer_state: str) -> tuple[dict[str, str], Path, Path]:
         root = Path(temporary)

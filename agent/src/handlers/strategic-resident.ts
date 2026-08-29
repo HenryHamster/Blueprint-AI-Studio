@@ -1713,17 +1713,25 @@ export async function handleStrategicResident(
     let turnContent: string | ContentBlock[] = typeof content === 'string'
       ? `${repoPrefix}${content}`
       : [{ type: 'text', text: repoPrefix }, ...content];
-    if (pendingRestartCheckpoint !== null) {
+    // A private Workday turn carries its own canonical, receipt-bound context
+    // frame. Mixing the ordinary session checkpoint into that frame can turn a
+    // bounded consultation into a broad autonomous recovery run. Preserve the
+    // checkpoint for the next ordinary turn instead.
+    if (!privateTurn && pendingRestartCheckpoint !== null) {
       const checkpointPrefix = `${pendingRestartCheckpoint}\n\n---\n\n`;
       turnContent = typeof content === 'string'
         ? `${checkpointPrefix}${content}`
         : [{ type: 'text', text: checkpointPrefix }, ...content];
       pendingRestartCheckpoint = null;
     }
+    // Private turns are self-contained and must not consume the general
+    // session bootstrap. The first ordinary operator/autonomous turn still
+    // receives it, even when one or more private turns ran first.
+    const includeBootstrap = !privateTurn && !firstTurnSent;
     const full: string | ContentBlock[] = typeof turnContent === 'string'
-      ? (firstTurnSent ? turnContent : `${bootstrapPrompt}\n\n---\n\n${turnContent}`)
-      : (firstTurnSent ? turnContent : [{ type: 'text', text: `${bootstrapPrompt}\n\n---\n\n` }, ...turnContent]);
-    firstTurnSent = true;
+      ? (includeBootstrap ? `${bootstrapPrompt}\n\n---\n\n${turnContent}` : turnContent)
+      : (includeBootstrap ? [{ type: 'text', text: `${bootstrapPrompt}\n\n---\n\n` }, ...turnContent] : turnContent);
+    if (includeBootstrap) firstTurnSent = true;
     if (!privateTurn) {
       statusRef.value = operator ? 'Responding to operator...' : 'Advancing project (autonomous)...';
     }

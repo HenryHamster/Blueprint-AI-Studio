@@ -502,11 +502,45 @@ def test_validate_contract_accepts_without_smoke_when_require_smoke_false():
         ({"command": "run", "spend_cap_usd": 0, "deadline_seconds": 60}, "spend_cap"),
         ({"command": "run", "spend_cap_usd": -2, "deadline_seconds": 60}, "spend_cap"),
         ({"command": "run", "spend_cap_usd": "x", "deadline_seconds": 60}, "spend_cap"),
+        (
+            {"command": "run", "spend_cap_usd": float("nan"), "deadline_seconds": 60},
+            "spend_cap",
+        ),
+        (
+            {"command": "run", "spend_cap_usd": float("inf"), "deadline_seconds": 60},
+            "spend_cap",
+        ),
         ({"command": "run", "spend_cap_usd": 1.0, "deadline_seconds": 0}, "deadline"),
         ({"command": "run", "spend_cap_usd": 1.0, "deadline_seconds": -5}, "deadline"),
         (
+            {"command": "run", "spend_cap_usd": 1.0, "deadline_seconds": float("nan")},
+            "deadline",
+        ),
+        (
+            {"command": "run", "spend_cap_usd": 1.0, "deadline_seconds": float("inf")},
+            "deadline",
+        ),
+        (
             {"command": "run", "spend_cap_usd": 1.0, "deadline_seconds": None},
             "deadline",
+        ),
+        (
+            {
+                "command": "run",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 60,
+                "no_progress_timeout_seconds": float("nan"),
+            },
+            "no_progress_timeout_seconds",
+        ),
+        (
+            {
+                "command": "run",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 60,
+                "no_progress_timeout_seconds": float("inf"),
+            },
+            "no_progress_timeout_seconds",
         ),
     ],
 )
@@ -516,6 +550,23 @@ def test_validate_contract_rejects_malformed(contract, needle):
     ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
     assert ok is False
     assert needle in reason
+
+
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["success_criterion", "success_criteria"])
+def test_validate_contract_rejects_nonfinite_criterion_threshold(field, threshold):
+    criterion = {"metric": "score", "operator": ">=", "threshold": threshold}
+    contract = {
+        "command": "run",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 60,
+        field: criterion if field == "success_criterion" else [criterion],
+    }
+
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+
+    assert ok is False
+    assert "threshold must be finite" in reason
 
 
 # --- runner_target (operator/agent runner pin) -----------------------------
@@ -2809,6 +2860,70 @@ def test_arms_contract_validation_missing_declared_metric():
     assert "declared_metric" in reason
 
 
+def test_arms_contract_rejects_simultaneous_command():
+    contract = {
+        "command": "python single.py",
+        "arms": [{"name": "a", "command": "python a.py"}],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+
+    assert ok is False
+    assert "mutually exclusive" in reason
+
+
+def test_arms_contract_normalize_validate_and_preview_are_idempotent():
+    from app.compute_experiment_contract import build_compute_contract_preview
+
+    contract = {
+        "arms": [
+            {"name": "a", "command": "python a.py"},
+            {"name": "b", "command": "python b.py"},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+
+    first_ok, first_reason = _validate_compute_launch_contract(
+        contract, require_smoke=False
+    )
+    assert first_ok is True, first_reason
+    normalized_command = contract["command"]
+
+    second_ok, second_reason = _validate_compute_launch_contract(
+        contract, require_smoke=False
+    )
+    assert second_ok is True, second_reason
+    assert contract["command"] == normalized_command
+
+    preview = build_compute_contract_preview(
+        contract,
+        runtime_config={"compute_experiment_spend_threshold_usd": 5.0},
+    )
+    assert preview["ok"] is True
+    assert preview["normalized_contract"]["command"] == normalized_command
+    assert preview["effective_launcher"] == normalized_command
+
+
+def test_declared_metric_length_matches_launch_api_cap():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "python run.py",
+            "declared_metric": "m" * 129,
+            "spend_cap_usd": 2.0,
+            "deadline_seconds": 600,
+        },
+        require_smoke=False,
+    )
+
+    assert ok is False
+    assert "at most 128" in reason
+
+
 def test_arms_contract_validation_empty_declared_metric():
     """declared_metric that is an empty string is rejected."""
     contract = {
@@ -3137,6 +3252,24 @@ def test_validate_contract_rejects_non_dict_container_registry_auth():
     ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
     assert ok is False
     assert "container_registry_auth" in reason
+
+
+def test_validate_contract_rejects_container_registry_auth_without_image():
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_registry_auth": {
+            "server": "registry.example.com",
+            "username": "runner",
+            "password": "secret",
+        },
+    }
+
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+
+    assert ok is False
+    assert reason == "container_registry_auth requires container_image"
 
 
 def test_validate_contract_rejects_non_string_field_in_container_registry_auth():

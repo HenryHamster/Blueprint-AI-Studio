@@ -13791,6 +13791,82 @@ class TestRunnerResumeFail_Closed:
         base.update(kwargs)
         return base
 
+    def test_repo_backed_job_without_token_fails_closed_before_checkout(self):
+        """A token-mint failure cannot silently run against an empty workspace."""
+        import threading
+        _runner_scripts_dir()
+        import local_runner
+        from unittest.mock import patch
+
+        reports = []
+
+        def fake_report(
+            orch_url,
+            token,
+            job_id,
+            *,
+            exec_status,
+            exit_code=None,
+            terminal_reason=None,
+            command_log=None,
+            **_kw,
+        ):
+            reports.append(
+                {
+                    "exec_status": exec_status,
+                    "exit_code": exit_code,
+                    "terminal_reason": terminal_reason,
+                    "command_log": command_log,
+                }
+            )
+            return False
+
+        job = self._make_job(
+            repo_clone={"owner": "acme", "repo": "private", "ref": "main"},
+            repo_token=None,
+        )
+        active = {"test-resume-001"}
+        with (
+            patch.object(local_runner, "_report_compute_job", fake_report),
+            patch.object(local_runner, "_clone_repo") as clone_repo,
+            patch.object(local_runner.tempfile, "mkdtemp") as mkdtemp,
+        ):
+            local_runner._run_compute_job(
+                job,
+                "https://api.example.com",
+                "tok",
+                active,
+                threading.Lock(),
+                capabilities=self._bwrap_caps(),
+            )
+
+        clone_repo.assert_not_called()
+        mkdtemp.assert_not_called()
+        assert reports == [
+            {
+                "exec_status": "failed",
+                "exit_code": local_runner.PROVISION_FAILURE_EXIT_CODE,
+                "terminal_reason": (
+                    local_runner.COMPUTE_REPO_AUTH_PROVISION_TERMINAL_REASON
+                ),
+                "command_log": {
+                    "text": "[runner] repository authentication unavailable for "
+                    "a repo-backed compute job; checkout and command never started",
+                    "truncated": False,
+                },
+            }
+        ]
+        from app.failure_classification import (
+            PROVISION_FAILURE,
+            classify_compute_terminal_reason,
+        )
+
+        assert (
+            classify_compute_terminal_reason(reports[0]["terminal_reason"], None)
+            == PROVISION_FAILURE
+        )
+        assert "test-resume-001" not in active
+
     def test_runner_resume_fails_closed_when_bundle_unavailable(self):
         """A missing predecessor bundle aborts the job — command never starts."""
         import threading
