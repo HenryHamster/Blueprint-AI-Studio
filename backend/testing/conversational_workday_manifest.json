@@ -37,13 +37,14 @@
         "test_stale_fast_claim_group_degrades_artifacts_without_losing_membership",
         "test_typed_fast_exact_completion_replay_rebroadcasts_canonical_message",
         "test_typed_workday_packet_and_continuation_routes_are_receipt_bound",
+        "test_restarted_resident_rebinds_pending_workday_packet_before_mutation",
         "test_workday_continuation_exact_replay_rebroadcasts_canonical_message",
         "test_fast_claim_retires_stale_private_result_and_delivers_next_continuation",
         "test_resident_final_fence_orders_equal_timestamps_deterministically",
         "test_resident_poll_rejects_query_identity_spoof",
         "test_stale_resident_poll_is_rejected_without_generation_query"
       ],
-      "test_count": 48
+      "test_count": 49
     },
     {
       "path": "backend/testing/test_strategic_fast_live_work.py",

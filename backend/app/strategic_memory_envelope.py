@@ -1320,6 +1320,99 @@ async def pin_fenced_context_envelope_for_packet(
     return envelope_transport(snapshot)
 
 
+async def rebind_fenced_context_envelope_for_worker(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    reference: Mapping[str, Any],
+    session_id: str,
+    claim_id: uuid.UUID,
+    worker_generation: int,
+    worker_incarnation: uuid.UUID,
+) -> StrategicEnvelopeTransport | None:
+    """Clone a live packet envelope onto the current Resident incarnation.
+
+    A durable private Workday packet can outlive the Fast process that created
+    it.  Its canonical bytes and Fast claim remain the immutable input fence,
+    but managed operations must be authorized by the *current* Resident
+    incarnation.  Reclaiming the packet therefore needs a new snapshot identity
+    with byte-identical content; otherwise the packet lease is current while
+    ``prepare_workday_consultation_operation_binding`` correctly rejects the
+    stale snapshot owner.
+
+    Privacy/authority validation and lock ordering stay delegated to the
+    packet-pin path.  Invalid, expired, or substituted references fail closed.
+    The original snapshot remains immutable for audit history.
+    """
+
+    if not session_id or worker_generation < 0:
+        return None
+    pinned = await pin_fenced_context_envelope_for_packet(
+        session,
+        project_id=project_id,
+        reference=reference,
+    )
+    if pinned is None:
+        return None
+    source = (
+        await session.execute(
+            select(StrategicContextEnvelopeSnapshot)
+            .where(
+                StrategicContextEnvelopeSnapshot.project_id == project_id,
+                StrategicContextEnvelopeSnapshot.snapshot_id == pinned.snapshot_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().first()
+    if (
+        source is None
+        or source.session_id != session_id
+        or source.claim_id != claim_id
+        or source.context_authority_generation
+        != pinned.context_authority_generation
+        or source.privacy_generation != pinned.privacy_generation
+        or source.canonical_sha256 != pinned.canonical_sha256
+        or canonical_sha256(source.canonical_envelope) != pinned.canonical_sha256
+    ):
+        return None
+    if (
+        source.worker_generation == worker_generation
+        and source.worker_incarnation == worker_incarnation
+    ):
+        return pinned
+
+    rebound = await store_context_envelope_snapshot(
+        session,
+        project_id=project_id,
+        session_id=session_id,
+        claim_id=claim_id,
+        worker_generation=worker_generation,
+        worker_incarnation=worker_incarnation,
+        input_revision=source.input_revision,
+        transcript_sequence=source.transcript_sequence,
+        ledger_revision=source.ledger_revision,
+        problem_model_revision=source.problem_model_revision,
+        decision_authority_revision=source.decision_authority_revision,
+        context_authority_generation=source.context_authority_generation,
+        privacy_generation=source.privacy_generation,
+        canonical_core=CanonicalEnvelopeCore(
+            canonical_envelope=source.canonical_envelope,
+            canonical_sha256=source.canonical_sha256,
+        ),
+        retrieval_trace={
+            "workday_worker_rebind": True,
+            "source_snapshot_id": str(source.snapshot_id),
+        },
+        expires_at=pinned.expires_at,
+    )
+    return await pin_fenced_context_envelope_for_packet(
+        session,
+        project_id=project_id,
+        reference=context_envelope_reference(rebound),
+    )
+
+
 __all__ = [
     "CanonicalEnvelopeCore",
     "ContextEnvelopeFenceError",
@@ -1343,5 +1436,6 @@ __all__ = [
     "MAX_PACKET_PINNED_ENVELOPE_TTL",
     "pin_fenced_context_envelope_for_packet",
     "purge_expired_context_envelope_snapshots",
+    "rebind_fenced_context_envelope_for_worker",
     "store_context_envelope_snapshot",
 ]

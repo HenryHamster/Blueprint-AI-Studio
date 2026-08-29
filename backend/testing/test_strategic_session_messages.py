@@ -1574,6 +1574,106 @@ async def test_post_ledger_fast_claim_and_workday_consultation_use_live_envelope
 
 
 @pytest.mark.asyncio
+async def test_restarted_resident_rebinds_pending_workday_packet_before_mutation(
+    client: AsyncClient, db_session
+):
+    """A packet created before provider restart remains safely writable after it."""
+
+    project, task = await _make_resident_poll_worker(db_session)
+    task.payloads = [{"type": "strategic_review", "typed_fast_enabled": True}]
+    flag_modified(task, "payloads")
+    db_session.add(task)
+    await db_session.commit()
+    first_incarnation = await _activate_typed_fast_worker(db_session, project, task)
+    inbound = await _add_typed_fast_input(db_session, project)
+    claim = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=_typed_fast_claim_payload(
+            task,
+            first_incarnation,
+            inbound.id,
+            client_claim_id=str(uuid.uuid4()),
+        ),
+    )
+    assert claim.status_code == 200, claim.text
+    original_snapshot_id = claim.json()["envelope"]["snapshot_id"]
+    completed = await client.post(
+        f"/api/agent/projects/{project.id}/conversation/turns/complete",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "worker_generation": 2,
+            "incarnation_id": first_incarnation,
+            "claim_id": claim.json()["claim_id"],
+            "owner": "fast",
+            "content": "I will verify the bounded state and follow up.",
+            "idempotency_key": "typed-workday-restart-initial-answer",
+            "envelope": claim.json()["envelope"],
+            "workday_request": {
+                "delivery_key": "restart-safe-consultation",
+                "question": "Persist the bounded correction.",
+            },
+        },
+    )
+    assert completed.status_code == 200, completed.text
+    packet_id = completed.json()["workday_packet"]["packet_id"]
+
+    # The provider process exits after creating the durable packet. A new
+    # incarnation of the same Resident task/session must own its private lease.
+    second_incarnation = await _activate_typed_fast_worker(db_session, project, task)
+    assert second_incarnation != first_incarnation
+    identity = {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "incarnation_id": second_incarnation,
+    }
+    packet_claim = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/claim-next",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**identity, "lease_seconds": 45},
+    )
+    assert packet_claim.status_code == 200, packet_claim.text
+    packet = packet_claim.json()["packet"]
+    assert packet["packet_id"] == packet_id
+    rebound_snapshot_id = packet["envelope"]["snapshot_id"]
+    assert rebound_snapshot_id != original_snapshot_id
+    assert packet["envelope"]["canonical_sha256"] == (
+        claim.json()["envelope"]["canonical_sha256"]
+    )
+    rebound = await db_session.get(
+        StrategicContextEnvelopeSnapshot,
+        uuid.UUID(rebound_snapshot_id),
+    )
+    assert rebound is not None
+    assert str(rebound.worker_incarnation) == second_incarnation
+    assert str(rebound.claim_id) == claim.json()["claim_id"]
+
+    problem_model_write = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": second_incarnation,
+            "op": "set_problem_model",
+            "data": {
+                "intent": {
+                    "purpose": "Keep durable Workday operations restart-safe.",
+                    "current_focus": "The recovered private packet can write.",
+                },
+                "capabilities": [],
+                "gaps": [],
+            },
+            "packet_id": packet_id,
+            "workday_claim_id": packet["workday_claim_id"],
+            "workday_operation_id": str(uuid.uuid4()),
+        },
+    )
+    assert problem_model_write.status_code == 200, problem_model_write.text
+
+
+@pytest.mark.asyncio
 async def test_fast_claim_retires_stale_private_result_and_delivers_next_continuation(
     client: AsyncClient, db_session
 ):
