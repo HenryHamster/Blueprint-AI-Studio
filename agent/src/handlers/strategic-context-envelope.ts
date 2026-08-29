@@ -251,8 +251,12 @@ export function buildPrivateWorkdayContextFrame(
     buildCanonicalResidentContextFrame(verified, afterTranscriptSequence),
     '',
     '## Private Workday role',
-    'Use repository, shell, browser, infrastructure, and Blueprint tools as needed to investigate the private question.',
-    'For requested managed-project execution, inspect existing directions and tasks first, then delegate through supported Blueprint task tooling only when needed. Report exact direction/task/watch ids and current states, or the exact blocker; do not pretend the foreground strategist made the change.',
+    'Treat the private question as the complete assignment and prioritize it over generic exploration.',
+    'When the question explicitly requests a supported direct strategic operation, execute that operation in this Workday turn before any broader investigation. Do not delegate it, inspect unrelated repository, direction, or task state, return a plan, or wait for another turn.',
+    'For a requested direct mutation, use only the minimum bounded sequence: read the live operation schema if it is unfamiliar, fetch the canonical target and required precondition, apply the exact requested mutation through ./strategic, then fetch the same canonical target for readback. Preserve unrelated fields and use the question\'s exact evidence, revision, and idempotency constraints. Attempt the mutation early enough to finish this sequence inside the current turn.',
+    'After an exact successful mutation receipt and matching canonical readback, return those exact identifiers and revisions immediately. On refusal, applied=false, missing receipt, mismatched readback, or a real blocker, stop and report the exact result instead of spending the turn on more exploration.',
+    'When the question requests implementation, research, or other work that must run as a task, inspect existing directions and tasks, then delegate through supported Blueprint task tooling. Report exact direction/task/watch ids and current states, or the exact blocker; do not pretend the foreground strategist made the change.',
+    'For an investigatory question with no requested direct operation, use repository, shell, browser, infrastructure, and Blueprint tools as needed to answer it.',
     'Return an evidence-grounded internal summary; do not attempt a public reply.',
   ].join('\n');
 }

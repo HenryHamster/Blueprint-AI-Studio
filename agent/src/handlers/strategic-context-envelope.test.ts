@@ -131,6 +131,15 @@ describe('persisted Strategic context envelope', () => {
     expect(workday).toContain(canonical);
     expect(workday).toContain('## Private Workday role');
     expect(workday).toContain('repository, shell, browser, infrastructure, and Blueprint tools');
+    expect(workday).toContain('Treat the private question as the complete assignment');
+    expect(workday).toContain('execute that operation in this Workday turn before any broader investigation');
+    expect(workday).toContain('read the live operation schema if it is unfamiliar');
+    expect(workday).toContain('apply the exact requested mutation through ./strategic');
+    expect(workday).toContain('fetch the same canonical target for readback');
+    expect(workday).toContain('exact successful mutation receipt and matching canonical readback');
+    expect(workday).toContain('missing receipt, mismatched readback, or a real blocker');
+    expect(workday).toContain('implementation, research, or other work that must run as a task');
+    expect(workday).not.toContain('inspect existing directions and tasks first');
     expect(workday).not.toContain('## Foreground role');
     expect(workday).not.toContain('Do not use repository, shell, browser, or infrastructure tools.');
     expect(workday).not.toContain('request a Workday consultation');

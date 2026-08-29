@@ -3601,7 +3601,8 @@ export async function handleStrategicResident(
             text: [
               'This is a private, durable typed-Fast consultation.',
               'The native Resident reply capability has been revoked for this turn. Do not attempt a public reply.',
-              'Use Workday tools as needed to investigate the question. Record durable strategic state only when the evidence warrants it.',
+              'Follow the Private Workday role below. The private question is the complete assignment; do not substitute generic exploration for an explicitly requested supported direct strategic operation.',
+              'Record durable strategic state only when requested and the supplied or minimally fetched canonical evidence warrants it.',
               'request-qualification is unavailable in this receipt-bound private turn; report readiness, or dispatch and watch verification work for Fast to follow.',
               'Your plain final text is an internal summary; it is not a public reply.',
               '',
