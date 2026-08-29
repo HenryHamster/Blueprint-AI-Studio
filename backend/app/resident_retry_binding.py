@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
 
 from app.models import Project, Task, TaskStatus
-from app.time_utils import _utcnow
+from app.time_utils import _coerce_naive_utc, _utcnow
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,7 @@ async def restore_resident_retry_binding(
     if project is None:
         return False
     from app.strategic_resident_session import (
+        _parse_iso_naive,
         read_resident_session,
         resident_session_is_active,
     )
@@ -66,9 +67,32 @@ async def restore_resident_retry_binding(
     next_context["runner_target_id"] = runner_id
     next_context["preferred_runner_target_id"] = runner_id
     task.context = next_context
+    # A retry keeps the same durable session/generation but starts a new Agent
+    # process with a fresh random incarnation id.  Do not dispatch that process
+    # while the predecessor's Resident-wide incarnation lease is still live:
+    # the initial admission heartbeat would correctly lose the CAS, exit 0, and
+    # leave this attempt stranded IN_PROGRESS until the 25-minute orphan sweep.
+    #
+    # Preserve a longer provider/account hold when one already exists.  The
+    # Task-column deadline is part of the pinned-runner claim guard, so this
+    # closes the dispatch race without prematurely revoking an incarnation that
+    # may still be finishing its terminal callback.
+    incarnation_expires_at = _parse_iso_naive(
+        (blob or {}).get("worker_incarnation_expires_at")
+    )
+    now = _utcnow()
+    if incarnation_expires_at is not None and incarnation_expires_at > now:
+        existing_retry_after = task.retry_after_until
+        if existing_retry_after is not None:
+            existing_retry_after = _coerce_naive_utc(existing_retry_after)
+        if (
+            existing_retry_after is None
+            or existing_retry_after < incarnation_expires_at
+        ):
+            task.retry_after_until = incarnation_expires_at
     task.status = TaskStatus.PROVISIONING
     task.vm_instance_id = f"runner:{runner_id}"
-    task.vm_provisioned_at = _utcnow()
+    task.vm_provisioned_at = now
     return True
 
 

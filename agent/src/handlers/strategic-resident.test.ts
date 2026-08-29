@@ -4571,7 +4571,13 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       }
       lifecycle.push('consultation-start');
       expect(autonomousSettled).toBe(true);
-      expect(JSON.stringify(prompt)).toContain('private, durable typed-Fast consultation');
+      const promptText = JSON.stringify(prompt);
+      expect(promptText).toContain('private, durable typed-Fast consultation');
+      expect(promptText).toContain('complete assignment');
+      expect(promptText).toContain('execute that operation in this Workday turn');
+      expect(promptText).toContain('apply the exact requested mutation through ./strategic');
+      expect(promptText).toContain('matching canonical readback');
+      expect(promptText).not.toContain('inspect existing directions and tasks first');
       activeWorkdayTurns -= 1;
       return Promise.resolve(turnResult({
         sentOperatorMessage: false,
