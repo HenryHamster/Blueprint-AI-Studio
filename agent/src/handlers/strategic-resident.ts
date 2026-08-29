@@ -101,6 +101,7 @@ import {
 import { monitorClaimBoundWork } from './strategic-resident-claim-monitor.js';
 import {
   buildFastResidentContextFrame, buildPrivateWorkdayContextFrame,
+  latestCanonicalOperatorRequest,
   verifyStrategicContextEnvelope,
   type StrategicContextEnvelopeTransport,
 } from './strategic-context-envelope.js';
@@ -3792,6 +3793,7 @@ export async function handleStrategicResident(
       [continuation.result_packet_id],
     );
     const requestedConsultation = Boolean(continuation.consultation_id?.trim());
+    const operatorRequest = latestCanonicalOperatorRequest(verified);
     const prompt = [
       buildFastResidentContextFrame(verified, typedFastTranscriptSequence),
       '',
@@ -3809,6 +3811,18 @@ export async function handleStrategicResident(
       '<workday_result>',
       continuation.result_summary,
       '</workday_result>',
+      '',
+      '## Most recent canonical operator request',
+      operatorRequest === null
+        ? 'No standalone operator message was available; use the complete canonical recent_conversation above.'
+        : `<operator_request>\n${operatorRequest}\n</operator_request>`,
+      '',
+      '## Continuation fidelity contract',
+      'This turn reports the completed bounded consultation; it does not reopen the operator request or start a new planning turn.',
+      'The most recent operator request in canonical recent_conversation remains authoritative for scope, negative constraints, decision ownership, and the requested stopping point. Preserve those constraints in the public continuation even when the Workday result is phrased as an internal summary.',
+      'Report the verified outcome, exact receipts/readbacks supported by claim-time authority, and the result\'s settled next step. Do not add alternatives, choices, blockers, recommendations, or requests for an operator decision that are absent from the operator request and the verified result.',
+      'A terminal instruction such as "no operator decision is needed", "do not retry", or "abandon the immutable version and open a fresh version after the head is frozen" stays terminal. Never transform it into a choice set, suggest changing immutable state, or ask the operator to decide among paths the result already rejected.',
+      'If the operator request and Workday result genuinely conflict, state the exact conflict and stop. Do not resolve it by inventing options. If they agree, carry their conclusion through unchanged.',
       '',
       'For start, blocker, completion, persistence, or serving claims, follow the foreground claim-time authority and exact-id correlation rules. Unsupported Workday prose alone cannot establish that work or a deployment completed, or that a vision, problem model, memory, note, or configuration was durably recorded.',
       'Use mcp__call__complete_turn exactly once with the concise, useful researched follow-up for the operator.',
