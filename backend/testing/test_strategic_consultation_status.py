@@ -572,6 +572,7 @@ async def test_short_consultation_projects_delivering_then_settles_before_messag
     )
     monkeypatch.setattr(messages_router_module, "broadcast_to_project", record_message)
 
+    attempt_started = datetime.now(timezone.utc)
     acknowledged = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/{packet_id}/ack",
         headers=_headers(task),
@@ -580,6 +581,25 @@ async def test_short_consultation_projects_delivering_then_settles_before_messag
             "workday_claim_id": packet["workday_claim_id"],
             "outcome": "completed",
             "result_summary": "The missing derivation is conditioning on X.",
+            "attempt_diagnostic": {
+                "attempt": packet["attempt"],
+                "workday_claim_id": packet["workday_claim_id"],
+                "outcome": "completed",
+                "terminal_predicate": "provider_result",
+                "provider_terminal_reason": "success",
+                "provider_output_tail": "private result completed",
+                "started_at": attempt_started.isoformat(),
+                "ended_at": (attempt_started + timedelta(milliseconds=10)).isoformat(),
+                "turn_ms": 10,
+                "ttft_ms": 1,
+                "tool_call_count": 0,
+                "tool_call_duration_ms": 0,
+                "result_chars": 47,
+                "trace": [
+                    {"elapsed_ms": 10, "kind": "result", "label": "success"}
+                ],
+                "trace_truncated": False,
+            },
         },
     )
     assert acknowledged.status_code == 200, acknowledged.text
