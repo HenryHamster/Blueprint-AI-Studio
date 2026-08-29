@@ -5042,19 +5042,24 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     let capabilityRevokedAtTurnStart = false;
     let privateMarkerKindAtTurnStart = '';
     let framesAtPrivateTurnStart = 0;
-    const workday = makeSession(() => {
-      if (workday.sendTurn.mock.calls.length > 1) {
-        throw new Error('resident sendTurn called while a turn is already active');
+    const sentPrompts: string[] = [];
+    const workday = makeSession((prompt) => {
+      sentPrompts.push(typeof prompt === 'string' ? prompt : JSON.stringify(prompt));
+      if (sentPrompts.length === 1) {
+        capabilityRevokedAtTurnStart = privateReplyPaths.length === 3
+          && privateReplyPaths.every((artifactPath) => !fs.existsSync(artifactPath));
+        const marker = JSON.parse(fs.readFileSync(privateTurnMarkerPath, 'utf8')) as { kind?: string };
+        privateMarkerKindAtTurnStart = marker.kind ?? '';
+        framesAtPrivateTurnStart = mockSendWsFrame.mock.calls.length;
+        workday._emit({ kind: 'text', text: 'PRIVATE_WORKDAY_TEXT_MUST_NOT_STREAM' });
+        workday._emit({ kind: 'tool', toolName: 'private_tool', text: 'PRIVATE_TOOL_MUST_NOT_STREAM' });
+        workday._emit({ kind: 'error', text: 'PRIVATE_ERROR_MUST_NOT_STREAM' });
+        return privateTurn;
       }
-      capabilityRevokedAtTurnStart = privateReplyPaths.length === 3
-        && privateReplyPaths.every((artifactPath) => !fs.existsSync(artifactPath));
-      const marker = JSON.parse(fs.readFileSync(privateTurnMarkerPath, 'utf8')) as { kind?: string };
-      privateMarkerKindAtTurnStart = marker.kind ?? '';
-      framesAtPrivateTurnStart = mockSendWsFrame.mock.calls.length;
-      workday._emit({ kind: 'text', text: 'PRIVATE_WORKDAY_TEXT_MUST_NOT_STREAM' });
-      workday._emit({ kind: 'tool', toolName: 'private_tool', text: 'PRIVATE_TOOL_MUST_NOT_STREAM' });
-      workday._emit({ kind: 'error', text: 'PRIVATE_ERROR_MUST_NOT_STREAM' });
-      return privateTurn;
+      alive = false;
+      return Promise.resolve(turnResult({
+        resultText: 'Ordinary autonomous review complete.\nTICK-VERDICT: CLEAR — no correction needed',
+      }));
     }, () => alive);
     mockStartSession.mockImplementation((options: unknown) => {
       const env = (options as { env?: Record<string, string> }).env ?? {};
@@ -5081,6 +5086,9 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await vi.advanceTimersByTimeAsync(5_000);
 
     expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(sentPrompts[0]).toContain('private, durable typed-Fast consultation');
+    expect(sentPrompts[0]).toContain('Inspect the repository without blocking Fast.');
+    expect(sentPrompts[0]).not.toContain('# Resident session state —');
     expect(capabilityRevokedAtTurnStart).toBe(true);
     expect(privateMarkerKindAtTurnStart).toBe('typed-consultation');
     const framesDuringPrivateTurn = mockSendWsFrame.mock.calls
@@ -5096,11 +5104,195 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       expect.stringContaining('sendTurn called while a turn is already active'),
     );
 
-    alive = false;
     resolvePrivate(turnResult({ resultText: 'Private investigation complete.' }));
+    await vi.advanceTimersByTimeAsync(4_000);
+    await done;
+    expect(workday.sendTurn).toHaveBeenCalledTimes(2);
+    expect(sentPrompts[1]).toContain('# Resident session state — P');
+    expect(sentPrompts[1]).not.toContain('private, durable typed-Fast consultation');
+    expect(() => fs.lstatSync(privateTurnMarkerPath)).toThrow();
+  });
+
+  it('keeps a consultation-restart checkpoint out of the private retry and delivers it to the next ordinary turn', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'operator-after-private-restart',
+      content: 'Continue with the ordinary Workday conversation.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    const envelope = typedEnvelope('Retry the private consultation after renewal loss.', 91);
+    let consultationClaims = 0;
+    let renewCalls = 0;
+    let operatorDelivered = false;
+    const ackBodies: Array<Record<string, unknown> | undefined> = [];
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?')) return Promise.resolve(null);
+      if (ackBodies.length >= 2 && !operatorDelivered) {
+        operatorDelivered = true;
+        return Promise.resolve({
+          messages: [operatorMessage],
+          fast_message_ids: [],
+          claim_required: true,
+        });
+      }
+      return Promise.resolve({ messages: [], fast_message_ids: [], claim_required: true });
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+          conversation_claim_held: true,
+        });
+      }
+      if (url.endsWith('/messages/claim')) {
+        return Promise.resolve({
+          claim_id: 'claim-operator-after-private-restart',
+          incarnation_id: 'incarnation-operator-after-private-restart',
+          incarnation_supported: true,
+          message_ids: [operatorMessage.id],
+        });
+      }
+      if (url.endsWith('/workday-consultations/claim-next')) {
+        consultationClaims += 1;
+        if (consultationClaims > 2) return Promise.resolve({ status: 'empty' });
+        return Promise.resolve({
+          status: 'claimed',
+          packet: {
+            packet_id: 'packet-private-restart',
+            workday_claim_id: `workday-claim-private-restart-${consultationClaims}`,
+            lease_expires_at: '2035-01-01T00:00:00.000Z',
+            attempt: consultationClaims,
+            claim_id: 'fast-claim-private-restart',
+            delivery_key: 'delivery-private-restart',
+            continuation_key: 'continuation-private-restart',
+            question: 'Retry the exact bounded private operation.',
+            envelope,
+          },
+        });
+      }
+      if (url.endsWith('/workday-consultations/packet-private-restart/renew')) {
+        renewCalls += 1;
+        return Promise.resolve({
+          workday_claim_id: 'different-owner-after-renewal-loss',
+          lease_expires_at: '2035-01-01T00:00:00.000Z',
+        });
+      }
+      if (url.endsWith('/workday-consultations/packet-private-restart/ack')) {
+        ackBodies.push(body);
+        return Promise.resolve({ status: body?.outcome });
+      }
+      return Promise.resolve({});
+    });
+
+    const runtime = {
+      replyPaths: [] as string[],
+      markerPath: '',
+    };
+    vi.mocked(fs.existsSync).mockImplementation((candidate) => {
+      const candidatePath = String(candidate);
+      if (
+        !runtime.replyPaths.includes(candidatePath)
+        && candidatePath !== runtime.markerPath
+      ) return true;
+      try {
+        fs.lstatSync(candidatePath);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+
+    let firstAlive = true;
+    let resolveFirstPrivate!: (result: ResidentTurnResult) => void;
+    const firstPrivate = new Promise<ResidentTurnResult>((resolve) => {
+      resolveFirstPrivate = resolve;
+    });
+    const firstPrompts: string[] = [];
+    const firstSession = makeSession((prompt) => {
+      firstPrompts.push(typeof prompt === 'string' ? prompt : JSON.stringify(prompt));
+      return firstPrivate;
+    }, () => firstAlive);
+    firstSession.interrupt.mockImplementation(() => {
+      firstAlive = false;
+      resolveFirstPrivate(turnResult({
+        interrupted: true,
+        processGone: true,
+        resultText: '',
+      }));
+    });
+
+    let secondAlive = true;
+    const secondPrompts: string[] = [];
+    const secondSession = makeSession((prompt) => {
+      secondPrompts.push(typeof prompt === 'string' ? prompt : JSON.stringify(prompt));
+      if (secondPrompts.length === 1) {
+        return Promise.resolve(turnResult({
+          sentOperatorMessage: false,
+          resultText: 'Private retry completed.',
+        }));
+      }
+      secondAlive = false;
+      return Promise.resolve(turnResult({
+        resultText: 'Ordinary recovery review complete.\nTICK-VERDICT: CLEAR — no correction needed',
+      }));
+    }, () => secondAlive);
+
+    const sessions = [firstSession, secondSession];
+    mockStartSession.mockImplementation((options: unknown) => {
+      const env = (options as { env?: Record<string, string> }).env ?? {};
+      runtime.replyPaths = [
+        env.BLUEPRINT_RESIDENT_REPLY_KEY_PATH,
+        env.BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH,
+        env.BLUEPRINT_RESIDENT_STAGED_REPLY_PATH,
+      ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+      runtime.markerPath = env.BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH || '';
+      for (const artifactPath of runtime.replyPaths) {
+        fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+        fs.writeFileSync(artifactPath, 'stale-public-reply-capability');
+      }
+      const next = sessions.shift();
+      if (!next) throw new Error('unexpected third Workday session');
+      return next;
+    });
+
+    const done = run('typed-fast-private-restart-context-isolation', {
+      ...qualifiedPayload(),
+      typed_fast_enabled: false,
+      strategic_session_autonomous: true,
+      strategic_session_message_poll_seconds: 0.25,
+      strategic_session_exploration_interval_seconds: 1,
+    });
+
+    for (let i = 0; i < 20 && firstPrompts.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(250);
+    }
+    expect(firstPrompts).toHaveLength(1);
+    expect(firstPrompts[0]).toContain('Retry the exact bounded private operation.');
+    expect(firstPrompts[0]).not.toContain('# Resident session state —');
+    expect(firstPrompts[0]).not.toContain('# Session checkpoint — compaction restart');
+
+    await vi.advanceTimersByTimeAsync(16_000);
+    for (let i = 0; i < 40 && secondPrompts.length < 2; i += 1) {
+      await vi.advanceTimersByTimeAsync(250);
+    }
     await vi.advanceTimersByTimeAsync(2_000);
     await done;
-    expect(() => fs.lstatSync(privateTurnMarkerPath)).toThrow();
+
+    expect(renewCalls).toBe(1);
+    expect(firstSession.interrupt).toHaveBeenCalledTimes(1);
+    expect(firstSession.close).toHaveBeenCalledTimes(1);
+    expect(mockStartSession).toHaveBeenCalledTimes(2);
+    expect(secondPrompts).toHaveLength(2);
+    expect(secondPrompts[0]).toContain('Retry the exact bounded private operation.');
+    expect(secondPrompts[0]).not.toContain('# Resident session state —');
+    expect(secondPrompts[0]).not.toContain('# Session checkpoint — compaction restart');
+    expect(secondPrompts[1]).toContain('# Resident session state — P');
+    expect(secondPrompts[1]).toContain('# Session checkpoint — compaction restart');
+    expect(secondPrompts[1]).not.toContain('Retry the exact bounded private operation.');
+    expect(secondPrompts[1]).toContain('Continue with the ordinary Workday conversation.');
+    expect(ackBodies.map(body => body?.outcome)).toEqual(['abandoned', 'completed']);
   });
 
   const runOrdinaryWorkdayOverlapCase = async (

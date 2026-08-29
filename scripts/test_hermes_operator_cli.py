@@ -242,6 +242,7 @@ def test_coding_agent_scope_cannot_use_project_operator_write(monkeypatch, capsy
                         "title": "Add operator regression test",
                         "prompt": "Implement the bounded regression coverage",
                         "task_type": "create",
+                        "priority": 50,
                         "idempotency_key": "hermes-create-1",
                         "base_branch": "automain",
                         "require_deps_landed_on": "automain",
