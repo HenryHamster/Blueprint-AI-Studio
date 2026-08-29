@@ -324,6 +324,7 @@ describe('typed Fast active-input integrity', () => {
   it('keeps terminal operator constraints authoritative before a Workday consultation', async () => {
     const content = [
       'Read the canonical problem model and running update through one private Workday consultation.',
+      'Report their exact full SHA-256 digests and byte counts without abbreviation.',
       'No operator decision is needed. Do not propose alternatives, retries, or an immutable-version rewrite.',
       'Carry the settled abandon-before-qualification conclusion forward unchanged.',
     ].join(' ');
@@ -341,6 +342,8 @@ describe('typed Fast active-input integrity', () => {
     expect(rendered).toContain('No operator decision is needed. Do not propose alternatives');
     expect(rendered).toContain('Requesting a private Workday consultation does not relax these constraints.');
     expect(rendered).toContain('Never turn a settled terminal instruction into a menu of ways around it');
+    expect(rendered).toContain('Do not abbreviate, ellipsize, round, summarize, or replace a requested exact value in either public role.');
+    expect(rendered).toContain('Report their exact full SHA-256 digests and byte counts without abbreviation.');
     expect(rendered.split(content)).toHaveLength(2);
   });
 });
