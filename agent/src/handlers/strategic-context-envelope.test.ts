@@ -5,6 +5,7 @@ import {
   buildFastResidentContextFrame,
   buildPrivateWorkdayContextFrame,
   consultationBelongsToEnvelope,
+  latestCanonicalOperatorRequest,
   verifyStrategicContextEnvelope,
   type StrategicContextEnvelopeTransport,
 } from './strategic-context-envelope.js';
@@ -143,6 +144,35 @@ describe('persisted Strategic context envelope', () => {
     expect(workday).not.toContain('## Foreground role');
     expect(workday).not.toContain('Do not use repository, shell, browser, or infrastructure tools.');
     expect(workday).not.toContain('request a Workday consultation');
+  });
+
+  it('projects the latest canonical operator request without trusting transcript order', () => {
+    const persisted = transport();
+    const raw = JSON.parse(Buffer.from(
+      persisted.canonical_envelope_b64,
+      'base64',
+    ).toString('utf8')) as Record<string, unknown>;
+    raw.recent_conversation = [
+      { sequence: 82, from_type: 'strategic', content: 'A later system reply.' },
+      { sequence: 81, from_type: 'user', content: 'No operator decision is needed.' },
+      { sequence: 80, from_type: 'operator', content: 'Earlier operator context.' },
+    ];
+    raw.transcript_sequence = 82;
+    const bytes = Buffer.from(JSON.stringify(raw), 'utf8');
+    const verified = verifyStrategicContextEnvelope({
+      ...persisted,
+      canonical_envelope_b64: bytes.toString('base64'),
+      canonical_sha256: createHash('sha256').update(bytes).digest('hex'),
+      transcript_sequence: 82,
+    }, {
+      contextAuthorityGeneration: 4,
+      privacyGeneration: 2,
+      now: new Date('2030-01-01T00:00:00.000Z'),
+    });
+
+    expect(latestCanonicalOperatorRequest(verified)).toBe(
+      'No operator decision is needed.',
+    );
   });
 
   it('preserves the public Fast foreground frame', () => {
