@@ -7,6 +7,7 @@ Relocated from test_agent.py when the strategic fetch surface was extracted
 into its own router seam; behavior and contracts are unchanged.
 """
 
+import hashlib
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -968,6 +969,83 @@ async def test_agent_fetch_problem_model_both_spellings_return_same_body(
     assert (
         body_underscore["data"]["intent"]["purpose"] == "Image rollover compatibility"
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_running_update_returns_exact_body_digest_and_aliases(
+    client: AsyncClient, db_session
+):
+    """Both route spellings expose an exact, receipt-comparable readback."""
+    running_update = "## Current state\n\nFrozen head is `abc123`.\n"
+    project = Project(
+        name="Running Update Fetch Test",
+        user_id="test-user-running-update",
+        running_update=running_update,
+        running_update_acknowledged_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-running-update",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    headers = {"x-agent-token": token}
+    hyphen = await client.get(
+        f"/api/agent/projects/{project.id}/running-update", headers=headers
+    )
+    underscore = await client.get(
+        f"/api/agent/projects/{project.id}/running_update", headers=headers
+    )
+
+    assert hyphen.status_code == 200, hyphen.text
+    assert underscore.status_code == 200, underscore.text
+    assert hyphen.json() == underscore.json()
+    data = hyphen.json()["data"]
+    assert data["running_update"] == running_update
+    assert data["bytes"] == len(running_update.encode("utf-8"))
+    assert data["sha256"] == hashlib.sha256(running_update.encode("utf-8")).hexdigest()
+    assert data["acknowledged_at"] == "2026-08-29T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_running_update_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """A task token cannot read another project's operator-facing document."""
+    project_a = Project(name="Running Update A", user_id="test-user-running-update-a")
+    project_b = Project(
+        name="Running Update B",
+        user_id="test-user-running-update-b",
+        running_update="private project B state",
+    )
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(
+        project_id=project_a.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-running-update-a",
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), task_a.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/running-update",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
 
 
 # ---------------------------------------------------------------------------

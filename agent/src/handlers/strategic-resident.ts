@@ -5867,6 +5867,11 @@ export async function handleStrategicResident(
         handlePureFastMessagesDuringWorkday,
       );
       let r: ResidentTurnResult;
+      // A durable typed consultation must start in a provider subprocess that
+      // has never seen the autonomous turn it pre-empted.  Track whether the
+      // generic pre-emption recovery below already created that boundary so we
+      // neither reuse a surviving child nor restart a freshly replaced one.
+      let preemptionRestarted = false;
       if (watch.kind !== 'done') {
         session.interrupt();
         const settledBeforeDeadline = await Promise.race([
@@ -5877,10 +5882,10 @@ export async function handleStrategicResident(
           invalidateSessionEvents();
           session.close();
           const abandoned = await turnPromise;
-          if (
-            watch.kind !== 'stop'
-            && !restartSessionFromCheckpoint('operator preemption deadline')
-          ) break;
+          if (watch.kind !== 'stop') {
+            if (!restartSessionFromCheckpoint('operator preemption deadline')) break;
+            preemptionRestarted = true;
+          }
           r = { ...abandoned, processGone: false, interrupted: true };
         } else {
           r = await turnPromise;
@@ -5910,7 +5915,19 @@ export async function handleStrategicResident(
         // result was not a canonical provider failure (handled immediately
         // above). Queue the checkpoint into a fresh subprocess before replying.
         if (!restartSessionFromCheckpoint('operator preemption process exit')) break;
+        preemptionRestarted = true;
         r = { ...r, processGone: false, interrupted: true };
+      }
+      if (watch.kind === 'consultation' && !preemptionRestarted) {
+        // SIGINT is advisory: Claude Code can finish the in-flight autonomous
+        // turn while keeping its persistent stream-json child alive. Reusing
+        // that child for the receipt-bound consultation leaks autonomous
+        // history and prior tool results into a supposedly self-contained
+        // private assignment. Always replace a surviving child here. The
+        // checkpoint remains queued for the next *ordinary* turn; runTurn's
+        // private fence deliberately withholds it (and the bootstrap) from the
+        // consultation.
+        if (!restartSessionFromCheckpoint('typed consultation isolation boundary')) break;
       }
       if (turnWedgedSession(r)) break;
       if (r.processGone) { stopReason = 'session_process_exited'; break; }

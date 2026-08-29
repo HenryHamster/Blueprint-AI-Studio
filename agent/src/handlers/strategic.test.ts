@@ -1066,7 +1066,10 @@ describe('handleStrategic problem_model recovery framing', () => {
     const payload: Record<string, unknown> = {
       project_name: 'Blueprint',
       _packer_meta: {
-        dropped: [{ key: 'open_messages', reason: 'budget exhausted', bytes: 20480, fetch_verb: 'message' }],
+        dropped: [
+          { key: 'open_messages', reason: 'budget exhausted', bytes: 20480, fetch_verb: 'message' },
+          { key: 'running_update', reason: 'budget exhausted', bytes: 4096 },
+        ],
         trimmed: [{ key: 'directions_summary', kind: 'list_trimmed', shown: 5, total: 20, bytes_original: 10240, bytes_trimmed: 2048 }],
       },
     };
@@ -1076,6 +1079,8 @@ describe('handleStrategic problem_model recovery framing', () => {
     const section = String(capturedThinkerParams?.packerMetaSection);
     // Per-key hint for dropped open_messages → message verb (via fetch_verb field)
     expect(section).toContain('./fetch message');
+    // The live running-update document has a dedicated canonical readback path.
+    expect(section).toContain('./fetch running-update');
     // Per-key hint for trimmed directions_summary → direction verb (via PAYLOAD_KEY_FETCH_VERB)
     expect(section).toContain('./fetch direction');
     // Byte size info appears for both entries

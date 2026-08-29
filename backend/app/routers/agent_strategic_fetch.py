@@ -1645,6 +1645,37 @@ async def agent_fetch_problem_model(
     return {"status": "success", "data": project.problem_model or {}}
 
 
+@router.get("/projects/{project_id}/running_update")
+@router.get("/projects/{project_id}/running-update")
+@limiter.limit("60/minute")
+async def agent_fetch_running_update(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return the exact current running-update document and its digest.
+
+    Receipt-bound private Workday operations need a canonical precondition read
+    and same-target readback for ``set_running_update``.  The strategic payload
+    is only a launch snapshot and the generic section endpoint intentionally
+    refuses this high-value field, so neither is sufficient after a live write.
+    Keep both spellings during image rollover, matching the problem-model fetch
+    contract.  Cross-project access remains a deliberate 404.
+    """
+    project = await _resolve_agent_project(project_id, token, session)
+    running_update = project.running_update or ""
+    return {
+        "status": "success",
+        "data": {
+            "running_update": running_update,
+            "sha256": hashlib.sha256(running_update.encode("utf-8")).hexdigest(),
+            "bytes": len(running_update.encode("utf-8")),
+            "acknowledged_at": utc_iso(project.running_update_acknowledged_at),
+        },
+    }
+
+
 @router.get("/projects/{project_id}/messages/{ref}")
 @limiter.limit("60/minute")
 async def agent_fetch_message(
@@ -2757,6 +2788,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "open_messages": "message",
     "directions_summary": "direction",
     "problem_model": "problem-model",
+    "running_update": "running-update",
     "version_phase": "version-phase",
     # Medium/high — dedicated fetch verbs
     "design_doc": "section",
@@ -2779,7 +2811,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "previous_decision_outcomes": "sections",
     "outcome_evaluation": "sections",
     # High/medium exempt — ephemeral, bounded at build time, or tiny scalars
-    "prompt_suffix": None, "running_update": None,
+    "prompt_suffix": None,
     "running_update_acknowledged_at": None, "user_last_active_at": None,
     "first_autonomous_improvement_at": None,
     "operator_context_refs": None, "cycle_start_reconciliation": None,
