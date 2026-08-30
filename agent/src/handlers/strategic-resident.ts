@@ -1712,6 +1712,7 @@ export async function handleStrategicResident(
     repoSnapshot?: ResidentRepoSnapshot,
     privateTurn = false,
     directExecution = false,
+    stallTimeoutOverrideMs?: number,
   ): Promise<ResidentTurnResult> => {
     const repoPrefix = repoSnapshot
       ? `${formatResidentRepoSnapshot(repoSnapshot)}\n\n---\n\n`
@@ -1754,9 +1755,11 @@ export async function handleStrategicResident(
     } else {
       streamer.working();
     }
-    const stallTimeoutMs = operator
-      ? (directExecution ? cfg.autonomousTurnTimeoutMs : cfg.turnTimeoutMs)
-      : cfg.autonomousTurnTimeoutMs;
+    const stallTimeoutMs = stallTimeoutOverrideMs ?? (
+      operator
+        ? (directExecution ? cfg.autonomousTurnTimeoutMs : cfg.turnTimeoutMs)
+        : cfg.autonomousTurnTimeoutMs
+    );
     let residentInput: string | Array<Record<string, unknown>>;
     if (Array.isArray(full)) {
       const materialized = await materializeContentBlocks(full);
@@ -1839,7 +1842,23 @@ export async function handleStrategicResident(
       RESIDENT_PRIVATE_TURN_MARKER_PATH,
       privateTurnKind,
       residentProcessIncarnation,
-      () => runTurn(content, false, undefined, repoSnapshot, true),
+      () => runTurn(
+        content,
+        false,
+        undefined,
+        repoSnapshot,
+        true,
+        false,
+        // Typed consultation inactivity is owned by
+        // awaitTypedConsultationTurn(), which renews the exact server claim
+        // before settling it. Keep ResidentSession's generic stall watchdog
+        // behind that authority boundary so it cannot pre-empt the durable
+        // consultation_inactivity_timeout predicate.
+        privateTurnKind === 'typed-consultation'
+          ? consultationAbandonDeadlineMs(cfg.autonomousTurnTimeoutMs)
+            + CONVERSATION_CLAIM_RENEW_MS
+          : undefined,
+      ),
       consultation,
       autonomous,
     ).finally(() => {
@@ -3694,12 +3713,15 @@ export async function handleStrategicResident(
         // session.interrupt() sends SIGINT, which exits the ENTIRE Claude Code
         // child process (not just this turn) — flag it before calling so the
         // main loop's next !session.isAlive() check attributes the exit
-        // correctly instead of misreporting a generic crash.
+        // correctly instead of misreporting a generic crash. The interruption
+        // does not revoke the exact server claim: the preceding renewal proved
+        // it held, and the fenced ack remains the final authority check. Any
+        // intervening loss returns 409 and takes the diagnostic-only path.
         consultationAbandonInterruptPending = true;
         session.interrupt();
         return {
           result: await turn,
-          leaseHeld: false,
+          leaseHeld: true,
           terminalPredicate: 'consultation_inactivity_timeout',
         };
       }

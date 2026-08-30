@@ -818,6 +818,7 @@
         "handleStrategicResident \u2014 typed Fast lease lifecycle > does not complete a failed typed consultation after $label [case 6]",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > does not complete a failed typed consultation after $label [case 7]",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > renews the typed consultation lease through a long failed-result delivery heartbeat stall",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > abandons a held consultation after semantic inactivity before starting attempt two",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > abandons a nonterminal normal Fast claim without provider dispatch",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > abandons an exact cold Fast claim when required attachment materialization fails before dispatch",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > acquires the fenced slot before readiness and releases it on normal shutdown",
@@ -893,7 +894,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 154
+      "test_count": 155
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
