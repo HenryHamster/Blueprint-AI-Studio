@@ -762,6 +762,52 @@ async def test_agent_fleet_source_sha_snapshot_falls_back_to_runner_source_sha(
 
 
 @pytest.mark.asyncio
+async def test_runner_contributes_one_precedence_ordered_source_identity(
+    gcp_cleanup_db,
+):
+    """One runner cannot prove its stale agent SHA and newer checkout SHA."""
+    project = Project(name="Runner source precedence", user_id="user-1")
+    gcp_cleanup_db.add(project)
+    await gcp_cleanup_db.commit()
+    await gcp_cleanup_db.refresh(project)
+
+    agent_sha = "d" * 40
+    checkout_sha = "e" * 40
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="2" * 64,
+        status="active",
+        last_seen_at=_utcnow(),
+        agent_source_sha=agent_sha,
+        source_sha=checkout_sha,
+    )
+    gcp_cleanup_db.add(runner)
+    await gcp_cleanup_db.commit()
+
+    assert await compute.fleet_serving_source_sha(
+        gcp_cleanup_db, agent_sha, project_id=str(project.id)
+    ) is True
+    assert await compute.fleet_serving_source_sha(
+        gcp_cleanup_db, checkout_sha, project_id=str(project.id)
+    ) is False
+    snapshot = await compute.agent_fleet_source_sha_snapshot(
+        gcp_cleanup_db, project.id
+    )
+    assert [bucket["source_sha"] for bucket in snapshot["buckets"]] == [agent_sha]
+
+    runner.agent_source_sha = None
+    gcp_cleanup_db.add(runner)
+    await gcp_cleanup_db.commit()
+    assert await compute.fleet_serving_source_sha(
+        gcp_cleanup_db, checkout_sha, project_id=str(project.id)
+    ) is True
+    snapshot = await compute.agent_fleet_source_sha_snapshot(
+        gcp_cleanup_db, project.id
+    )
+    assert [bucket["source_sha"] for bucket in snapshot["buckets"]] == [checkout_sha]
+
+
+@pytest.mark.asyncio
 async def test_agent_fleet_source_sha_snapshot_includes_runner_kind(gcp_cleanup_db):
     """Live LocalRunner rows appear as runner-kind buckets in the snapshot."""
     from app.models import LocalRunner

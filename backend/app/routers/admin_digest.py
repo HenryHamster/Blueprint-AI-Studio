@@ -114,6 +114,7 @@ from app.anomaly_detection import router as _anomaly_detection_router  # noqa: E
 from app.efficiency_snapshot import router as _efficiency_snapshot_router  # noqa: E402
 from app.routers.admin_pipeline_observability import router as _pipeline_obs_router  # noqa: E402
 from app.routers.admin_release_version import router as _release_version_router  # noqa: E402
+from app.routers.admin_release_qualification_control import router as _qualification_control_router  # noqa: E402
 
 router.include_router(_viewport_debt_router)
 router.include_router(_sr_diagnostics_router)
@@ -121,6 +122,7 @@ router.include_router(_anomaly_detection_router)
 router.include_router(_efficiency_snapshot_router)
 router.include_router(_pipeline_obs_router)
 router.include_router(_release_version_router)
+router.include_router(_qualification_control_router)
 
 # Residual-case CRUD endpoints relocated to app.residual_case_endpoints.
 # Re-exported here so existing call sites keep working.

@@ -5706,10 +5706,10 @@ async def check_capability_proof_trial_stall(ctx: SweepContext) -> List[CheckRes
 
 @register_check(
     "unmapped_acceptance_criteria",
-    "Flag active criteria not linked to any direction — they can never accumulate merge evidence",
+    "Flag ordinary active criteria not linked to any direction — they can never accumulate merge evidence",
 )
 async def check_unmapped_acceptance_criteria(ctx: SweepContext) -> List[CheckResult]:
-    """Flag ACTIVE acceptance criteria that are not mapped to any Direction.
+    """Flag ordinary ACTIVE acceptance criteria not mapped to any Direction.
 
     An unmapped criterion is structurally guaranteed to never receive
     ``task_merge`` evidence via ``record_task_merge_evidence``, because that
@@ -5718,17 +5718,24 @@ async def check_unmapped_acceptance_criteria(ctx: SweepContext) -> List[CheckRes
     ``criterion_keys``.  A criterion authored but never linked to a Direction
     falls into neither bucket and silently stays uncovered indefinitely.
 
-    This check surfaces unmapped active criteria per project so operators can
-    take corrective action (link the criterion to a Direction, or retract it).
+    This check surfaces unmapped ordinary active criteria per project so
+    operators can take corrective action (link the criterion to a Direction,
+    or retract it).
 
-    * ``self_reported`` = total active criteria on the open version.
-    * ``ground_truth``  = active criteria that ARE mapped to at least one Direction.
-    * ``delta``         = unmapped active criteria count (self_reported - ground_truth).
+    Machine-enforced authorship policy criteria are excluded because they do
+    not accumulate ordinary Direction merge evidence.
+
+    * ``self_reported`` = total ordinary active criteria on the open version.
+    * ``ground_truth``  = ordinary active criteria mapped to at least one Direction.
+    * ``delta``         = unmapped ordinary active criteria count.
 
     SKIPPED when no open version or no active criteria exist.
     Bounded to ``ctx.max_projects`` projects.
     """
-    from app.acceptance_criteria import get_unmapped_active_criterion_keys
+    from app.acceptance_criteria import (
+        get_unmapped_active_criterion_keys,
+        is_operator_authorship_criterion,
+    )
     from app.models import Project
     from app.release_version import current_open_version
 
@@ -5764,14 +5771,19 @@ async def check_unmapped_acceptance_criteria(ctx: SweepContext) -> List[CheckRes
         from app.acceptance_criteria import get_criteria_for_version
 
         criteria = await get_criteria_for_version(ctx.session, open_version.id)
-        active_criteria = [c for c in criteria if c.status == "active"]
+        active_criteria = [
+            criterion
+            for criterion in criteria
+            if criterion.status == "active"
+            and not is_operator_authorship_criterion(criterion)
+        ]
         if not active_criteria:
             results.append(
                 CheckResult(
                     check="unmapped_acceptance_criteria",
                     status=CheckStatus.SKIPPED,
                     subject=pid,
-                    detail="no active criteria on open version",
+                    detail="no ordinary active criteria on open version",
                 )
             )
             continue
@@ -5793,7 +5805,10 @@ async def check_unmapped_acceptance_criteria(ctx: SweepContext) -> List[CheckRes
                     ground_truth=mapped_count,
                     delta=0,
                     subject=pid,
-                    detail=f"all {total_active} active criterion/criteria mapped to a direction",
+                    detail=(
+                        f"all {total_active} ordinary active criterion/criteria "
+                        "mapped to a direction"
+                    ),
                 )
             )
         else:
@@ -5808,7 +5823,8 @@ async def check_unmapped_acceptance_criteria(ctx: SweepContext) -> List[CheckRes
                     severity="warn",
                     subject=pid,
                     detail=(
-                        f"{unmapped_count} active criterion/criteria unmapped to any direction "
+                        f"{unmapped_count} ordinary active criterion/criteria "
+                        "unmapped to any direction "
                         f"and will never receive merge evidence: {preview}"
                         + (" (and more)" if unmapped_count > 5 else "")
                     ),
@@ -5821,7 +5837,7 @@ async def check_unmapped_acceptance_criteria(ctx: SweepContext) -> List[CheckRes
                 check="unmapped_acceptance_criteria",
                 status=CheckStatus.OK,
                 subject="global",
-                detail="no projects with active criteria to audit",
+                detail="no projects with ordinary active criteria to audit",
             )
         )
 

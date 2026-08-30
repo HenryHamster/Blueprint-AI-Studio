@@ -321,6 +321,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
         source_path="backend/app/release_qualification_authority.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "release_qualification_control.py"): GoverningCap(
+        source_path="backend/app/release_qualification_control.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_qualification_intents.py"): GoverningCap(
         source_path="backend/app/release_qualification_intents.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
