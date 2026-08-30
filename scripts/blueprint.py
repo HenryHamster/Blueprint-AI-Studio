@@ -4299,6 +4299,7 @@ def _qualification_control_projection_valid(value: object, pid: str) -> bool:
 def _qualification_control_context_valid(
     context: object, pid: str, key: str | None
 ) -> bool:
+    receipt = context.get("receipt") if isinstance(context, dict) else None
     return (
         isinstance(context, dict)
         and context.get("schema_version") == 1
@@ -4309,8 +4310,18 @@ def _qualification_control_context_valid(
         and type(context.get("requester_can_mutate")) is bool
         and _qualification_control_projection_valid(context.get("current"), pid)
         and (
-            context.get("receipt") is None
-            or _qualification_control_projection_valid(context.get("receipt"), pid)
+            receipt is None
+            or _qualification_control_projection_valid(receipt, pid)
+        )
+        and (
+            (key is None and receipt is None)
+            or (
+                key is not None
+                and (
+                    receipt is None
+                    or receipt.get("idempotency_key") == key
+                )
+            )
         )
     )
 

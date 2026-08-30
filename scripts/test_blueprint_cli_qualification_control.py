@@ -359,7 +359,7 @@ def test_scoped_credentials_cannot_use_control_surface(monkeypatch, action):
     argv = (
         ["qualification-control", "show", "--project-id", PROJECT_ID]
         if action == "show"
-        else _argv("hold")
+        else _argv(action)
     )
     assert blueprint.main(argv) == 1
     assert calls == [("GET", "/api/agent-access/v1/me")]
@@ -390,6 +390,10 @@ def test_show_validates_the_canonical_readback(monkeypatch, capsys):
     assert payload["retry_argv"] == [
         "qualification-control", "show", "--project-id", PROJECT_ID,
     ]
+
+    context = _committed(_request())
+    context["requested_idempotency_key"] = None
+    assert blueprint.main(argv) == 1
 
 
 @pytest.mark.parametrize(
@@ -432,3 +436,16 @@ def test_malformed_keyed_show_preserves_the_receipt_key(monkeypatch, capsys):
         "qualification-control", "show", "--project-id", PROJECT_ID,
         "--idempotency-key", KEY,
     ]
+
+
+def test_keyed_show_rejects_a_self_consistent_receipt_for_another_key(
+    monkeypatch
+):
+    other_request = _request(key="different-key")
+    context = _context(current_revision=1, receipt=_receipt(other_request))
+    _wire(monkeypatch, lambda *_args, **_kwargs: context)
+    argv = [
+        "--json", "qualification-control", "show", "--project-id", PROJECT_ID,
+        "--idempotency-key", KEY,
+    ]
+    assert blueprint.main(argv) == 1
