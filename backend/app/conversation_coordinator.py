@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any
 
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -84,6 +85,16 @@ class WorkdayConsultationClaim:
     workday_claim_id: uuid.UUID
     lease_expires_at: datetime
     attempt: int
+    prior_attempts: tuple[dict[str, Any], ...] = ()
+    prior_receipts: tuple[dict[str, Any], ...] = ()
+
+
+class WorkdayConsultationPacketProvenanceInvalid(ValueError):
+    """A private packet cannot be projected without trusting corrupt state."""
+
+    def __init__(self, packet_id: uuid.UUID):
+        super().__init__("Workday consultation packet provenance is invalid")
+        self.packet_id = packet_id
 
 
 @dataclass(frozen=True)
@@ -1222,9 +1233,6 @@ async def _finalize_workday_consultation_packet(
     packet_id: uuid.UUID,
     row: ProjectMessage,
     context: dict[str, Any],
-    task_id: uuid.UUID,
-    worker_generation: int,
-    worker_incarnation: uuid.UUID,
     resident_session_id: str,
     workday_claim_id: uuid.UUID,
     outcome: str,
@@ -1241,19 +1249,15 @@ async def _finalize_workday_consultation_packet(
     from app.strategic_workday_mutation_rebind import (
         WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY,
         WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY,
-        bounded_workday_mutation_receipts,
+        authoritative_workday_operation_receipts,
         workday_mutation_receipts_have_more,
     )
 
     # A retry is a continuation of the same packet, so its result must expose
     # every durable receipt, not only writes made under the final claim id.
-    mutation_receipts = bounded_workday_mutation_receipts(
+    mutation_receipts = authoritative_workday_operation_receipts(
         context,
         packet_id=packet_id,
-        task_id=task_id,
-        resident_session_id=resident_session_id,
-        worker_generation=worker_generation,
-        limit=64,
     )
     mutation_receipts_have_more = workday_mutation_receipts_have_more(context)
     result_key = f"workday-consultation-result:{packet_id}:{workday_claim_id}"
@@ -1452,6 +1456,26 @@ async def claim_next_workday_consultation_packet(
         if not _is_workday_consultation_packet(row, resident_session_id=None):
             continue
         context = dict(row.context or {})
+        from app.strategic_workday_mutation_rebind import (
+            authoritative_workday_operation_receipts,
+        )
+
+        try:
+            bounded_workday_consultation_attempts(context)
+            prior_receipts = authoritative_workday_operation_receipts(
+                context,
+                packet_id=row.id,
+            )
+            prior_attempt = context.get(_WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY, 0)
+            if (
+                not isinstance(prior_attempt, int)
+                or isinstance(prior_attempt, bool)
+                or prior_attempt < 0
+                or prior_attempt >= _WORKDAY_CONSULTATION_MAX_UNACKED_CLAIMS
+            ):
+                raise ValueError("consultation claim attempt is invalid")
+        except (HTTPException, ValueError) as exc:
+            raise WorkdayConsultationPacketProvenanceInvalid(row.id) from exc
         prior_claim_id_raw = context.get(_WORKDAY_CLAIM_ID_CONTEXT_KEY)
         prior_expires_at = _workday_claim_expiry(
             context.get(_WORKDAY_CLAIM_EXPIRES_CONTEXT_KEY)
@@ -1478,7 +1502,6 @@ async def claim_next_workday_consultation_packet(
         except (TypeError, ValueError, AttributeError):
             workday_claim_id = uuid.uuid4()
             same_owner = False
-        prior_attempt = int(context.get(_WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY) or 0)
         if not same_owner and prior_claim_id_raw is not None and prior_attempt >= 1:
             # A dead worker cannot send an ack. Preserve that attempt explicitly
             # at the reclaim boundary instead of letting it disappear behind the
@@ -1551,9 +1574,6 @@ async def claim_next_workday_consultation_packet(
                 packet_id=row.id,
                 row=row,
                 context=context,
-                task_id=task_id,
-                worker_generation=worker_generation,
-                worker_incarnation=worker_incarnation,
                 resident_session_id=resident_session_id,
                 workday_claim_id=workday_claim_id,
                 outcome="failed",
@@ -1584,10 +1604,7 @@ async def claim_next_workday_consultation_packet(
 
             prior_session_id = str(row.resident_session_id or "").strip()
             if prior_session_id:
-                context.setdefault(
-                    RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
-                    prior_session_id,
-                )
+                context[RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY] = prior_session_id
             row.resident_session_id = resident_session_id
         row.context = context
         row.handling_state = MessageHandlingState.CLAIMED
@@ -1600,6 +1617,8 @@ async def claim_next_workday_consultation_packet(
             workday_claim_id=workday_claim_id,
             lease_expires_at=expires_at,
             attempt=attempt,
+            prior_attempts=tuple(bounded_workday_consultation_attempts(context)),
+            prior_receipts=tuple(prior_receipts),
         )
     return None
 
@@ -1782,9 +1801,6 @@ async def acknowledge_workday_consultation_packet(
             packet_id=packet_id,
             row=row,
             context=context,
-            task_id=task_id,
-            worker_generation=worker_generation,
-            worker_incarnation=worker_incarnation,
             resident_session_id=resident_session_id,
             workday_claim_id=workday_claim_id,
             outcome=outcome,
@@ -1902,10 +1918,7 @@ async def claim_next_workday_consultation_continuation(
 
             prior_session_id = str(row.resident_session_id or "").strip()
             if prior_session_id:
-                context.setdefault(
-                    RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
-                    prior_session_id,
-                )
+                context[RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY] = prior_session_id
             row.resident_session_id = resident_session_id
         row.context = context
         row.handling_state = MessageHandlingState.CLAIMED

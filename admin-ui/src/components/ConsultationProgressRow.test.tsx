@@ -48,6 +48,7 @@ function detail(overrides: Partial<ConsultationDetail> = {}): ConsultationDetail
     },
     steps: [{ op: 'read_task', entity_kind: 'task', entity_id: '1234567890', effect: 'inspected' }],
     steps_truncated: false,
+    attempts: [],
     last_failure: null,
     result: {
       id: 'r-1',
@@ -144,6 +145,76 @@ describe('ConsultationProgressRow', () => {
     await waitFor(() =>
       expect(screen.getByText(/write_scope_denied: operator approval required/))
         .toBeInTheDocument());
+  });
+
+  test('keeps every terminal attempt, provider tail, timing, and bounded trace visible', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 375 });
+    const longTail = `first attempt ended without a terminal provider result ${'x'.repeat(1940)}`;
+    fetchDetail.mockResolvedValue(detail({
+      outcome: 'failed',
+      attempts: [
+        {
+          attempt: 1,
+          workday_claim_id: '11111111-1111-1111-1111-111111111111',
+          outcome: 'abandoned',
+          terminal_predicate: 'consultation_inactivity_timeout',
+          provider_terminal_reason: 'inactivity_timeout',
+          provider_output_tail: longTail,
+          started_at: '2026-08-29T20:00:00Z',
+          ended_at: '2026-08-29T20:06:01Z',
+          turn_ms: 361_000,
+          ttft_ms: 1_250,
+          tool_call_count: 2,
+          tool_call_duration_ms: 2_500,
+          result_chars: 0,
+          trace: [
+            { elapsed_ms: 0, kind: 'text', label: 'provider_started' },
+            { elapsed_ms: 1_000, kind: 'tool', label: 't'.repeat(80) },
+            { elapsed_ms: 360_000, kind: 'error', label: 'inactivity_timeout', is_error: true },
+          ],
+          trace_truncated: true,
+        },
+        {
+          attempt: 2,
+          workday_claim_id: '22222222-2222-2222-2222-222222222222',
+          outcome: 'failed',
+          terminal_predicate: 'provider_failed',
+          provider_terminal_reason: 'aborted_streaming',
+          provider_output_tail: 'terminal_reason=aborted_streaming',
+          started_at: '2026-08-29T20:07:00Z',
+          ended_at: '2026-08-29T20:12:59Z',
+          turn_ms: 359_000,
+          ttft_ms: null,
+          tool_call_count: 1,
+          tool_call_duration_ms: 500,
+          result_chars: 17,
+          trace: [{ elapsed_ms: 358_500, kind: 'result', label: 'provider_failed' }],
+          trace_truncated: false,
+        },
+      ],
+    }));
+    const user = userEvent.setup();
+    render(
+      <ConsultationProgressRow
+        projectId="p"
+        consultationId="c-1"
+        row={indexRow({ state: 'delivered', outcome: 'failed' })}
+      />,
+    );
+
+    await user.click(screen.getByRole('button'));
+
+    const first = await screen.findByTestId('consultation-attempt-1');
+    const second = screen.getByTestId('consultation-attempt-2');
+    expect(first).toHaveTextContent(/Attempt 1 · abandoned · consultation_inactivity_timeout/);
+    expect(first).toHaveTextContent(/turn 6\.0 min · TTFT 1\.3 s/);
+    expect(first).toHaveTextContent(/Provider: inactivity_timeout/);
+    expect(first).toHaveTextContent(/first attempt ended without a terminal provider result/);
+    expect(first).toHaveTextContent(/inactivity_timeout/);
+    expect(first).toHaveTextContent(/Some trace events are outside this bounded window/);
+    expect(screen.getByText(longTail)).toHaveClass('whitespace-pre-wrap', 'break-words');
+    expect(second).toHaveTextContent(/Attempt 2 · failed · provider_failed/);
+    expect(second).toHaveTextContent(/terminal_reason=aborted_streaming/);
   });
 
   test('renders nothing until the index knows about the consultation', () => {

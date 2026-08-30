@@ -684,9 +684,21 @@ async def test_endpoints_serve_the_projection_and_404_unknown_ids(
 ):
     project = await _make_project(db_session)
     request = _public_request(project.id)
+    attempt = _attempt(
+        1,
+        "failed",
+        "provider_failed",
+        output_tail="terminal_reason=aborted_streaming",
+    )
     db_session.add(request)
     await db_session.commit()
-    db_session.add(_packet(project.id, request.id))
+    db_session.add(
+        _packet(
+            project.id,
+            request.id,
+            context={"_workday_consultation_attempts": [attempt]},
+        )
+    )
     await db_session.commit()
 
     listing = await client.get(
@@ -701,6 +713,14 @@ async def test_endpoints_serve_the_projection_and_404_unknown_ids(
     )
     assert detail.status_code == 200
     assert detail.json()["state"] == "queued"
+    serialized_attempt = detail.json()["attempts"][0]
+    assert serialized_attempt["attempt"] == 1
+    assert serialized_attempt["workday_claim_id"] == attempt["workday_claim_id"]
+    assert serialized_attempt["terminal_predicate"] == "provider_failed"
+    assert serialized_attempt["provider_terminal_reason"] == "aborted_streaming"
+    assert "aborted_streaming" in serialized_attempt["provider_output_tail"]
+    assert serialized_attempt["turn_ms"] == 250
+    assert serialized_attempt["trace"][-1]["label"] == "provider_failed"
 
     missing = await client.get(
         f"/api/admin/projects/{project.id}"

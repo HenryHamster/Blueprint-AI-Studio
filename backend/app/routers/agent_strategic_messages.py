@@ -91,8 +91,12 @@ from app.strategic_consultation_status import (
 from app.strategic_fast_live_work import _fast_live_work_authority
 from app.strategic_workday_handoff_recovery import (
     PRIVATE_HANDOFF_RETIREMENT_LIMIT as _PRIVATE_HANDOFF_RETIREMENT_LIMIT,
+    _RECOVERY_SUMMARY as _WORKDAY_RECOVERY_SUMMARY,
     recover_retired_private_handoff as _recover_retired_private_handoff,
     retire_unavailable_private_handoff as _retire_unavailable_private_handoff,
+    terminal_recovery_source_candidate_from_server_key as _terminal_recovery_source_candidate_from_server_key,
+    workday_packet_source_id_from_server_lineage as _workday_packet_source_id_from_server_lineage,
+    workday_result_server_lineage as _workday_result_server_lineage,
 )
 from app.time_utils import _utcnow, utc_iso
 from app.routers.agent import verify_agent_token
@@ -633,23 +637,30 @@ async def _rebind_private_packet_envelope_to_current_worker(
     """Make a restart-surviving Workday packet writable by its live claimant."""
 
     context = dict(row.context or {})
-    try:
-        fast_claim_id = uuid.UUID(str(context.get("claim_id")))
-    except (TypeError, ValueError, AttributeError):
+    fast_claim_id = _private_workday_fast_claim_id(context)
+    if fast_claim_id is None:
         raise HTTPException(
             status_code=409,
             detail="Private Workday packet Fast claim identity is invalid",
-        ) from None
+        )
+    from app.session_message_handoff import (
+        RESIDENT_HANDOFF_AT_CONTEXT_KEY,
+        RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
+    )
     from app.strategic_memory_envelope import (
         context_envelope_reference,
         rebind_fenced_context_envelope_for_worker,
     )
 
+    source_session_id = str(
+        context.get(RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY) or session_id
+    ).strip()
     rebound = await rebind_fenced_context_envelope_for_worker(
         session,
         project_id=project_id,
         reference=context.get("envelope"),
         session_id=session_id,
+        source_session_id=source_session_id,
         claim_id=fast_claim_id,
         worker_generation=worker_generation,
         worker_incarnation=worker_incarnation,
@@ -660,10 +671,25 @@ async def _rebind_private_packet_envelope_to_current_worker(
             detail="Strategic context envelope is stale, expired, or revoked",
         )
     context["envelope"] = context_envelope_reference(rebound)
+    # These markers are a one-use rebind instruction, not permanent routing
+    # authority.  Leaving the old source-session marker beside a reference
+    # already rebound to the current session makes the next lease renewal or
+    # reclaim validate the current snapshot against the retired owner.
+    context.pop(RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY, None)
+    context.pop(RESIDENT_HANDOFF_AT_CONTEXT_KEY, None)
     row.context = context
     session.add(row)
     await session.flush()
     return rebound
+
+
+def _private_workday_fast_claim_id(context: dict[str, Any]) -> uuid.UUID | None:
+    """Return the immutable Fast claim fence carried by a modern handoff."""
+
+    try:
+        return uuid.UUID(str(context.get("claim_id")))
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 @router.post("/projects/{project_id}/strategic-call/finalized-transcript")
@@ -1581,22 +1607,11 @@ def _workday_consultation_packet_response(
     lease_expires_at: datetime,
     attempt: int,
     envelope: Any,
+    prior_attempts: tuple[dict[str, Any], ...],
+    prior_receipts: tuple[dict[str, Any], ...],
 ) -> dict[str, Any]:
     """Project only server-created packet fields to the authenticated Resident."""
     context = packet.context if isinstance(packet.context, dict) else {}
-    from app.conversation_coordinator import bounded_workday_consultation_attempts
-    from app.strategic_workday_mutation_rebind import (
-        WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY,
-        WORKDAY_OPERATION_LEDGER_CONTEXT_KEY,
-        WORKDAY_OPERATION_LEDGER_LIMIT,
-        bounded_workday_mutation_receipts,
-    )
-    ledger = context.get(WORKDAY_OPERATION_LEDGER_CONTEXT_KEY)
-    ledger_context = {
-        WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: ledger
-        if isinstance(ledger, list)
-        else []
-    }
     return {
         "packet_id": str(packet.id),
         "workday_claim_id": str(workday_claim_id),
@@ -1608,13 +1623,181 @@ def _workday_consultation_packet_response(
         "consultation_id": context.get("_workday_consultation_atomic_reply_id"),
         "question": packet.content,
         "envelope": envelope.model_dump(mode="json"),
-        "prior_attempts": bounded_workday_consultation_attempts(context),
-        "prior_receipts": bounded_workday_mutation_receipts(
-            ledger_context,
-            packet_id=packet.id,
-            limit=WORKDAY_OPERATION_LEDGER_LIMIT,
-        ),
+        "prior_attempts": list(prior_attempts),
+        "prior_receipts": list(prior_receipts),
     }
+
+
+async def _reconciled_workday_continuation_receipts(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    result_content: str,
+    result_context: dict[str, Any],
+    source_packet_id: uuid.UUID | None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Recover the canonical packet ledger behind a bounded result projection."""
+
+    from app.strategic_workday_mutation_rebind import (
+        WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY,
+        WORKDAY_OPERATION_LEDGER_CONTEXT_KEY,
+        authoritative_workday_operation_receipts,
+        authoritative_workday_result_receipts,
+        workday_mutation_receipts_have_more,
+    )
+
+    if source_packet_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Workday continuation receipt provenance is invalid",
+        )
+    if result_context.get("source_packet_id") != str(source_packet_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Workday continuation receipt source linkage is invalid",
+        )
+    result_receipts = authoritative_workday_result_receipts(
+        result_context,
+        packet_id=source_packet_id,
+    )
+    source_packet = (
+        await session.execute(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.id == source_packet_id,
+            )
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if source_packet is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Workday continuation receipt source is unavailable",
+        )
+    source_context = (
+        source_packet.context if isinstance(source_packet.context, dict) else {}
+    )
+    if WORKDAY_OPERATION_LEDGER_CONTEXT_KEY in result_context:
+        raise HTTPException(
+            status_code=409,
+            detail="Workday continuation result ledger provenance is invalid",
+        )
+    if result_context.get("_workday_terminal_recovery") is True:
+        terminal_recovery_is_canonical = bool(
+            not result_receipts
+            and not workday_mutation_receipts_have_more(result_context)
+            and WORKDAY_OPERATION_LEDGER_CONTEXT_KEY not in source_context
+            and source_packet.from_type == "strategic"
+            and source_packet.surface == MessageSurface.CONVERSATION
+            and result_context.get("source_packet_id") == str(source_packet.id)
+            and result_context.get("_workday_consultation_atomic_reply_id")
+            == str(source_packet.id)
+            and result_context.get("claim_id")
+            == source_context.get("_conversation_claim_id")
+            and result_context.get("delivery_key") == "terminal-recovery"
+            and result_context.get("_conversation_consultation_continuation")
+            == "terminal-recovery"
+            and result_context.get("result_state") == "failed"
+            and result_content == _WORKDAY_RECOVERY_SUMMARY
+            and source_context.get("message_role") == "operator_reply"
+            and source_context.get("_workday_consultation_requested") is True
+            and source_context.get("_conversation_public_reply_owner") == "fast"
+            and source_context.get("privacy_state") not in {"redacted", "deleted"}
+        )
+        try:
+            uuid.UUID(str(result_context.get("claim_id")))
+        except (TypeError, ValueError, AttributeError):
+            terminal_recovery_is_canonical = False
+        if not terminal_recovery_is_canonical:
+            raise HTTPException(
+                status_code=409,
+                detail="Workday terminal recovery provenance is invalid",
+            )
+        return [], False
+
+    linkage_keys = (
+        "delivery_key",
+        "_conversation_consultation_continuation",
+        "_workday_consultation_atomic_reply_id",
+        "_workday_consultation_ack_claim_id",
+    )
+    normal_source_is_canonical = bool(
+        source_packet.from_type == "system"
+        and source_packet.surface == MessageSurface.CONVERSATION
+        and source_packet.status == "handled"
+        and source_packet.handling_state == MessageHandlingState.RESPONDED
+        and source_context.get("_conversation_consultation_packet") is True
+        and source_context.get("audience") == "strategist-internal"
+        and source_context.get("message_role") == "workday_consultation"
+        and source_context.get("public_reply_owner") == "fast"
+        and result_content
+        == source_context.get("_workday_consultation_result_summary")
+        and result_context.get("result_state")
+        == source_context.get("_workday_consultation_ack_outcome")
+        and all(
+            isinstance(result_context.get(key), str)
+            and bool(result_context.get(key))
+            and result_context.get(key) == source_context.get(key)
+            for key in linkage_keys
+        )
+    )
+    try:
+        uuid.UUID(str(source_context.get("claim_id")))
+        uuid.UUID(str(source_context.get("_workday_consultation_ack_claim_id")))
+    except (TypeError, ValueError, AttributeError):
+        normal_source_is_canonical = False
+    claimless_legacy_result = result_context.get("claim_id") is None
+    if claimless_legacy_result:
+        legacy_result_is_read_only = bool(
+            normal_source_is_canonical
+            and not result_receipts
+            and not workday_mutation_receipts_have_more(result_context)
+            and WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY not in result_context
+            and WORKDAY_OPERATION_LEDGER_CONTEXT_KEY not in source_context
+            and not workday_mutation_receipts_have_more(source_context)
+        )
+        if not legacy_result_is_read_only:
+            raise HTTPException(
+                status_code=409,
+                detail="Legacy Workday continuation provenance is invalid",
+            )
+        return [], False
+    normal_source_is_canonical = bool(
+        normal_source_is_canonical
+        and isinstance(result_context.get("claim_id"), str)
+        and bool(result_context.get("claim_id"))
+        and result_context.get("claim_id") == source_context.get("claim_id")
+    )
+    if not normal_source_is_canonical:
+        raise HTTPException(
+            status_code=409,
+            detail="Workday continuation receipt source linkage is invalid",
+        )
+    packet_receipts = authoritative_workday_operation_receipts(
+        source_context,
+        packet_id=source_packet_id,
+    )
+    packet_by_operation = {
+        receipt["operation_id"]: receipt for receipt in packet_receipts
+    }
+    if any(
+        packet_by_operation.get(receipt["operation_id"]) != receipt
+        for receipt in result_receipts
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Workday continuation receipt projection conflicts with source",
+        )
+    if (
+        workday_mutation_receipts_have_more(result_context)
+        and not workday_mutation_receipts_have_more(source_context)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Workday continuation receipt projection conflicts with source",
+        )
+    return packet_receipts, workday_mutation_receipts_have_more(source_context)
 
 
 @router.post("/projects/{project_id}/workday-consultations/claim-next")
@@ -1653,23 +1836,102 @@ async def claim_next_workday_consultation(
         worker_generation=payload.worker_generation,
         incarnation_id=payload.incarnation_id,
     )
-    from app.conversation_coordinator import claim_next_workday_consultation_packet
+    from app.conversation_coordinator import (
+        WorkdayConsultationPacketProvenanceInvalid,
+        claim_next_workday_consultation_packet,
+    )
 
     packet_claim = None
+    packet_response = None
     resolved_envelope = None
     retired_handoffs = 0
     while True:
-        packet_claim = await claim_next_workday_consultation_packet(
-            session,
-            project_id=project_id,
-            task_id=task.id,
-            worker_generation=payload.worker_generation,
-            worker_incarnation=accepted_incarnation,
-            resident_session_id=payload.session_id,
-            lease_seconds=payload.lease_seconds,
-        )
+        try:
+            packet_claim = await claim_next_workday_consultation_packet(
+                session,
+                project_id=project_id,
+                task_id=task.id,
+                worker_generation=payload.worker_generation,
+                worker_incarnation=accepted_incarnation,
+                resident_session_id=payload.session_id,
+                lease_seconds=payload.lease_seconds,
+            )
+        except WorkdayConsultationPacketProvenanceInvalid as exc:
+            poisoned_packet = (
+                await session.execute(
+                    select(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.id == exc.packet_id,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if poisoned_packet is None:
+                continue
+            source_id = await _workday_packet_source_id_from_server_lineage(
+                session,
+                row=poisoned_packet,
+            )
+            await _retire_unavailable_private_handoff(
+                session,
+                row=poisoned_packet,
+                reason="continuation_provenance_invalid",
+            )
+            await _recover_retired_private_handoff(
+                session,
+                project=project,
+                task=task,
+                row=poisoned_packet,
+                worker_generation=payload.worker_generation,
+                worker_incarnation=accepted_incarnation,
+                resident_session_id=payload.session_id,
+                trust_row_context=False,
+                server_source_id=source_id,
+            )
+            logger.warning(
+                "[STRATEGIC] Retired private Workday packet %s because its "
+                "attempt/receipt provenance is invalid",
+                poisoned_packet.id,
+            )
+            retired_handoffs += 1
+            if retired_handoffs >= _PRIVATE_HANDOFF_RETIREMENT_LIMIT:
+                packet_claim = None
+                break
+            continue
         if packet_claim is None:
             break
+        packet_source_id = await _workday_packet_source_id_from_server_lineage(
+            session,
+            row=packet_claim.message,
+        )
+        if packet_source_id is None:
+            await _retire_unavailable_private_handoff(
+                session,
+                row=packet_claim.message,
+                reason="continuation_provenance_invalid",
+            )
+            await _recover_retired_private_handoff(
+                session,
+                project=project,
+                task=task,
+                row=packet_claim.message,
+                worker_generation=payload.worker_generation,
+                worker_incarnation=accepted_incarnation,
+                resident_session_id=payload.session_id,
+                trust_row_context=False,
+            )
+            logger.warning(
+                "[STRATEGIC] Retired private Workday packet %s because its "
+                "server-authored source provenance is invalid",
+                packet_claim.message.id,
+            )
+            retired_handoffs += 1
+            if retired_handoffs >= _PRIVATE_HANDOFF_RETIREMENT_LIMIT:
+                packet_claim = None
+                break
+            continue
         try:
             packet_row, _ = await _resolve_message_context_envelope(
                 session,
@@ -1716,20 +1978,20 @@ async def claim_next_workday_consultation(
                 packet_claim = None
                 break
             continue
-        break
-    await session.commit()
-    if packet_claim is None:
-        return {"status": "empty"}
-    return {
-        "status": "claimed",
-        "packet": _workday_consultation_packet_response(
+        packet_response = _workday_consultation_packet_response(
             packet=packet_claim.message,
             workday_claim_id=packet_claim.workday_claim_id,
             lease_expires_at=packet_claim.lease_expires_at,
             attempt=packet_claim.attempt,
             envelope=resolved_envelope,
-        ),
-    }
+            prior_attempts=packet_claim.prior_attempts,
+            prior_receipts=packet_claim.prior_receipts,
+        )
+        break
+    await session.commit()
+    if packet_claim is None:
+        return {"status": "empty"}
+    return {"status": "claimed", "packet": packet_response}
 
 
 @router.post("/projects/{project_id}/workday-consultations/{packet_id}/ack")
@@ -2003,6 +2265,9 @@ async def claim_next_workday_continuation(
 
     claim = None
     resolved_envelope = None
+    result_context: dict[str, Any] = {}
+    mutation_receipts: list[dict[str, Any]] = []
+    mutation_receipts_have_more = False
     retired_handoffs = 0
     missing_recovery_checked = False
     while True:
@@ -2033,13 +2298,99 @@ async def claim_next_workday_continuation(
                 if recovered is not None:
                     continue
             break
+        # Validate server-source/receipt provenance before resolving or
+        # rebinding any private envelope. An invalid historical row must never
+        # mint current-worker snapshot authority merely because it was first in
+        # the queue.
+        result_context = (
+            claim.message.context
+            if isinstance(claim.message.context, dict)
+            else {}
+        )
+        server_lineage = await _workday_result_server_lineage(
+            session,
+            row=claim.message,
+        )
+        try:
+            if (
+                server_lineage is None
+                or result_context.get("_workday_consultation_atomic_reply_id")
+                != str(server_lineage.public_source_id)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Workday continuation server lineage is invalid",
+                )
+            mutation_receipts, mutation_receipts_have_more = (
+                await _reconciled_workday_continuation_receipts(
+                    session,
+                    project_id=project_id,
+                    result_content=claim.message.content,
+                    result_context=result_context,
+                    source_packet_id=(
+                        server_lineage.authority_row_id
+                        if server_lineage is not None
+                        else None
+                    ),
+                )
+            )
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            neutral_source_id = (
+                server_lineage.public_source_id
+                if server_lineage is not None
+                else await _terminal_recovery_source_candidate_from_server_key(
+                    session,
+                    row=claim.message,
+                )
+            )
+            await _retire_unavailable_private_handoff(
+                session,
+                row=claim.message,
+                reason="continuation_provenance_invalid",
+            )
+            await _recover_retired_private_handoff(
+                session,
+                project=project,
+                task=task,
+                row=claim.message,
+                worker_generation=payload.worker_generation,
+                worker_incarnation=accepted_incarnation,
+                resident_session_id=payload.session_id,
+                trust_row_context=False,
+                server_source_id=neutral_source_id,
+            )
+            logger.warning(
+                "[STRATEGIC] Retired private Workday continuation %s because "
+                "its source/receipt provenance is invalid: %s",
+                claim.message.id,
+                exc.detail,
+            )
+            retired_handoffs += 1
+            resolved_envelope = None
+            result_context = {}
+            mutation_receipts = []
+            mutation_receipts_have_more = False
+            if retired_handoffs >= _PRIVATE_HANDOFF_RETIREMENT_LIMIT:
+                logger.warning(
+                    "[STRATEGIC] Paused invalid Workday continuation "
+                    "retirement after %s rows; the next poll will resume",
+                    retired_handoffs,
+                )
+                claim = None
+                break
+            continue
         try:
             from app.session_message_handoff import (
                 RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
             )
 
             claim_context = dict(claim.message.context or {})
-            if claim_context.get(RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY):
+            if (
+                claim_context.get(RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY)
+                and _private_workday_fast_claim_id(claim_context) is not None
+            ):
                 resolved_envelope = (
                     await _rebind_private_packet_envelope_to_current_worker(
                         session,
@@ -2092,28 +2443,6 @@ async def claim_next_workday_continuation(
     if claim is None:
         await session.commit()
         return {"status": "empty"}
-    from app.strategic_workday_mutation_rebind import (
-        bounded_workday_mutation_receipts,
-        workday_mutation_receipts_have_more,
-    )
-
-    result_context = claim.message.context if isinstance(claim.message.context, dict) else {}
-    try:
-        source_packet_id = uuid.UUID(str(result_context.get("source_packet_id")))
-        workday_claim_id = uuid.UUID(
-            str(result_context.get("_workday_consultation_ack_claim_id"))
-        )
-    except (TypeError, ValueError, AttributeError):
-        source_packet_id = workday_claim_id = None
-    mutation_receipts = bounded_workday_mutation_receipts(
-        result_context,
-        packet_id=source_packet_id,
-        workday_claim_id=workday_claim_id,
-        task_id=task.id,
-        resident_session_id=payload.session_id,
-        worker_generation=payload.worker_generation,
-        worker_incarnation=accepted_incarnation,
-    )
     current_live_work_authority = await _fast_live_work_authority(
         session,
         project=project,
@@ -2126,7 +2455,7 @@ async def claim_next_workday_continuation(
         "consultation_mutation_receipts"
     ] = {
         "returned_count": len(mutation_receipts),
-        "has_more": workday_mutation_receipts_have_more(result_context),
+        "has_more": mutation_receipts_have_more,
     }
     await session.commit()
     return {
