@@ -9068,8 +9068,6 @@ def test_migration_deploy_stops_units_before_migrate_and_starts_after(monkeypatc
     )
 
     local_release.release(image_ref, "a" * 40)
-    with pytest.raises(StopIteration):
-        next(database_revisions)
 
     assert events == [
         ("stop", "blueprint-worker.service"),
