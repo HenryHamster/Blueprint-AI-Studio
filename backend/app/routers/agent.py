@@ -631,10 +631,30 @@ async def verify_agent_token(
                 raise cold_authority_error
             if task.status in _AGENT_INACTIVE_TASK_STATUSES:
                 _terminated_task_ids[task_id] = time.time()
-                if is_idempotent_path and (
-                    not token_vm
-                    or not task.vm_instance_id
-                    or task.vm_instance_id != token_vm
+                # Parking deliberately releases the VM by clearing
+                # ``task.vm_instance_id``.  A lost-response retry therefore
+                # cannot satisfy the ordinary same-VM check below, even though
+                # the signed JWT still carries the VM that performed the park.
+                # Admit only the exact status path: its task+VM lookup misses
+                # and the PARKED/null-VM branch returns an immutable
+                # {"status": "parked"} response before any payload mutation.
+                # Cold-successor tasks were fenced above, and every other
+                # identityless inactive task/path remains fail-closed.
+                parked_status_noop = bool(
+                    request.method == "POST"
+                    and request.url.path == "/api/agent/status"
+                    and task.status == TaskStatus.PARKED
+                    and task.vm_instance_id is None
+                    and token_vm
+                )
+                if (
+                    is_idempotent_path
+                    and (
+                        not token_vm
+                        or not task.vm_instance_id
+                        or task.vm_instance_id != token_vm
+                    )
+                    and not parked_status_noop
                 ):
                     _log_agent_auth_reject(
                         "terminal_vm_identity_missing_or_mismatched",

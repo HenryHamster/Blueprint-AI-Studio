@@ -4632,6 +4632,72 @@ async def test_agent_token_rejected_on_terminal_idempotent_vm_mismatch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.BLOCKED,
+    ],
+    ids=["completed", "failed", "cancelled", "blocked"],
+)
+async def test_agent_status_identityless_non_parked_task_fails_closed(
+    client: AsyncClient,
+    db_session,
+    caplog,
+    terminal_status: TaskStatus,
+):
+    """Only PARKED/null-VM status retries may reach the parked no-op."""
+    from app.routers.agent import _terminated_task_ids
+
+    project = Project(name="Identityless Status Auth", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=None,
+        status=terminal_status,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    token_vm = "agent-vm-released-terminal"
+    token = create_agent_token(task_id, token_vm)
+
+    _terminated_task_ids.pop(task_id, None)
+    caplog.set_level(logging.INFO)
+
+    try:
+        response = await client.post(
+            "/api/agent/status",
+            json={"task_id": task_id, "status": "COMPLETED"},
+            headers={"x-agent-token": token},
+        )
+    finally:
+        _terminated_task_ids.pop(task_id, None)
+
+    assert response.status_code == 403
+    response_json = response.json()
+    detail = response_json.get("detail") or response_json.get("error", {}).get(
+        "message"
+    )
+    assert detail == "vm_instance_mismatch"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="terminal_vm_identity_missing_or_mismatched",
+        path="/api/agent/status",
+        task_id=task_id,
+        token_vm_instance_id=token_vm,
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_token_rejected_on_project_mismatch(
     client: AsyncClient, db_session, caplog
 ):
