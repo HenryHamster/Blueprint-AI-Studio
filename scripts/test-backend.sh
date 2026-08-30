@@ -1081,10 +1081,40 @@ if [ "$USE_POSTGRES" = "1" ]; then
   if [ "$SANDBOX_POSTGRES" = "1" ]; then
     "$PG_BIN/pg_isready" -h "$PG_SOCKET" -U test
   else
-    for _ in $(seq 1 30); do
-      if docker exec "$PG_CONTAINER" pg_isready -U test &>/dev/null; then break; fi
-      sleep 0.5
+    # The official image briefly accepts connections on a bootstrap server
+    # before POSTGRES_DB exists, then restarts into the final server.  A plain
+    # pg_isready can therefore succeed too early.  Prove that the exact target
+    # database can execute SQL, require that proof to remain true across two
+    # probes, and fail closed if the bounded wait is exhausted.
+    POSTGRES_READY=0
+    POSTGRES_READY_STREAK=0
+    POSTGRES_PROBE_RESULT=""
+    for POSTGRES_READY_ATTEMPT in $(seq 1 30); do
+      # PID 1 remains docker-entrypoint.sh while its temporary bootstrap
+      # postmaster is running.  Only the final `exec postgres` makes PID 1
+      # postgres, so do not count a query against the temporary server.
+      if [ "$(docker exec "$PG_CONTAINER" cat /proc/1/comm 2>/dev/null || true)" = "postgres" ] \
+          && POSTGRES_PROBE_RESULT="$(docker exec "$PG_CONTAINER" \
+          psql -X -w -U test -d test_blueprint -v ON_ERROR_STOP=1 \
+          -Atqc 'SELECT 1' 2>&1)" \
+          && [ "$(printf '%s' "$POSTGRES_PROBE_RESULT" | tr -d '[:space:]')" = "1" ]; then
+        POSTGRES_READY_STREAK=$((POSTGRES_READY_STREAK + 1))
+        if [ "$POSTGRES_READY_STREAK" -ge 2 ]; then
+          POSTGRES_READY=1
+          echo "PostgreSQL target database ready after $POSTGRES_READY_ATTEMPT probe(s)"
+          break
+        fi
+      else
+        POSTGRES_READY_STREAK=0
+      fi
+      sleep 1
     done
+    if [ "$POSTGRES_READY" != "1" ]; then
+      echo "ERROR: PostgreSQL target database did not become stably ready after 30 probes" >&2
+      [ -z "$POSTGRES_PROBE_RESULT" ] || echo "Last readiness probe: $POSTGRES_PROBE_RESULT" >&2
+      docker logs "$PG_CONTAINER" >&2 || true
+      exit 1
+    fi
   fi
   echo "=== Checking migration-required PostgreSQL extensions ==="
   if [ "$SANDBOX_POSTGRES" = "1" ]; then
