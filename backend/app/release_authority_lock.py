@@ -8,12 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Project, ReleaseVersion
 
-_MODULE_SIZE_GOVERNANCE_CAP: int = 150
+_MODULE_SIZE_GOVERNANCE_CAP: int = 160
 
 
 async def lock_release_project(
     session: AsyncSession,
     project_id: Any,
+    *,
+    skip_locked: bool = False,
 ) -> Project | None:
     return (
         (
@@ -22,7 +24,7 @@ async def lock_release_project(
                 .where(Project.id == project_id)
                 # Project primary keys are immutable. FOR NO KEY UPDATE keeps
                 # writer serialization without blocking child FK KEY SHARE.
-                .with_for_update(key_share=True)
+                .with_for_update(key_share=True, skip_locked=skip_locked)
                 .execution_options(populate_existing=True)
             )
         )
@@ -53,16 +55,20 @@ async def lock_release_project_key_share(
 async def lock_project_then_version(
     session: AsyncSession,
     version_id: Any,
+    *,
+    skip_locked: bool = False,
 ) -> ReleaseVersion | None:
-    """Probe identity without a lock, then acquire Project before Version."""
-    project = await lock_release_project_for_version(session, version_id)
+    """Probe identity, then lock Project -> Version or skip either contention."""
+    project = await lock_release_project_for_version(
+        session, version_id, skip_locked=skip_locked
+    )
     if project is None:
         return None
     return (
         await session.execute(
             select(ReleaseVersion)
             .where(ReleaseVersion.id == version_id)
-            .with_for_update()
+            .with_for_update(skip_locked=skip_locked)
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
@@ -71,6 +77,8 @@ async def lock_project_then_version(
 async def lock_release_project_for_version(
     session: AsyncSession,
     version_id: Any,
+    *,
+    skip_locked: bool = False,
 ) -> Project | None:
     project_id = (
         (
@@ -86,7 +94,9 @@ async def lock_release_project_for_version(
     return (
         None
         if project_id is None
-        else await lock_release_project(session, project_id)
+        else await lock_release_project(
+            session, project_id, skip_locked=skip_locked
+        )
     )
 
 

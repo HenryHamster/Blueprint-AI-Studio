@@ -5397,6 +5397,158 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     });
   });
 
+  it('abandons a held consultation after semantic inactivity before starting attempt two', async () => {
+    vi.useFakeTimers();
+    mockApiGet.mockResolvedValue({
+      messages: [],
+      fast_message_ids: [],
+      claim_required: true,
+    });
+    const envelope = typedEnvelope('Apply the exact bounded v57 contract.', 903);
+    const priorReceipts = Array.from({ length: 9 }, (_, index) => ({
+      op: index < 7 ? 'create_acceptance_criterion' : index === 7
+        ? 'update_direction'
+        : 'set_acceptance_criteria',
+      operation_index: index + 1,
+    }));
+    let claimCount = 0;
+    let renewCalls = 0;
+    const ackBodies: Array<Record<string, unknown>> = [];
+    const diagnosticBodies: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+          stop_requested: ackBodies.length >= 2,
+        });
+      }
+      if (url.endsWith('/workday-consultations/claim-next')) {
+        claimCount += 1;
+        if (claimCount > 2) return Promise.resolve({ status: 'empty' });
+        const attempt = claimCount;
+        return Promise.resolve({
+          status: 'claimed',
+          packet: {
+            packet_id: 'packet-inactivity-recovery',
+            workday_claim_id: `claim-inactivity-recovery-${attempt}`,
+            lease_expires_at: '2035-01-01T00:00:00.000Z',
+            attempt,
+            claim_id: 'fast-claim-inactivity-recovery',
+            delivery_key: 'delivery-inactivity-recovery',
+            continuation_key: 'continuation-inactivity-recovery',
+            question: 'Apply the exact bounded v57 contract.',
+            envelope,
+            ...(attempt === 2 ? {
+              prior_attempts: [{
+                attempt: 1,
+                terminal_predicate: 'consultation_inactivity_timeout',
+              }],
+              prior_receipts: priorReceipts,
+            } : {}),
+          },
+        });
+      }
+      if (url.endsWith('/workday-consultations/packet-inactivity-recovery/renew')) {
+        renewCalls += 1;
+        return Promise.resolve({
+          workday_claim_id: body?.workday_claim_id,
+          lease_expires_at: '2035-01-01T00:00:00.000Z',
+        });
+      }
+      if (url.endsWith('/workday-consultations/packet-inactivity-recovery/ack')) {
+        ackBodies.push(JSON.parse(JSON.stringify(body ?? {})) as Record<string, unknown>);
+        return Promise.resolve({ status: body?.outcome });
+      }
+      if (url.endsWith('/workday-consultations/packet-inactivity-recovery/attempt-diagnostic')) {
+        diagnosticBodies.push(body ?? {});
+        return Promise.resolve({
+          status: 'recorded',
+          attempt_diagnostic: body?.attempt_diagnostic,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    let firstAlive = true;
+    let resolveFirst!: (result: ResidentTurnResult) => void;
+    const firstTurn = new Promise<ResidentTurnResult>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const firstSession = makeSession(() => firstTurn, () => firstAlive);
+    firstSession.interrupt.mockImplementation(() => {
+      firstAlive = false;
+      resolveFirst(turnResult({
+        resultText: '',
+        interrupted: true,
+        processGone: true,
+        sentOperatorMessage: false,
+        providerTerminalReason: 'interrupted',
+      }));
+    });
+
+    const secondPrompts: string[] = [];
+    const secondSession = makeSession((prompt) => {
+      secondPrompts.push(typeof prompt === 'string' ? prompt : JSON.stringify(prompt));
+      return Promise.resolve(turnResult({
+        resultText: 'Recovered only the two missing v57 writes.',
+        sentOperatorMessage: false,
+        providerTerminalReason: 'success',
+      }));
+    }, () => true);
+    bindSessionWithPrivateRuntime([firstSession, secondSession]);
+
+    const done = run('typed-consultation-inactivity-recovery', {
+      ...qualifiedPayload(),
+      typed_fast_enabled: false,
+      strategic_session_autonomous: true,
+      strategic_session_autonomous_turn_timeout_seconds: 1,
+      strategic_session_message_poll_seconds: 0.25,
+    });
+    for (let i = 0; i < 20 && firstSession.sendTurn.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(250);
+    }
+    expect(firstSession.sendTurn).toHaveBeenCalledWith(expect.anything(), {
+      stallTimeoutMs: 255_000,
+    });
+
+    await vi.advanceTimersByTimeAsync(241_000);
+    for (let i = 0; i < 80 && ackBodies.length < 2; i += 1) {
+      await vi.advanceTimersByTimeAsync(250);
+    }
+    await vi.advanceTimersByTimeAsync(5_000);
+    await done;
+
+    expect(renewCalls).toBeGreaterThanOrEqual(1);
+    expect(firstSession.interrupt).toHaveBeenCalledTimes(1);
+    expect(firstSession.close).toHaveBeenCalledTimes(1);
+    expect(mockStartSession).toHaveBeenCalledTimes(2);
+    expect(diagnosticBodies).toEqual([]);
+    expect(ackBodies).toHaveLength(2);
+    expect(ackBodies[0]).toMatchObject({
+      workday_claim_id: 'claim-inactivity-recovery-1',
+      outcome: 'abandoned',
+      attempt_diagnostic: {
+        attempt: 1,
+        outcome: 'abandoned',
+        terminal_predicate: 'consultation_inactivity_timeout',
+      },
+    });
+    expect(ackBodies[1]).toMatchObject({
+      workday_claim_id: 'claim-inactivity-recovery-2',
+      outcome: 'completed',
+      attempt_diagnostic: {
+        attempt: 2,
+        outcome: 'completed',
+        terminal_predicate: 'provider_result',
+      },
+    });
+    expect(secondPrompts).toHaveLength(1);
+    expect(secondPrompts[0]).toContain('Durable prior-attempt reconciliation');
+    expect(secondPrompts[0]).toContain('consultation_inactivity_timeout');
+    expect(secondPrompts[0]).toContain('set_acceptance_criteria');
+  });
+
   it.each([
     {
       label: 'partial provider failure',
