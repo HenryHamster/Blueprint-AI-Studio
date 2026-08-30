@@ -9,7 +9,7 @@
       "script": "scripts/bootstrap_local_app_release.py"
     },
     "release": {
-      "flags": ["--expected-revision", "--image", "--rehearse"],
+      "flags": ["--expected-revision", "--image", "--operation-id", "--receipt-only", "--rehearse"],
       "script": "scripts/local_app_release.py"
     }
   },
@@ -54,7 +54,9 @@ content is folded into the immutable bundle's content digest alongside the
 other allowlisted sources, so the installed bundle stays bound to the
 declared revision.
 
-The bootstrap installs a new content-addressed script bundle and redirects only
+Bootstrap stops the old deploy agent first and requires the root release
+service to be exactly inactive; active or transitional releases abort before
+the installed set is rewritten. It then installs a new content-addressed script bundle and redirects only
 the API unit's future starts to the new wrapper, installs the always-on
 non-root deploy agent, and installs a socket-activated root release executor.
 Because systemd dependencies
@@ -75,12 +77,14 @@ The deploy agent does not use `sudo`: its hardened non-root unit connects to
 account. The agent's live approval read, exact CI manifest binding, superseding
 promotion re-read, and activation receipt POST remain the authority checks;
 the root executor independently validates the digest and revision before it
-starts the immutable release tool. A failed root-release activation phase is
-retried at most three times, with 5 seconds and then 10 seconds of backoff.
-Accepted or ambiguous socket handoffs are fenced and never replayed. Exhaustion
-is reported and persisted as `phase=failed` with the attempt count and
-`root_release.failure_reason`; it is not converted into a serving-confirmation
-timeout.
+starts the immutable release tool. The operation ID is SHA-256 over canonical
+JSON containing project ID, version number, promoted SHA, and
+`activation_requested_at`. Activation is submitted once. Only a proven
+pre-connect failure or an exact identity-bound `NOT_ACCEPTED`/no-claim result
+for an unresolved handoff may retry the same operation on a later poll;
+pending, terminal, completed, and ambiguous handoffs are never resubmitted.
+Every restart queries the exact root receipt before a serving probe or backend
+receipt.
 
 ## Qualification and integrated pre-stop checks
 
@@ -114,22 +118,29 @@ check and never run candidate code on the production host before promotion.
 
 ## Release
 
-Run the root-owned immutable `local_app_release.py` with the artifact's exact
-`image_ref` and `revision`. Do not use a tag. Launch it as a transient systemd
-service so an SSH or Wi-Fi interruption does not terminate the transaction:
+The normal path is the approval-bound deploy agent or `blueprint deploy`; they
+derive and persist the stable operation ID. For break-glass direct execution,
+freeze that same ID and use the exact image digest and revision. Never use a
+tag or invent a new ID after an ambiguous send:
 
 ```bash
 sudo systemd-run \
   --unit=blueprint-local-app-release \
   --collect \
   --wait \
+  --pipe \
   /usr/bin/env -i \
     SUDO_USER=henry_hamster \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     /usr/local/lib/blueprint-node/REVIEWED_BUNDLE/local_app_release.py \
     --image IMAGE_AT_SHA256 \
-    --expected-revision FULL_GIT_SHA
+    --expected-revision FULL_GIT_SHA \
+    --operation-id STABLE_64_HEX_OPERATION_ID
 ```
+
+Reconcile without activation by repeating the exact command with
+`--receipt-only`. It returns an existing terminal receipt or closes a claim
+only after exact installed digest/revision, health, worker, and schema checks.
 
 The release tool verifies the installed local-control-plane manifest, image
 digest and labels, static-tree manifest, service ownership, public origin,
@@ -171,7 +182,9 @@ Local API revision and health must pass before public health. Once a migration
 downtime window begins, a failure leaves the app units stopped and requires a
 fix-forward release; it never rolls prior code back across a possibly advanced
 schema. Other failed activations roll back only their touched services using
-the same identity and readiness checks. Root-only receipts are written below
+the same identity and readiness checks. Before effects, an operation-aware run
+writes root-only `operation-<id>.request.json`, followed by at most one
+immutable `operation-<id>.json` terminal receipt below
 `/var/lib/blueprint/local-app-releases/`. If the run fails after its integrated
 pre-stop checks pass, abort and use that receipt to identify the failed phase;
 do not blindly retry. Before migration downtime begins, the tool restores its

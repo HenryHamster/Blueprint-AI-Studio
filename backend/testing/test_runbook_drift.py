@@ -57,6 +57,8 @@ def test_runbook_matches_release_script_contract() -> None:
     assert result["entrypoints"]["release"]["flags"] == [
         "--expected-revision",
         "--image",
+        "--operation-id",
+        "--receipt-only",
         "--rehearse",
     ]
     assert "live systemd privilege boundary" in result["preconditions"]
