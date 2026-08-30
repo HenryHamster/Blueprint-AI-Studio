@@ -239,12 +239,6 @@ def _retired_invalid_terminal_recovery_is_rebuildable(
     create a fresh constant-summary row while preserving this incident row.
     """
 
-    from app.strategic_workday_mutation_rebind import (
-        WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY,
-        WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY,
-        WORKDAY_OPERATION_LEDGER_CONTEXT_KEY,
-    )
-
     retirement = context.get(_PRIVATE_HANDOFF_RETIREMENT_CONTEXT_KEY)
     retired_at = retirement.get("retired_at") if isinstance(retirement, dict) else None
     try:
@@ -268,9 +262,6 @@ def _retired_invalid_terminal_recovery_is_rebuildable(
         and isinstance(retired_at, str)
         and bool(retired_at.strip())
         and "_workday_continuation_completion_idempotency_key" not in context
-        and WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY not in context
-        and WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY not in context
-        and WORKDAY_OPERATION_LEDGER_CONTEXT_KEY not in context
         and not any(key in context for key in _PRIVATE_HANDOFF_CLAIM_CONTEXT_KEYS)
     )
 
