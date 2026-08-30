@@ -110,7 +110,7 @@ from app.release_qualification_authority import (
     _lock_exact_qualification_authority,
     _measure_candidate_operator_authorship,
     _measured_authorship_receipt_for_audit_spawn,
-    _observe_ci_unresolved_promotion_pending,
+    _observe_ci_unresolved_promotion_pending,  # noqa: F401 - protocol re-export
     qualification_authority_fingerprint,
     qualification_finalize_authority_fingerprint,
     qualification_project_observation_fingerprint,
@@ -120,6 +120,10 @@ from app.release_qualification_observation_protocol import (
     CI_RECOVERY,
     FinalizeObservationRequired,
     extend_finalize_observation_packet,
+)
+from app.release_qualification_control import (
+    automatic_qualification_start_block,
+    qualification_continuation_block,
 )
 from app.release_commit_authorship import (
     authorship_category_evidence,
@@ -2301,8 +2305,19 @@ async def run_qualification(
     continued_attempt_id = _coerce_qualification_attempt_id(
         qualification_attempt_id
     )
+    if qualification_attempt_id is not None and continued_attempt_id is None:
+        return {"status": "invalid_qualification_attempt_id"}
+    if explicit_request and auto_trigger:
+        return {"status": "invalid_qualification_authority"}
     attempt_id = continued_attempt_id or uuid.uuid4()
     is_new_attempt = continued_attempt_id is None
+    async def _lock_authority(**kwargs):
+        return await _lock_exact_qualification_authority(
+            session,
+            fresh_automatic=auto_trigger and is_new_attempt,
+            qualification_attempt_id=continued_attempt_id,
+            **kwargs,
+        )
     retry_episode = max(0, int(retry_episode or 0))
     prior_qual = version.last_qualification or {}
     if exact_authority is None:
@@ -2385,6 +2400,18 @@ async def run_qualification(
         )
         return {"status": "explicit_request_required"}
 
+    continuation_block = qualification_continuation_block(
+        version, continued_attempt_id
+    )
+    if continuation_block is not None:
+        return continuation_block
+    if auto_trigger and is_new_attempt:
+        automatic_block = await automatic_qualification_start_block(
+            session, project_id
+        )
+        if automatic_block is not None:
+            return automatic_block
+
     # Drop a product probe the open version's ACTIVE rubric cannot satisfy
     # BEFORE any qualification work (credential resolution, candidate SHA
     # resolution, locking, or child spawn) is spent.  The walkthrough_e2e
@@ -2431,8 +2458,7 @@ async def run_qualification(
     # be overwritten by a concurrent configuration observation.
     if not resolve_project_promotion_enabled(project_id):
         locked_version, authority_block = (
-            await _lock_exact_qualification_authority(
-                session,
+            await _lock_authority(
                 project_id=project_id,
                 version_id=version.id,
                 version_number=version.version_number,
@@ -2533,8 +2559,7 @@ async def run_qualification(
 
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:
-        version, authority_block = await _lock_exact_qualification_authority(
-            session,
+        version, authority_block = await _lock_authority(
             project_id=project_id,
             version_id=version.id,
             version_number=version.version_number,
@@ -2594,8 +2619,7 @@ async def run_qualification(
             repo,
             exc,
         )
-        version, authority_block = await _lock_exact_qualification_authority(
-            session,
+        version, authority_block = await _lock_authority(
             project_id=project_id,
             version_id=version.id,
             version_number=version.version_number,
@@ -2746,8 +2770,7 @@ async def run_qualification(
         if _sync_gate is not None:
             deferral_record = _sync_gate.pop("_deferral_record", None)
             version, authority_block = (
-                await _lock_exact_qualification_authority(
-                    session,
+                await _lock_authority(
                     project_id=project_id,
                     version_id=version.id,
                     version_number=version.version_number,
@@ -2789,8 +2812,7 @@ async def run_qualification(
             int(_pre_lock_qual.get("promotion_failure_count") or 0) >=
             _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS):
         if exact_authority:
-            version, authority_block = await _lock_exact_qualification_authority(
-                session,
+            version, authority_block = await _lock_authority(
                 project_id=project_id,
                 version_id=version.id,
                 version_number=version.version_number,
@@ -2834,8 +2856,7 @@ async def run_qualification(
                 version.version_number,
             )
             if exact_authority:
-                version, authority_block = await _lock_exact_qualification_authority(
-                    session,
+                version, authority_block = await _lock_authority(
                     project_id=project_id,
                     version_id=version.id,
                     version_number=version.version_number,
@@ -2893,8 +2914,7 @@ async def run_qualification(
 
     # 4. Project -> ReleaseVersion serialization prevents duplicate children;
     #    populate_existing also defeats a caller's stale cached version row.
-    locked_version, authority_block = await _lock_exact_qualification_authority(
-        session,
+    locked_version, authority_block = await _lock_authority(
         project_id=project_id,
         version_id=version.id,
         version_number=version.version_number,
@@ -3112,28 +3132,6 @@ async def run_qualification(
     # same qualification attempt inherits the frozen selection; a new request
     # with no selection runs no product probe. The selection was strictly
     # normalized before any GitHub I/O above.
-    if continued_attempt_id is not None:
-        projected_attempt_id = _coerce_qualification_attempt_id(
-            prior_qual.get("qualification_attempt_id")
-        ) or _coerce_qualification_attempt_id(
-            version.active_qualification_attempt_id
-        )
-        if (
-            projected_attempt_id is not None
-            and projected_attempt_id != continued_attempt_id
-        ):
-            logger.info(
-                "[RELEASE_QUALIFIER] refusing stale retry attempt %s for v%d; "
-                "active attempt is %s",
-                continued_attempt_id,
-                version.version_number,
-                projected_attempt_id,
-            )
-            return {
-                "status": "stale_qualification_attempt",
-                "qualification_attempt_id": str(continued_attempt_id),
-                "active_qualification_attempt_id": str(projected_attempt_id),
-            }
     prior_status = prior_qual.get("status")
     ci_unresolved_recovered_same_sha = (
         prior_status == "not_promoted"

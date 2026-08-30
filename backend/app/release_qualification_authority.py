@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from app import github, release_task_admission, release_version
+from app import github, release_qualification_control, release_version
 from app.failure_reason import exception_reason
 from app.models import Project
 from app.time_utils import _utcnow
@@ -26,7 +26,6 @@ def _release_qualifier_module():
     from app import release_qualifier as rq
 
     return rq
-
 
 def qualification_authority_fingerprint(
     version: release_version.ReleaseVersion,
@@ -96,9 +95,11 @@ async def _lock_exact_qualification_authority(
     expected_phase_changed_at: datetime | None,
     expected_authority_fingerprint: str | None = None,
     expected_project_observation_fingerprint: str | None = None,
+    fresh_automatic: bool = False,
+    qualification_attempt_id: uuid.UUID | None = None,
 ) -> tuple[release_version.ReleaseVersion | None, dict[str, Any] | None]:
-    admission_block = await release_task_admission.start_block(
-        session, project_id, version_number
+    admission_block = await release_qualification_control.qualification_start_block(
+        session, project_id, version_number, fresh_automatic=fresh_automatic
     )
     if admission_block is not None:
         return None, admission_block
@@ -112,17 +113,13 @@ async def _lock_exact_qualification_authority(
     ):
         return None, {"status": "superseded_project_observation_state"}
     locked_version = (
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == version_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
+        await session.execute(
+            select(release_version.ReleaseVersion)
+            .where(release_version.ReleaseVersion.id == version_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
-        .scalars()
-        .first()
-    )
+    ).scalars().first()
     if locked_version is None:
         return None, {"status": "version_not_found"}
     if (
@@ -136,6 +133,11 @@ async def _lock_exact_qualification_authority(
         return None, {"status": "wrong_phase"}
     if locked_version.phase_changed_at != expected_phase_changed_at:
         return None, {"status": "superseded_phase_epoch"}
+    continuation_block = release_qualification_control.qualification_continuation_block(
+        locked_version, qualification_attempt_id
+    )
+    if continuation_block is not None:
+        return None, continuation_block
     if (
         expected_authority_fingerprint is not None
         and qualification_authority_fingerprint(locked_version)

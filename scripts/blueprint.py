@@ -1108,6 +1108,7 @@ def _scoped_command_key(args: argparse.Namespace) -> tuple[str, str | None]:
         "messages": "messages_cmd",
         "strategic": "strategic_cmd",
         "compute": "compute_cmd",
+        "qualification-control": "qualification_control_cmd",
     }.get(command)
     subcommand = getattr(args, subcommand_attr, None) if subcommand_attr else None
     # Bare `projects` and `projects list` are the same read, so both map to the
@@ -4247,6 +4248,275 @@ def _fleet_revoke(args: argparse.Namespace) -> None:
     result = api("DELETE", _fleet_runner_projects_path(runner, f"/{target}"))
     print(f"Revoked: {target} from runner {runner.get('id')}")
     _emit(args, result, _render_runner_allow_list)
+
+
+# ── qualification-control ───────────────────────────────────────────────────
+
+def _qualification_control_projection_valid(value: object, pid: str) -> bool:
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or value.get("project_id") != pid
+        or type(value.get("revision")) is not int
+        or value["revision"] < 0
+        or type(value.get("automatic_starts_enabled")) is not bool
+    ):
+        return False
+    if value["revision"] == 0:
+        return all(
+            value.get(field) is None
+            for field in (
+                "id", "idempotency_key", "specification_hash", "actor_user_id",
+                "reason", "created_at",
+            )
+        )
+    return (
+        _is_canonical_uuid(value.get("id"))
+        and isinstance(value.get("idempotency_key"), str)
+        and bool(value["idempotency_key"])
+        and isinstance(value.get("specification_hash"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["specification_hash"]) is not None
+        and isinstance(value.get("actor_user_id"), str)
+        and bool(value["actor_user_id"])
+        and isinstance(value.get("reason"), str)
+        and bool(value["reason"])
+        and isinstance(value.get("created_at"), str)
+        and bool(value["created_at"])
+    )
+
+
+def _qualification_control_context_valid(
+    context: object, pid: str, key: str
+) -> bool:
+    return (
+        isinstance(context, dict)
+        and context.get("schema_version") == 1
+        and context.get("project_id") == pid
+        and context.get("requested_idempotency_key") == key
+        and _qualification_control_projection_valid(context.get("current"), pid)
+        and (
+            context.get("receipt") is None
+            or _qualification_control_projection_valid(context.get("receipt"), pid)
+        )
+    )
+
+
+def _qualification_control_specification_hash(
+    request: dict, pid: str, actor_user_id: str
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "project_id": pid,
+        "expected_revision": request["expected_revision"],
+        "automatic_starts_enabled": request["automatic_starts_enabled"],
+        "idempotency_key": request["idempotency_key"],
+        "actor_user_id": actor_user_id,
+        "reason": request["reason"],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _qualification_control_receipt_matches(
+    request: dict, pid: str, context: object
+) -> bool:
+    if not _qualification_control_context_valid(
+        context, pid, request["idempotency_key"]
+    ):
+        return False
+    receipt = context.get("receipt")
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        return False
+    return (
+        receipt.get("project_id") == pid
+        and receipt.get("revision") == request["expected_revision"] + 1
+        and receipt.get("automatic_starts_enabled")
+        is request["automatic_starts_enabled"]
+        and receipt.get("idempotency_key") == request["idempotency_key"]
+        and receipt.get("reason") == request["reason"]
+        and receipt.get("specification_hash")
+        == _qualification_control_specification_hash(
+            request, pid, receipt["actor_user_id"]
+        )
+    )
+
+
+def _qualification_control_current_matches(
+    request: dict, pid: str, context: object
+) -> bool:
+    current = context.get("current") if isinstance(context, dict) else None
+    receipt = context.get("receipt") if isinstance(context, dict) else None
+    base_match = (
+        _qualification_control_context_valid(
+            context, pid, request["idempotency_key"]
+        )
+        and isinstance(current, dict)
+        and isinstance(receipt, dict)
+        and type(current.get("revision")) is int
+        and current["revision"] >= request["expected_revision"] + 1
+        and current.get("automatic_starts_enabled")
+        is request["automatic_starts_enabled"]
+    )
+    if not base_match:
+        return False
+    if current["revision"] == receipt["revision"]:
+        return current == receipt
+    return True
+
+
+def _qualification_control_retry_argv(
+    action: str, pid: str, request: dict
+) -> list[str]:
+    return [
+        "qualification-control", action,
+        "--project-id", pid,
+        "--expected-revision", str(request["expected_revision"]),
+        "--idempotency-key", request["idempotency_key"],
+        "--reason", request["reason"],
+    ]
+
+
+def _emit_qualification_control_failure(
+    args: argparse.Namespace, message: str, retry_argv: list[str]
+) -> int:
+    payload = {
+        "action": getattr(args, "qualification_control_cmd", None),
+        "status": "not_committed_or_ambiguous",
+        "message": message,
+        "retry_argv": retry_argv,
+    }
+    if _json_mode(args):
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"ERROR: {message}", file=sys.stderr)
+        print(
+            f"Exact recovery command: blueprint {shlex.join(retry_argv)}",
+            file=sys.stderr,
+        )
+    return 1
+
+
+def _render_qualification_control(data: dict) -> None:
+    print("=== QUALIFICATION CONTROL ===")
+    print(json.dumps(data.get("result"), indent=2, default=str))
+
+
+def cmd_qualification_control(args: argparse.Namespace) -> int:
+    action = args.qualification_control_cmd
+    key = getattr(args, "idempotency_key", None)
+    if key is not None and (
+        not key or key != key.strip() or len(key) > 255
+    ):
+        print(
+            "ERROR: qualification-control idempotency key must be non-empty, "
+            "canonical, and at most 255 characters.",
+            file=sys.stderr,
+        )
+        return 1
+    expected_revision = getattr(args, "expected_revision", None)
+    reason = getattr(args, "reason", None)
+    if action != "show" and expected_revision < 0:
+        print("ERROR: --expected-revision must be non-negative.", file=sys.stderr)
+        return 1
+    if action != "show" and (
+        not reason or reason != reason.strip() or len(reason) > 500
+    ):
+        print(
+            "ERROR: qualification-control reason must be non-empty, canonical, "
+            "and at most 500 characters.",
+            file=sys.stderr,
+        )
+        return 1
+    pid = get_project_id(getattr(args, "project_id", None))
+    keyed_path = f"/api/admin/projects/{pid}/qualification-control"
+    if key is not None:
+        keyed_path += f"?idempotency_key={quote(key, safe='')}"
+    if action == "show":
+        result = api("GET", keyed_path)
+        _emit(args, {"action": action, "result": result}, _render_qualification_control)
+        return 0
+
+    _require_write_config(f"qualification-control {action}")
+    request = {
+        "automatic_starts_enabled": action == "arm",
+        "expected_revision": expected_revision,
+        "idempotency_key": key,
+        "reason": reason,
+    }
+    retry_argv = _qualification_control_retry_argv(action, pid, request)
+    context = api("GET", keyed_path)
+    if not _qualification_control_context_valid(context, pid, key):
+        return _emit_qualification_control_failure(
+            args, "qualification-control readback is malformed", retry_argv
+        )
+    if isinstance(context, dict) and context.get("receipt") is not None:
+        if (
+            _qualification_control_receipt_matches(request, pid, context)
+            and _qualification_control_current_matches(request, pid, context)
+        ):
+            _emit(
+                args,
+                {"action": action, "result": context},
+                _render_qualification_control,
+            )
+            return 0
+        return _emit_qualification_control_failure(
+            args,
+            "the stored receipt or current qualification-control state does "
+            "not match the frozen request",
+            retry_argv,
+        )
+    current = context.get("current") if isinstance(context, dict) else None
+    if (
+        not isinstance(current, dict)
+        or type(current.get("revision")) is not int
+        or current["revision"] != expected_revision
+    ):
+        return _emit_qualification_control_failure(
+            args,
+            "qualification-control authority changed before the request was sent",
+            retry_argv,
+        )
+    prompt = (
+        f"About to {action} automatic qualification starts for project {pid}.\n"
+        f"- Expected control revision: {expected_revision}\n"
+        f"- Idempotency key: {key}\n"
+        f"- Reason: {reason}\nProceed?"
+    )
+    if not _confirm(prompt, getattr(args, "yes", False)):
+        print("Aborted.")
+        return 0
+    raw_body = json.dumps(
+        request, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    post_error: Exception | None = None
+    try:
+        api("POST", keyed_path.split("?", 1)[0], raw_body=raw_body)
+    except Exception as exc:  # noqa: BLE001 - ambiguous send requires readback
+        post_error = exc
+    try:
+        reconciled = api("GET", keyed_path)
+    except APIError as exc:
+        detail = f"keyed readback failed after the control request: {exc}"
+        if post_error is not None:
+            detail = f"control request and {detail}"
+        return _emit_qualification_control_failure(args, detail, retry_argv)
+    if (
+        _qualification_control_receipt_matches(request, pid, reconciled)
+        and _qualification_control_current_matches(request, pid, reconciled)
+    ):
+        _emit(
+            args,
+            {"action": action, "result": reconciled},
+            _render_qualification_control,
+        )
+        return 0
+    return _emit_qualification_control_failure(
+        args,
+        "keyed readback did not prove the frozen qualification-control objective",
+        retry_argv,
+    )
 
 
 # ── promote-recover ──────────────────────────────────────────────────────────
@@ -10005,6 +10275,42 @@ def build_parser() -> argparse.ArgumentParser:
     p_dirs_cancel.add_argument("--yes", action="store_true",
                                 help="Skip the confirmation prompt.")
 
+    # qualification-control
+    p_qc = sub.add_parser(
+        "qualification-control",
+        parents=[common],
+        help="Read or fence fresh automatic release qualification starts.",
+    )
+    qc_sub = p_qc.add_subparsers(
+        dest="qualification_control_cmd", required=True
+    )
+    p_qc_show = qc_sub.add_parser(
+        "show", parents=[common], help="Read current control and an optional receipt."
+    )
+    p_qc_show.add_argument(
+        "--idempotency-key", default=None, help="Include the exact keyed receipt."
+    )
+    for action in ("hold", "arm"):
+        p_qc_mutate = qc_sub.add_parser(
+            action,
+            parents=[common],
+            help=f"{action.title()} fresh automatic qualification starts.",
+        )
+        p_qc_mutate.add_argument(
+            "--expected-revision", type=int, required=True,
+            help="Exact current control revision.",
+        )
+        p_qc_mutate.add_argument(
+            "--idempotency-key", required=True,
+            help="Stable project-scoped retry key.",
+        )
+        p_qc_mutate.add_argument(
+            "--reason", required=True, help="Canonical operator reason."
+        )
+        p_qc_mutate.add_argument(
+            "--yes", action="store_true", help="Skip the confirmation prompt."
+        )
+
     # promote-recover
     p_pr = sub.add_parser("promote-recover", parents=[common],
                           help="Promotion + recovery levers (confirms before mutating).")
@@ -12425,6 +12731,7 @@ _DISPATCH = {
     "directions": cmd_directions,
     "trials": cmd_trials,
     "fleet": cmd_fleet,
+    "qualification-control": cmd_qualification_control,
     "promote-recover": cmd_promote_recover,
     "logs": cmd_logs,
     "messages": cmd_messages,

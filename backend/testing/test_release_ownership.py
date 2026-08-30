@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app import release_qualifier
-from app.models import Project, ReleaseVersion
+from app.models import Project, ReleaseQualificationControlRevision, ReleaseVersion
 from app.release_qualifier_audit import _spawn_release_audit_task
 
 
@@ -37,6 +37,8 @@ class _RecordingSession:
         entity = statement.column_descriptions[0].get("entity")
         if entity is Project:
             return _Result(self.locked_project)
+        if entity is ReleaseQualificationControlRevision:
+            return _Result(None)
         return _Result(self.locked_version)
 
     async def get(self, model, _identity, **_kwargs):

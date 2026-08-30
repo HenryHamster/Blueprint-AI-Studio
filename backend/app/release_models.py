@@ -623,6 +623,59 @@ class ReleaseQualificationIntent(SQLModel, table=True):
     )
 
 
+class ReleaseQualificationControlRevision(SQLModel, table=True):
+    """Append-only project control for fresh automatic qualification starts."""
+
+    __tablename__ = "releasequalificationcontrolrevision"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "revision",
+            name="uq_releasequalificationcontrol_project_revision",
+        ),
+        UniqueConstraint(
+            "project_id",
+            "idempotency_key",
+            name="uq_releasequalificationcontrol_project_key",
+        ),
+        CheckConstraint(
+            "revision >= 1",
+            name="ck_releasequalificationcontrol_revision",
+        ),
+        CheckConstraint(
+            "length(specification_hash) = 64",
+            name="ck_releasequalificationcontrol_specification_hash",
+        ),
+        Index(
+            "ix_releasequalificationcontrol_project_latest",
+            "project_id",
+            "revision",
+        ),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    revision: int = Field(sa_column=Column(Integer, nullable=False))
+    automatic_starts_enabled: bool = Field(
+        default=True,
+        sa_column=Column(Boolean, nullable=False, server_default=text("true")),
+    )
+    idempotency_key: str = Field(sa_column=Column(String(255), nullable=False))
+    specification_hash: str = Field(sa_column=Column(String(64), nullable=False))
+    actor_user_id: str = Field(sa_column=Column(String(255), nullable=False))
+    reason: str = Field(sa_column=Column(Text, nullable=False))
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+
 class VersionAcceptanceCriterion(SQLModel, table=True):
     """A single verifiable acceptance criterion scoped to a release version.
 
