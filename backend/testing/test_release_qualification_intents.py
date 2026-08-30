@@ -994,3 +994,66 @@ async def test_execution_timeout_rolls_back_and_releases_claim(
     assert intent.claim_id is None
     assert intent.last_error.startswith("TimeoutError:")
     assert version.last_qualification is None
+
+
+@pytest.mark.asyncio
+async def test_classified_non_authorizing_result_clears_dirty_json_before_receipt(
+    db_session,
+    mocker,
+):
+    project, version = await _make_project_and_version(
+        db_session,
+        phase="stabilize",
+    )
+    task = await _source_task(db_session, project)
+    intent = await prepare_qualification_intent(
+        db_session,
+        request={"reason": "classified rollback", "probes": []},
+        task=task,
+        project=project,
+    )
+    assert intent is not None
+    await db_session.commit()
+
+    async def _classified_apply(
+        request,
+        source_task,
+        source_project,
+        session,
+        *,
+        result_out,
+        **kwargs,
+    ):
+        version.last_qualification = {"status": "must_rollback"}
+        flag_modified(version, "last_qualification")
+        session.add(version)
+        result_out.update(status="superseded")
+        return False
+
+    apply_mock = mocker.patch(
+        "app.strategic_completion._apply_qualify_request",
+        side_effect=_classified_apply,
+    )
+
+    assert await drain_qualification_intent(
+        intent.id,
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.refresh(intent)
+    await db_session.refresh(version)
+    assert intent.status == "superseded"
+    assert intent.result["status"] == "superseded"
+    assert intent.result["delivery_state"] == "committed"
+    assert intent.result["intent_id"] == str(intent.id)
+    assert intent.result["project_id"] == str(project.id)
+    assert intent.result["release_version_id"] == str(version.id)
+    assert intent.result["source_task_id"] == str(task.id)
+    assert intent.result["attempt_count"] == 1
+    assert intent.result["claim_id"]
+    assert intent.result["specification_hash"] == intent.specification_hash
+    assert version.last_qualification is None
+    assert not await drain_qualification_intent(
+        intent.id,
+        session_factory=_shared_session_factory(db_session),
+    )
+    assert apply_mock.await_count == 1

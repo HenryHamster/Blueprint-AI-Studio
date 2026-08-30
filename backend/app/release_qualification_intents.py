@@ -893,7 +893,7 @@ async def drain_qualification_intent(
                     # compliance-cache/error projection accumulated before the
                     # final authority fence, then commit only the exact result
                     # receipt below in a fresh transaction.
-                    await execution_session.rollback()
+                    await _rollback_failed_execution(execution_session)
                 receipt = {
                     **apply_result,
                     "delivery_state": "committed",
