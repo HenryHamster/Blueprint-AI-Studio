@@ -12,10 +12,10 @@ from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import or_, update
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Project, ReleaseQualificationIntent, ReleaseVersion, Task
+from app.task_locking import with_vision_locked
 from app.time_utils import _utcnow
 
 
@@ -347,7 +347,8 @@ def _fail_invalid_committed_receipt(
     intent.next_attempt_at = None
 
 
-def _deliver_refresh_from_committed_receipt(
+async def _deliver_refresh_from_committed_receipt(
+    session,
     intent: ReleaseQualificationIntent,
     project: Project,
 ) -> None:
@@ -362,13 +363,18 @@ def _deliver_refresh_from_committed_receipt(
         return
     from app.strategic_trigger import mark_strategic_refresh_in_vision
 
-    vision = dict(project.vision or {})
-    mark_strategic_refresh_in_vision(
-        vision,
-        "qualification blocked by actionable CI compliance evidence",
+    def _mark_refresh(vision: dict) -> None:
+        mark_strategic_refresh_in_vision(
+            vision,
+            "qualification blocked by actionable CI compliance evidence",
+        )
+
+    await with_vision_locked(
+        session,
+        project.id,
+        _mark_refresh,
+        _locked_project=project,
     )
-    project.vision = vision
-    flag_modified(project, "vision")
     result["refresh_delivery_state"] = "delivered"
     intent.result = result
 
@@ -426,7 +432,7 @@ async def _claim_intent(session, intent_id: uuid.UUID) -> uuid.UUID | None:
             )
         else:
             _settle_committed_result(intent, now=now)
-            _deliver_refresh_from_committed_receipt(intent, project)
+            await _deliver_refresh_from_committed_receipt(session, intent, project)
         session.add(project)
         session.add(intent)
         await session.commit()
@@ -629,7 +635,7 @@ async def _settle_claim(
                 )
             else:
                 _settle_committed_result(intent, now=now)
-                _deliver_refresh_from_committed_receipt(intent, project)
+                await _deliver_refresh_from_committed_receipt(session, intent, project)
                 session.add(project)
         elif execution_error is not None:
             intent.last_error = (

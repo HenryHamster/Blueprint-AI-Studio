@@ -21,6 +21,7 @@ from app.models import DiscoveryCycle, StrategicSpawnRequest, Task
 from app.release_models import ReleaseVersion, VersionAcceptanceCriterion
 from app.routers.agent_access import _get_user_project
 from app.strategic_spawn_requests import stable_replay_specification_hash
+from app.time_utils import utc_iso
 
 
 router = APIRouter(prefix="/api/agent-access/v1", tags=["agent-access"])
@@ -35,7 +36,7 @@ _RECOGNIZED_PARENT_TYPES = {"strategic_review"}
 
 
 def _iso(value: datetime | None) -> str | None:
-    return value.isoformat() if value is not None else None
+    return utc_iso(value)
 
 
 def _safe_text(value: Any, limit: int) -> str | None:

@@ -20,7 +20,7 @@ class _RecordingSession:
     async def flush(self) -> None:
         return None
 
-    async def execute(self, _statement):
+    async def execute(self, statement):
         class _Result:
             def __init__(self, value):
                 self.value = value
@@ -34,9 +34,14 @@ class _RecordingSession:
             def scalar_one_or_none(self):
                 return self.value
 
-        return _Result(self.locked_version or self.locked_project)
+        entity = statement.column_descriptions[0].get("entity")
+        if entity is Project:
+            return _Result(self.locked_project)
+        return _Result(self.locked_version)
 
-    async def get(self, _model, _identity):
+    async def get(self, model, _identity, **_kwargs):
+        if model is Project:
+            return self.locked_project
         return None
 
 

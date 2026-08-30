@@ -5681,6 +5681,100 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       String(text).includes('typed Workday consultation ack deferred'))).toHaveLength(1);
   });
 
+  it('does not retry a consultation ack after an authoritative 409', async () => {
+    vi.useFakeTimers();
+    mockApiGet.mockResolvedValue({
+      messages: [],
+      fast_message_ids: [],
+      claim_required: true,
+    });
+
+    const envelope = typedEnvelope('Lose this private delivery authority.', 92);
+    let consultationClaims = 0;
+    let alive = true;
+    const ackBodies: Array<Record<string, unknown>> = [];
+    const diagnosticBodies: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+        });
+      }
+      if (url.endsWith('/workday-consultations/claim-next')) {
+        consultationClaims += 1;
+        return Promise.resolve(consultationClaims === 1 ? {
+          status: 'claimed',
+          packet: {
+            packet_id: 'packet-ack-authority-lost',
+            workday_claim_id: 'workday-claim-ack-authority-lost',
+            lease_expires_at: '2035-01-01T00:00:00.000Z',
+            attempt: 1,
+            claim_id: 'fast-claim-ack-authority-lost',
+            delivery_key: 'delivery-ack-authority-lost',
+            continuation_key: 'continuation-ack-authority-lost',
+            question: 'Lose this private delivery authority.',
+            envelope,
+          },
+        } : { status: 'empty' });
+      }
+      if (url.endsWith('/workday-consultations/packet-ack-authority-lost/renew')) {
+        return Promise.resolve({
+          workday_claim_id: 'workday-claim-ack-authority-lost',
+          lease_expires_at: '2035-01-01T00:00:00.000Z',
+        });
+      }
+      if (url.endsWith('/workday-consultations/packet-ack-authority-lost/ack')) {
+        ackBodies.push(JSON.parse(JSON.stringify(body ?? {})) as Record<string, unknown>);
+        alive = false;
+        return Promise.reject(new Error('consultation acknowledgement rejected (409)'));
+      }
+      if (url.endsWith(
+        '/workday-consultations/packet-ack-authority-lost/attempt-diagnostic',
+      )) {
+        diagnosticBodies.push(
+          JSON.parse(JSON.stringify(body ?? {})) as Record<string, unknown>,
+        );
+        return Promise.resolve({
+          status: 'recorded',
+          attempt_diagnostic: body?.attempt_diagnostic,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const workday = makeSession(() => Promise.resolve(turnResult({
+      resultText: 'Private result whose claim was displaced.',
+      sentOperatorMessage: false,
+      providerTerminalReason: 'success',
+      providerOutputTail: 'Private result whose claim was displaced.',
+      trace: [{ elapsedMs: 1, kind: 'result', label: 'success' }],
+    })), () => alive);
+    bindSessionWithPrivateRuntime(workday);
+
+    const done = run('typed-fast-ack-authority-lost', {
+      ...qualifiedPayload(),
+      typed_fast_enabled: false,
+      strategic_session_autonomous: true,
+      strategic_session_message_poll_seconds: 0.001,
+      strategic_session_exploration_interval_seconds: 1,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await done;
+
+    expect(ackBodies).toHaveLength(1);
+    expect(diagnosticBodies).toHaveLength(1);
+    expect(diagnosticBodies[0]?.attempt_diagnostic).toMatchObject({
+      attempt: 1,
+      outcome: 'abandoned',
+      terminal_predicate: 'consultation_ack_authority_lost',
+      provider_terminal_reason: 'success',
+    });
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(workday.interrupt).not.toHaveBeenCalled();
+    expect(consultationClaims).toBe(1);
+  });
+
   it('keeps a consultation-restart checkpoint out of the private retry and delivers it to the next ordinary turn', async () => {
     vi.useFakeTimers();
     const operatorMessage = {

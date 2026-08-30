@@ -30,7 +30,7 @@ from app.service_credentials import (
     request_allowed,
 )
 from app.strategic_spawn_requests import stable_replay_specification_hash
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow, utc_iso
 from testing.factories import make_membership
 
 
@@ -367,7 +367,7 @@ async def test_release_spawn_evidence_is_exact_private_and_fail_closed(
     assert body["two_task_dependency_chain_complete"] is True
     assert body["complete"] is True
     assert body["two_task_spawn_chain_complete"] is True
-    assert body["release_version"]["window_end"] == successor_opened_at.isoformat()
+    assert body["release_version"]["window_end"] == utc_iso(successor_opened_at)
     assert [item["request_id"] for item in body["requests"]] == [
         str(first_request.id),
         str(second_request.id),

@@ -3511,7 +3511,7 @@ def test_retired_directions_summary_includes_durable_memory_entries():
                     "id": "d-pruned",
                     "text": readable_text,
                     "text_tokens": ["improve", "auth", "performance"],
-                    "retired_at": "2026-06-01T00:00:00",
+                    "retired_at": _recent_iso(1),
                     "reason": "saturation",
                     "gap_id": "g-auth",
                 }
@@ -3539,7 +3539,7 @@ def test_retired_directions_summary_surfaces_outcome():
                 {
                     "id": "d-sup",
                     "text_tokens": ["improve", "auth"],
-                    "retired_at": "2026-06-01T00:00:00",
+                    "retired_at": _recent_iso(1),
                     "reason": "strategic_superseded",
                     "outcome": "superseded by d-successor",
                 }
@@ -3563,7 +3563,7 @@ def test_retired_directions_summary_falls_back_to_structured_outcome():
                 {
                     "id": "d-struct",
                     "text_tokens": ["improve", "auth"],
-                    "retired_at": "2026-06-01T00:00:00",
+                    "retired_at": _recent_iso(1),
                     "reason": "saturation",
                     # No freetext "outcome" — the lifecycle retire path never writes
                     # it — but the structured retired_outcome is always present.
@@ -3592,7 +3592,7 @@ def test_retired_directions_summary_prefers_freetext_over_structured_outcome():
                 {
                     "id": "d-both-outcomes",
                     "text_tokens": ["improve", "auth"],
-                    "retired_at": "2026-06-01T00:00:00",
+                    "retired_at": _recent_iso(1),
                     "reason": "strategic_superseded",
                     "outcome": "superseded by d-successor",
                     "retired_outcome": {
@@ -3616,7 +3616,7 @@ def test_retired_directions_summary_omits_outcome_when_absent():
                 {
                     "id": "d-old",
                     "text_tokens": ["improve", "auth"],
-                    "retired_at": "2026-06-01T00:00:00",
+                    "retired_at": _recent_iso(1),
                     "reason": "saturation",
                 }
             ]
@@ -3634,7 +3634,7 @@ def test_retired_directions_summary_deduplicates_live_and_memory():
             {
                 "id": "d-both",
                 "status": "retired",
-                "retired_at": "2026-06-10T00:00:00",
+                "retired_at": _recent_iso(1),
                 "text": "improve auth",
                 "research_history": [],
             }
@@ -3644,7 +3644,7 @@ def test_retired_directions_summary_deduplicates_live_and_memory():
                 {
                     "id": "d-both",
                     "text_tokens": ["improve", "auth"],
-                    "retired_at": "2026-06-10T00:00:00",
+                    "retired_at": _recent_iso(1),
                     "reason": "saturation",
                 }
             ]
@@ -3683,7 +3683,7 @@ def test_retired_directions_summary_memory_surfaces_outcome():
                 {
                     "id": "d-pruned-with-merges",
                     "text_tokens": ["improve", "auth"],
-                    "retired_at": "2026-06-01T00:00:00",
+                    "retired_at": _recent_iso(1),
                     "reason": "saturation",
                     "cycles": 5,
                     "prs_merged": 3,
@@ -3712,7 +3712,7 @@ def test_retired_directions_summary_cost_per_merge_includes_aggregate_cost():
                 "id": "d-evicted-cost",
                 "text": "direction with evicted cost",
                 "status": "retired",
-                "retired_at": "2026-06-01T00:00:00",
+                "retired_at": _recent_iso(1),
                 "research_history": [],
                 "history_aggregate": {
                     "total_cycles": 5,
@@ -3858,7 +3858,7 @@ def test_retired_directions_summary_preserves_text_order():
                     # alphabetical and reverse-alphabetical, so any set-based
                     # reconstruction will reliably produce a different order.
                     "text_tokens": ["zebra", "mango", "apple", "kite"],
-                    "retired_at": "2026-06-01T00:00:00",
+                    "retired_at": _recent_iso(1),
                     "reason": "saturation",
                 }
             ]
@@ -4036,7 +4036,7 @@ def test_retired_directions_summary_legacy_entry_no_text_falls_back_to_tokens():
                 {
                     "id": "d-legacy-tokens",
                     "text_tokens": ["zebra", "mango", "apple"],
-                    "retired_at": "2026-06-01T00:00:00",
+                    "retired_at": _recent_iso(1),
                     "reason": "saturation",
                 }
             ]

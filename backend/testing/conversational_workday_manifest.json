@@ -86,6 +86,7 @@
         "test_workday_operation_authority_allows_new_ask_but_rejects_conflict",
         "test_workday_operation_cannot_rebind_after_version_cut",
         "test_paused_intent_stays_due_then_applies_once",
+        "test_fresh_committed_refresh_arms_once_without_losing_vision",
         "test_phase_epoch_drift_supersedes_without_execution",
         "test_committed_receipt_recovers_without_replaying_apply",
         "test_mismatched_committed_receipt_fails_without_replay_or_refresh",
@@ -103,7 +104,7 @@
         "test_execution_timeout_rolls_back_and_releases_claim",
         "test_classified_non_authorizing_result_clears_dirty_json_before_receipt"
       ],
-      "test_count": 20
+      "test_count": 21
     },
     {
       "path": "backend/testing/test_agent_access_release_spawns.py",
@@ -827,6 +828,7 @@
         "handleStrategicResident \u2014 typed Fast lease lifecycle > completes a preserved Fast turn after resolved workspace prep before Workday identity launch fails",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > continues polling and heartbeating while the Fast readiness probe is pending",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > does not preempt an active autonomous Workday turn for a Fast-only reply",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > does not retry a consultation ack after an authoritative 409",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > does not start a Fast foreground child for a resolved workspace with no Fast message",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > does not start cold Fast while an active call survives an omitted heartbeat projection",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > fails closed on %s before a private autonomous turn can execute [case 1]",
@@ -891,7 +893,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 153
+      "test_count": 154
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",

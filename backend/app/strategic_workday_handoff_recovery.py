@@ -35,6 +35,9 @@ from app.session_message_handoff import (
     RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
 )
 from app.strategic_conversation_query import strategic_conversation_predicate
+from app.strategic_autonomous_handoff_lineage import (
+    autonomous_workday_result_lineage_valid,
+)
 from app.time_utils import _utcnow
 
 _ATOMIC_REPLY_ID = "_workday_consultation_atomic_reply_id"
@@ -77,7 +80,7 @@ logger = logging.getLogger(__name__)
 class WorkdayResultServerLineage:
     """Canonical public source and receipt authority selected by server keys."""
 
-    public_source_id: uuid.UUID
+    public_source_id: uuid.UUID | None
     authority_row_id: uuid.UUID
     kind: str
     projections_valid: bool = True
@@ -1016,6 +1019,18 @@ async def workday_result_server_lineage(
             public_source_id=terminal_source_id,
             authority_row_id=terminal_source_id,
             kind="terminal_recovery",
+        )
+    autonomous_lineage = await autonomous_workday_result_lineage_valid(
+        session,
+        row=row,
+        key_parts=key_parts,
+    )
+    if autonomous_lineage is not None:
+        return WorkdayResultServerLineage(
+            public_source_id=None,
+            authority_row_id=row.id,
+            kind="autonomous_handoff",
+            projections_valid=autonomous_lineage,
         )
     if len(key_parts) != 3 or key_parts[0] != "workday-consultation-result":
         return None

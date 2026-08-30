@@ -1954,6 +1954,7 @@ class TestFinalizeInfraFailure:
 
         assert result["status"] == "infra_failure"
         assert result["is_permanent_gate_incapacity"] is True
+        assert result["same_error_as_prior"] is True
         assert result["same_signature_streak"] == 4  # 3 prior + current all same sig
 
 
@@ -2238,6 +2239,55 @@ class TestFinalizeInfraFailure:
         assert result["is_permanent_gate_incapacity"] is False
         # The trailing same-signature count should be 1 (just current entry)
         assert result["same_signature_streak"] == 1
+
+    @pytest.mark.asyncio
+    async def test_legacy_signature_fallback_stops_at_malformed_history_tail(
+        self, db_session, mocker
+    ):
+        """A malformed immediate predecessor cannot bridge legacy authority."""
+        from app import release_qualifier_audit as rqa
+
+        _project, version = await _make_project_and_version(db_session)
+        signature = "migration_apply:unknown:migration_apply_check_unavailable"
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 3,
+            "infra_attempt_history": [
+                {
+                    "signature": signature,
+                    "engine_sha": "current-engine-sha",
+                    "child_failures": [],
+                },
+                None,
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        mocker.patch.object(rqa, "get_serving_sha", return_value="current-engine-sha")
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(),
+        )
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "migration_apply_check_unavailable",
+        )
+        await db_session.commit()
+
+        assert result["same_error_as_prior"] is False
+        assert result["same_signature_streak"] == 1
+        assert result["is_permanent_gate_incapacity"] is False
+        preview_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_permanent_gate_incapacity_resets_on_serving_engine_change(
