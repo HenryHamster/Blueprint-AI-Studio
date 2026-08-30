@@ -16637,7 +16637,6 @@
   "testing/test_release_qualifier__finalize_qualification.py::test_evaluate_hotfix_scope_pure_predicate": 0.1,
   "testing/test_release_qualifier__finalize_qualification.py::test_finalize_absent_candidate_ci_stays_strict_for_single_branch_project": 0.044,
   "testing/test_release_qualifier__finalize_qualification.py::test_finalize_absent_candidate_ci_stays_strict_when_topology_raises": 0.044,
-  "testing/test_release_qualifier__finalize_qualification.py::test_finalize_absent_integration_branch_candidate_ci_self_clears_ci_unresolved": 0.044,
   "testing/test_release_qualifier__finalize_qualification.py::test_finalize_apply_gate_ok_does_not_block_promotion": 0.044,
   "testing/test_release_qualifier__finalize_qualification.py::test_finalize_blocks_on_migration_apply_drift": 0.044,
   "testing/test_release_qualifier__finalize_qualification.py::test_finalize_blocks_on_migration_identity_collision": 0.044,

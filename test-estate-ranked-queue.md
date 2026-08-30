@@ -59,7 +59,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P2 | backend | `backend/testing/test_release_qualifier__finalize_qualification_2.py` | 7,232 | 116 | critical (>5000 LOC) | 5.220s measured | — |
 | P2 | backend | `backend/testing/test_strategic_state.py` | 10,800 | 176 | critical (>5000 LOC) | 4.542s measured | protected; declared floor 176 |
 | P2 | backend | `backend/testing/test_release_qualifier__sweep_stuck_qualifications.py` | 7,351 | 149 | critical (>5000 LOC) | 3.776s measured | — |
-| P2 | backend | `backend/testing/test_release_qualifier__finalize_qualification.py` | 7,670 | 106 | critical (>5000 LOC) | 3.708s measured | — |
+| P2 | backend | `backend/testing/test_release_qualifier__finalize_qualification.py` | 7,670 | 106 | critical (>5000 LOC) | 3.664s measured | — |
 | P2 | backend | `backend/testing/test_warm_pool_maintainer.py` | 5,921 | 123 | critical (>5000 LOC) | 3.564s measured | — |
 | P2 | admin-ui | `admin-ui/src/components/VersionLifecyclePanel.test.tsx` | 5,420 | 181 | critical (>5000 LOC) | 2.891s measured | — |
 | P2 | backend | `backend/testing/test_acceptance_gate.py` | 5,813 | 133 | critical (>5000 LOC) | 1.790s measured | — |
