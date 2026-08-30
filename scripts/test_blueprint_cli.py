@@ -9026,7 +9026,7 @@ def test_migration_deploy_stops_units_before_migrate_and_starts_after(monkeypatc
     monkeypatch.setattr(local_release, "_inspect_candidate", lambda *_args: "sha256:" + "c" * 64)
     monkeypatch.setattr(local_release, "_retain_prior_image", lambda _image: "retained:old")
     monkeypatch.setattr(local_release, "_image_schema_revision", lambda _image: "0743")
-    database_revisions = iter(("0742", "0743"))
+    database_revisions = iter(("0742", "0743", "0743"))
     monkeypatch.setattr(
         local_release, "_database_schema_revision", lambda: next(database_revisions)
     )
