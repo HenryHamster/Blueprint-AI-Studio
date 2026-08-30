@@ -23,12 +23,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import github
 from app.database import AsyncSessionLocal
 from app.models import Project, ReleasePrepromotionDispatch, ReleaseVersion
+from app.release_authority_lock import lock_release_project
+from app.release_prepromotion_gradeability import (
+    PREPROMOTION_REHEARSAL_CONTRACT_TYPE,
+    normalize_rehearsal_evidence_contract,
+    rubric_requires_rehearsal_contract,
+    validate_prepromotion_gradeability,
+)
 from app.time_utils import _utcnow
 _MODULE_SIZE_GOVERNANCE_CAP: int = 1072
 
 PREPROMOTION_REHEARSAL_KIND = "blueprint.prepromotion_ci_build_smoke.v1"
 PREPROMOTION_REHEARSAL_SCHEMA_VERSION = 1
-PREPROMOTION_REHEARSAL_CONTRACT_TYPE = "prepromotion_ci_build_smoke"
 PREPROMOTION_REHEARSAL_WORKFLOW = "prepromotion-rehearsal.yml"
 # The workflow definition is loaded only from protected main.  The exact
 # automain candidate is supplied as immutable input and checked out as data by
@@ -57,114 +63,6 @@ PREPROMOTION_REHEARSAL_INPUTS: dict[str, str] = {
     # impossible.
 }
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
-
-# Evidence producers are ordered before the promotion gate. Structured
-# metadata, never a fixed criterion key or prose marker, selects the trusted-CI
-# producer.
-_PREPROMOTION_GRADEABILITY_PHASES = {
-    "qualification_setup": 10,
-    "qualification_evidence": 20,
-    "promotion_gate": 30,
-}
-
-
-def validate_prepromotion_gradeability(
-    active_categories: list[Mapping[str, Any]],
-    *,
-    contracts: Mapping[str, Mapping[str, Any]] | None = None,
-) -> None:
-    """Reject promotion criteria whose evidence producer is not pre-gradeable.
-
-    Every active category can force ``not_met`` during qualification.  Ordinary
-    categories are produced by the blind merge-grade in the qualification
-    evidence phase; special machine-backed categories are selected by their
-    closed evidence contract. A producer at or after the gate, or one with an
-    unknown phase, is a circular/deadlocked contract and fails closed.
-    """
-    declared = contracts or {}
-    for category in active_categories:
-        key = str(
-            category.get("category_key") or category.get("criterion_key") or ""
-        ).strip()
-        if not key:
-            raise ValueError("active promotion criterion has no stable key")
-        contract = declared.get(key)
-        is_trusted_ci = (
-            normalize_rehearsal_evidence_contract(
-                category.get("evidence_contract")
-            )
-            is not None
-        )
-        if contract is None:
-            contract = (
-                {
-                    "producer": "trusted_ci_candidate_build_smoke",
-                    "producer_phase": "qualification_setup",
-                    "gate_phase": "promotion_gate",
-                    "prerequisites": ("durable_candidate_bound_outbox",),
-                }
-                if is_trusted_ci
-                else {
-                    "producer": "blind_merge_grade",
-                    "producer_phase": "qualification_evidence",
-                    "gate_phase": "promotion_gate",
-                }
-            )
-        producer = str(contract.get("producer") or "").strip()
-        producer_phase = str(contract.get("producer_phase") or "").strip()
-        gate_phase = str(contract.get("gate_phase") or "").strip()
-        if not producer:
-            raise ValueError(f"criterion {key} has no evidence producer")
-        if (
-            producer_phase not in _PREPROMOTION_GRADEABILITY_PHASES
-            or gate_phase not in _PREPROMOTION_GRADEABILITY_PHASES
-        ):
-            raise ValueError(
-                f"criterion {key} has an unknown gradeability phase "
-                f"({producer_phase!r} -> {gate_phase!r})"
-            )
-        if (
-            _PREPROMOTION_GRADEABILITY_PHASES[producer_phase]
-            >= _PREPROMOTION_GRADEABILITY_PHASES[gate_phase]
-        ):
-            raise ValueError(
-                f"criterion {key} evidence producer {producer!r} runs at or "
-                f"after its promotion gate"
-            )
-        if is_trusted_ci and (
-            "durable_candidate_bound_outbox"
-            not in contract.get("prerequisites", ())
-        ):
-            raise ValueError(
-                f"criterion {key} is missing the durable candidate outbox "
-                "precondition"
-            )
-
-
-def normalize_rehearsal_evidence_contract(raw: Any) -> dict[str, Any] | None:
-    """Return the one explicit CI build/smoke evidence contract shape."""
-    if not isinstance(raw, Mapping) or set(raw) != {"type", "predicate"}:
-        return None
-    predicate = raw.get("predicate")
-    if (
-        raw.get("type") != PREPROMOTION_REHEARSAL_CONTRACT_TYPE
-        or not isinstance(predicate, Mapping)
-        or set(predicate) != {"required"}
-        or predicate.get("required") is not True
-    ):
-        return None
-    return {
-        "type": PREPROMOTION_REHEARSAL_CONTRACT_TYPE,
-        "predicate": {"required": True},
-    }
-
-
-def rubric_requires_rehearsal_contract(criteria: list[Mapping[str, Any]]) -> bool:
-    return any(
-        normalize_rehearsal_evidence_contract(item.get("evidence_contract")) is not None
-        for item in criteria
-    )
-
 
 async def dispatch_prepromotion_rehearsal(
     token: str,
@@ -324,21 +222,42 @@ async def _cas_dispatch_result(
     session_factory=AsyncSessionLocal,
 ) -> None:
     async with session_factory() as session:
+        # Probe immutable parent identities without a row lock, then join the
+        # canonical Project -> ReleaseVersion -> child-intent lock order. The
+        # admin rearm path holds those same rows in that order.
+        probe = await session.get(ReleasePrepromotionDispatch, dispatch_id)
+        if probe is None:
+            return
+        project_id = probe.project_id
+        release_version_id = probe.release_version_id
+        project = await lock_release_project(session, project_id)
+        if project is None:
+            return
+        version = (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(ReleaseVersion.id == release_version_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if version is None or version.project_id != project_id:
+            return
         row = (
             await session.execute(
                 select(ReleasePrepromotionDispatch)
                 .where(ReleasePrepromotionDispatch.id == dispatch_id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if (
             row is None
+            or row.project_id != project_id
+            or row.release_version_id != release_version_id
             or row.dispatch_attempts != attempt
             or row.status != "attempting"
         ):
-            return
-        version = await session.get(ReleaseVersion, row.release_version_id)
-        if version is None:
             return
         active_candidate = (version.last_qualification or {}).get("candidate_sha")
         if version.status != "open" or active_candidate != row.candidate_sha:
@@ -347,10 +266,9 @@ async def _cas_dispatch_result(
             session.add(row)
             await session.commit()
             return
-        project = await session.get(Project, row.project_id)
         repository = (
             f"{project.github_owner}/{project.github_repo}"
-            if project is not None and project.github_owner and project.github_repo
+            if project.github_owner and project.github_repo
             else None
         )
         existing_receipt = (

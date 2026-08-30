@@ -28,6 +28,11 @@ from app.release_artifacts import (
     aggregate_required_artifact_status,
     is_backend_revision_artifact,
 )
+from app.release_authority_lock import (
+    lock_project_then_version as _lock_project_then_version,
+    lock_release_project_for_version as _lock_release_project_for_version,
+    relock_matching_open_release as _relock_matching_open_release,
+)
 from app.release_merge_refusal import promotion_merge_refusal
 from app.release_promotion import (
     _candidate_already_on_main,
@@ -87,6 +92,7 @@ from app.release_serving_confirmation import (
 
 logger = logging.getLogger(__name__)
 _MODULE_SIZE_GOVERNANCE_CAP: int = 2841
+
 
 # Audit C9: hard wall-clock deadline on the ``promotion_pending`` sub-state.
 #
@@ -479,17 +485,7 @@ async def _reconcile_if_not_promoted_but_pr_merged(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            version: release_version.ReleaseVersion | None = (
-                (
-                    await session.execute(
-                        select(release_version.ReleaseVersion)
-                        .where(release_version.ReleaseVersion.id == version_id)
-                        .with_for_update()
-                    )
-                )
-                .scalars()
-                .first()
-            )
+            version = await _lock_project_then_version(session, version_id)
             if version is None:
                 return False
             if version.status != "open":
@@ -1094,17 +1090,7 @@ async def _reconcile_if_managed_check_wait(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            version: release_version.ReleaseVersion | None = (
-                (
-                    await session.execute(
-                        select(release_version.ReleaseVersion)
-                        .where(release_version.ReleaseVersion.id == version_id)
-                        .with_for_update()
-                    )
-                )
-                .scalars()
-                .first()
-            )
+            version = await _lock_project_then_version(session, version_id)
             if version is None:
                 return False
             if version.status != "open":
@@ -2232,12 +2218,16 @@ async def _reconcile_if_pending_qualification_superseded(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
+            project = await _lock_release_project_for_version(session, version_id)
+            if project is None:
+                return False
             version: release_version.ReleaseVersion | None = (
                 (
                     await session.execute(
                         select(release_version.ReleaseVersion)
                         .where(release_version.ReleaseVersion.id == version_id)
                         .with_for_update()
+                        .execution_options(populate_existing=True)
                     )
                 )
                 .scalars()
@@ -2258,10 +2248,13 @@ async def _reconcile_if_pending_qualification_superseded(
             candidate_sha: str | None = qual.get("candidate_sha")
             if not candidate_sha:
                 return False
-
-            project = await session.get(Project, version.project_id)
-            if project is None:
-                return False
+            initial_qualification = dict(qual)
+            initial_project_identity = (
+                project.github_owner,
+                project.github_repo,
+                project.integration_branch,
+                project.promotion_target,
+            )
 
             # Single-branch repo guard — mirrors promote().  When the integration
             # branch IS the promotion target there is no separate release trunk,
@@ -2378,6 +2371,19 @@ async def _reconcile_if_pending_qualification_superseded(
             ):
                 return False
 
+            # GitHub I/O ran without release authority. Rejoin the canonical
+            # Project -> Version order and require the exact pending predicate
+            # observed before I/O; an exact cut or newer attempt wins.
+            authority = await _relock_matching_open_release(
+                session,
+                version_id,
+                qualification=initial_qualification,
+                project_identity=initial_project_identity,
+            )
+            if authority is None:
+                return False
+            project, version = authority
+
             logger.info(
                 "[RELEASE_QUALIFIER] reconcile pending_superseded: candidate "
                 "%s for v%d is on %s without a promotion_pending marker — "
@@ -2457,17 +2463,7 @@ async def _reconcile_if_promotion_pending_timed_out(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            version: release_version.ReleaseVersion | None = (
-                (
-                    await session.execute(
-                        select(release_version.ReleaseVersion)
-                        .where(release_version.ReleaseVersion.id == version_id)
-                        .with_for_update()
-                    )
-                )
-                .scalars()
-                .first()
-            )
+            version = await _lock_project_then_version(session, version_id)
             if version is None:
                 return False
             if version.status != "open":
@@ -2751,18 +2747,7 @@ async def _reconcile_if_promotion_pending_timed_out(
             # clearing it into a promotion_failed record.  A concurrent landing
             # or operator action wins without being overwritten.
             session.expire_all()
-            locked: release_version.ReleaseVersion | None = (
-                (
-                    await session.execute(
-                        select(release_version.ReleaseVersion)
-                        .where(release_version.ReleaseVersion.id == version_id)
-                        .with_for_update()
-                        .execution_options(populate_existing=True)
-                    )
-                )
-                .scalars()
-                .first()
-            )
+            locked = await _lock_project_then_version(session, version_id)
             if locked is None or locked.status != "open":
                 return False
             locked_qual = locked.last_qualification or {}

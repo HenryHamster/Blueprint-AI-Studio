@@ -28,7 +28,6 @@ unchanged.
 
 from __future__ import annotations
 
-
 import json
 import logging
 import uuid
@@ -41,10 +40,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app import github, release_version
-from app.models import Project, QualificationVerdict
-from app.release_artifacts import get_or_create_release_deploy_artifact
 from app.failure_reason import exception_reason, promotion_failure_result
+from app.models import Project, QualificationVerdict
 from app.notification_dispatch import post_event_message
+from app.release_artifacts import get_or_create_release_deploy_artifact
+from app.release_authority_lock import lock_release_project
 from app.release_merge_refusal import promotion_merge_refusal
 from app.release_scoring import _DEFAULT_POLICY, compute_composite
 from app.shared_state import (
@@ -1190,9 +1190,9 @@ async def promote(
 
     Operates on the ``session`` it is given — which the finalize chain runs as a
     DEDICATED session, so the intermediate commit only ever flushes qualifier
-    state.  ``promote()`` issues that one intermediate commit itself; the
-    caller (``_finalize_in_dedicated_session``) commits the final state write.
-    Returns a result dict.
+    state. ``promote()`` issues its intermediate commit; the success recorder
+    then commits the canonical terminal state before any remote or separate-
+    session follow-up. Callers may commit again harmlessly. Returns a result dict.
     """
     base_record = dict(base_record or {})
     project = await session.get(Project, version.project_id)
@@ -2073,6 +2073,13 @@ async def _record_promotion_failure(
     none resolves, ``candidate_sha_unresolved`` is stamped so the hold has a
     stated reason instead of being a blank.
     """
+    # Project→Version is the canonical release-writer order used by qualifier,
+    # deferral, intent settlement, and exact cuts. Hold Project before re-locking
+    # Version so the operator receipt's message-sequence allocation is reentrant
+    # instead of introducing a Version→Project deadlock edge.
+    locked_project = await lock_release_project(session, version.project_id)
+    if locked_project is None:
+        return promotion_failure_result(error, conflict, detail)
     locked = await _relock_version_for_promotion_write(
         session, version, lock_released=lock_released
     )
@@ -2254,9 +2261,9 @@ async def _record_promotion_success(
     ``version.status == "open"`` under that lock.  If the row already reads
     ``status="promoted"`` a concurrent finalize / a crash-retry already promoted
     this version — bail as already-landed WITHOUT opening a duplicate vN+1,
-    instead of double-promoting.  Every ``promote()`` success path reaches here
-    AFTER the intermediate commit, so ``lock_released`` defaults to ``True``
-    (re-read + re-lock from the DB).  ``already_landed`` is True when
+    instead of double-promoting.  Paths that released their earlier lock pass
+    ``lock_released=True`` so this function re-reads and re-locks from the DB;
+    the empty-diff path may retain its existing lock.  ``already_landed`` is True when
     ``promote()`` reached here via an idempotency path (the merge was already on
     ``main``); it only affects logging.
 
@@ -2265,7 +2272,13 @@ async def _record_promotion_success(
     is non-fatal — it is wrapped in try/except and only logs a warning.  The
     merge already succeeded; the tag is cosmetic convenience.
     """
-    _record_project = await session.get(Project, version.project_id)
+    _record_project = await lock_release_project(session, version.project_id)
+    if _record_project is None:
+        return {
+            "status": "promoted",
+            "promoted_sha": promoted_sha or candidate_sha,
+            "next_version_number": None,
+        }
     integration_branch, promotion_target = _lts_branch_names(_record_project)
     locked = await _relock_version_for_promotion_write(
         session, version, lock_released=lock_released
@@ -2431,44 +2444,51 @@ async def _record_promotion_success(
         next_version.version_number,
     )
 
-    # Best-effort: auto-activate staged directions gated on the version that
-    # just promoted (begin-after-current-version-promotes work). Fully isolated
-    # in its OWN session + try/except so a sweep failure can NEVER abort or fail
-    # the promotion — exactly mirroring the best-effort release-tag step below.
-    # A separate session is required because the promotion's own writes ride the
-    # caller's later commit (nothing is durable here yet), so this must not share
-    # that transaction. The reaper sweep is the self-healing backstop if this
-    # path fails.
+    await _notify_operator(
+        session,
+        version,
+        "release_promoted",
+        (
+            f"Released v{version.version_number} — {integration_branch} → {promotion_target} promoted "
+            f"(confidence {float(base_record.get('confidence') or 0.0):.2f}). "
+            f"Production deploy is running; v{next_version.version_number} is "
+            f"now open for build."
+        ),
+        extra={
+            "confidence": base_record.get("confidence"),
+            "sub_scores": base_record.get("sub_scores"),
+            "promoted_sha": effective_sha,
+            "pr_url": pr_url,
+            "next_version_number": next_version.version_number,
+        },
+    )
+
+    # The successful promotion, successor, verdict, and operator receipt form
+    # one canonical transaction. Commit it before any separate-session or
+    # remote follow-up so child-FK writes cannot self-block behind this
+    # transaction's Project lock and no side effect can precede durable truth.
+    await session.commit()
+
+    # Best-effort post-commit staged activation. The reaper owns retry/liveness.
     try:
         from app.database import AsyncSessionLocal
         from app.directions_repo import activate_eligible_staged_directions
         from app.strategic_trigger import request_strategic_refresh
 
-        _promoted_n = version.version_number
-        _staged_pid = version.project_id
         async with AsyncSessionLocal() as _staged_session:
             _activated = await activate_eligible_staged_directions(
-                _staged_session, _staged_pid, _promoted_n
+                _staged_session,
+                version.project_id,
+                version.version_number,
             )
             if _activated:
-                # Arm a strategic refresh so the strategist immediately re-plans
-                # with the newly-active directions instead of waiting out the
-                # normal cadence (the post-promotion refresh is otherwise wired
-                # via the qualification-resolved trigger; this guarantees it).
                 await request_strategic_refresh(
                     _staged_session,
-                    _staged_pid,
-                    f"staged_directions_activated:v{_promoted_n}",
+                    version.project_id,
+                    f"staged_directions_activated:v{version.version_number}",
                 )
                 await _staged_session.commit()
-                logger.info(
-                    "[RELEASE_QUALIFIER] v%d promotion activated %d staged "
-                    "direction(s); armed strategic refresh for project %s",
-                    _promoted_n,
-                    len(_activated),
-                    _staged_pid,
-                )
-    except Exception as exc:  # noqa: BLE001 — staged activation must not abort promotion
+    except Exception as exc:  # noqa: BLE001 — reaper retries after commit
         logger.warning(
             "[RELEASE_QUALIFIER] staged-direction activation failed after v%d "
             "promotion (non-fatal; reaper backstop will retry): %s",
@@ -2476,9 +2496,8 @@ async def _record_promotion_success(
             exc,
         )
 
-    # Best-effort: create a git tag v{version_number} on the promoted SHA.
-    # A tag-creation failure must NEVER abort or fail the promotion — the merge
-    # already succeeded and the tag is cosmetic convenience only.
+    # Cosmetic tag creation is also post-commit: remote latency must not extend
+    # the canonical Project/Version critical section.
     if token and owner and repo:
         tag_name = f"v{version.version_number}"
         try:
@@ -2502,25 +2521,6 @@ async def _record_promotion_success(
                 tag_name,
                 exc,
             )
-
-    await _notify_operator(
-        session,
-        version,
-        "release_promoted",
-        (
-            f"Released v{version.version_number} — {integration_branch} → {promotion_target} promoted "
-            f"(confidence {float(base_record.get('confidence') or 0.0):.2f}). "
-            f"Production deploy is running; v{next_version.version_number} is "
-            f"now open for build."
-        ),
-        extra={
-            "confidence": base_record.get("confidence"),
-            "sub_scores": base_record.get("sub_scores"),
-            "promoted_sha": effective_sha,
-            "pr_url": pr_url,
-            "next_version_number": next_version.version_number,
-        },
-    )
 
     # Best-effort: snapshot the lane baseline for the just-promoted version.
     # Runs in its OWN session so a failure here can never abort or fail the
@@ -2551,9 +2551,9 @@ async def _record_promotion_success(
 
     # Best-effort: auto-supersede still-open, non-bug-class operator messages that
     # belong to versions now at least two releases behind the freshly-opened one.
-    # Runs in its OWN session (the promotion's own writes ride the caller's later
-    # commit and are not yet durable) and can NEVER abort the promotion — mode-
-    # gated, default observe. Mirrors the lane-baseline / staged-activation blocks.
+    # Runs in its OWN session after the canonical promotion commit and can NEVER
+    # abort the promotion — mode-gated, default observe. Mirrors the lane-baseline
+    # and staged-activation blocks.
     try:
         from app.message_supersession import run_supersession_on_version_close
 
@@ -2577,10 +2577,11 @@ async def _record_promotion_success(
     # away instead of waiting up to an hour for the periodic sweep — the event-
     # driven half of the "apply at the event AND self-heal via a periodic sweep"
     # pattern. Runs in its OWN session (the driver commits its pin write and must
-    # not ride the caller's later transaction) and is STRICTLY fire-and-forget:
+    # not ride the caller's transaction) and runs only after canonical promotion
+    # state is committed.  It is synchronous but strictly best-effort:
     # any error (no build config, GitHub/registry/docker failure, timeout) is
-    # swallowed and logged only, so promotion can never be blocked, slowed, or
-    # failed by it. Reuses the SAME process-wide build concurrency guard the
+    # swallowed and logged only, so it can delay the response but can never roll
+    # back or fail the committed promotion. Reuses the SAME process-wide build concurrency guard the
     # periodic sweep and admin endpoint use — a build already in flight defers
     # (``deferred``/``builder_busy``) and the hourly sweep picks it up. An
     # unchanged manifest costs only a cheap registry lookup via the driver's

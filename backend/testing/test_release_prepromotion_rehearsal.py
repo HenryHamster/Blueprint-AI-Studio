@@ -14,7 +14,7 @@ from _release_qualifier_testhelpers import (
 from sqlalchemy import select
 
 from app.acceptance_criteria import normalize_evidence_contract
-from app.models import ProjectMember, ReleasePrepromotionDispatch
+from app.models import Project, ProjectMember, ReleasePrepromotionDispatch, ReleaseVersion
 from app.release_prepromotion_rehearsal import (
     PREPROMOTION_REHEARSAL_CHECKS,
     PREPROMOTION_REHEARSAL_CONTRACT_TYPE,
@@ -809,6 +809,62 @@ async def test_stale_prefix_does_not_starve_current_candidate_across_bounded_swe
     dispatch.assert_awaited_once()
     await db_session.refresh(current)
     assert current.status == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_admin_request_locks_project_before_version_and_intent(
+    db_session, mocker
+):
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {"candidate_sha": _CANDIDATE}
+    db_session.add(
+        ProjectMember(
+            project_id=project.id,
+            user_id=project.user_id,
+            role="owner",
+        )
+    )
+    db_session.add(version)
+    await db_session.commit()
+    events = []
+    real_execute = db_session.execute
+    real_add = db_session.add
+
+    async def observed_execute(statement, *args, **kwargs):
+        if getattr(statement, "_for_update_arg", None) is not None:
+            descriptions = getattr(statement, "column_descriptions", ())
+            entity = descriptions[0].get("entity") if descriptions else None
+            if entity is Project:
+                events.append("project_fu")
+            elif entity is ReleaseVersion:
+                events.append("version_fu")
+        return await real_execute(statement, *args, **kwargs)
+
+    def observed_add(instance, *args, **kwargs):
+        if isinstance(instance, ReleasePrepromotionDispatch):
+            events.append("intent_added")
+        return real_add(instance, *args, **kwargs)
+
+    mocker.patch.object(
+        db_session,
+        "execute",
+        new=AsyncMock(side_effect=observed_execute),
+    )
+    mocker.patch.object(db_session, "add", side_effect=observed_add)
+    result = await release_router.request_prepromotion_rehearsal(
+        project.id,
+        version.version_number,
+        db_session,
+        {"user_id": project.user_id},
+    )
+
+    assert events == ["project_fu", "version_fu", "intent_added"]
+    row = await db_session.get(
+        ReleasePrepromotionDispatch,
+        result["dispatch"]["request_id"],
+    )
+    assert row is not None
+    assert row.status == "claimed"
 
 
 @pytest.mark.asyncio

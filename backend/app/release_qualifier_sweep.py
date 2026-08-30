@@ -34,6 +34,9 @@ from app.models import (
     TaskStatus,
 )
 from app.release_artifacts import iter_release_artifact_providers
+from app.release_authority_lock import (
+    lock_project_then_version as _lock_project_then_version,
+)
 from app.release_promotion import _notify_operator, _resolve_github_with_session
 from app.release_reconciliation import (
     _confirm_serving_or_fail,
@@ -111,6 +114,8 @@ from app.release_qualifier_auto_trigger import (
 )
 
 logger = logging.getLogger(__name__)
+
+
 # Matches the design-pinned JSON cap.  Raised 2150 -> 2250 to seat the
 # promotion_failed / deferred_unsynced re-driver loops (the executors the
 # trigger resolver's T5/T5b decisions had been dead-ending without).
@@ -597,17 +602,7 @@ async def _recheck_ci_compliance_blocked_version(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as recheck_session:
-        version = (
-            (
-                await recheck_session.execute(
-                    select(release_version.ReleaseVersion)
-                    .where(release_version.ReleaseVersion.id == version_id)
-                    .with_for_update()
-                )
-            )
-            .scalars()
-            .first()
-        )
+        version = await _lock_project_then_version(recheck_session, version_id)
         if version is None:
             return False
         qual = (
@@ -891,16 +886,8 @@ async def sweep_stuck_qualifications(
             _factory = session_factory or AsyncSessionLocal
             try:
                 async with _factory() as crash_session:
-                    locked_v = (
-                        (
-                            await crash_session.execute(
-                                select(release_version.ReleaseVersion)
-                                .where(release_version.ReleaseVersion.id == version_id)
-                                .with_for_update()
-                            )
-                        )
-                        .scalars()
-                        .first()
+                    locked_v = await _lock_project_then_version(
+                        crash_session, version_id
                     )
                     if (
                         locked_v is not None

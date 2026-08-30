@@ -37,6 +37,7 @@ from app.release_activation_approval import (
     ActivationApprover,
     approve_latest_promoted_activation,
 )
+from app.release_authority_lock import lock_release_project
 from app.qualification_state_resolver import (
     resolve_effective_qualification_state,
     resolve_newest_qualification_verdict,
@@ -1983,6 +1984,8 @@ async def request_prepromotion_rehearsal(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="owner"
     )
+    if await lock_release_project(session, project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
     version = (
         await session.execute(
             select(ReleaseVersion)

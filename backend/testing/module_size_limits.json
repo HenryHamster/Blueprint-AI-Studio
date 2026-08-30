@@ -77,6 +77,8 @@
     "failure_layer_classifier.py": 400,
     "pipeline_alert_scan.py": 600,
     "release_qualifier.py": 10900,
+    "release_prepromotion_gradeability.py": 150,
+    "release_qualification_intents.py": 1100,
     "release_reconciliation.py": 3700,
     "release_stall_alerts.py": 1450,
     "release_promotion.py": 3600,

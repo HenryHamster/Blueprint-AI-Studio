@@ -322,6 +322,35 @@ def test_self_heal_clamps_governed_release_qualifier_cap(tmp_path, mocker):
     assert cap - count < cap * 0.10
 
 
+@pytest.mark.parametrize(
+    ("module_key", "source_path"),
+    (
+        (
+            "release_prepromotion_gradeability.py",
+            "backend/app/release_prepromotion_gradeability.py",
+        ),
+        ("release_authority_lock.py", "backend/app/release_authority_lock.py"),
+        (
+            "release_qualification_authority.py",
+            "backend/app/release_qualification_authority.py",
+        ),
+        (
+            "release_qualification_observation_protocol.py",
+            "backend/app/release_qualification_observation_protocol.py",
+        ),
+    ),
+)
+def test_new_release_modules_have_paired_governing_cap_repairs(
+    module_key,
+    source_path,
+):
+    assert slp.governing_cap_repair("backend", module_key, 999) == {
+        "source_path": source_path,
+        "constant_name": "_MODULE_SIZE_GOVERNANCE_CAP",
+        "new_limit": 999,
+    }
+
+
 def test_self_heal_removes_cap_for_deleted_file(tmp_path):
     """--fix removes stale entries once a capped source file is deleted."""
     repo_root = tmp_path / "repo"

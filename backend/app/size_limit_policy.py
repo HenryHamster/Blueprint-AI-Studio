@@ -269,6 +269,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
         source_path="backend/app/release_artifacts.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "release_authority_lock.py"): GoverningCap(
+        source_path="backend/app/release_authority_lock.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_commit_authorship.py"): GoverningCap(
         source_path="backend/app/release_commit_authorship.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
@@ -289,6 +293,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
         source_path="backend/app/release_prepromotion_rehearsal.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "release_prepromotion_gradeability.py"): GoverningCap(
+        source_path="backend/app/release_prepromotion_gradeability.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_promotion.py"): GoverningCap(
         source_path="backend/app/release_promotion.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
@@ -299,6 +307,18 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
     ),
     ("backend", "release_qualification_deferral.py"): GoverningCap(
         source_path="backend/app/release_qualification_deferral.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualification_authority.py"): GoverningCap(
+        source_path="backend/app/release_qualification_authority.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualification_intents.py"): GoverningCap(
+        source_path="backend/app/release_qualification_intents.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualification_observation_protocol.py"): GoverningCap(
+        source_path="backend/app/release_qualification_observation_protocol.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
     ("backend", "release_qualifier.py"): GoverningCap(

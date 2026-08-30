@@ -1318,7 +1318,10 @@ def test_audit_leg_proof_state_matrix():
     for expected_state, kwargs in cases:
         proof = rq._build_audit_leg_proof(**kwargs)
         assert proof["state"] == expected_state
-        assert proof["required"] is (expected_state == "proven")
+        assert proof["required"] is (
+            kwargs["binding_expected_count"] > 0
+            and not kwargs["legacy_advisory_only"]
+        )
         assert proof["candidate_sha"] == kwargs["candidate_sha"]
         assert proof["audit_task_id"] == kwargs["audit_task_id"]
         assert proof["binding_expected_count"] == kwargs["binding_expected_count"]
