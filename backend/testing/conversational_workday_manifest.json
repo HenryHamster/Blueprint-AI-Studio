@@ -65,8 +65,6 @@
         "test_workday_operation_replay_survives_projection_window_and_is_packet_scoped",
         "test_authoritative_receipt_ledgers_reject_duplicate_operation_ids",
         "test_authoritative_receipt_ledgers_reject_divergent_semantic_effects",
-        "test_completion_debt_replay_projects_the_exact_debt_id",
-        "test_qualification_intent_replay_projects_exact_intent_id",
         "test_retry_with_new_claim_incarnation_and_operation_id_replays_exact_semantics",
         "test_version_and_acceptance_criterion_receipts_are_bounded_and_projectable",
         "test_private_strategic_operation_inventory_fails_closed_without_receipts",
@@ -78,7 +76,16 @@
         "test_direct_acceptance_criteria_is_composite_receipted_and_replay_safe",
         "test_composite_receipt_capacity_failure_rolls_back_every_write"
       ],
-      "test_count": 15
+      "test_count": 13
+    },
+    {
+      "path": "backend/testing/test_strategic_workday_replay_projection.py",
+      "reason": "Protects exact receipt replay projections for completion-debt and Resident qualification-intent entity identifiers after the focused test-file split.",
+      "test_ids": [
+        "test_completion_debt_replay_projects_the_exact_debt_id",
+        "test_qualification_intent_replay_projects_exact_intent_id"
+      ],
+      "test_count": 2
     },
     {
       "path": "backend/testing/test_release_qualification_intents.py",

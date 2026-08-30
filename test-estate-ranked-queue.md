@@ -500,7 +500,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | admin-ui | `admin-ui/src/components/TaskCard.test.tsx` | 1,030 | 79 | under 1500 LOC | 1.829s measured | — |
 | G | backend | `backend/testing/test_admin_bulk_cancellation_fencing.py` | 246 | 2 | under 1500 LOC | 1.827s measured | — |
 | G | backend | `backend/testing/test_discovery_review_sequencing.py` | 271 | 4 | under 1500 LOC | 1.794s measured | — |
-| G | backend | `backend/testing/test_strategic_ops_registry.py` | 274 | 7 | under 1500 LOC | 1.784s measured | — |
+| G | backend | `backend/testing/test_strategic_ops_registry.py` | 284 | 7 | under 1500 LOC | 1.784s measured | — |
 | G | backend | `backend/testing/test_migration_0682_workday_repair.py` | 600 | 6 | under 1500 LOC | 1.768s measured | — |
 | G | backend | `backend/testing/test_filter_file_conflicts.py` | 1,153 | 42 | under 1500 LOC | 1.767s measured | — |
 | G | admin-ui | `admin-ui/src/components/ProjectResourceEnvelopeSection.test.tsx` | 555 | 16 | under 1500 LOC | 1.725s measured | — |
@@ -525,7 +525,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_migration_exemptions_admin.py` | 293 | 13 | under 1500 LOC | 1.547s measured | — |
 | G | admin-ui | `admin-ui/src/components/SettingsNotificationsSection.test.tsx` | 384 | 15 | under 1500 LOC | 1.546s measured | — |
 | G | backend | `backend/testing/test_runner_enroll_docs_accuracy.py` | 599 | 19 | under 1500 LOC | 1.546s measured | — |
-| G | backend | `backend/testing/test_strategic_memory_knowledge.py` | 245 | 4 | under 1500 LOC | 1.537s measured | — |
+| G | backend | `backend/testing/test_strategic_memory_knowledge.py` | 416 | 4 | under 1500 LOC | 1.537s measured | — |
 | G | backend | `backend/testing/test_ci_rerun_operator_resolution.py` | 186 | 3 | under 1500 LOC | 1.493s measured | — |
 | G | backend | `backend/testing/test_issue_implementation.py` | 693 | 15 | under 1500 LOC | 1.493s measured | — |
 | G | backend | `backend/testing/test_compute_zone_health.py` | 1,251 | 94 | under 1500 LOC | 1.492s measured | — |
@@ -560,7 +560,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_findings_index.py` | 416 | 11 | under 1500 LOC | 1.097s measured | — |
 | G | admin-ui | `admin-ui/src/components/NotesTool.test.tsx` | 424 | 15 | under 1500 LOC | 1.087s measured | protected; declared floor 15 |
 | G | backend | `backend/testing/test_release_qualifier_retained_scoring.py` | 125 | 1 | under 1500 LOC | 1.082s measured | — |
-| G | backend | `backend/testing/test_strategic_workday_mutation_rebind.py` | 1,141 | 13 | under 1500 LOC | 1.053s measured | protected; declared floor 13 |
+| G | backend | `backend/testing/test_strategic_workday_mutation_rebind.py` | 1,476 | 13 | under 1500 LOC | 1.052s measured | protected; declared floor 13 |
 | G | agent | `agent/src/prompts/terminal-checkpoint-helpers.test.ts` | 435 | 12 | under 1500 LOC | 1.041s measured | — |
 | G | backend | `backend/testing/test_security.py` | 721 | 68 | under 1500 LOC | 0.981s measured | — |
 | G | agent | `agent/src/handlers/strategic-resident-cold-fast.stream.test.ts` | 577 | 22 | under 1500 LOC | 0.944s measured | — |
@@ -576,7 +576,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_strategic_cycle_cost_projection.py` | 1,143 | 46 | under 1500 LOC | 0.761s measured | — |
 | G | admin-ui | `admin-ui/src/components/PrimaryTabNav.test.tsx` | 257 | 12 | under 1500 LOC | 0.759s measured | — |
 | G | backend | `backend/testing/test_exact_task_admission_immutability.py` | 90 | 1 | under 1500 LOC | 0.754s measured | — |
-| G | backend | `backend/testing/test_strategic_cold_successor.py` | 1,483 | 20 | under 1500 LOC | 0.751s measured | protected; declared floor 20 |
+| G | backend | `backend/testing/test_strategic_cold_successor.py` | 1,499 | 20 | under 1500 LOC | 0.751s measured | protected; declared floor 20 |
 | G | backend | `backend/testing/test_research_deferred_carry.py` | 62 | 1 | under 1500 LOC | 0.738s measured | — |
 | G | admin-ui | `admin-ui/src/components/TaskDetailDrawerSections.test.tsx` | 1,016 | 81 | under 1500 LOC | 0.737s measured | — |
 | G | admin-ui | `admin-ui/src/components/DirectionAutoPauseWidget.test.tsx` | 102 | 4 | under 1500 LOC | 0.737s measured | — |
@@ -696,7 +696,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | admin-ui | `admin-ui/src/components/ProblemModelViewer.test.tsx` | 418 | 13 | under 1500 LOC | 0.180s measured | — |
 | G | backend | `backend/testing/test_verification_toolchain.py` | 203 | 5 | under 1500 LOC | 0.179s measured | — |
 | G | backend | `backend/testing/test_resident_supersession_livelock.py` | 395 | 19 | under 1500 LOC | 0.178s measured | — |
-| G | backend | `backend/testing/test_runbook_drift.py` | 103 | 5 | under 1500 LOC | 0.177s measured | — |
+| G | backend | `backend/testing/test_runbook_drift.py` | 105 | 5 | under 1500 LOC | 0.177s measured | — |
 | G | backend | `backend/testing/test_migration_0716_strategic_memory_source_control_plane.py` | 112 | 2 | under 1500 LOC | 0.176s measured | — |
 | G | agent | `agent/src/vitest.globalSetup.test.ts` | 237 | 16 | under 1500 LOC | 0.176s measured | — |
 | G | admin-ui | `admin-ui/src/hooks/useConversation.test.tsx` | 1,218 | 36 | under 1500 LOC | 0.174s measured | protected; declared floor 36 |
@@ -802,9 +802,9 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | admin-ui | `admin-ui/src/components/LlmCostBreakdownPanel.test.tsx` | 136 | 6 | under 1500 LOC | 0.061s measured | — |
 | G | backend | `backend/testing/test_broadcast.py` | 300 | 36 | under 1500 LOC | 0.060s measured | — |
 | G | agent | `agent/src/handlers/verify-tests.integration.test.ts` | 134 | 1 | under 1500 LOC | 0.060s measured | — |
-| G | backend | `backend/testing/test_deployed_sha.py` | 781 | 31 | under 1500 LOC | 0.059s measured | — |
+| G | backend | `backend/testing/test_deployed_sha.py` | 822 | 31 | under 1500 LOC | 0.059s measured | — |
 | G | backend | `backend/testing/test_digest_payload_metric_manifest.py` | 256 | 6 | under 1500 LOC | 0.058s measured | — |
-| G | agent | `agent/src/providers/resident-session.test.ts` | 1,162 | 50 | under 1500 LOC | 0.056s measured | protected; declared floor 50 |
+| G | agent | `agent/src/providers/resident-session.test.ts` | 1,185 | 50 | under 1500 LOC | 0.056s measured | protected; declared floor 50 |
 | G | admin-ui | `admin-ui/src/components/SavedViewsTabStrip.test.tsx` | 88 | 8 | under 1500 LOC | 0.056s measured | — |
 | G | admin-ui | `admin-ui/src/hooks/useCommandPaletteShortcut.test.tsx` | 205 | 10 | under 1500 LOC | 0.054s measured | — |
 | G | backend | `backend/testing/test_migration_0668_drop_projectcomputeimagebuild.py` | 218 | 3 | under 1500 LOC | 0.053s measured | — |
@@ -915,7 +915,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_migration_0151_reconcile.py` | 98 | 5 | under 1500 LOC | 0.015s measured | — |
 | G | backend | `backend/testing/test_orchestrator_health_authority.py` | 32 | 3 | under 1500 LOC | 0.015s measured | — |
 | G | agent | `agent/src/prompts/context-prefix.test.ts` | 1,205 | 69 | under 1500 LOC | 0.015s measured | — |
-| G | agent | `agent/src/handlers/strategic-cold-successor.test.ts` | 649 | 23 | under 1500 LOC | 0.015s measured | protected; declared floor 23 |
+| G | agent | `agent/src/handlers/strategic-cold-successor.test.ts` | 735 | 23 | under 1500 LOC | 0.015s measured | protected; declared floor 23 |
 | G | admin-ui | `admin-ui/src/utils/directionHelpers.test.ts` | 140 | 17 | under 1500 LOC | 0.015s measured | — |
 | G | backend | `backend/testing/test_leader_lock_keepalive.py` | 149 | 6 | under 1500 LOC | 0.015s measured | — |
 | G | backend | `backend/testing/test_release_artifact_freshness.py` | 150 | 5 | under 1500 LOC | 0.014s measured | — |
@@ -955,8 +955,8 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | agent | `agent/src/handlers/structured-output-repair.test.ts` | 732 | 32 | under 1500 LOC | 0.009s measured | — |
 | G | agent | `agent/src/utils/agent-token.test.ts` | 312 | 21 | under 1500 LOC | 0.009s measured | — |
 | G | agent | `agent/src/token-file.test.ts` | 280 | 25 | under 1500 LOC | 0.009s measured | — |
+| G | agent | `agent/src/handlers/strategic-ops-registry.test.ts` | 217 | 13 | under 1500 LOC | 0.009s measured | — |
 | G | admin-ui | `admin-ui/src/components/MessagesPanel.invariant.test.ts` | 212 | 9 | under 1500 LOC | 0.009s measured | — |
-| G | agent | `agent/src/handlers/strategic-ops-registry.test.ts` | 207 | 13 | under 1500 LOC | 0.009s measured | — |
 | G | admin-ui | `admin-ui/src/App.wiring.test.ts` | 124 | 14 | under 1500 LOC | 0.009s measured | protected; declared floor 14 |
 | G | admin-ui | `admin-ui/src/utils/pendingAttachmentStore.test.ts` | 77 | 3 | under 1500 LOC | 0.009s measured | protected; declared floor 3 |
 | G | admin-ui | `admin-ui/src/utils/strategicWorkbenchSession.test.ts` | 66 | 4 | under 1500 LOC | 0.009s measured | — |
@@ -1054,6 +1054,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | admin-ui | `admin-ui/src/utils/conversationSendState.test.ts` | 30 | 1 | under 1500 LOC | 0.002s measured | — |
 | G | agent | `agent/src/utils/sanitize.test.ts` | 17 | 3 | under 1500 LOC | 0.002s measured | — |
 | G | admin-ui | `admin-ui/src/useAppState.selection.test.ts` | 15 | 2 | under 1500 LOC | 0.002s measured | — |
+| G | backend | `backend/testing/test_strategic_workday_replay_projection.py` | 35 | 2 | under 1500 LOC | 0.001s measured | protected; declared floor 2 |
 | G | agent | `agent/src/branch-literal-regression.test.ts` | 122 | 3 | under 1500 LOC | 0.001s measured | — |
 | G | admin-ui | `admin-ui/src/branch-literal-regression.test.ts` | 93 | 3 | under 1500 LOC | 0.001s measured | — |
 | G | agent | `agent/src/handlers/strategic-stall-advisory.test.ts` | 48 | 3 | under 1500 LOC | 0.001s measured | — |
