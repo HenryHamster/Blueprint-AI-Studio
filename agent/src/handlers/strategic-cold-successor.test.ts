@@ -17,17 +17,25 @@ const mocks = vi.hoisted(() => {
   };
 });
 
-vi.mock('../index.js', () => ({
-  apiGet: mocks.apiGet,
-  apiPost: mocks.apiPost,
-  sanitize: (value: string) => value,
-  sendLog: mocks.sendLog,
-}));
+vi.mock('../index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../index.js')>();
+  return {
+    ...actual,
+    apiGet: mocks.apiGet,
+    apiPost: mocks.apiPost,
+    sanitize: (value: string) => value,
+    sendLog: mocks.sendLog,
+  };
+});
 
-vi.mock('../providers/runners.js', () => ({
-  RuntimeUnavailableError: mocks.RuntimeUnavailableError,
-  runIsolatedTextOnlyMemory: mocks.runTextOnly,
-}));
+vi.mock('../providers/runners.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../providers/runners.js')>();
+  return {
+    ...actual,
+    RuntimeUnavailableError: mocks.RuntimeUnavailableError,
+    runIsolatedTextOnlyMemory: mocks.runTextOnly,
+  };
+});
 
 vi.mock('node:fs', () => ({
   default: {
