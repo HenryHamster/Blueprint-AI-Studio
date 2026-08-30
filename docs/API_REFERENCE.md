@@ -683,9 +683,16 @@ truncated). Notable behaviors:
   `severity`, `note`, `resolving_ref`, `verified_against_sha`. Returns `409`
   when no open version exists.
 - `set_memory` records a durable behavioral preference or strategic insight that
-  persists across session restarts. Required `data` fields: `key` (string, ≤ 200
-  chars) and `content` (string, ≤ 2000 chars). Entries are capped at 50; oldest
-  are evicted first.
+  persists across session restarts. Supply a non-empty `body` (or legacy `note`),
+  with optional `title`, `summary`, `topic`, and `tags`. A `handoff`-tagged write
+  must include the exact active `expected_head_id`; replacement also binds
+  `supersedes_id` to that same head. The server atomically creates the new head,
+  dismisses the predecessor, and records both mutation receipts.
+- `dismiss_knowledge` handles ordinary dismissal by document UUID. The bounded
+  legacy split-handoff repair additionally requires private Workday receipt
+  authority, the exact sorted two-head set in `expected_handoff_head_ids`, the
+  surviving `superseded_by_id`, and a reason. Stale, sole-head, direct, or
+  mismatched cleanup is rejected without a write.
 
 Pipeline **action** verbs. Each re-enters the same server-side implementation
 its operator HTTP lever calls, so behavior cannot drift between the two. All

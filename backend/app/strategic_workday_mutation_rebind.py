@@ -59,6 +59,7 @@ _ENTITY_OPS = frozenset(
         "decide_churn_retirement",
         "spawn_task",
         "set_memory",
+        "dismiss_knowledge",
         "watch_task",
         "ack_watch",
         "cancel_watch",
@@ -785,6 +786,8 @@ def workday_operation_replay_response(receipt: Mapping[str, Any]) -> dict[str, A
     }.get(str(receipt.get("entity_kind")))
     if receipt.get("op") == "cancel_task" and entity_key == "task_id":
         entity_key = "target_task_id"
+    if receipt.get("op") == "dismiss_knowledge" and entity_key == "doc_id":
+        entity_key = "document_id"
     if entity_key is not None:
         body[entity_key] = receipt["entity_id"]
     if receipt.get("target_revision") is not None:

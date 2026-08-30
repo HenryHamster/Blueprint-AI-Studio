@@ -89,6 +89,13 @@ def test_manifest_is_wellformed():
     memory = next(entry for entry in manifest if entry["op"] == "set_memory")
     assert {"expected_head_id", "supersedes_id"} <= set(memory["input"]["fields"])
     assert any("tagged handoff must include" in note for note in memory["input"]["notes"])
+    dismiss = next(entry for entry in manifest if entry["op"] == "dismiss_knowledge")
+    assert {
+        "knowledge_document_id",
+        "expected_handoff_head_ids",
+        "superseded_by_id",
+    } <= set(dismiss["input"]["fields"])
+    assert any("exact sorted two-head set" in note for note in dismiss["input"]["notes"])
 
 
 def test_create_direction_manifest_matches_backend_contract():

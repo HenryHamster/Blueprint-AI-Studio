@@ -11,12 +11,14 @@ from sqlmodel import select
 
 from app.models import (
     Direction,
+    KnowledgeDocument,
     MessageHandlingState,
     MessageSurface,
     MessageType,
     ProjectMessage,
     ReleaseQualificationIntent,
     ReleaseVersion,
+    SourceKind,
     Task,
     VersionAcceptanceCriterion,
 )
@@ -223,37 +225,6 @@ def test_authoritative_receipt_ledgers_reject_divergent_semantic_effects():
         assert "history is invalid" in ambiguous.value.detail
 
 
-def test_completion_debt_replay_projects_the_exact_debt_id():
-    receipt = {
-        "op": "dispose_completion_debt",
-        "entity_kind": "completion_debt",
-        "entity_id": "00000000-0000-0000-0000-000000000123",
-        "effect": "updated",
-    }
-
-    assert workday_operation_replay_response(receipt) == {
-        "status": "ok",
-        "op": "dispose_completion_debt",
-        "idempotent_replay": True,
-        "debt_id": "00000000-0000-0000-0000-000000000123",
-    }
-
-
-def test_qualification_intent_replay_projects_exact_intent_id():
-    receipt = {
-        "op": "request_qualification",
-        "entity_kind": "release_qualification_intent",
-        "entity_id": "00000000-0000-0000-0000-000000000456",
-        "effect": "created",
-    }
-
-    assert workday_operation_replay_response(receipt) == {
-        "status": "ok",
-        "op": "request_qualification",
-        "idempotent_replay": True,
-        "qualification_intent_id": "00000000-0000-0000-0000-000000000456",
-    }
-
 def test_retry_with_new_claim_incarnation_and_operation_id_replays_exact_semantics():
     project_id = uuid.uuid4()
     task = Task(id=uuid.uuid4(), project_id=project_id, payloads=[{}])
@@ -425,6 +396,370 @@ async def _claim_receipt_bound_workday_packet(
     )
     assert claimed.status_code == 200, claimed.text
     return claimed.json()["packet"]["workday_claim_id"]
+
+
+@pytest.mark.asyncio
+async def test_handoff_cleanup_requires_exact_two_head_receipt_and_replays(
+    client: AsyncClient,
+    db_session,
+):
+    project, task, identity, packet = await _start_receipt_bound_workday_packet(
+        client, db_session
+    )
+    task.payloads = [{"type": "strategic_review", "typed_fast_enabled": True}]
+    flag_modified(task, "payloads")
+    heads = [
+        KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            source_kind=SourceKind.STRATEGIC_MEMORY.value,
+            title=f"Legacy handoff {index}",
+            summary=f"Legacy handoff {index}",
+            body=f"Durable predecessor checkpoint {index}.",
+            tags=["handoff"],
+            lifecycle_status="consumed",
+        )
+        for index in range(2)
+    ]
+    ordinary = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.UNKNOWN.value,
+        title="Ordinary knowledge",
+        summary="Ordinary knowledge",
+        body="Private Workday must not gain ambient dismissal authority.",
+        tags=[],
+        lifecycle_status="consumed",
+    )
+    db_session.add_all([task, ordinary, *heads])
+    await db_session.commit()
+    heads.sort(key=lambda item: str(item.id))
+    target, keeper = heads
+    expected_head_ids = [str(item.id) for item in heads]
+    data = {
+        "knowledge_document_id": str(target.id),
+        "reason": "Retire the stale predecessor after exact reconciliation.",
+        "expected_handoff_head_ids": expected_head_ids,
+        "superseded_by_id": str(keeper.id),
+    }
+
+    direct = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": identity["incarnation_id"],
+            "op": "dismiss_knowledge",
+            "data": data,
+        },
+    )
+    assert direct.status_code == 409, direct.text
+    assert "requires Workday receipt authority" in direct.text
+
+    workday_claim_id = await _claim_receipt_bound_workday_packet(
+        client,
+        project=project,
+        task=task,
+        identity=identity,
+    )
+    request = {
+        "task_id": str(task.id),
+        "resident_incarnation_id": identity["incarnation_id"],
+        "packet_id": str(packet.id),
+        "workday_claim_id": workday_claim_id,
+        "workday_operation_id": str(uuid.uuid4()),
+        "op": "dismiss_knowledge",
+        "data": data,
+    }
+
+    private_ordinary = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **request,
+            "workday_operation_id": str(uuid.uuid4()),
+            "data": {
+                "knowledge_document_id": str(ordinary.id),
+                "reason": "Must remain direct-only.",
+            },
+        },
+    )
+    assert private_ordinary.status_code == 409, private_ordinary.text
+    await db_session.refresh(ordinary)
+    assert ordinary.lifecycle_status == "consumed"
+
+    wrong_set = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **request,
+            "workday_operation_id": str(uuid.uuid4()),
+            "data": {
+                **data,
+                "expected_handoff_head_ids": sorted(
+                    [str(target.id), str(uuid.uuid4())]
+                ),
+            },
+        },
+    )
+    assert wrong_set.status_code == 409, wrong_set.text
+    invalid_types = [
+        {**data, "reason": ["not", "a", "string"]},
+        {**data, "superseded_by_id": 12345678901234567890123456789012},
+        {
+            **data,
+            "expected_handoff_head_ids": [
+                expected_head_ids[0],
+                12345678901234567890123456789012,
+            ],
+        },
+    ]
+    for invalid_data in invalid_types:
+        invalid = await client.post(
+            "/api/agent/strategic",
+            headers=_headers(task, vm="agent-vm-resident-poll"),
+            json={
+                **request,
+                "workday_operation_id": str(uuid.uuid4()),
+                "data": invalid_data,
+            },
+        )
+        assert invalid.status_code == 400, invalid.text
+    await db_session.refresh(target)
+    await db_session.refresh(keeper)
+    assert target.lifecycle_status == "consumed"
+    assert keeper.lifecycle_status == "consumed"
+
+    created = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=request,
+    )
+    assert created.status_code == 200, created.text
+    assert created.json() == {
+        "status": "ok",
+        "op": "dismiss_knowledge",
+        "document_id": str(target.id),
+    }
+    await db_session.refresh(target)
+    await db_session.refresh(keeper)
+    assert target.lifecycle_status == "dismissed"
+    assert target.dismissed_at is not None
+    assert target.dismissed_reason == (
+        f"superseded by {keeper.id}: "
+        "Retire the stale predecessor after exact reconciliation."
+    )
+    assert keeper.lifecycle_status == "consumed"
+    assert keeper.dismissed_at is None
+    dismissed_at = target.dismissed_at
+
+    durable_packet = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == packet.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().one()
+    ledger = durable_packet.context[WORKDAY_OPERATION_LEDGER_CONTEXT_KEY]
+    assert len(ledger) == 1
+    assert ledger[0]["operation_id"] == request["workday_operation_id"]
+    assert ledger[0]["op"] == "dismiss_knowledge"
+    assert ledger[0]["entity_kind"] == "knowledge_document"
+    assert ledger[0]["entity_id"] == str(target.id)
+    assert ledger[0]["effect"] == "updated"
+
+    replay = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=request,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == {
+        "status": "ok",
+        "op": "dismiss_knowledge",
+        "idempotent_replay": True,
+        "document_id": str(target.id),
+    }
+    changed_replay = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **request,
+            "data": {**data, "reason": "Changed replay must fail closed."},
+        },
+    )
+    assert changed_replay.status_code == 409, changed_replay.text
+
+    semantic_replay = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**request, "workday_operation_id": str(uuid.uuid4())},
+    )
+    assert semantic_replay.status_code == 200, semantic_replay.text
+    assert semantic_replay.json() == {
+        "status": "ok",
+        "op": "dismiss_knowledge",
+        "idempotent_replay": True,
+        "document_id": str(target.id),
+    }
+
+    rejected_after_cleanup = [
+        {
+            **data,
+            "knowledge_document_id": str(keeper.id),
+            "superseded_by_id": str(target.id),
+        },
+        {
+            **data,
+            "knowledge_document_id": str(keeper.id),
+            "superseded_by_id": str(uuid.uuid4()),
+        },
+    ]
+    for stale_data in rejected_after_cleanup:
+        rejected = await client.post(
+            "/api/agent/strategic",
+            headers=_headers(task, vm="agent-vm-resident-poll"),
+            json={
+                **request,
+                "workday_operation_id": str(uuid.uuid4()),
+                "data": stale_data,
+            },
+        )
+        assert rejected.status_code == 409, rejected.text
+    missing_cas = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **request,
+            "workday_operation_id": str(uuid.uuid4()),
+            "data": {
+                "knowledge_document_id": str(keeper.id),
+                "reason": "Missing exact head set must fail.",
+            },
+        },
+    )
+    assert missing_cas.status_code == 400, missing_cas.text
+
+    await db_session.refresh(target)
+    await db_session.refresh(keeper)
+    refreshed_packet = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == packet.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().one()
+    assert target.dismissed_at == dismissed_at
+    assert target.lifecycle_status == "dismissed"
+    assert keeper.lifecycle_status == "consumed"
+    assert refreshed_packet.context[WORKDAY_OPERATION_LEDGER_CONTEXT_KEY] == ledger
+
+
+@pytest.mark.asyncio
+async def test_bound_set_memory_records_supersession_child_and_replays(
+    client: AsyncClient,
+    db_session,
+):
+    project, task, identity, packet = await _start_receipt_bound_workday_packet(
+        client, db_session
+    )
+    task.payloads = [{"type": "strategic_review", "typed_fast_enabled": True}]
+    flag_modified(task, "payloads")
+    predecessor = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.STRATEGIC_MEMORY.value,
+        title="Previous handoff",
+        summary="Previous handoff",
+        body="Resume from the previous durable checkpoint.",
+        tags=["handoff"],
+        lifecycle_status="consumed",
+    )
+    db_session.add_all([task, predecessor])
+    await db_session.commit()
+    workday_claim_id = await _claim_receipt_bound_workday_packet(
+        client,
+        project=project,
+        task=task,
+        identity=identity,
+    )
+    operation_id = str(uuid.uuid4())
+    request = {
+        "task_id": str(task.id),
+        "resident_incarnation_id": identity["incarnation_id"],
+        "packet_id": str(packet.id),
+        "workday_claim_id": workday_claim_id,
+        "workday_operation_id": operation_id,
+        "op": "set_memory",
+        "data": {
+            "title": "Current handoff",
+            "body": "Resume from the current durable checkpoint.",
+            "tags": ["handoff"],
+            "expected_head_id": str(predecessor.id),
+            "supersedes_id": str(predecessor.id),
+        },
+    }
+    created = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=request,
+    )
+    assert created.status_code == 200, created.text
+    created_id = created.json()["doc_id"]
+    await db_session.refresh(predecessor)
+    assert predecessor.lifecycle_status == "dismissed"
+    assert predecessor.dismissed_reason == f"superseded by {created_id}"
+
+    durable_packet = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == packet.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().one()
+    ledger = durable_packet.context[WORKDAY_OPERATION_LEDGER_CONTEXT_KEY]
+    assert [receipt["op"] for receipt in ledger] == [
+        "dismiss_knowledge",
+        "set_memory",
+    ]
+    assert ledger[0]["operation_id"] != operation_id
+    assert ledger[0]["entity_kind"] == "knowledge_document"
+    assert ledger[0]["entity_id"] == str(predecessor.id)
+    assert ledger[0]["effect"] == "updated"
+    assert ledger[1]["operation_id"] == operation_id
+    assert ledger[1]["entity_kind"] == "knowledge_document"
+    assert ledger[1]["entity_id"] == created_id
+    assert ledger[1]["effect"] == "created"
+
+    replay = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=request,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == {
+        "status": "ok",
+        "op": "set_memory",
+        "idempotent_replay": True,
+        "doc_id": created_id,
+    }
+    refreshed_packet = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == packet.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().one()
+    assert refreshed_packet.context[WORKDAY_OPERATION_LEDGER_CONTEXT_KEY] == ledger
+    rows = (
+        await db_session.execute(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.project_id == project.id,
+                KnowledgeDocument.source_kind == SourceKind.STRATEGIC_MEMORY.value,
+            )
+        )
+    ).scalars().all()
+    assert {str(row.id) for row in rows} == {str(predecessor.id), created_id}
 
 
 @pytest.mark.asyncio

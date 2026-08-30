@@ -135,6 +135,11 @@ describe('generated ./strategic CLI derives from the registry', () => {
     expect(memory?.fields).toContain('supersedes_id');
     expect(memory?.notes?.join('\n')).toContain('tagged handoff must include expected_head_id');
     expect(memory?.notes?.join('\n')).toContain('expected_head_id and supersedes_id to the same exact');
+    const dismiss = cliOpInput('dismiss-knowledge');
+    expect(dismiss?.fields).toContain('expected_handoff_head_ids');
+    expect(dismiss?.fields).toContain('superseded_by_id');
+    expect(dismiss?.notes?.join('\n')).toContain('exact sorted two-head set');
+    expect(dismiss?.notes?.join('\n')).toContain('private Workday receipt authority');
   });
 
   it('spawn-task advertises depends_on and documents its authoring-time rejection cases', () => {
