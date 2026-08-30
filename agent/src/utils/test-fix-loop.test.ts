@@ -4,9 +4,10 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 // processes or touching the network. execFileAsync is the runner-invocation
 // seam we control per-test to simulate placeholder / empty / real suites.
 // vi.hoisted so the fn is initialized before the hoisted vi.mock factory runs.
-const { execFileAsync, mockApiPost, mockReaddirSync } = vi.hoisted(() => ({
+const { execFileAsync, mockApiPost, mockExecFileSync, mockReaddirSync } = vi.hoisted(() => ({
   execFileAsync: vi.fn<(cmd: string, args: string[], opts?: unknown) => Promise<string>>(),
   mockApiPost: vi.fn<(path: string, body?: Record<string, unknown>) => Promise<unknown>>(),
+  mockExecFileSync: vi.fn(),
   mockReaddirSync: vi.fn<(path: fs.PathLike) => string[]>(),
 }));
 vi.mock('../index.js', () => ({
@@ -45,10 +46,15 @@ vi.mock('./diff-detection.js', () => ({
   detectLoopDivergence: vi.fn(() => null),
 }));
 
-vi.mock('child_process', async importOriginal => ({
-  ...(await importOriginal<typeof import('child_process')>()),
-  execSync: vi.fn(() => ''),
-}));
+vi.mock('child_process', async importOriginal => {
+  const original = await importOriginal<typeof import('child_process')>();
+  mockExecFileSync.mockImplementation(original.execFileSync);
+  return {
+    ...original,
+    execFileSync: mockExecFileSync,
+    execSync: vi.fn(() => ''),
+  };
+});
 
 vi.mock('fs', () => ({
   default: {
@@ -77,7 +83,6 @@ import {
 import { runClaudeCode } from '../providers/runners.js';
 import { apiPost } from '../index.js';
 import { expectCalledWith } from './typed-mock-call.js';
-import { SKIP_NEEDS_PYTHON3_BINARY } from '../test-python.js';
 import type { TestRunner } from './test-runners.js';
 
 // Default fs.existsSync behavior matching the module-level mock factory:
@@ -119,6 +124,61 @@ function configureStructuredVitestFailure(records: Array<{ testcase: string; det
     (typeof p === 'string' && (p.endsWith('/vitest.config.ts') || p.includes('/tmp/vitest-current-'))),
   );
   vi.mocked(fs.readFileSync).mockReturnValue(vitestFailureReport(records));
+}
+
+type FailureRecord = {
+  route: string;
+  testcase: string;
+  kind: 'failure';
+  detail: string;
+};
+
+function failureRecord(
+  testcase: string,
+  detail: string,
+  route = 'size-guardrail.test.ts',
+): FailureRecord {
+  return { route, testcase, kind: 'failure', detail };
+}
+
+function queueComparatorAttribution({
+  current,
+  baseline,
+  newFailures,
+  suppressedFailures = {},
+  times = 1,
+}: {
+  current: FailureRecord[];
+  baseline: FailureRecord[];
+  newFailures: Record<string, string>;
+  suppressedFailures?: Record<string, { detail: string; reason: string }>;
+  times?: number;
+}): () => void {
+  const output = JSON.stringify({
+    blocking: Object.keys(newFailures).length > 0,
+    new_failures: newFailures,
+    suppressed_failures: suppressedFailures,
+    disappeared_failures: {},
+    skipped_failures: {},
+  });
+  for (let index = 0; index < times; index += 1) {
+    mockExecFileSync.mockReturnValueOnce(output);
+  }
+  return () => {
+    expect(mockExecFileSync).toHaveBeenCalledTimes(times);
+    for (const call of mockExecFileSync.mock.calls) {
+      expect(call).toEqual([
+        'python3',
+        [canonicalComparatorPath()],
+        {
+          cwd: process.cwd(),
+          encoding: 'utf-8',
+          input: JSON.stringify({ current, baseline }),
+          timeout: 30_000,
+        },
+      ]);
+    }
+  };
 }
 
 describe('canonicalComparatorPath', () => {
@@ -749,25 +809,22 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
     vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
   });
 
-// The cases below exercise the branch AFTER compareStructuredFailures returns a
-// real attribution, and that comparator is PRODUCTION code which execs a literal
-// `python3` (see compareStructuredFailures in ./test-fix-loop.ts). The agent only
-// ever runs on Linux, so hardcoding `python3` there is correct and must not change
-// for a dev host's benefit — but it does mean no test-side interpreter choice can
-// rescue these on a Windows box with no `python3` on PATH: the comparator returns
-// null, testFixLoop routes to `verificationUnverified`, and the assertions fail for
-// a reason that has nothing to do with the size-breach logic under test.
-//
-// SKIP_NEEDS_PYTHON3_BINARY is true ONLY on win32 AND only when no real `python3`
-// executable exists, so Linux CI always runs every case here and a python3 that
-// vanishes from a CI image still reds the build instead of silently skipping.
-const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
-
-  itNeedsPython3('auto-bumps only the comparator-attributed cap via a scoped repair target and re-verifies — no LLM call', async () => {
+  // These unit cases own the attribution fixture. The production Python
+  // comparator remains exercised by its parity and verify-tests integration suites.
+  it('auto-bumps only the comparator-attributed cap via a scoped repair target and re-verifies — no LLM call', async () => {
     const newSizeDetail =
       '[breach] agent/prompt.ts: 1700 lines (cap: 1650)\n' +
       '1 size breach(es) in module_size_limits.json.';
     configureStructuredVitestFailure([{ testcase: 'new size breach', detail: newSizeDetail }]);
+    const assertComparator = queueComparatorAttribution({
+      current: [failureRecord('new size breach', newSizeDetail)],
+      baseline: [failureRecord(
+        'old failure', 'old failure', 'agent/src/size-guardrail.test.ts',
+      )],
+      newFailures: {
+        'size-guardrail.test.ts::new size breach::failure': newSizeDetail,
+      },
+    });
     let testRunCalls = 0;
     execFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (cmd === 'python3' && args.includes('--fix')) {
@@ -795,15 +852,23 @@ const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
     expect(bumpCall?.[1]).toEqual([
       'backend/testing/check_size_limits.py', '--fix', '--repair-target', 'agent/prompt.ts',
     ]);
+    assertComparator();
     // The breach was resolved deterministically — no refactor/LLM path taken.
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 
-  itNeedsPython3('auto-adds an attributed missing cap through its scoped repair target — no LLM call', async () => {
+  it('auto-adds an attributed missing cap through its scoped repair target — no LLM call', async () => {
     const COVERAGE_FAILURE =
       '[uncapped] agent/prompts/huge.ts: 1700 lines (threshold: 1500) — NO cap entry\n' +
       'module_size_limits.json size guardrail';
     configureStructuredVitestFailure([{ testcase: 'new uncapped size breach', detail: COVERAGE_FAILURE }]);
+    const assertComparator = queueComparatorAttribution({
+      current: [failureRecord('new uncapped size breach', COVERAGE_FAILURE)],
+      baseline: [],
+      newFailures: {
+        'size-guardrail.test.ts::new uncapped size breach::failure': COVERAGE_FAILURE,
+      },
+    });
     let testRunCalls = 0;
     execFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (cmd === 'python3' && args.includes('--fix')) {
@@ -829,11 +894,12 @@ const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
     expect(bumpCall?.[1]).toEqual([
       'backend/testing/check_size_limits.py', '--fix', '--repair-target', 'agent/prompts/huge.ts',
     ]);
+    assertComparator();
     // Remediated deterministically — the refactor-biased LLM path never ran.
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 
-  itNeedsPython3('auto-adds caps for EVERY offender in the byte-exact aggregated missing-cap failure — no LLM call', async () => {
+  it('auto-adds caps for EVERY offender in the byte-exact aggregated missing-cap failure — no LLM call', async () => {
     // Restores the regression the synthetic '[uncapped] …' fixture could not
     // catch: this is the message test_invariants._missing_cap_message and
     // agent/src/moduleSize.contract.test.ts actually emit, and it lists every
@@ -841,6 +907,13 @@ const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
     configureStructuredVitestFailure([
       { testcase: 'agent no uncapped large file', detail: AGGREGATED_MISSING_CAP_FAILURE },
     ]);
+    const assertComparator = queueComparatorAttribution({
+      current: [failureRecord('agent no uncapped large file', AGGREGATED_MISSING_CAP_FAILURE)],
+      baseline: [],
+      newFailures: {
+        'size-guardrail.test.ts::agent no uncapped large file::failure': AGGREGATED_MISSING_CAP_FAILURE,
+      },
+    });
     let testRunCalls = 0;
     execFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (cmd === 'python3' && args.includes('--fix')) return Promise.resolve('Added 2 cap(s).');
@@ -864,6 +937,7 @@ const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
       '--repair-target', 'agent/prompts/huge.ts',
       '--repair-target', 'agent/utils/big.ts',
     ]);
+    assertComparator();
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 
@@ -886,11 +960,23 @@ const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
     expect(bumpCall).toBeUndefined();
   });
 
-  itNeedsPython3('testFixLoop — deterministic size-breach remediation does not run deterministic cap bump for an inherited-only breach', async () => {
+  it('testFixLoop — deterministic size-breach remediation does not run deterministic cap bump for an inherited-only breach', async () => {
     const inheritedSizeDetail =
       '[breach] backend/chronic.py: 1720 lines (cap: 1600)\n' +
       'module_size_limits.json size guardrail';
     configureStructuredVitestFailure([{ testcase: 'inherited chronic size breach', detail: inheritedSizeDetail }]);
+    const inheritedRecord = failureRecord('inherited chronic size breach', inheritedSizeDetail);
+    const assertComparator = queueComparatorAttribution({
+      current: [inheritedRecord],
+      baseline: [inheritedRecord],
+      newFailures: {},
+      suppressedFailures: {
+        'size-guardrail.test.ts::inherited chronic size breach::failure': {
+          detail: inheritedSizeDetail,
+          reason: 'same route/test/failure kind failed on baseline',
+        },
+      },
+    });
     execFileAsync.mockRejectedValue(new Error(`Command failed: npm test\n${inheritedSizeDetail}`));
 
     const result = await testFixLoop(
@@ -903,10 +989,11 @@ const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
     expect(execFileAsync.mock.calls.some(([cmd, args]) =>
       cmd === 'python3' && Array.isArray(args) && args.includes('--fix'),
     )).toBe(false);
+    assertComparator();
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 
-  itNeedsPython3('keeps an inherited size breach out of the LLM prompt when a new non-size failure remains', async () => {
+  it('keeps an inherited size breach out of the LLM prompt when a new non-size failure remains', async () => {
     const inheritedSizeDetail =
       '[breach] backend/chronic.py: 1720 lines (cap: 1600)\nmodule_size_limits.json size guardrail';
     const newFailure = 'AssertionError: expected enabled to be true';
@@ -914,6 +1001,21 @@ const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
       { testcase: 'inherited chronic size breach', detail: inheritedSizeDetail },
       { testcase: 'new behavior', detail: newFailure },
     ]);
+    const inheritedRecord = failureRecord('inherited chronic size breach', inheritedSizeDetail);
+    const assertComparator = queueComparatorAttribution({
+      current: [inheritedRecord, failureRecord('new behavior', newFailure)],
+      baseline: [inheritedRecord],
+      newFailures: {
+        'size-guardrail.test.ts::new behavior::failure': newFailure,
+      },
+      suppressedFailures: {
+        'size-guardrail.test.ts::inherited chronic size breach::failure': {
+          detail: inheritedSizeDetail,
+          reason: 'same route/test/failure kind failed on baseline',
+        },
+      },
+      times: 2,
+    });
     execFileAsync.mockRejectedValue(new Error(`Command failed: npm test\n${inheritedSizeDetail}\n${newFailure}`));
 
     await testFixLoop(
@@ -928,9 +1030,10 @@ const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(runClaudeCode).mock.calls[0][0]).toContain(newFailure);
     expect(vi.mocked(runClaudeCode).mock.calls[0][0]).not.toContain('backend/chronic.py');
+    assertComparator();
   });
 
-  itNeedsPython3('repairs a new size target without including a concurrent inherited size offender', async () => {
+  it('repairs a new size target without including a concurrent inherited size offender', async () => {
     const inheritedSizeDetail =
       '[breach] backend/chronic.py: 1720 lines (cap: 1600)\nmodule_size_limits.json size guardrail';
     const newSizeDetail =
@@ -939,6 +1042,20 @@ const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
       { testcase: 'inherited chronic size breach', detail: inheritedSizeDetail },
       { testcase: 'new size breach', detail: newSizeDetail },
     ]);
+    const inheritedRecord = failureRecord('inherited chronic size breach', inheritedSizeDetail);
+    const assertComparator = queueComparatorAttribution({
+      current: [inheritedRecord, failureRecord('new size breach', newSizeDetail)],
+      baseline: [inheritedRecord],
+      newFailures: {
+        'size-guardrail.test.ts::new size breach::failure': newSizeDetail,
+      },
+      suppressedFailures: {
+        'size-guardrail.test.ts::inherited chronic size breach::failure': {
+          detail: inheritedSizeDetail,
+          reason: 'same route/test/failure kind failed on baseline',
+        },
+      },
+    });
     let calls = 0;
     execFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (cmd === 'python3' && args.includes('--fix')) return Promise.resolve('Bumped 1 cap(s).');
@@ -961,6 +1078,7 @@ const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
     expect(bumpCall?.[1]).toEqual([
       'backend/testing/check_size_limits.py', '--fix', '--repair-target', 'agent/new.ts',
     ]);
+    assertComparator();
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 
