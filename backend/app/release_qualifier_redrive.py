@@ -347,7 +347,9 @@ async def _redrive_error_qualification(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as redrive_session:
-        version = await _lock_project_then_version(redrive_session, version_id)
+        version = await _lock_project_then_version(
+            redrive_session, version_id, skip_locked=True
+        )
         if version is None:
             return False
         qual = version.last_qualification
@@ -542,7 +544,9 @@ async def _redrive_infra_failure_qualification(
         # stale ``infra_failure`` marker mid-flight (2026-08-05: an explicit
         # qualification and this re-driver double-spawned duplicate
         # release_audit tasks two minutes apart).
-        version = await _lock_project_then_version(redrive_session, version_id)
+        version = await _lock_project_then_version(
+            redrive_session, version_id, skip_locked=True
+        )
         if version is None:
             return False
         qual = version.last_qualification
@@ -856,7 +860,9 @@ async def _redrive_rubric_changed_qualification(
         # Row-lock the version (same as the infra re-driver) so this autonomous
         # re-drive serializes against a concurrently-committing explicit
         # qualification instead of reading a stale rubric marker mid-flight.
-        version = await _lock_project_then_version(redrive_session, version_id)
+        version = await _lock_project_then_version(
+            redrive_session, version_id, skip_locked=True
+        )
         if version is None:
             return False
         qual = version.last_qualification
@@ -1036,7 +1042,9 @@ async def _redrive_walkthrough_contract_qualification(
         # autonomous re-drive serializes against a concurrently-committing
         # explicit qualification instead of reading a stale contract-failure
         # marker mid-flight.
-        version = await _lock_project_then_version(redrive_session, version_id)
+        version = await _lock_project_then_version(
+            redrive_session, version_id, skip_locked=True
+        )
         if version is None:
             return False
         qual = version.last_qualification
@@ -2000,7 +2008,9 @@ async def _redrive_deferred_unsynced_qualification(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as redrive_session:
-        version = await _lock_project_then_version(redrive_session, version_id)
+        version = await _lock_project_then_version(
+            redrive_session, version_id, skip_locked=True
+        )
         if version is None:
             return False
         qual = version.last_qualification

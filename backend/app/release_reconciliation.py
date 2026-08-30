@@ -280,22 +280,16 @@ async def _reconcile_if_promotion_failed_landed(
     version_id: uuid.UUID,
     *,
     session_factory=None,
+    skip_locked: bool = False,
 ) -> bool:
     """Reconcile an open version whose promotion-failure candidate is already on main."""
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            # Lock the version row — same serialization point as _finalize_locked_version.
             version: release_version.ReleaseVersion | None = (
-                (
-                    await session.execute(
-                        select(release_version.ReleaseVersion)
-                        .where(release_version.ReleaseVersion.id == version_id)
-                        .with_for_update()
-                    )
+                await _lock_project_then_version(
+                    session, version_id, skip_locked=skip_locked
                 )
-                .scalars()
-                .first()
             )
             if version is None:
                 return False
@@ -463,6 +457,7 @@ async def _reconcile_if_not_promoted_but_pr_merged(
     version_id: uuid.UUID,
     *,
     session_factory=None,
+    skip_locked: bool = False,
 ) -> bool:
     """Reconcile an open version recorded as not_promoted/ci_unresolved whose PR merged.
 
@@ -485,7 +480,9 @@ async def _reconcile_if_not_promoted_but_pr_merged(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            version = await _lock_project_then_version(session, version_id)
+            version = await _lock_project_then_version(
+                session, version_id, skip_locked=skip_locked
+            )
             if version is None:
                 return False
             if version.status != "open":
@@ -1057,6 +1054,7 @@ async def _reconcile_if_managed_check_wait(
     version_id: uuid.UUID,
     *,
     session_factory=None,
+    skip_locked: bool = False,
 ) -> bool:
     """Reconcile a promotion PR in ``managed_check_wait`` mode.
 
@@ -1090,7 +1088,9 @@ async def _reconcile_if_managed_check_wait(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            version = await _lock_project_then_version(session, version_id)
+            version = await _lock_project_then_version(
+                session, version_id, skip_locked=skip_locked
+            )
             if version is None:
                 return False
             if version.status != "open":
@@ -2194,6 +2194,7 @@ async def _reconcile_if_pending_qualification_superseded(
     version_id: uuid.UUID,
     *,
     session_factory=None,
+    skip_locked: bool = False,
 ) -> bool:
     """Reconcile an open version whose pending qualification candidate landed out-of-band.
 
@@ -2218,7 +2219,9 @@ async def _reconcile_if_pending_qualification_superseded(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            project = await _lock_release_project_for_version(session, version_id)
+            project = await _lock_release_project_for_version(
+                session, version_id, skip_locked=skip_locked
+            )
             if project is None:
                 return False
             version: release_version.ReleaseVersion | None = (
@@ -2226,7 +2229,7 @@ async def _reconcile_if_pending_qualification_superseded(
                     await session.execute(
                         select(release_version.ReleaseVersion)
                         .where(release_version.ReleaseVersion.id == version_id)
-                        .with_for_update()
+                        .with_for_update(skip_locked=skip_locked)
                         .execution_options(populate_existing=True)
                     )
                 )
@@ -2443,6 +2446,7 @@ async def _reconcile_if_promotion_pending_timed_out(
     version_id: uuid.UUID,
     *,
     session_factory=None,
+    skip_locked: bool = False,
 ) -> bool:
     """Force-fail a ``promotion_pending`` sub-state that has stranded too long.
 
@@ -2463,7 +2467,9 @@ async def _reconcile_if_promotion_pending_timed_out(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            version = await _lock_project_then_version(session, version_id)
+            version = await _lock_project_then_version(
+                session, version_id, skip_locked=skip_locked
+            )
             if version is None:
                 return False
             if version.status != "open":

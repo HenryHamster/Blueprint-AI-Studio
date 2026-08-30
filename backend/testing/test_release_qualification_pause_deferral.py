@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from datetime import timedelta, timezone
@@ -473,13 +474,23 @@ async def test_project_lock_contention_never_spends_finalizer_crash_budget(
                 .with_for_update(key_share=True)
             )
         ).scalar_one()
+        locked_version = (
+            await lock_session.execute(
+                select(rv.ReleaseVersion)
+                .where(rv.ReleaseVersion.id == version_id)
+                .with_for_update()
+            )
+        ).scalar_one()
 
         # The normal finalization seam sees SKIP LOCKED as unavailable and
         # leaves the exact pending attempt for a later sweep. It must not reach
         # the generic sweep exception path that increments crash streak.
-        finalized = await rq.sweep_stuck_qualifications(
-            db_session,
-            session_factory=Session,
+        finalized = await asyncio.wait_for(
+            rq.sweep_stuck_qualifications(
+                db_session,
+                session_factory=Session,
+            ),
+            timeout=5,
         )
         assert finalized == 0
 
@@ -497,15 +508,19 @@ async def test_project_lock_contention_never_spends_finalizer_crash_budget(
                 )
             ),
         )
-        typed_result = await rq._finalize_in_dedicated_session(
-            version_id,
-            session_factory=Session,
+        typed_result = await asyncio.wait_for(
+            rq._finalize_in_dedicated_session(
+                version_id,
+                session_factory=Session,
+            ),
+            timeout=5,
         )
         assert typed_result is None
         mocker.stop(forced_denial)
         # Keep the ORM reference live so the row lock is unambiguously retained
         # through both calls; release happens at context exit.
         assert locked_project.id == project_id
+        assert locked_version.id == version_id
 
     db_session.expire_all()
     refreshed = await db_session.get(rv.ReleaseVersion, version_id)

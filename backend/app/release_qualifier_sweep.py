@@ -628,7 +628,9 @@ async def _recheck_ci_compliance_blocked_version(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as recheck_session:
-        version = await _lock_project_then_version(recheck_session, version_id)
+        version = await _lock_project_then_version(
+            recheck_session, version_id, skip_locked=True
+        )
         if version is None:
             return False
         qual = (
@@ -880,7 +882,9 @@ async def sweep_stuck_qualifications(
     for version_id in hotfix_version_ids:
         try:
             if await _reconcile_hotfix_audit_trail(
-                version_id, session_factory=session_factory
+                version_id,
+                session_factory=session_factory,
+                skip_locked=True,
             ):
                 finalized += 1
         except Exception:
@@ -913,7 +917,7 @@ async def sweep_stuck_qualifications(
             try:
                 async with _factory() as crash_session:
                     locked_v = await _lock_project_then_version(
-                        crash_session, version_id
+                        crash_session, version_id, skip_locked=True
                     )
                     if (
                         locked_v is not None
@@ -1123,6 +1127,7 @@ async def sweep_stuck_qualifications(
             reconciled = await _reconcile_if_promotion_failed_landed(
                 version_id,
                 session_factory=session_factory,
+                skip_locked=True,
             )
         except Exception:
             logger.exception(
@@ -1150,6 +1155,7 @@ async def sweep_stuck_qualifications(
             reconciled = await _reconcile_if_not_promoted_but_pr_merged(
                 version_id,
                 session_factory=session_factory,
+                skip_locked=True,
             )
         except Exception:
             logger.exception(
@@ -1179,6 +1185,7 @@ async def sweep_stuck_qualifications(
             reconciled = await _reconcile_if_managed_check_wait(
                 version_id,
                 session_factory=session_factory,
+                skip_locked=True,
             )
         except Exception:
             logger.exception(
@@ -1208,6 +1215,7 @@ async def sweep_stuck_qualifications(
             reconciled = await _reconcile_if_pending_qualification_superseded(
                 version_id,
                 session_factory=session_factory,
+                skip_locked=True,
             )
         except Exception:
             logger.exception(
@@ -1242,6 +1250,7 @@ async def sweep_stuck_qualifications(
             timed_out = await _reconcile_if_promotion_pending_timed_out(
                 version_id,
                 session_factory=session_factory,
+                skip_locked=True,
             )
         except Exception:
             logger.exception(

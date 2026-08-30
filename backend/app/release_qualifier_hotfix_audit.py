@@ -37,7 +37,7 @@ def _hotfix_audit_was_attempted(qual: dict[str, Any]) -> bool:
 
 
 async def _reconcile_hotfix_audit_trail(
-    version_id: Any, *, session_factory=None
+    version_id: Any, *, session_factory=None, skip_locked: bool = False
 ) -> bool:
     """Restore a hotfix's debt/Alert after its request session was lost.
 
@@ -56,7 +56,9 @@ async def _reconcile_hotfix_audit_trail(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as audit_session:
-        version = await _lock_project_then_version(audit_session, version_id)
+        version = await _lock_project_then_version(
+            audit_session, version_id, skip_locked=skip_locked
+        )
         qual = dict(version.last_qualification or {}) if version else {}
         candidate_sha = qual.get("candidate_sha")
         if not (
