@@ -1859,6 +1859,10 @@ async def clear_deploy_failed(
     # will reacquire Project -> Version -> ordered artifact locks and reject any
     # drift from this candidate snapshot.
     await session.rollback()
+    # The observation/apply helpers below own every post-I/O ORM row.  Detach
+    # the expired pre-observation identity map so stale Project, Version, or
+    # artifact instances cannot be reused accidentally across this boundary.
+    session.expunge_all()
 
     now = _utcnow()
     observation = await observe_release_artifacts(

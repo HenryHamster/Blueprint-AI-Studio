@@ -10659,6 +10659,11 @@ async def _finalize_locked_version(
         )
         return None
 
+    # ``rollback()`` expires ORM state.  Keep the immutable display value as a
+    # scalar so the diagnostic-only exits below never lazy-load ``version``
+    # after ending their transaction.
+    locked_version_number = version.version_number
+
     qual = version.last_qualification or {}
     if qual.get("status") != "pending":
         # Idempotent no-op after a lock-serialized non-promote finalization.
@@ -10688,7 +10693,7 @@ async def _finalize_locked_version(
             logger.info(
                 "[RELEASE_QUALIFIER] finalize: v%d external gate packet was "
                 "superseded before apply",
-                version.version_number,
+                locked_version_number,
             )
             return None
 
@@ -10762,7 +10767,7 @@ async def _finalize_locked_version(
         logger.info(
             "[RELEASE_QUALIFIER] finalize: v%d became ready after the "
             "unlocked gate peek; deferring one cycle for a complete gate packet",
-            version.version_number,
+            locked_version_number,
         )
         return None
 

@@ -836,6 +836,11 @@ async def sweep_stuck_qualifications(
                     await evidence_session.commit()
                 else:
                     await evidence_session.rollback()
+                    # This scoped session has no more work in the iteration.
+                    # Make the rollback terminator explicit so neither humans
+                    # nor the MissingGreenlet flow guard can mistake later,
+                    # independently-scoped ORM reads for this session's state.
+                    continue
         except Exception:
             logger.exception(
                 "[RELEASE_QUALIFIER] sweep: acceptance evidence refresh failed "
