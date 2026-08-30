@@ -13,6 +13,7 @@ import type {
   CurrentVersion,
   DimensionState,
   GoalAlignment,
+  InfraFailureEvidence,
   LatestAudit,
   OutOfBandPromotion,
   QualificationVerdictRecord,
@@ -700,7 +701,96 @@ export type DurableQualificationEvidence = {
   promotion_error_detail?: string | null;
   goal_alignment?: GoalAlignment | null;
   blind_merge_grade?: BlindMergeGrade | null;
+  infra_failure_evidence?: InfraFailureEvidence | null;
 };
+
+function InfraFailureEvidenceDetails({ evidence }: { evidence: InfraFailureEvidence }) {
+  return (
+    <details
+      data-testid="infra-failure-evidence"
+      className="basis-full rounded border border-red-500/20 bg-red-500/5 px-2 py-1 text-ui-sm"
+    >
+      <summary className="cursor-pointer text-red-300">
+        infra diagnostics — showing {evidence.events.length} of {evidence.events_total}
+        {evidence.events_truncated ? ' (first + latest retained)' : ''}
+        {' · '}qualification attempts: {evidence.attempts_total}
+        {evidence.attempts_truncated ? ' total (first + latest retained)' : ''}
+      </summary>
+      <div className="mt-1 space-y-1 pl-2 border-l border-red-500/20">
+        {evidence.events.map((event, eventIndex) => (
+          <div key={`${event.failed_task_id ?? event.leg ?? 'event'}-${eventIndex}`} className="space-y-0.5">
+            <p className="text-neutral-400">
+              <span className="font-mono text-red-300">
+                {evidence.events_truncated && eventIndex === 0
+                  ? 'first'
+                  : evidence.events_truncated && eventIndex === evidence.events.length - 1
+                    ? 'latest'
+                    : `event ${eventIndex + 1}`}
+              </span>
+              {' · '}{event.leg ?? 'unknown leg'} · {event.status ?? event.failure_category ?? 'failed'}
+              {event.terminal_at ? ` · ${event.terminal_at}` : ''}
+            </p>
+            {(event.failed_task_id || event.replacement_task_id) && (
+              <p className="font-mono text-ui-xs text-neutral-600 break-all">
+                {event.failed_task_id ? `task ${event.failed_task_id}` : ''}
+                {event.replacement_task_id ? ` → ${event.replacement_task_id}` : ''}
+              </p>
+            )}
+            {event.attempt_trace.map((attempt, attemptIndex) => (
+              <div
+                key={`${attempt.attempt_ordinal ?? attemptIndex}-${attempt.status ?? 'attempt'}`}
+                className="pl-2 text-ui-xs text-neutral-500"
+              >
+                <p>
+                  attempt {attempt.attempt_ordinal ?? attemptIndex + 1}
+                  {attempt.status ? ` · ${attempt.status}` : ''}
+                  {attempt.vm_provisioned_at ? ` · provisioned ${attempt.vm_provisioned_at}` : ''}
+                  {attempt.vm_stopped_at ? ` · stopped ${attempt.vm_stopped_at}` : ''}
+                  {attempt.terminal_at ? ` · terminal ${attempt.terminal_at}` : ''}
+                  {attempt.agent_error?.duration_ms != null
+                    ? ` · ${attempt.agent_error.duration_ms}ms`
+                    : ''}
+                </p>
+                {attempt.agent_error?.provider_terminal_reason && (
+                  <p>provider: {attempt.agent_error.provider_terminal_reason}</p>
+                )}
+                {attempt.agent_error?.last_stream_event && (
+                  <p>last event: {attempt.agent_error.last_stream_event}</p>
+                )}
+                {attempt.agent_error
+                  && (typeof attempt.agent_error.result_event_seen === 'boolean'
+                    || typeof attempt.agent_error.provider_result_is_error === 'boolean') && (
+                  <p>
+                    {typeof attempt.agent_error.result_event_seen === 'boolean'
+                      ? `result seen: ${String(attempt.agent_error.result_event_seen)}`
+                      : ''}
+                    {typeof attempt.agent_error.result_event_seen === 'boolean'
+                      && typeof attempt.agent_error.provider_result_is_error === 'boolean'
+                      ? ' · '
+                      : ''}
+                    {typeof attempt.agent_error.provider_result_is_error === 'boolean'
+                      ? `provider error: ${String(attempt.agent_error.provider_result_is_error)}`
+                      : ''}
+                  </p>
+                )}
+                {(attempt.agent_error?.output_tail || attempt.child_tail) && (
+                  <p className="font-mono text-neutral-400 break-all">
+                    {attempt.agent_error?.output_tail ?? attempt.child_tail}
+                  </p>
+                )}
+              </div>
+            ))}
+            {event.attempt_trace_truncated && (
+              <p className="text-ui-xs text-amber-400">
+                showing {event.attempt_trace.length} of {event.attempt_trace_total} task attempts (first + latest retained)
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
 
 function formatCompactDetail(value: unknown): string {
   if (value == null) return '';
@@ -875,11 +965,14 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
     );
   }
 
-  if (chips.length === 0) return null;
+  if (chips.length === 0 && !q.infra_failure_evidence) return null;
 
   return (
     <div data-testid="durable-qualification-evidence" className="flex flex-wrap gap-1.5 pt-0.5">
       {chips}
+      {q.infra_failure_evidence && (
+        <InfraFailureEvidenceDetails evidence={q.infra_failure_evidence} />
+      )}
     </div>
   );
 }

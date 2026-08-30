@@ -1223,7 +1223,10 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                   <QualSummary q={cv.last_qualification} />
                   <DebtEnforcePreview q={cv.last_qualification} />
                   {cv.last_qualification.candidate_sha && (() => {
-                    const matchedVerdict = verdicts.find(v => v.candidate_sha === cv.last_qualification?.candidate_sha);
+                    const attemptId = cv.last_qualification?.qualification_attempt_id;
+                    const matchedVerdict = attemptId
+                      ? verdicts.find(v => v.qualification_attempt_id === attemptId)
+                      : verdicts.find(v => v.candidate_sha === cv.last_qualification?.candidate_sha);
                     return matchedVerdict?.terminal_status === 'promoted' ? (
                       <PostPromotionOutcomeBadge outcome={matchedVerdict.post_promotion_outcome} outcomeAt={matchedVerdict.post_promotion_outcome_at} />
                     ) : null;

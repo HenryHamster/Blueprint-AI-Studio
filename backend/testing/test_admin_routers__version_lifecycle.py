@@ -3802,6 +3802,26 @@ class TestVersionLifecycleInfraFailureFields:
                 "audit_missing_reason": None,
                 "candidate_sha": "abc1234",
                 "finalized_at": "2026-05-27T00:00:00",
+                "infra_failure_child_events": [
+                    {
+                        "diagnostic_schema_version": 1,
+                        "leg": "audit",
+                        "failed_task_id": "00000000-0000-0000-0000-000000000001",
+                        "attempt_trace": [
+                            {
+                                "attempt_ordinal": 1,
+                                "status": "FAILED",
+                                "agent_error": {
+                                    "schema": 1,
+                                    "provider_terminal_reason": "aborted_streaming",
+                                    "output_tail": "bounded provider tail",
+                                },
+                            }
+                        ],
+                        "attempt_trace_total": 1,
+                        "attempt_trace_truncated": False,
+                    }
+                ],
             },
         )
         db_session.add(version)
@@ -3837,6 +3857,12 @@ class TestVersionLifecycleInfraFailureFields:
         assert lq["error"] == "audit_report_missing"
         assert lq["consecutive_infra_errors"] == 2
         assert lq["audit_missing_reason"] is None
+        attempt = lq["infra_failure_evidence"]["events"][0]["attempt_trace"][0]
+        assert attempt["attempt_ordinal"] == 1
+        assert attempt["agent_error"]["provider_terminal_reason"] == (
+            "aborted_streaming"
+        )
+        assert attempt["agent_error"]["output_tail"] == "bounded provider tail"
 
     @pytest.mark.asyncio
     async def test_infra_failure_fields_absent_for_successful_qualification(

@@ -304,8 +304,64 @@ export interface LatestAudit {
   } | null;
 }
 
+export interface InfraFailureAgentErrorEvidence {
+  schema: 1;
+  exit_code?: number;
+  duration_ms?: number;
+  provider_api_error_status?: number;
+  model_output_seen?: boolean;
+  result_event_seen?: boolean;
+  provider_result_is_error?: boolean;
+  provider?: string;
+  auth_mode?: string;
+  exit_signal?: string;
+  last_stream_event?: string;
+  classified?: string;
+  provider_result_subtype?: string;
+  provider_terminal_reason?: string;
+  provider_error_source?: string;
+  provider_error_code?: string;
+  output_tail?: string;
+}
+
+export interface InfraFailureAttemptEvidence {
+  attempt_ordinal?: number;
+  status?: string;
+  vm_provisioned_at?: string;
+  vm_stopped_at?: string;
+  terminal_at?: string;
+  failure_category?: string;
+  child_tail?: string;
+  agent_error?: InfraFailureAgentErrorEvidence;
+}
+
+export interface InfraFailureEventEvidence {
+  leg?: string;
+  failed_task_id?: string;
+  replacement_task_id?: string;
+  status?: string;
+  failure_category?: string;
+  terminal_at?: string;
+  task_attempt_ordinal?: number;
+  label?: string;
+  respawn_count?: number;
+  attempt_trace: InfraFailureAttemptEvidence[];
+  attempt_trace_total: number;
+  attempt_trace_truncated: boolean;
+}
+
+export interface InfraFailureEvidence {
+  schema_version: 1;
+  events: InfraFailureEventEvidence[];
+  events_total: number;
+  events_truncated: boolean;
+  attempts_total: number;
+  attempts_truncated: boolean;
+}
+
 export interface VersionQualification {
   status: QualificationStatus | null;
+  qualification_attempt_id?: string | null;
   confidence: number | null;
   threshold: number | null;
   sub_scores: VersionQualificationSubScores | null;
@@ -318,6 +374,7 @@ export interface VersionQualification {
   candidate_sha?: string | null;
   // Infra-failure context (populated only when status=infra_failure).
   error?: string | null;
+  infra_failure_evidence?: InfraFailureEvidence | null;
   consecutive_infra_errors?: number | null;
   // True when the same migration-apply gate failure has repeated 3+ times with
   // an identical infra-failure signature. The operator hotfix-deploy channel is
@@ -1501,10 +1558,12 @@ export async function triggerQualify(projectId: string): Promise<QualifyTriggerR
 export interface QualificationVerdictRecord {
   id: string;
   release_version_id: string;
+  qualification_attempt_id?: string | null;
   candidate_sha: string;
   confidence: number | null;
   sub_scores: VersionQualificationSubScores | null;
   blocker: string | null;
+  infra_failure_evidence?: InfraFailureEvidence | null;
   audit_missing_reason: string | null;
   audit_findings?: AuditFinding[] | null;
   excluded_audit_findings?: AuditFinding[] | null;

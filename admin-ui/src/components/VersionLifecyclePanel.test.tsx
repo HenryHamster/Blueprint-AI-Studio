@@ -1589,6 +1589,37 @@ describe('VersionLifecyclePanel', () => {
                 promotion_pr_url: 'https://example.com/pr/open',
                 promotion_conflict: true,
                 promotion_error_detail: 'merge conflict',
+                infra_failure_evidence: {
+                  schema_version: 1,
+                  events_total: 6,
+                  events_truncated: true,
+                  attempts_total: 8,
+                  attempts_truncated: true,
+                  events: [{
+                    leg: 'audit',
+                    failed_task_id: 'task-current-failure',
+                    status: 'FAILED',
+                    terminal_at: '2026-08-30T00:07:00Z',
+                    attempt_trace_total: 6,
+                    attempt_trace_truncated: true,
+                    attempt_trace: [
+                      {
+                        attempt_ordinal: 1,
+                        status: 'FAILED',
+                        vm_provisioned_at: '2026-08-30T00:01:00Z',
+                        agent_error: {
+                          schema: 1,
+                          duration_ms: 360000,
+                          result_event_seen: true,
+                          provider_result_is_error: true,
+                          provider_terminal_reason: 'aborted_streaming',
+                          output_tail: 'bounded redacted output tail',
+                        },
+                      },
+                      { attempt_ordinal: 6, status: 'FAILED' },
+                    ],
+                  }],
+                },
               }),
             }),
           })}
@@ -1606,6 +1637,13 @@ describe('VersionLifecyclePanel', () => {
       expect(within(evidence).getByText(/promotion conflict/)).toBeInTheDocument();
       expect(within(evidence).getByTitle('open version needs a schema migration')).toBeInTheDocument();
       expect(within(evidence).getByTitle('apply path still diverges')).toBeInTheDocument();
+      const infra = within(evidence).getByTestId('infra-failure-evidence');
+      expect(within(infra).getByText(/showing 1 of 6/)).toBeInTheDocument();
+      expect(within(infra).getByText(/qualification attempts: 8 total/)).toBeInTheDocument();
+      expect(within(infra).getByText(/aborted_streaming/)).toBeInTheDocument();
+      expect(within(infra).getByText(/360000ms/)).toBeInTheDocument();
+      expect(within(infra).getByText(/bounded redacted output tail/)).toBeInTheDocument();
+      expect(within(infra).getByText(/showing 2 of 6 task attempts/)).toBeInTheDocument();
     });
 
     it('renders durable qualification evidence in verdict history', async () => {
@@ -1631,6 +1669,29 @@ describe('VersionLifecyclePanel', () => {
             promotion_pr_url: 'https://example.com/pr/123',
             promotion_conflict: false,
             promotion_error_detail: null,
+            infra_failure_evidence: {
+              schema_version: 1,
+              events_total: 1,
+              events_truncated: false,
+              attempts_total: 1,
+              attempts_truncated: false,
+              events: [{
+                leg: 'challenge',
+                failed_task_id: 'task-history-failure',
+                status: 'FAILED',
+                attempt_trace_total: 1,
+                attempt_trace_truncated: false,
+                attempt_trace: [{
+                  attempt_ordinal: 1,
+                  status: 'FAILED',
+                  agent_error: {
+                    schema: 1,
+                    provider_terminal_reason: 'provider_failed',
+                    output_tail: 'historical bounded tail',
+                  },
+                }],
+              }],
+            },
             would_promote: true,
             promotion_enabled: true,
             terminal_status: 'promoted',
@@ -1662,6 +1723,11 @@ describe('VersionLifecyclePanel', () => {
       expect(within(evidence).getByText(/promotion PR/)).toBeInTheDocument();
       expect(within(evidence).getByTitle('schema migration verified')).toBeInTheDocument();
       expect(within(evidence).getByTitle('apply path verified')).toBeInTheDocument();
+      const infra = within(evidence).getByTestId('infra-failure-evidence');
+      expect(within(infra).getByText(/provider_failed/)).toBeInTheDocument();
+      expect(within(infra).getByText(/historical bounded tail/)).toBeInTheDocument();
+      expect(within(infra).queryByText(/result seen:/)).not.toBeInTheDocument();
+      expect(within(infra).queryByText(/provider error:/)).not.toBeInTheDocument();
     });
 
     it('renders challenger-refuted false positives with reason in verdict history', async () => {
@@ -3016,6 +3082,63 @@ describe('VersionLifecyclePanel', () => {
         expect(badges.length).toBeGreaterThanOrEqual(1);
         const servingBadge = badges.find(b => b.getAttribute('data-outcome') === 'serving_confirmed');
         expect(servingBadge).toBeDefined();
+      });
+    });
+
+    it('matches a same-SHA requalification by exact attempt identity', async () => {
+      const candidateSha = 'abcdef1234567890';
+      const baseVerdict = {
+        release_version_id: 'rv1',
+        candidate_sha: candidateSha,
+        confidence: 0.93,
+        sub_scores: null,
+        blocker: null,
+        audit_missing_reason: null,
+        would_promote: true,
+        promotion_enabled: true,
+        threshold: 0.9,
+        started_at: null,
+        finalized_at: '2026-01-02T00:00:00Z',
+        created_at: '2026-01-02T00:00:00Z',
+      };
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            ...baseVerdict,
+            id: 'old-verdict',
+            qualification_attempt_id: 'attempt-old',
+            terminal_status: 'promoted',
+            post_promotion_outcome: 'deploy_failed',
+          },
+          {
+            ...baseVerdict,
+            id: 'current-verdict',
+            qualification_attempt_id: 'attempt-current',
+            terminal_status: 'not_promoted',
+            post_promotion_outcome: null,
+          },
+        ],
+        total: 2,
+      });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                candidate_sha: candidateSha,
+                qualification_attempt_id: 'attempt-current',
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await screen.findByTestId('verdict-history');
+      await waitFor(() => {
+        expect(screen.getAllByTestId('post-promotion-outcome-badge')).toHaveLength(1);
       });
     });
   });
