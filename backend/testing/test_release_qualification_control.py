@@ -148,6 +148,8 @@ async def test_control_api_enforces_roles_strict_types_and_uncached_readback(
     read = await client.get(path)
     assert read.status_code == 200, read.text
     assert read.headers["cache-control"] == "no-store, private"
+    assert read.json()["requester_actor_user_id"] == _OWNER_ID
+    assert read.json()["requester_can_mutate"] is True
     for invalid in (
         {
             "expected_revision": True,
@@ -176,6 +178,8 @@ async def test_control_api_enforces_roles_strict_types_and_uncached_readback(
     assert hold.status_code == 200, hold.text
     assert hold.headers["cache-control"] == "no-store, private"
     assert hold.json()["receipt"]["actor_user_id"] == _OWNER_ID
+    assert hold.json()["requester_actor_user_id"] == _OWNER_ID
+    assert hold.json()["requester_can_mutate"] is True
 
     async def viewer_user():
         return {"user_id": "control-viewer", "email": "viewer@example.com"}
@@ -191,7 +195,10 @@ async def test_control_api_enforces_roles_strict_types_and_uncached_readback(
     original_override = app.dependency_overrides.get(get_current_user)
     app.dependency_overrides[get_current_user] = viewer_user
     try:
-        assert (await client.get(path)).status_code == 200
+        viewer_read = await client.get(path)
+        assert viewer_read.status_code == 200
+        assert viewer_read.json()["requester_actor_user_id"] == "control-viewer"
+        assert viewer_read.json()["requester_can_mutate"] is False
         assert (
             await client.post(
                 path,

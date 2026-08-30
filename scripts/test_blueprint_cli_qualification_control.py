@@ -22,7 +22,10 @@ def _request(*, enabled=False, revision=0, key=KEY, reason=REASON):
     }
 
 
-def _context(*, current_revision=0, current_enabled=True, receipt=None):
+def _context(
+    *, current_revision=0, current_enabled=True, receipt=None,
+    requester_actor="owner-user", requester_can_mutate=True,
+):
     current = {
         "schema_version": 1,
         "project_id": PROJECT_ID,
@@ -36,6 +39,12 @@ def _context(*, current_revision=0, current_enabled=True, receipt=None):
         "created_at": None,
     }
     if current_revision > 0:
+        current_request = _request(
+            enabled=current_enabled,
+            revision=current_revision - 1,
+            key=f"current-revision-{current_revision}",
+            reason="Later control",
+        )
         current = {
             "schema_version": 1,
             "project_id": PROJECT_ID,
@@ -43,7 +52,11 @@ def _context(*, current_revision=0, current_enabled=True, receipt=None):
             "revision": current_revision,
             "automatic_starts_enabled": current_enabled,
             "idempotency_key": f"current-revision-{current_revision}",
-            "specification_hash": "b" * 64,
+            "specification_hash": (
+                blueprint._qualification_control_specification_hash(
+                    current_request, PROJECT_ID, "owner-user"
+                )
+            ),
             "actor_user_id": "owner-user",
             "reason": "Later control",
             "created_at": "2026-08-30T20:01:00",
@@ -56,6 +69,8 @@ def _context(*, current_revision=0, current_enabled=True, receipt=None):
         "current": current,
         "receipt": receipt,
         "requested_idempotency_key": KEY,
+        "requester_actor_user_id": requester_actor,
+        "requester_can_mutate": requester_can_mutate,
     }
 
 
@@ -149,6 +164,33 @@ def test_hold_freezes_one_raw_post_and_reconciles_exact_receipt(
     ).encode("utf-8")
 
 
+def test_canonical_hash_matches_the_independent_golden_vector():
+    assert blueprint._qualification_control_specification_hash(
+        _request(), PROJECT_ID, "owner-user"
+    ) == "1d87078494e2123042dc01c82caf7a85fb7088fd1ee055d76897b68c057d6e78"
+
+
+def test_arm_freezes_the_enabled_raw_request(monkeypatch):
+    posts = []
+    request = _request(enabled=True)
+
+    def fake_api(method, path, body=None, timeout=30, *, raw_body=None):
+        if method == "GET" and not posts:
+            return _context()
+        if method == "POST":
+            posts.append(raw_body)
+            return {"status": "acknowledged"}
+        if method == "GET":
+            return _committed(request)
+        raise AssertionError((method, path))
+
+    _wire(monkeypatch, fake_api)
+    assert blueprint.main(_argv("arm")) == 0
+    assert posts == [
+        json.dumps(request, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ]
+
+
 def test_lost_post_response_reconciles_without_replay(monkeypatch):
     posts = []
     request = _request()
@@ -159,6 +201,25 @@ def test_lost_post_response_reconciles_without_replay(monkeypatch):
         if method == "POST":
             posts.append(raw_body)
             raise blueprint.APIError("lost response", request_may_have_been_sent=True)
+        if method == "GET":
+            return _committed(request)
+        raise AssertionError((method, path))
+
+    _wire(monkeypatch, fake_api)
+    assert blueprint.main(_argv()) == 0
+    assert len(posts) == 1
+
+
+def test_authoritative_conflict_reconciles_once_without_replay(monkeypatch):
+    posts = []
+    request = _request()
+
+    def fake_api(method, path, body=None, timeout=30, *, raw_body=None):
+        if method == "GET" and not posts:
+            return _context()
+        if method == "POST":
+            posts.append(raw_body)
+            raise blueprint.APIError("HTTP 409: conflict")
         if method == "GET":
             return _committed(request)
         raise AssertionError((method, path))
@@ -284,7 +345,7 @@ def test_invalid_authority_fails_before_api(monkeypatch, extra):
     assert calls == []
 
 
-@pytest.mark.parametrize("action", ["show", "hold"])
+@pytest.mark.parametrize("action", ["show", "hold", "arm"])
 def test_scoped_credentials_cannot_use_control_surface(monkeypatch, action):
     calls = []
 
@@ -302,3 +363,72 @@ def test_scoped_credentials_cannot_use_control_surface(monkeypatch, action):
     )
     assert blueprint.main(argv) == 1
     assert calls == [("GET", "/api/agent-access/v1/me")]
+
+
+def test_show_validates_the_canonical_readback(monkeypatch, capsys):
+    context = _context()
+    context["requested_idempotency_key"] = None
+
+    def fake_api(method, path, body=None, timeout=30, *, raw_body=None):
+        assert (method, path) == (
+            "GET",
+            f"/api/admin/projects/{PROJECT_ID}/qualification-control",
+        )
+        return context
+
+    _wire(monkeypatch, fake_api)
+    argv = [
+        "--json", "qualification-control", "show", "--project-id", PROJECT_ID,
+    ]
+    assert blueprint.main(argv) == 0
+    assert json.loads(capsys.readouterr().out)["result"] == context
+
+    context["current"]["revision"] = "0"
+    assert blueprint.main(argv) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "not_committed_or_ambiguous"
+    assert payload["retry_argv"] == [
+        "qualification-control", "show", "--project-id", PROJECT_ID,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("context"),
+    [
+        _committed(_request(), current_revision=1) | {
+            "requester_actor_user_id": "different-owner",
+        },
+        _committed(_request(), current_revision=1) | {
+            "requester_can_mutate": False,
+        },
+    ],
+)
+def test_mutation_preflight_requires_same_authorized_actor(
+    monkeypatch, context
+):
+    posts = []
+
+    def fake_api(method, path, body=None, timeout=30, *, raw_body=None):
+        if method == "GET":
+            return context
+        posts.append(raw_body)
+        raise AssertionError("unauthorized or different actor must not post")
+
+    _wire(monkeypatch, fake_api)
+    assert blueprint.main(_argv()) == 1
+    assert posts == []
+
+
+def test_malformed_keyed_show_preserves_the_receipt_key(monkeypatch, capsys):
+    context = _context(current_revision=1, current_enabled=False)
+    context["current"]["specification_hash"] = "f" * 64
+    _wire(monkeypatch, lambda *_args, **_kwargs: context)
+    argv = [
+        "--json", "qualification-control", "show", "--project-id", PROJECT_ID,
+        "--idempotency-key", KEY,
+    ]
+    assert blueprint.main(argv) == 1
+    assert json.loads(capsys.readouterr().out)["retry_argv"] == [
+        "qualification-control", "show", "--project-id", PROJECT_ID,
+        "--idempotency-key", KEY,
+    ]

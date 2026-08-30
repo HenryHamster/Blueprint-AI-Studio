@@ -4270,7 +4270,7 @@ def _qualification_control_projection_valid(value: object, pid: str) -> bool:
                 "reason", "created_at",
             )
         )
-    return (
+    projection_valid = (
         _is_canonical_uuid(value.get("id"))
         and isinstance(value.get("idempotency_key"), str)
         and bool(value["idempotency_key"])
@@ -4283,16 +4283,30 @@ def _qualification_control_projection_valid(value: object, pid: str) -> bool:
         and isinstance(value.get("created_at"), str)
         and bool(value["created_at"])
     )
+    if not projection_valid:
+        return False
+    request = {
+        "expected_revision": value["revision"] - 1,
+        "automatic_starts_enabled": value["automatic_starts_enabled"],
+        "idempotency_key": value["idempotency_key"],
+        "reason": value["reason"],
+    }
+    return value["specification_hash"] == _qualification_control_specification_hash(
+        request, pid, value["actor_user_id"]
+    )
 
 
 def _qualification_control_context_valid(
-    context: object, pid: str, key: str
+    context: object, pid: str, key: str | None
 ) -> bool:
     return (
         isinstance(context, dict)
         and context.get("schema_version") == 1
         and context.get("project_id") == pid
         and context.get("requested_idempotency_key") == key
+        and isinstance(context.get("requester_actor_user_id"), str)
+        and bool(context["requester_actor_user_id"])
+        and type(context.get("requester_can_mutate")) is bool
         and _qualification_control_projection_valid(context.get("current"), pid)
         and (
             context.get("receipt") is None
@@ -4326,6 +4340,7 @@ def _qualification_control_receipt_matches(
     ):
         return False
     receipt = context.get("receipt")
+    requester_actor = context.get("requester_actor_user_id")
     if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
         return False
     return (
@@ -4334,10 +4349,11 @@ def _qualification_control_receipt_matches(
         and receipt.get("automatic_starts_enabled")
         is request["automatic_starts_enabled"]
         and receipt.get("idempotency_key") == request["idempotency_key"]
+        and receipt.get("actor_user_id") == requester_actor
         and receipt.get("reason") == request["reason"]
         and receipt.get("specification_hash")
         == _qualification_control_specification_hash(
-            request, pid, receipt["actor_user_id"]
+            request, pid, requester_actor
         )
     )
 
@@ -4434,6 +4450,15 @@ def cmd_qualification_control(args: argparse.Namespace) -> int:
         keyed_path += f"?idempotency_key={quote(key, safe='')}"
     if action == "show":
         result = api("GET", keyed_path)
+        retry_argv = ["qualification-control", "show", "--project-id", pid]
+        if key is not None:
+            retry_argv.extend(["--idempotency-key", key])
+        if not _qualification_control_context_valid(result, pid, key):
+            return _emit_qualification_control_failure(
+                args,
+                "qualification-control readback is malformed",
+                retry_argv,
+            )
         _emit(args, {"action": action, "result": result}, _render_qualification_control)
         return 0
 
@@ -4449,6 +4474,12 @@ def cmd_qualification_control(args: argparse.Namespace) -> int:
     if not _qualification_control_context_valid(context, pid, key):
         return _emit_qualification_control_failure(
             args, "qualification-control readback is malformed", retry_argv
+        )
+    if context.get("requester_can_mutate") is not True:
+        return _emit_qualification_control_failure(
+            args,
+            "current requester lacks owner qualification-control authority",
+            retry_argv,
         )
     if isinstance(context, dict) and context.get("receipt") is not None:
         if (
