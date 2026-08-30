@@ -204,7 +204,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P5 | agent | `agent/src/index.provider-runner.test.ts` | 1,880 | 134 | moderate (1500–2999 LOC) | 0.117s measured | protected; declared floor 134 |
 | P5 | backend | `backend/testing/test_llm_runtime.py` | 1,998 | 49 | moderate (1500–2999 LOC) | 0.100s measured | — |
 | P5 | backend | `backend/testing/test_max_plan_pool_usage.py` | 2,499 | 96 | moderate (1500–2999 LOC) | 0.087s measured | — |
-| P5 | backend | `backend/testing/test_impacted_tests.py` | 1,591 | 63 | moderate (1500–2999 LOC) | 0.082s measured | — |
+| P5 | backend | `backend/testing/test_impacted_tests.py` | 1,587 | 63 | moderate (1500–2999 LOC) | 0.082s measured | — |
 | P5 | agent | `agent/src/index.test.ts` | 1,885 | 201 | moderate (1500–2999 LOC) | 0.065s measured | — |
 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.utils.test.ts` | 1,622 | 168 | moderate (1500–2999 LOC) | 0.063s measured | — |
 | P5 | agent | `agent/src/index.utilities.test.ts` | 1,556 | 131 | moderate (1500–2999 LOC) | 0.059s measured | — |

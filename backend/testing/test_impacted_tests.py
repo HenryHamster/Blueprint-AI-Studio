@@ -537,12 +537,8 @@ def test_live_surface_manifest_is_valid_and_registers_websocket_sentinel():
 
 
 def test_live_surface_manifest_registers_rollback_safety_guard():
-    """Every app change must select the exact whole-tree rollback guard."""
-    selector = (
-        "backend/testing/test_audit_finding_class_guards.py::"
-        "TestRollbackSafetyRegressionCheck::"
-        "test_rollback_missing_greenlet_regression_check"
-    )
+    """Every app change must select the whole-tree rollback guard module."""
+    selector = "backend/testing/test_audit_finding_class_guards.py"
     ordinary, mandatory = impacted_tests.resolve_impacted_partition(
         ["backend/app/release_qualifier.py"],
         impacted_tests._DEFAULT_REPO_ROOT,
