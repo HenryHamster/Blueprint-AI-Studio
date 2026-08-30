@@ -265,6 +265,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
         source_path="backend/app/release_activation.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "release_activation_receipt.py"): GoverningCap(
+        source_path="backend/app/release_activation_receipt.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_artifacts.py"): GoverningCap(
         source_path="backend/app/release_artifacts.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
@@ -359,6 +363,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
     ),
     ("backend", "release_serving_confirmation.py"): GoverningCap(
         source_path="backend/app/release_serving_confirmation.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_serving_observation.py"): GoverningCap(
+        source_path="backend/app/release_serving_observation.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
     ("backend", "release_stall_alerts.py"): GoverningCap(

@@ -1724,13 +1724,18 @@ async def clear_deploy_failed(
     from app.release_reconciliation import (  # noqa: PLC0415
         _aggregate_non_backend_required_artifact_status,
         _recover_serving_confirmed,
-        _refresh_release_artifact_rows,
+    )
+    from app.release_serving_observation import (  # noqa: PLC0415
+        apply_serving_observation,
+        observe_release_artifacts,
+        serving_artifact_authority_fingerprint,
+        serving_project_authority_fingerprint,
+        serving_version_authority_fingerprint,
     )
     from app.time_utils import _utcnow  # noqa: PLC0415
 
-    version = None
     project_row = await session.get(Project, project_id)
-    promoted_versions = (
+    version = (
         (
             await session.execute(
                 select(ReleaseVersion)
@@ -1739,51 +1744,103 @@ async def clear_deploy_failed(
                     ReleaseVersion.project_id == project_id,
                     ReleaseVersion.status == "promoted",
                 )
-                .order_by(ReleaseVersion.promoted_at.desc())
-                .limit(20)
+                .order_by(ReleaseVersion.version_number.desc())
+                .limit(1)
             )
         )
         .scalars()
-        .all()
+        .first()
     )
-    for candidate in promoted_versions:
-        aggregate, _ = _version_serving_summary(candidate, project_row)
-        if (
-            candidate.serving_status == "deploy_failed"
-            or aggregate["serving_status"] == "deploy_failed"
-        ):
-            await session.execute(
-                select(ReleaseVersion)
-                .where(ReleaseVersion.id == candidate.id)
-                .with_for_update()
-            )
-            version = candidate
-            break
-    if version is None:
+    aggregate = (
+        _version_serving_summary(version, project_row)[0]
+        if version is not None
+        else None
+    )
+    if version is None or (
+        version.serving_status != "deploy_failed"
+        and (aggregate or {}).get("serving_status") != "deploy_failed"
+    ):
         raise HTTPException(
             status_code=404,
-            detail="No promoted version in deploy_failed state for this project.",
+            detail=(
+                "The latest promoted version is not in deploy_failed state for "
+                "this project."
+            ),
         )
 
     version_id = version.id
+    initial_project_authority = serving_project_authority_fingerprint(project_row)
+    initial_version_authority = serving_version_authority_fingerprint(version)
+    initial_artifact_authority = serving_artifact_authority_fingerprint(
+        list(version.deploy_artifacts)
+    )
 
-    # Release the row lock before network I/O, following the established reconcile
-    # pattern in release_reconciliation.py.  The session uses expire_on_commit=False
-    # so version attrs remain accessible after the commit.
-    await session.commit()
+    # End the read transaction before provider I/O. The exact observation apply
+    # will reacquire Project -> Version -> ordered artifact locks and reject any
+    # drift from this candidate snapshot.
+    await session.rollback()
 
     now = _utcnow()
-    (
-        provider_rows,
-        _,
-        _,
-        backend_artifact,
-    ) = await _refresh_release_artifact_rows(
+    observation = await observe_release_artifacts(
         session,
-        version,
+        version_id,
         now,
         recheck_failed_required=True,
+        expected_version_status="promoted",
     )
+    if observation is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The deploy-failed release authority changed while serving was "
+                "observed; retry against current state."
+            ),
+        )
+    if (
+        observation.project_authority != initial_project_authority
+        or observation.version_authority != initial_version_authority
+        or observation.artifact_baseline != initial_artifact_authority
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The selected deploy-failed authority changed before serving "
+                "observation began; retry against current state."
+            ),
+        )
+    applied = await apply_serving_observation(session, observation)
+    if applied is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The deploy-failed serving observation was superseded before "
+                "it could be applied."
+            ),
+        )
+    version = applied.version
+    provider_rows = applied.provider_rows
+    backend_artifact = applied.backend_artifact
+
+    latest_promoted_id = (
+        await session.execute(
+            select(ReleaseVersion.id)
+            .where(
+                ReleaseVersion.project_id == project_id,
+                ReleaseVersion.status == "promoted",
+            )
+            .order_by(ReleaseVersion.version_number.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if latest_promoted_id != version.id:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The deploy-failed release was superseded by a newer promotion "
+                "while serving was observed."
+            ),
+        )
     non_backend_status, non_backend_reason = (
         _aggregate_non_backend_required_artifact_status(provider_rows)
     )
@@ -1855,28 +1912,6 @@ async def clear_deploy_failed(
                 detail="A force clear requires a non-empty operator reason.",
             )
         clear_mode = "operator_attested"
-
-    # Re-acquire the row lock for the write phase.  All validation is complete;
-    # _recover_serving_confirmed requires an already-locked session.
-    # Expire the identity-map copy before re-locking so we evaluate current DB
-    # state, not the cached pre-I/O instance (matches reconcile pattern in
-    # release_reconciliation.py lines 208-224).
-    session.expire_all()
-    version = (
-        (
-            await session.execute(
-                select(ReleaseVersion)
-                .where(ReleaseVersion.id == version_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        )
-        .scalars()
-        .first()
-    )
-
-    if version is None:
-        raise HTTPException(status_code=404, detail="Release version not found.")
 
     authorship_plan = None
     if clear_mode == "verified":
@@ -2048,7 +2083,15 @@ async def record_activation_receipt(
     current state without error.
     """
     from app.release_reconciliation import (  # noqa: PLC0415
+        _confirm_serving_or_fail,
         _record_activation_receipt,
+    )
+    from app.release_activation_receipt import (  # noqa: PLC0415
+        replay_activation_receipt,
+    )
+    from app.release_serving_observation import (  # noqa: PLC0415
+        serving_project_authority_fingerprint,
+        serving_version_authority_fingerprint,
     )
     from app.time_utils import _utcnow  # noqa: PLC0415
 
@@ -2066,7 +2109,7 @@ async def record_activation_receipt(
                     ReleaseVersion.project_id == project_id,
                     ReleaseVersion.version_number == payload.version_number,
                 )
-                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -2074,7 +2117,8 @@ async def record_activation_receipt(
     )
     if version is None:
         raise HTTPException(status_code=404, detail="Release version not found.")
-    if version.status != "promoted":
+    has_receipt = "activation_receipt" in (version.last_qualification or {})
+    if not has_receipt and version.status != "promoted":
         raise HTTPException(
             status_code=409,
             detail=(
@@ -2085,6 +2129,16 @@ async def record_activation_receipt(
         )
 
     effective_sha = (payload.revision or version.promoted_sha or "").strip()
+    if not _SHA40_RE.fullmatch(effective_sha):
+        raise HTTPException(
+            status_code=409,
+            detail="The promoted version has no valid revision to receipt.",
+        )
+    project = await session.get(Project, project_id, populate_existing=True)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    observed_project_authority = serving_project_authority_fingerprint(project)
+    observed_version_authority = serving_version_authority_fingerprint(version)
 
     # Approved-activation guard: an in-product approval authorizes EXACTLY the
     # approved version's promoted SHA, so a receipt under that approval must
@@ -2092,7 +2146,7 @@ async def record_activation_receipt(
     # approval exists and the version is not yet resolved (including a
     # never-armed promotion with serving_status NULL); the legacy CLI receipt
     # path (no approval) and already-resolved versions are unchanged.
-    if version.activation_requested_at is not None:
+    if not has_receipt and version.activation_requested_at is not None:
         from app.release_activation import (  # noqa: PLC0415
             reject_stale_or_mismatched_approved_receipt,
         )
@@ -2103,37 +2157,137 @@ async def record_activation_receipt(
         if rejection_detail:
             raise HTTPException(status_code=409, detail=rejection_detail)
 
-    receipt_mode = (
-        "approved_activation" if version.activation_requested_at else "cli_activation"
+    operator_id = str(current_user["user_id"])
+    operator_display = str(current_user.get("email") or operator_id)
+    now = _utcnow()
+    version_id = version.id
+
+    # The approval/ancestry preflight above may perform GitHub I/O. End its
+    # read transaction before taking release-authority locks, then prove that
+    # the exact project/version authority observed by that preflight is still
+    # current inside the bounded receipt transaction.
+    await session.rollback()
+    locked_project = await lock_release_project(session, project_id)
+    if locked_project is None:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Activation project authority changed during verification; "
+                "retry against current state."
+            ),
+        )
+    version = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.id == version_id,
+                    ReleaseVersion.project_id == project_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
     )
-    if (
-        version.serving_status == "serving_confirmed"
-        and version.served_sha == effective_sha
-    ):
-        # Idempotent re-POST: the version already serves the bound revision.
+    try:
+        replay = (
+            None
+            if version is None
+            else replay_activation_receipt(
+                version,
+                revision=payload.revision,
+                host=payload.host,
+                operator_id=operator_id,
+                operator_display=operator_display,
+            )
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if replay is not None:
+        replay_version_id = version.id
+        await session.rollback()
+        await _confirm_serving_or_fail(replay_version_id)
+        session.expire_all()
+        version = await session.get(
+            ReleaseVersion, replay_version_id, populate_existing=True
+        )
+        if version is None:
+            raise HTTPException(status_code=404, detail="Release version not found.")
+        replay["serving_status"] = version.serving_status or replay["serving_status"]
+        replay["served_sha"] = version.served_sha or replay["served_sha"]
         return {
             "version_number": version.version_number,
             "serving_status": version.serving_status,
             "served_sha": version.served_sha,
             "served_at": utc_iso(version.served_at),
             "deploy_failure_reason": version.deploy_failure_reason,
-            "receipt": {
-                "mode": receipt_mode,
-                "serving_status": "serving_confirmed",
-                "served_sha": effective_sha,
-            },
+            "receipt": replay,
         }
+    if (
+        version is None
+        or serving_project_authority_fingerprint(locked_project)
+        != observed_project_authority
+        or serving_version_authority_fingerprint(version)
+        != observed_version_authority
+    ):
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Activation version authority was superseded before the receipt "
+                "could be recorded."
+            ),
+        )
 
-    operator_id = current_user.get("email") or current_user["user_id"]
-    now = _utcnow()
-    receipt = await _record_activation_receipt(
-        session,
-        version,
-        revision=payload.revision,
-        host=payload.host,
-        operator_id=operator_id,
-        now=now,
+    latest_promoted_id = (
+        await session.execute(
+            select(ReleaseVersion.id)
+            .where(
+                ReleaseVersion.project_id == project_id,
+                ReleaseVersion.status == "promoted",
+            )
+            .order_by(ReleaseVersion.version_number.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if latest_promoted_id != version.id:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Activation receipt was superseded by a newer promoted version.",
+        )
+
+    # Serialize all existing artifact rows before the local receipt projection.
+    # The helper may seed a newly registered artifact, but never calls a
+    # provider. Project->Version ordering makes that create race-safe.
+    from app.models import ReleaseDeployArtifact  # noqa: PLC0415
+
+    await session.execute(
+        select(ReleaseDeployArtifact)
+        .where(ReleaseDeployArtifact.version_id == version.id)
+        .order_by(
+            ReleaseDeployArtifact.artifact_kind,
+            ReleaseDeployArtifact.id,
+        )
+        .with_for_update()
     )
+    try:
+        receipt = await _record_activation_receipt(
+            session,
+            version,
+            revision=payload.revision,
+            host=payload.host,
+            operator_id=operator_id,
+            operator_display=operator_display,
+            now=now,
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     authorship_plan = receipt.pop("_authorship_plan", None)
     await session.commit()
     if authorship_plan is not None:
@@ -2143,7 +2297,17 @@ async def record_activation_receipt(
             version.id,
             expected_receipt_identity=authorship_plan["receipt_identity"],
         )
-    await session.refresh(version)
+
+    # The host-side effect and its immutable receipt are now durable. Provider
+    # observation is an ordinary, independently retryable continuation and can
+    # fail without losing or ambiguating the activation receipt.
+    await _confirm_serving_or_fail(version_id)
+    session.expire_all()
+    version = await session.get(ReleaseVersion, version_id, populate_existing=True)
+    if version is None:
+        raise HTTPException(status_code=404, detail="Release version not found.")
+    receipt["serving_status"] = version.serving_status or receipt["serving_status"]
+    receipt["served_sha"] = version.served_sha or effective_sha
     return {
         "version_number": version.version_number,
         "serving_status": version.serving_status,

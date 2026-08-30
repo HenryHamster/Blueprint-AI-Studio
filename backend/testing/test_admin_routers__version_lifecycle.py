@@ -1648,12 +1648,10 @@ class TestClearDeployFailed:
     ):
         """The version row lock must be released before provider.check (network I/O).
 
-        clear_deploy_failed previously held with_for_update() across the entire
-        _refresh_release_artifact_rows call, which calls provider.check() — a GitHub
-        or Cloud Run network operation.  The fix commits (releasing the lock) before
-        the network I/O, matching the reconcile pattern.
+        clear_deploy_failed previously held with_for_update() across provider
+        checks. The observation phase must run before the exact short CAS apply.
 
-        This test patches _refresh_release_artifact_rows so that, during the call, it
+        This test patches observe_release_artifacts so that, during the call, it
         attempts a nowait FOR UPDATE lock on the version row from a separate DB session.
         If the endpoint already committed (releasing its lock), the probe succeeds.
         If the endpoint still holds the lock, the probe raises an OperationalError.
@@ -1674,7 +1672,8 @@ class TestClearDeployFailed:
 
         lock_probe_results: list[bool] = []
 
-        async def _probe_then_return(session, ver, now, **kwargs):
+        async def _probe_then_return(session, observed_version_id, now, **kwargs):
+            assert observed_version_id == version_id
             # Attempt a no-wait lock on the version row from a SEPARATE session.
             # Succeeds only if clear_deploy_failed already committed its initial lock.
             async with AsyncSessionLocal() as probe_session:
@@ -1688,12 +1687,11 @@ class TestClearDeployFailed:
                 except OperationalError:
                     lock_probe_results.append(False)
                 await probe_session.rollback()
-            # Return empty provider_rows and no backend artifact so the endpoint
-            # proceeds to the force-check branch (payload.force=False → 409).
-            return [], False, False, None
+            # No observation plan is an explicit stale/unavailable 409.
+            return None
 
         mocker.patch(
-            "app.release_reconciliation._refresh_release_artifact_rows",
+            "app.release_serving_observation.observe_release_artifacts",
             side_effect=_probe_then_return,
         )
 
@@ -1701,12 +1699,11 @@ class TestClearDeployFailed:
             f"/api/admin/projects/{project.id}/clear-deploy-failed",
             json={},
         )
-        # 409 is expected: empty provider_rows → non_backend_status serving_confirmed,
-        # backend_artifact=None → serving_sha_unobservable path → force=False → 409.
+        # 409 is expected because the synthetic observer returns no plan.
         assert resp.status_code == 409, resp.text
         assert lock_probe_results == [True], (
             "Version row lock must be released (committed) before "
-            "_refresh_release_artifact_rows is called; probe could not acquire lock"
+            "observe_release_artifacts is called; probe could not acquire lock"
         )
 
 
@@ -1866,15 +1863,262 @@ class TestRecordActivationReceipt:
         )
         assert first.status_code == 200, first.text
         assert first.json()["serving_status"] == "serving_confirmed"
+        await db_session.refresh(version)
+        from app.models import ReleaseDeployArtifact
+        from app.release_artifacts import BACKEND_REVISION_ARTIFACT_KIND
 
-        second = await client.post(
-            f"/api/admin/projects/{project.id}/activation-receipt", json=body
-        )
+        backend_artifact = (
+            await db_session.execute(
+                select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        ).scalar_one()
+        activated_at = (version.last_qualification or {})["activation_receipt"][
+            "activated_at"
+        ]
+        version_served_at = version.served_at
+        backend_served_at = backend_artifact.served_at
+
+        original_override = app.dependency_overrides[get_current_user]
+
+        async def renamed_user():
+            return {
+                "user_id": TEST_USER_ID,
+                "email": "renamed@example.com",
+                "role": "admin",
+            }
+
+        app.dependency_overrides[get_current_user] = renamed_user
+        try:
+            second = await client.post(
+                f"/api/admin/projects/{project.id}/activation-receipt", json=body
+            )
+        finally:
+            app.dependency_overrides[get_current_user] = original_override
         assert second.status_code == 200, second.text
         data = second.json()
         assert data["serving_status"] == "serving_confirmed"
         assert data["served_sha"] == "b" * 40
         assert data["receipt"]["serving_status"] == "serving_confirmed"
+        await db_session.refresh(version)
+        await db_session.refresh(backend_artifact)
+        assert (
+            (version.last_qualification or {})["activation_receipt"]["activated_at"]
+            == activated_at
+        )
+        assert version.served_at == version_served_at
+        assert backend_artifact.served_at == backend_served_at
+
+        conflict = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt",
+            json={**body, "host": "different-host"},
+        )
+        assert conflict.status_code == 409, conflict.text
+        await db_session.refresh(version)
+        await db_session.refresh(backend_artifact)
+        receipt = (version.last_qualification or {})["activation_receipt"]
+        assert receipt["operator_id"] == TEST_USER_ID
+        assert receipt["operator_display"] == TEST_USER_EMAIL
+        assert receipt["operator"] == TEST_USER_EMAIL
+        assert receipt["host"] == "hamsterwheel"
+        assert receipt["activated_at"] == activated_at
+        assert version.served_at == version_served_at
+        assert backend_artifact.served_at == backend_served_at
+
+    @pytest.mark.asyncio
+    async def test_exact_receipt_replays_after_newer_promotion_without_mutation(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A response-lost retry is governed by its immutable receipt, not the
+        project's later latest-promotion pointer without replaying receipt writes."""
+        self._scope_backend_only(mocker)
+        project = await self._deploy_identity_project(db_session)
+        version = await self._make_promoted_unconfirmed_version(
+            db_session, project.id, promoted_sha="promotedsha999"
+        )
+        body = {
+            "version_number": version.version_number,
+            "revision": "e" * 40,
+            "host": "hamsterwheel",
+        }
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt", json=body
+        )
+        assert first.status_code == 200, first.text
+        await db_session.refresh(version)
+        before = json.loads(json.dumps(version.last_qualification))
+        served_at = version.served_at
+
+        await self._make_promoted_unconfirmed_version(
+            db_session,
+            project.id,
+            promoted_sha="newerpromotedsha",
+            version_number=2,
+        )
+        continuation = mocker.patch(
+            "app.release_reconciliation._confirm_serving_or_fail",
+            new_callable=AsyncMock,
+        )
+        artifact_create = mocker.patch(
+            "app.release_activation_receipt.get_or_create_release_deploy_artifact",
+            new_callable=AsyncMock,
+        )
+
+        replay = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt", json=body
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["receipt"]["mode"] == "cli_activation"
+        continuation.assert_awaited_once_with(version.id)
+        artifact_create.assert_not_awaited()
+        await db_session.refresh(version)
+        assert json.loads(json.dumps(version.last_qualification)) == before
+        assert version.served_at == served_at
+
+    @pytest.mark.asyncio
+    async def test_cli_receipt_replays_after_later_approval_without_mode_rewrite(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Mutable approval fields cannot rewrite a durable CLI receipt."""
+        from datetime import datetime, timezone
+
+        self._scope_backend_only(mocker)
+        project = await self._deploy_identity_project(db_session)
+        version = await self._make_promoted_unconfirmed_version(
+            db_session, project.id, promoted_sha="promotedsha999"
+        )
+        body = {
+            "version_number": version.version_number,
+            "revision": "f" * 40,
+            "host": "hamsterwheel",
+        }
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt", json=body
+        )
+        assert first.status_code == 200, first.text
+        await db_session.refresh(version)
+        before = json.loads(json.dumps(version.last_qualification))
+        version.activation_requested_at = datetime(2026, 8, 30, tzinfo=timezone.utc)
+        version.activation_requested_by = "later-approver@example.com"
+        db_session.add(version)
+        await db_session.commit()
+
+        continuation = mocker.patch(
+            "app.release_reconciliation._confirm_serving_or_fail",
+            new_callable=AsyncMock,
+        )
+        replay = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt", json=body
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["receipt"]["mode"] == "cli_activation"
+        continuation.assert_awaited_once_with(version.id)
+        await db_session.refresh(version)
+        assert (version.last_qualification or {})["activation_receipt"] == before[
+            "activation_receipt"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stable_actor_id_rejects_different_principal_with_same_email(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        from datetime import datetime, timezone
+
+        from app.release_activation_receipt import (
+            ActivationReceiptConflict,
+            record_activation_receipt,
+        )
+
+        self._scope_backend_only(mocker)
+        project = await self._deploy_identity_project(db_session)
+        version = await self._make_promoted_unconfirmed_version(
+            db_session, project.id, promoted_sha="promotedsha999"
+        )
+        body = {
+            "version_number": version.version_number,
+            "revision": "c" * 40,
+            "host": "hamsterwheel",
+        }
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt", json=body
+        )
+        assert first.status_code == 200, first.text
+        await db_session.refresh(version)
+        before = json.loads(json.dumps(version.last_qualification))
+
+        with pytest.raises(ActivationReceiptConflict):
+            await record_activation_receipt(
+                db_session,
+                version,
+                revision="c" * 40,
+                host="hamsterwheel",
+                operator_id="different-stable-user-id",
+                operator_display=TEST_USER_EMAIL,
+                now=datetime(2026, 8, 30, tzinfo=timezone.utc),
+            )
+
+        assert json.loads(json.dumps(version.last_qualification)) == before
+
+    @pytest.mark.asyncio
+    async def test_legacy_receipt_replays_only_for_exact_historical_display(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        from datetime import datetime, timezone
+
+        from app.release_activation_receipt import (
+            ActivationReceiptConflict,
+            record_activation_receipt,
+        )
+
+        self._scope_backend_only(mocker)
+        project = await self._deploy_identity_project(db_session)
+        version = await self._make_promoted_unconfirmed_version(
+            db_session, project.id, promoted_sha="promotedsha999"
+        )
+        body = {
+            "version_number": version.version_number,
+            "revision": "d" * 40,
+            "host": "hamsterwheel",
+        }
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt", json=body
+        )
+        assert first.status_code == 200, first.text
+        await db_session.refresh(version)
+        qual = dict(version.last_qualification or {})
+        legacy = dict(qual["activation_receipt"])
+        legacy.pop("operator_id")
+        legacy.pop("operator_display")
+        qual["activation_receipt"] = legacy
+        version.last_qualification = qual
+        db_session.add(version)
+        await db_session.commit()
+
+        replay = await record_activation_receipt(
+            db_session,
+            version,
+            revision="d" * 40,
+            host="hamsterwheel",
+            operator_id=TEST_USER_ID,
+            operator_display=TEST_USER_EMAIL,
+            now=datetime(2026, 8, 30, tzinfo=timezone.utc),
+        )
+        assert replay["serving_status"] == "serving_confirmed"
+        assert "operator_id" not in version.last_qualification["activation_receipt"]
+
+        with pytest.raises(ActivationReceiptConflict):
+            await record_activation_receipt(
+                db_session,
+                version,
+                revision="d" * 40,
+                host="hamsterwheel",
+                operator_id=TEST_USER_ID,
+                operator_display="renamed@example.com",
+                now=datetime(2026, 8, 30, tzinfo=timezone.utc),
+            )
 
     @pytest.mark.asyncio
     async def test_404_when_version_number_unknown(

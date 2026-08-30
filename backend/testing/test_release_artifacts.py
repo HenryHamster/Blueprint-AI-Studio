@@ -452,6 +452,51 @@ async def test_optional_agent_image_freshness_continues_after_required_artifacts
     assert await _serving_confirmation_candidate_ids(db_session) == [version.id]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["deploy_failed", "confirmation_timed_out"])
+@pytest.mark.parametrize("scalar_status", [None, "serving_confirmed"])
+async def test_terminal_required_artifact_mismatch_remains_sweep_candidate(
+    db_session, terminal_status, scalar_status
+):
+    """A projected confirmed scalar cannot hide a terminal required row."""
+    project = Project(name="Artifact-Mismatch", user_id=f"user-{terminal_status}")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="promoted",
+        promoted_sha=_SHA,
+        serving_status=scalar_status,
+        served_sha=_SHA,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    artifact = ReleaseDeployArtifact(
+        version_id=version.id,
+        artifact_kind=PROMOTION_MERGE_ARTIFACT_KIND,
+        serving_status=terminal_status,
+        reason_code="terminal_required_mismatch",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    assert await _serving_confirmation_candidate_ids(db_session) == [version.id]
+
+    artifact.artifact_kind = AGENT_IMAGE_ARTIFACT_KIND
+    db_session.add(artifact)
+    await db_session.commit()
+    assert await _serving_confirmation_candidate_ids(db_session) == []
+
+    artifact.artifact_kind = PROMOTION_MERGE_ARTIFACT_KIND
+    version.serving_status = terminal_status
+    db_session.add_all([artifact, version])
+    await db_session.commit()
+    assert await _serving_confirmation_candidate_ids(db_session) == []
+
+
 def test_summarize_deploy_identity_projects_backend_scalar(monkeypatch):
     """For the deploy-identity project the backend provider IS observable, so the
     legacy-scalar projection applies even without a row."""

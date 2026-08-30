@@ -19,7 +19,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import exists, or_, select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -162,6 +162,11 @@ async def _serving_confirmation_candidate_ids(session) -> list:
     registered_artifact_kinds = tuple(
         provider.artifact_kind for provider in iter_release_artifact_providers()
     )
+    required_artifact_kinds = tuple(
+        provider.artifact_kind
+        for provider in iter_release_artifact_providers()
+        if provider.required
+    )
     unresolved_filter = release_version.ReleaseVersion.serving_status == "unconfirmed"
     if registered_artifact_kinds:
         pending_artifact_exists = exists(
@@ -175,6 +180,27 @@ async def _serving_confirmation_candidate_ids(session) -> list:
             )
         )
         unresolved_filter = or_(unresolved_filter, pending_artifact_exists)
+    if required_artifact_kinds:
+        terminal_mismatch_exists = exists(
+            select(ReleaseDeployArtifact.id).where(
+                ReleaseDeployArtifact.version_id == release_version.ReleaseVersion.id,
+                ReleaseDeployArtifact.artifact_kind.in_(required_artifact_kinds),
+                ReleaseDeployArtifact.serving_status.in_(
+                    ("deploy_failed", "confirmation_timed_out")
+                ),
+            )
+        )
+        unresolved_filter = or_(
+            unresolved_filter,
+            and_(
+                or_(
+                    release_version.ReleaseVersion.serving_status.is_(None),
+                    release_version.ReleaseVersion.serving_status
+                    == "serving_confirmed",
+                ),
+                terminal_mismatch_exists,
+            ),
+        )
     return list(
         (
             await session.execute(
