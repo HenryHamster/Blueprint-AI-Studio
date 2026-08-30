@@ -7572,10 +7572,10 @@ async def test_managed_check_wait_snapshot_reloads_fresh_row_after_promotion(
     )
     mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value={}))
     # The reconciler harvests _auto_remediation via read_telemetry_or_doc; the
-    # minimal _FakeSession below cannot model that select(ProjectTelemetry.value)
-    # query (it returns a ReleaseVersion for every execute()). Stub the harvest
-    # to the same empty-config value a real session yields when the project never
-    # customized auto-remediation, so the test exercises the expire/re-read path.
+    # minimal _FakeSession below cannot model the ProjectTelemetry query. Stub
+    # the harvest to the same empty-config value a real session yields when the
+    # project never customized auto-remediation, so the test exercises the
+    # canonical Project -> ReleaseVersion lock and expire/re-read path.
     mocker.patch(
         "app.project_telemetry.read_telemetry_or_doc",
         new=AsyncMock(return_value={}),
@@ -7595,6 +7595,15 @@ async def test_managed_check_wait_snapshot_reloads_fresh_row_after_promotion(
         "confidence": 0.95,
         "promoted_sha": "feedface" * 5,
     }
+    project = Project(
+        id=project_id,
+        name="Reconcile-Test",
+        user_id="reconcile-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="release",
+    )
 
     class _FakeResult:
         def __init__(self, value):
@@ -7606,6 +7615,9 @@ async def test_managed_check_wait_snapshot_reloads_fresh_row_after_promotion(
         def first(self):
             return self._value
 
+        def scalar_one_or_none(self):
+            return self._value
+
     class _FakeSession:
         def __init__(self, stale_row, fresh_row):
             self._stale_row = stale_row
@@ -7615,20 +7627,22 @@ async def test_managed_check_wait_snapshot_reloads_fresh_row_after_promotion(
         def expire_all(self):
             self.expired = True
 
-        async def execute(self, _stmt):
+        async def execute(self, stmt):
+            selected = stmt.column_descriptions[0]
+            entity = selected.get("entity")
+            expression = selected.get("expr")
+            if entity is Project:
+                return _FakeResult(project)
+            if (
+                entity is rv.ReleaseVersion
+                and getattr(expression, "key", None) == "project_id"
+            ):
+                return _FakeResult(project_id)
             return _FakeResult(self._fresh_row if self.expired else self._stale_row)
 
         async def get(self, model, pk):
             if model is Project and pk == project_id:
-                return Project(
-                    id=project_id,
-                    name="Reconcile-Test",
-                    user_id="reconcile-user",
-                    github_owner="acme",
-                    github_repo="widget",
-                    integration_branch="automain",
-                    promotion_target="release",
-                )
+                return project
             return None
 
         def add(self, _obj):
