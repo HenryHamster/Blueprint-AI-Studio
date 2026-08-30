@@ -3533,7 +3533,17 @@ async def claim_resident_messages(
     # Resolve project membership before taking the exclusive authority lock.
     await _resolve_agent_project(project_id, token, session)
     await session.rollback()
-    project = await _lock_resident_claim_project(session, project_id)
+    # Keep this refetch explicit at the rollback boundary: the direct
+    # ``session.execute(... populate_existing=True)`` proves that every Project
+    # attribute below belongs to the newly locked authority snapshot.
+    project = (
+        await session.execute(
+            select(Project)
+            .where(Project.id == project_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     from app.strategic_cold_successor_authority import reject_active_cold_successor
