@@ -42,6 +42,36 @@ async def _source_task(db_session, project):
     return task
 
 
+def _committed_receipt(
+    intent: ReleaseQualificationIntent,
+    *,
+    status: str,
+    **extra,
+):
+    assert intent.claim_id is not None
+    return {
+        "delivery_state": "committed",
+        "status": status,
+        "refresh_required": False,
+        "intent_id": str(intent.id),
+        "project_id": str(intent.project_id),
+        "release_version_id": str(intent.release_version_id),
+        "source_task_id": str(intent.source_task_id),
+        "authority_kind": intent.authority_kind,
+        "authority_key": intent.authority_key,
+        "idempotency_key": intent.idempotency_key,
+        "specification_hash": intent.specification_hash,
+        "attempt_count": int(intent.attempt_count or 0),
+        "expected_phase_changed_at": (
+            intent.expected_phase_changed_at.isoformat()
+            if intent.expected_phase_changed_at is not None
+            else None
+        ),
+        "claim_id": str(intent.claim_id),
+        **extra,
+    }
+
+
 @pytest.mark.asyncio
 async def test_prepare_qualification_intent_is_atomic_and_idempotent(db_session):
     project, version = await _make_project_and_version(
@@ -261,7 +291,12 @@ async def test_paused_intent_stays_due_then_applies_once(db_session, mocker):
     assert intent.result["delivery_state"] == "committed"
     assert intent.result["candidate_sha"] == "a" * 40
     assert intent.result["qualification_attempt_id"] == "attempt-1"
+    assert intent.result["intent_id"] == str(intent.id)
+    assert intent.result["project_id"] == str(project.id)
     assert intent.result["release_version_id"] == str(version.id)
+    assert intent.result["source_task_id"] == str(task.id)
+    assert intent.result["claim_id"]
+    assert intent.result["attempt_count"] == 1
     assert intent.result["specification_hash"] == intent.specification_hash
     assert intent.result["refresh_required"] is False
     assert apply_mock.await_count == 1
@@ -324,12 +359,7 @@ async def test_committed_receipt_recovers_without_replaying_apply(db_session, mo
     intent.attempt_count = 1
     intent.claim_id = uuid.uuid4()
     intent.lease_expires_at = _utcnow() - timedelta(seconds=1)
-    intent.result = {
-        "delivery_state": "committed",
-        "status": "spawned",
-        "release_version_id": str(version.id),
-        "specification_hash": intent.specification_hash,
-    }
+    intent.result = _committed_receipt(intent, status="spawned")
     db_session.add(intent)
     await db_session.commit()
     apply_mock = mocker.patch(
@@ -346,6 +376,252 @@ async def test_committed_receipt_recovers_without_replaying_apply(db_session, mo
     assert intent.claim_id is None
     assert intent.result["status"] == "spawned"
     assert apply_mock.await_count == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("intent_id", str(uuid.uuid4())),
+        ("project_id", str(uuid.uuid4())),
+        ("claim_id", str(uuid.uuid4())),
+        ("specification_hash", "f" * 64),
+        ("attempt_count", 99),
+        ("attempt_count", True),
+        ("attempt_count", 1.0),
+        ("refresh_required", "false"),
+        ("refresh_delivery_state", "delivered"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_mismatched_committed_receipt_fails_without_replay_or_refresh(
+    db_session,
+    mocker,
+    field,
+    wrong_value,
+):
+    project, _version = await _make_project_and_version(
+        db_session,
+        phase="stabilize",
+    )
+    task = await _source_task(db_session, project)
+    intent = await prepare_qualification_intent(
+        db_session,
+        request={"reason": "reject forged receipt", "probes": []},
+        task=task,
+        project=project,
+    )
+    assert intent is not None
+    intent.status = "attempting"
+    intent.attempt_count = 1
+    intent.claim_id = uuid.uuid4()
+    intent.lease_expires_at = _utcnow() - timedelta(seconds=1)
+    receipt = _committed_receipt(
+        intent,
+        status="ci_compliance_blocked",
+        refresh_required=True,
+    )
+    receipt[field] = wrong_value
+    intent.result = receipt
+    db_session.add(intent)
+    await db_session.commit()
+    apply_mock = mocker.patch(
+        "app.strategic_completion._apply_qualify_request",
+        new_callable=mocker.AsyncMock,
+    )
+
+    assert not await drain_qualification_intent(
+        intent.id,
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.refresh(intent)
+    await db_session.refresh(project)
+    assert intent.status == "failed"
+    assert intent.claim_id is None
+    assert intent.lease_expires_at is None
+    assert intent.result["delivery_state"] == "invalid"
+    assert field in intent.result["receipt_validation_error"]
+    assert "_strategic_refresh" not in (project.vision or {})
+    apply_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_missing_null_epoch_receipt_identity_fails_without_replay(
+    db_session,
+    mocker,
+):
+    project, version = await _make_project_and_version(
+        db_session,
+        phase="stabilize",
+    )
+    version.phase_changed_at = None
+    db_session.add(version)
+    await db_session.commit()
+    task = await _source_task(db_session, project)
+    intent = await prepare_qualification_intent(
+        db_session,
+        request={"reason": "reject omitted null epoch", "probes": []},
+        task=task,
+        project=project,
+    )
+    assert intent is not None
+    assert intent.expected_phase_changed_at is None
+    intent.status = "attempting"
+    intent.attempt_count = 1
+    intent.claim_id = uuid.uuid4()
+    intent.lease_expires_at = _utcnow() - timedelta(seconds=1)
+    receipt = _committed_receipt(intent, status="spawned")
+    del receipt["expected_phase_changed_at"]
+    intent.result = receipt
+    db_session.add(intent)
+    await db_session.commit()
+    apply_mock = mocker.patch(
+        "app.strategic_completion._apply_qualify_request",
+        new_callable=mocker.AsyncMock,
+    )
+
+    assert not await drain_qualification_intent(
+        intent.id,
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.refresh(intent)
+    assert intent.status == "failed"
+    assert intent.result["delivery_state"] == "invalid"
+    assert "expected_phase_changed_at" in intent.result["receipt_validation_error"]
+    apply_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_receipt_requires_matching_blocked_status(
+    db_session,
+    mocker,
+):
+    project, _version = await _make_project_and_version(
+        db_session,
+        phase="stabilize",
+    )
+    task = await _source_task(db_session, project)
+    intent = await prepare_qualification_intent(
+        db_session,
+        request={"reason": "reject mismatched refresh", "probes": []},
+        task=task,
+        project=project,
+    )
+    assert intent is not None
+    intent.status = "attempting"
+    intent.attempt_count = 1
+    intent.claim_id = uuid.uuid4()
+    intent.lease_expires_at = _utcnow() - timedelta(seconds=1)
+    intent.result = _committed_receipt(
+        intent,
+        status="spawned",
+        refresh_required=True,
+    )
+    db_session.add(intent)
+    await db_session.commit()
+    apply_mock = mocker.patch(
+        "app.strategic_completion._apply_qualify_request",
+        new_callable=mocker.AsyncMock,
+    )
+
+    assert not await drain_qualification_intent(
+        intent.id,
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.refresh(intent)
+    await db_session.refresh(project)
+    assert intent.status == "failed"
+    assert "only valid for ci_compliance_blocked" in intent.last_error
+    assert "_strategic_refresh" not in (project.vision or {})
+    apply_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_malformed_result_shape_terminalizes_without_replay(
+    db_session,
+    mocker,
+):
+    project, _version = await _make_project_and_version(
+        db_session,
+        phase="stabilize",
+    )
+    task = await _source_task(db_session, project)
+    intent = await prepare_qualification_intent(
+        db_session,
+        request={"reason": "corrupt result", "probes": []},
+        task=task,
+        project=project,
+    )
+    assert intent is not None
+    intent.status = "attempting"
+    intent.attempt_count = 1
+    intent.claim_id = uuid.uuid4()
+    intent.lease_expires_at = _utcnow() - timedelta(seconds=1)
+    intent.result = ["corrupt"]
+    db_session.add(intent)
+    await db_session.commit()
+    apply_mock = mocker.patch(
+        "app.strategic_completion._apply_qualify_request",
+        new_callable=mocker.AsyncMock,
+    )
+
+    assert not await drain_qualification_intent(
+        intent.id,
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.refresh(intent)
+    await db_session.refresh(project)
+    assert intent.status == "failed"
+    assert intent.claim_id is None
+    assert intent.result["delivery_state"] == "invalid"
+    assert intent.result["malformed_result_type"] == "list"
+    assert "not an object" in intent.last_error
+    assert "_strategic_refresh" not in (project.vision or {})
+    apply_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_commit_fenced_receipt_canonicalizes_locked_intent_identity(db_session):
+    project, _version = await _make_project_and_version(
+        db_session,
+        phase="stabilize",
+    )
+    task = await _source_task(db_session, project)
+    intent = await prepare_qualification_intent(
+        db_session,
+        request={"reason": "canonical receipt", "probes": []},
+        task=task,
+        project=project,
+    )
+    assert intent is not None
+    claim_id = uuid.uuid4()
+    intent.status = "attempting"
+    intent.attempt_count = 1
+    intent.claim_id = claim_id
+    intent.lease_expires_at = _utcnow() + timedelta(minutes=5)
+    db_session.add(intent)
+    await db_session.commit()
+
+    await _commit_fenced_receipt(
+        db_session,
+        intent_id=intent.id,
+        claim_id=claim_id,
+        receipt={
+            "delivery_state": "committed",
+            "status": "spawned",
+            "intent_id": str(uuid.uuid4()),
+            "project_id": str(uuid.uuid4()),
+            "claim_id": str(uuid.uuid4()),
+            "specification_hash": "0" * 64,
+        },
+    )
+    await db_session.refresh(intent)
+    assert intent.result["intent_id"] == str(intent.id)
+    assert intent.result["project_id"] == str(project.id)
+    assert intent.result["release_version_id"] == str(intent.release_version_id)
+    assert intent.result["source_task_id"] == str(task.id)
+    assert intent.result["claim_id"] == str(claim_id)
+    assert intent.result["attempt_count"] == 1
+    assert intent.result["specification_hash"] == intent.specification_hash
 
 
 @pytest.mark.asyncio
@@ -407,10 +683,10 @@ async def test_unknown_committed_status_fails_closed_without_replay(
     intent.attempt_count = 1
     intent.claim_id = uuid.uuid4()
     intent.lease_expires_at = _utcnow() - timedelta(seconds=1)
-    intent.result = {
-        "delivery_state": "committed",
-        "status": "new_unclassified_outcome",
-    }
+    intent.result = _committed_receipt(
+        intent,
+        status="new_unclassified_outcome",
+    )
     db_session.add(intent)
     await db_session.commit()
     apply_mock = mocker.patch(
@@ -491,11 +767,11 @@ async def test_committed_refresh_receipt_arms_wake_atomically_once(
     intent.attempt_count = 1
     intent.claim_id = uuid.uuid4()
     intent.lease_expires_at = _utcnow() - timedelta(seconds=1)
-    intent.result = {
-        "delivery_state": "committed",
-        "status": "ci_compliance_blocked",
-        "refresh_required": True,
-    }
+    intent.result = _committed_receipt(
+        intent,
+        status="ci_compliance_blocked",
+        refresh_required=True,
+    )
     db_session.add(intent)
     await db_session.commit()
     apply_mock = mocker.patch(

@@ -495,7 +495,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | admin-ui | `admin-ui/src/components/PipelineWorkspace.test.tsx` | 855 | 23 | under 1500 LOC | 2.059s measured | — |
 | G | backend | `backend/testing/test_cost_summary.py` | 326 | 11 | under 1500 LOC | 2.053s measured | — |
 | G | agent | `agent/src/handlers/audit-challenge.test.ts` | 702 | 32 | under 1500 LOC | 2.047s measured | — |
-| G | backend | `backend/testing/test_strategic_workday_handoff_recovery.py` | 1,333 | 12 | under 1500 LOC | 2.023s measured | protected; declared floor 12 |
+| G | backend | `backend/testing/test_strategic_workday_handoff_recovery.py` | 1,342 | 12 | under 1500 LOC | 2.023s measured | protected; declared floor 12 |
 | G | backend | `backend/testing/test_auto_review.py` | 395 | 11 | under 1500 LOC | 2.020s measured | — |
 | G | backend | `backend/testing/test_research_mem_eval.py` | 172 | 2 | under 1500 LOC | 1.993s measured | — |
 | G | backend | `backend/testing/test_discovery_review__successor_direction.py` | 162 | 5 | under 1500 LOC | 1.964s measured | — |
@@ -560,6 +560,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_vm_heartbeat_image.py` | 506 | 13 | under 1500 LOC | 1.240s measured | — |
 | G | admin-ui | `admin-ui/src/components/DirectionPortfolioSection.test.tsx` | 645 | 20 | under 1500 LOC | 1.225s measured | — |
 | G | admin-ui | `admin-ui/src/components/EffortEfficiencyPanel.test.tsx` | 507 | 24 | under 1500 LOC | 1.199s measured | — |
+| G | backend | `backend/testing/test_release_qualification_intents.py` | 996 | 19 | under 1500 LOC | 1.182s measured | protected; declared floor 19 |
 | G | admin-ui | `admin-ui/src/components/KeyboardShortcutsOverlay.test.tsx` | 60 | 3 | under 1500 LOC | 1.165s measured | — |
 | G | backend | `backend/testing/test_warm_pool_cost_metrics.py` | 625 | 17 | under 1500 LOC | 1.152s measured | — |
 | G | agent | `agent/src/providers/resident-reply-tool.test.ts` | 113 | 3 | under 1500 LOC | 1.148s measured | — |
@@ -603,7 +604,6 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_strategic_consultation_detail.py` | 824 | 17 | under 1500 LOC | 0.633s measured | protected; declared floor 17 |
 | G | backend | `backend/testing/test_inline_llm.py` | 345 | 10 | under 1500 LOC | 0.626s measured | — |
 | G | admin-ui | `admin-ui/eslint-rules/no-fixed-width-overflow.test.js` | 92 | 0 | under 1500 LOC | 0.605s measured | — |
-| G | backend | `backend/testing/test_release_qualification_intents.py` | 720 | 14 | under 1500 LOC | 0.604s measured | protected; declared floor 14 |
 | G | backend | `backend/testing/test_admin_notifications.py` | 85 | 2 | under 1500 LOC | 0.603s measured | — |
 | G | admin-ui | `admin-ui/src/components/KanbanColumn.test.tsx` | 150 | 6 | under 1500 LOC | 0.591s measured | — |
 | G | backend | `backend/testing/test_retry_budget.py` | 31 | 2 | under 1500 LOC | 0.586s measured | — |

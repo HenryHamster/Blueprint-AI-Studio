@@ -87,6 +87,11 @@
         "test_paused_intent_stays_due_then_applies_once",
         "test_phase_epoch_drift_supersedes_without_execution",
         "test_committed_receipt_recovers_without_replaying_apply",
+        "test_mismatched_committed_receipt_fails_without_replay_or_refresh",
+        "test_missing_null_epoch_receipt_identity_fails_without_replay",
+        "test_refresh_receipt_requires_matching_blocked_status",
+        "test_malformed_result_shape_terminalizes_without_replay",
+        "test_commit_fenced_receipt_canonicalizes_locked_intent_identity",
         "test_lost_claim_fences_dirty_release_mutation",
         "test_unknown_committed_status_fails_closed_without_replay",
         "test_expired_claim_at_retry_cap_terminalizes_without_replay",
@@ -96,7 +101,7 @@
         "test_exact_null_epoch_fences_sha_error_write_after_drift",
         "test_execution_timeout_rolls_back_and_releases_claim"
       ],
-      "test_count": 14
+      "test_count": 19
     },
     {
       "path": "backend/testing/test_strategic_consultation_detail.py",

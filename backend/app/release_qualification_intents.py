@@ -257,14 +257,105 @@ def _settle_committed_result(
     intent.lease_expires_at = None
 
 
+def _receipt_identity(
+    intent: ReleaseQualificationIntent,
+    *,
+    claim_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    """Canonical immutable identity for one committed delivery receipt."""
+
+    effective_claim_id = claim_id if claim_id is not None else intent.claim_id
+    return {
+        "intent_id": str(intent.id),
+        "project_id": str(intent.project_id),
+        "release_version_id": str(intent.release_version_id),
+        "source_task_id": str(intent.source_task_id),
+        "authority_kind": intent.authority_kind,
+        "authority_key": intent.authority_key,
+        "idempotency_key": intent.idempotency_key,
+        "specification_hash": intent.specification_hash,
+        "attempt_count": int(intent.attempt_count or 0),
+        "expected_phase_changed_at": (
+            intent.expected_phase_changed_at.isoformat()
+            if intent.expected_phase_changed_at is not None
+            else None
+        ),
+        "claim_id": (
+            str(effective_claim_id) if effective_claim_id is not None else None
+        ),
+    }
+
+
+def _validate_committed_receipt(
+    intent: ReleaseQualificationIntent,
+) -> str | None:
+    """Return a bounded diagnostic when a receipt is not this live claim's."""
+
+    if not isinstance(intent.result, dict):
+        return "qualification intent result payload is not an object"
+    result = dict(intent.result)
+    if result.get("delivery_state") != "committed":
+        return "qualification receipt is not marked committed"
+    if intent.status != "attempting":
+        return "committed qualification receipt has no attempting intent"
+    if intent.claim_id is None:
+        return "committed qualification receipt has no live claim"
+    if not isinstance(result.get("status"), str) or not result.get("status"):
+        return "committed qualification receipt has no result status"
+    if not isinstance(result.get("refresh_required"), bool):
+        return "committed qualification receipt has invalid refresh_required"
+    if result["refresh_required"] and result.get("status") != "ci_compliance_blocked":
+        return (
+            "committed qualification receipt refresh_required is only valid "
+            "for ci_compliance_blocked"
+        )
+    if "refresh_delivery_state" in result:
+        return "committed qualification receipt has premature refresh_delivery_state"
+    for field, expected in _receipt_identity(intent).items():
+        if field not in result:
+            return f"committed qualification receipt identity missing: {field}"
+        if field == "attempt_count" and type(result[field]) is not int:
+            return "committed qualification receipt identity mismatch: attempt_count"
+        if result.get(field) != expected:
+            return f"committed qualification receipt identity mismatch: {field}"
+    return None
+
+
+def _fail_invalid_committed_receipt(
+    intent: ReleaseQualificationIntent,
+    *,
+    error: str,
+    now,
+) -> None:
+    """Terminalize an untrusted receipt without replaying or delivering it."""
+
+    result = (
+        dict(intent.result)
+        if isinstance(intent.result, dict)
+        else {"malformed_result_type": type(intent.result).__name__}
+    )
+    result["delivery_state"] = "invalid"
+    result["receipt_validation_error"] = error[:500]
+    result["invalidated_at"] = now.isoformat()
+    intent.result = result
+    intent.status = "failed"
+    intent.completed_at = now
+    intent.last_error = error[:4000]
+    intent.claim_id = None
+    intent.lease_expires_at = None
+    intent.next_attempt_at = None
+
+
 def _deliver_refresh_from_committed_receipt(
     intent: ReleaseQualificationIntent,
     project: Project,
 ) -> None:
     """Atomically arm a committed qualification wake under the Project lock."""
 
-    result = dict(intent.result or {})
-    if not result.get("refresh_required"):
+    if not isinstance(intent.result, dict):
+        return
+    result = dict(intent.result)
+    if result.get("refresh_required") is not True:
         return
     if result.get("refresh_delivery_state") == "delivered":
         return
@@ -310,18 +401,34 @@ async def _claim_intent(session, intent_id: uuid.UUID) -> uuid.UUID | None:
     if project is None or version is None or intent is None:
         return None
     now = _utcnow()
+    if intent.status in {"applied", "superseded", "failed"}:
+        return None
+    if not isinstance(intent.result, dict):
+        _fail_invalid_committed_receipt(
+            intent,
+            error="qualification intent result payload is not an object",
+            now=now,
+        )
+        session.add(intent)
+        await session.commit()
+        return None
     if (intent.result or {}).get("delivery_state") == "committed":
         # The release mutation and receipt committed together, but the worker
         # died before lifecycle settlement. Finalize from the receipt and never
         # replay the already-applied operation.
-        if intent.status not in {"applied", "superseded", "failed"}:
+        receipt_error = _validate_committed_receipt(intent)
+        if receipt_error is not None:
+            _fail_invalid_committed_receipt(
+                intent,
+                error=receipt_error,
+                now=now,
+            )
+        else:
             _settle_committed_result(intent, now=now)
-        _deliver_refresh_from_committed_receipt(intent, project)
+            _deliver_refresh_from_committed_receipt(intent, project)
         session.add(project)
         session.add(intent)
         await session.commit()
-        return None
-    if intent.status in {"applied", "superseded", "failed"}:
         return None
     if (
         int(intent.attempt_count or 0) >= QUALIFICATION_INTENT_MAX_ATTEMPTS
@@ -489,15 +596,40 @@ async def _settle_claim(
         if project is None or version is None or intent is None:
             return False, {}, project_id
         if intent.status != "attempting" or intent.claim_id != claim_id:
-            return False, dict(intent.result or {}), project_id
+            return (
+                False,
+                (
+                    dict(intent.result)
+                    if isinstance(intent.result, dict)
+                    else {"malformed_result_type": type(intent.result).__name__}
+                ),
+                project_id,
+            )
         now = _utcnow()
+        if not isinstance(intent.result, dict):
+            _fail_invalid_committed_receipt(
+                intent,
+                error="qualification intent result payload is not an object",
+                now=now,
+            )
+            session.add(intent)
+            await session.commit()
+            return True, dict(intent.result or {}), project_id
         if (intent.result or {}).get("delivery_state") == "committed":
             # A commit acknowledgement can be lost after PostgreSQL made the
-            # transaction durable. The receipt is authoritative; never turn an
-            # ambiguous success back into a replayable pending intent.
-            _settle_committed_result(intent, now=now)
-            _deliver_refresh_from_committed_receipt(intent, project)
-            session.add(project)
+            # transaction durable. Only an exact claim-bound receipt is
+            # authoritative; a mismatched result must never settle or wake.
+            receipt_error = _validate_committed_receipt(intent)
+            if receipt_error is not None:
+                _fail_invalid_committed_receipt(
+                    intent,
+                    error=receipt_error,
+                    now=now,
+                )
+            else:
+                _settle_committed_result(intent, now=now)
+                _deliver_refresh_from_committed_receipt(intent, project)
+                session.add(project)
         elif execution_error is not None:
             intent.last_error = (
                 f"{type(execution_error).__name__}: {execution_error}"
@@ -578,16 +710,12 @@ async def _commit_fenced_receipt(
         ).one_or_none()
         intent_state = (
             await session.execute(
-                select(
-                    ReleaseQualificationIntent.status,
-                    ReleaseQualificationIntent.claim_id,
-                    ReleaseQualificationIntent.lease_expires_at,
-                    ReleaseQualificationIntent.expected_phase_changed_at,
-                )
+                select(ReleaseQualificationIntent)
                 .where(ReleaseQualificationIntent.id == intent_id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
-        ).one_or_none()
+        ).scalar_one_or_none()
     now = _utcnow()
     if (
         project_state is None
@@ -617,6 +745,16 @@ async def _commit_fenced_receipt(
         }
     elif project_state.paused and receipt.get("status") != "project_paused":
         receipt = {**receipt, "status": "project_paused"}
+    receipt.pop("refresh_delivery_state", None)
+    receipt["refresh_required"] = bool(
+        receipt.get("status") == "ci_compliance_blocked"
+        and receipt.get("refresh_required") is True
+    )
+    receipt = {
+        **receipt,
+        "delivery_state": "committed",
+        **_receipt_identity(intent_state, claim_id=claim_id),
+    }
     fenced_update = await session.execute(
         update(ReleaseQualificationIntent)
         .where(
@@ -633,6 +771,19 @@ async def _commit_fenced_receipt(
         )
     # Exact release mutation + exact delivery receipt are one commit.
     await session.commit()
+
+
+async def _rollback_failed_execution(session) -> None:
+    """Discard every failed apply mutation before this session is reused."""
+
+    await session.rollback()
+    # Production factories return independent sessions, but the SQLite test
+    # harness deliberately reuses one identity map. SQLAlchemy can retain a
+    # flag_modified JSON object as dirty after rollback in that arrangement;
+    # refresh it from the rolled-back database before claim settlement commits.
+    for obj in tuple(session.dirty):
+        await session.refresh(obj)
+    session.expire_all()
 
 
 async def drain_qualification_intent(
@@ -677,17 +828,10 @@ async def drain_qualification_intent(
                     raise QualificationIntentClaimLost(
                         "qualification intent claim was superseded"
                     )
-                intent_receipt_fields = {
-                    "intent_id": str(intent.id),
-                    "release_version_id": str(intent.release_version_id),
-                    "expected_phase_changed_at": (
-                        intent.expected_phase_changed_at.isoformat()
-                        if intent.expected_phase_changed_at is not None
-                        else None
-                    ),
-                    "specification_hash": intent.specification_hash,
-                    "authority_key": intent.authority_key,
-                }
+                intent_receipt_fields = _receipt_identity(
+                    intent,
+                    claim_id=claim_id,
+                )
                 project = await execution_session.get(
                     Project, intent.project_id, populate_existing=True
                 )
@@ -754,7 +898,6 @@ async def drain_qualification_intent(
                     **apply_result,
                     "delivery_state": "committed",
                     **intent_receipt_fields,
-                    "claim_id": str(claim_id),
                     "refresh_required": bool(refresh_required),
                     "committed_at": _utcnow().isoformat(),
                 }
@@ -767,11 +910,11 @@ async def drain_qualification_intent(
     except asyncio.CancelledError as exc:
         execution_error = exc
         if execution_session is not None:
-            await execution_session.rollback()
+            await _rollback_failed_execution(execution_session)
     except Exception as exc:  # noqa: BLE001
         execution_error = exc
         if execution_session is not None:
-            await execution_session.rollback()
+            await _rollback_failed_execution(execution_session)
         logger.warning(
             "Qualification intent %s execution failed; retaining for retry",
             intent_id,
