@@ -88,10 +88,29 @@ def stable_work_specification_hash(specification: dict[str, Any]) -> str:
     raw_context = task_spec.get("context")
     context = dict(raw_context) if isinstance(raw_context, dict) else {}
     context.pop("parent_strategic_task_id", None)
+    context.pop("_workday_consultation_provenance", None)
     task_spec["context"] = context
     task_spec.pop("watch", None)
     task_spec.pop("watch_purpose", None)
     return stable_specification_hash({"task": task_spec})
+
+
+def stable_replay_specification_hash(specification: dict[str, Any]) -> str:
+    """Hash caller-owned intent while retaining Workday provenance for audit.
+
+    A replacement packet or Resident may replay the same stable operation key.
+    Its server receipt provenance remains stored on the request and task, but
+    does not change the requested executable work.
+    """
+
+    replay_spec = dict(specification)
+    task_spec = dict(replay_spec.get("task") or {})
+    raw_context = task_spec.get("context")
+    context = dict(raw_context) if isinstance(raw_context, dict) else {}
+    context.pop("_workday_consultation_provenance", None)
+    task_spec["context"] = context
+    replay_spec["task"] = task_spec
+    return stable_specification_hash(replay_spec)
 
 
 def strategic_work_idempotency_key(
@@ -550,7 +569,7 @@ async def submit_strategic_spawn(
             "parent task is missing or belongs to another project"
         )
 
-    specification_hash = stable_specification_hash(specification)
+    specification_hash = stable_replay_specification_hash(specification)
     work_specification_hash = stable_work_specification_hash(specification)
     normalized_key = (
         str(idempotency_key or "").strip()[:128]
@@ -571,7 +590,14 @@ async def submit_strategic_spawn(
         )
     ).scalar_one_or_none()
     if existing is not None:
-        if existing.specification_hash != specification_hash:
+        if (
+            existing.specification_hash != specification_hash
+            and (
+                not isinstance(existing.specification, dict)
+                or stable_replay_specification_hash(existing.specification)
+                != specification_hash
+            )
+        ):
             raise ValueError(
                 "idempotency_key was already used for a different spawn specification"
             )
@@ -630,10 +656,36 @@ async def submit_strategic_spawn(
             or ""
         )
         if active_work_hash != work_specification_hash:
-            raise ValueError(
-                "idempotency_key already identifies different active work in "
-                "this direction"
+            prior_request = (
+                await session.execute(
+                    select(StrategicSpawnRequest)
+                    .where(
+                        StrategicSpawnRequest.project_id == project_id,
+                        StrategicSpawnRequest.task_id == active_task.id,
+                    )
+                    .order_by(StrategicSpawnRequest.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            prior_specification = (
+                prior_request.specification if prior_request is not None else None
             )
+            if (
+                not isinstance(prior_specification, dict)
+                or stable_work_specification_hash(prior_specification)
+                != work_specification_hash
+            ):
+                raise ValueError(
+                    "idempotency_key already identifies different active work in "
+                    "this direction"
+                )
+            active_context = dict(active_task.context or {})
+            active_context["_strategic_work_specification_hash"] = (
+                work_specification_hash
+            )
+            active_task.context = active_context
+            flag_modified(active_task, "context")
+            session.add(active_task)
         request = StrategicSpawnRequest(
             project_id=project_id,
             parent_task_id=parent_task_id,

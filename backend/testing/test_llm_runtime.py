@@ -6,6 +6,7 @@ import pytest
 
 from app.failure_classification import RATE_LIMIT, classify_failure
 from app.max_plan_pool import (
+    EXACT_MODEL_ROUTE_CONTEXT_KEY,
     _account_by_id,
     _max_plan_pools,
     apply_task_llm_runtime_context,
@@ -171,6 +172,82 @@ async def test_select_llm_runtime_for_task_uses_explicit_model_provider(
     assert result.provider == "anthropic"
     assert result.model == "claude-sonnet-4-6"
     assert result.account_id == "acct-anthropic"
+
+
+@pytest.mark.asyncio
+async def test_exact_route_preserves_provider_model_and_effort_without_fallback(
+    clean_runtime_pool,
+):
+    ga_only = {
+        "id": "acct-gemini-ga-only",
+        "user_id": _TEST_USER,
+        "name": "gemini ga only",
+        "provider": "gemini",
+        "auth_mode": "api_key",
+        "runtime_secret": "AIzaTestKeyForBlueprint",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+        "provider_metadata": {"available_models": ["gemini-2.5-pro"]},
+    }
+    alternate = {
+        "id": "acct-deepseek",
+        "user_id": _TEST_USER,
+        "name": "deepseek",
+        "provider": "deepseek",
+        "auth_mode": "api_key",
+        "runtime_secret": "deepseek-test-key",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).extend([ga_only, alternate])
+    _account_by_id[ga_only["id"]] = ga_only
+    _account_by_id[alternate["id"]] = alternate
+
+    task = _task(
+        payload={
+            "type": "create",
+            "model": "gemini-3.1-pro-preview",
+            "effort": "high",
+            "provider_preference": ["gemini"],
+        },
+        context={
+            EXACT_MODEL_ROUTE_CONTEXT_KEY: {
+                "provider": "gemini",
+                "model": "gemini-3.1-pro-preview",
+                "effort": "high",
+            }
+        },
+    )
+    runtime_config = {
+        "provider_selection_mode": "balanced",
+        "provider_routing_verdict_state": "ADOPT",
+        "task_type_categories": {"build": ["create"]},
+        "category_routing": {
+            "build": {
+                "providers": ["deepseek", "gemini"],
+                "effort": "low",
+            }
+        },
+    }
+
+    assert resolve_task_routing(task, runtime_config) == {
+        "providers": ["gemini"],
+        "effort": "high",
+    }
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=task,
+        runtime_config=runtime_config,
+    )
+
+    assert result is not None
+    assert result.provider == "gemini"
+    assert result.model == "gemini-3.1-pro-preview"
+    assert result.account is None
+    assert "routing_fallback" not in task.context
+    assert "model_fallback" not in task.context
 
 
 @pytest.mark.asyncio

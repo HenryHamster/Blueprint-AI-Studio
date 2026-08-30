@@ -80,6 +80,7 @@ from app.max_plan_pool import (
     get_task_llm_provider,
     get_llm_account_identity,
     reconcile_llm_runtime_identity,
+    resolve_exact_model_route,
     resolve_task_quality_tier,
     record_completion_event,
     record_task_outcome,
@@ -2604,7 +2605,17 @@ async def update_agent_status(
                             provider_name = get_task_llm_provider(task)
                             current_model = model or _extract_task_model(task)
                             fallback_model = None
-                            if provider_name and current_model:
+                            exact_route = resolve_exact_model_route(ctx)
+                            exact_route_is_active = bool(
+                                exact_route is not None
+                                and exact_route[0] == provider_name
+                                and exact_route[1] == current_model
+                            )
+                            if (
+                                provider_name
+                                and current_model
+                                and not exact_route_is_active
+                            ):
                                 try:
                                     from app.providers.registry import get_provider
 

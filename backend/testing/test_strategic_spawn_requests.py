@@ -327,6 +327,59 @@ async def test_spawn_request_dispatches_once_and_registers_one_watch(db_session)
 
 
 @pytest.mark.asyncio
+async def test_workday_provenance_does_not_change_stable_replay_identity(db_session):
+    project, owner = await _owner(db_session)
+    first_spec = _spec("Implement receipt-bound work")
+    first_spec["task"]["context"]["_workday_consultation_provenance"] = {
+        "packet_id": str(uuid.uuid4()),
+        "workday_claim_id": str(uuid.uuid4()),
+    }
+    replay_spec = _spec("Implement receipt-bound work")
+    replay_spec["task"]["context"]["_workday_consultation_provenance"] = {
+        "packet_id": str(uuid.uuid4()),
+        "workday_claim_id": str(uuid.uuid4()),
+    }
+
+    first = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=owner.id,
+        task_type="create",
+        specification=first_spec,
+        idempotency_key="workday-stable-request",
+        direction_id=None,
+    )
+    replay = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=owner.id,
+        task_type="create",
+        specification=replay_spec,
+        idempotency_key="workday-stable-request",
+        direction_id=None,
+    )
+
+    assert replay.replayed is True
+    assert replay.request.id == first.request.id
+    assert replay.task.id == first.task.id
+    changed = _spec("Implement receipt-bound work")
+    changed["task"]["context"]["_workday_consultation_provenance"] = replay_spec[
+        "task"
+    ]["context"]["_workday_consultation_provenance"]
+    changed["task"]["payloads"][0]["effort"] = "low"
+    with pytest.raises(ValueError, match="different spawn specification"):
+        await submit_strategic_spawn(
+            db_session,
+            project_id=project.id,
+            parent_task_id=owner.id,
+            task_type="create",
+            specification=changed,
+            idempotency_key="workday-stable-request",
+            direction_id=None,
+        )
+
+
+@pytest.mark.asyncio
 async def test_reused_idempotency_key_rejects_different_specification(db_session):
     project, owner = await _owner(db_session)
     await submit_strategic_spawn(
@@ -449,8 +502,16 @@ async def test_active_work_deduplicates_across_resident_generations(db_session):
     second_owner = await _next_owner(db_session, project, "Replacement Resident")
     first_spec = _spec("Implement bounded direction work")
     first_spec["task"]["context"]["parent_strategic_task_id"] = str(first_owner.id)
+    first_spec["task"]["context"]["_workday_consultation_provenance"] = {
+        "packet_id": str(uuid.uuid4()),
+        "workday_claim_id": str(uuid.uuid4()),
+    }
     second_spec = _spec("Implement bounded direction work")
     second_spec["task"]["context"]["parent_strategic_task_id"] = str(second_owner.id)
+    second_spec["task"]["context"]["_workday_consultation_provenance"] = {
+        "packet_id": str(uuid.uuid4()),
+        "workday_claim_id": str(uuid.uuid4()),
+    }
 
     first = await submit_strategic_spawn(
         db_session,

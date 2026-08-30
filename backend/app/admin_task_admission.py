@@ -297,12 +297,8 @@ async def prepare_task_creation_authority(
             )
         if open_version is not None:
             criterion_release_version_id = open_version.id
-        if direction is not None:
-            if open_version is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="exact direction criteria require an open release version",
-                )
+        if direction is not None and normalized_criterion_ids:
+            assert open_version is not None
             direction_version_id = direction_criterion_release_version_id(direction)
             if direction_version_id != open_version.id:
                 raise HTTPException(

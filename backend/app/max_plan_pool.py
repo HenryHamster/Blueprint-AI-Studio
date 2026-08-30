@@ -543,6 +543,35 @@ def _routing_entry(raw: Any) -> tuple[list[str] | None, str | None]:
 # review (high effort) are excluded — the verdict only compares DeepSeek
 # cost/quality on the cheaper tiers.
 _VERDICT_AFFECTED_CATEGORIES: frozenset[str] = frozenset({"initiative", "build", "ops"})
+EXACT_MODEL_ROUTE_CONTEXT_KEY = "_strategic_exact_model_route"
+EXACT_MODEL_ROUTE_EFFORTS: frozenset[str] = frozenset(
+    {"low", "medium", "high", "max"}
+)
+
+
+def resolve_exact_model_route(context: Any) -> tuple[str, str, str] | None:
+    """Return a complete server-authored provider/model/effort authority."""
+
+    route = (
+        context.get(EXACT_MODEL_ROUTE_CONTEXT_KEY)
+        if isinstance(context, Mapping)
+        else None
+    )
+    if not isinstance(route, Mapping):
+        return None
+    provider = route.get("provider")
+    model = route.get("model")
+    effort = route.get("effort")
+    if (
+        not isinstance(provider, str)
+        or not provider.strip()
+        or not isinstance(model, str)
+        or not model.strip()
+        or not isinstance(effort, str)
+        or effort not in EXACT_MODEL_ROUTE_EFFORTS
+    ):
+        return None
+    return provider.strip(), model.strip(), effort
 
 
 def _apply_routing_verdict(
@@ -636,6 +665,11 @@ def _resolve_routing_core(
     runtime_config = _ensure_migrated(runtime_config)
     providers: list[str] | None = None
     effort: str | None = None
+    exact_route = resolve_exact_model_route(context)
+    if exact_route is not None:
+        exact_provider, _exact_model, exact_effort = exact_route
+        providers = [exact_provider]
+        effort = exact_effort
 
     # Layer 1+2: per-task payload/context — payload wins.
     for source in (payload if isinstance(payload, Mapping) else None, context):
@@ -675,9 +709,10 @@ def _resolve_routing_core(
                 effort = cand_effort
 
     resolved_providers = providers if providers is not None else list(ALL_PROVIDERS)
-    resolved_providers = _apply_routing_verdict(
-        resolved_providers, task_type, runtime_config
-    )
+    if exact_route is None:
+        resolved_providers = _apply_routing_verdict(
+            resolved_providers, task_type, runtime_config
+        )
     capability = get_task_capability(task_type)
     if capability is not None and capability.allowed_providers is not None:
         # A task capability's verified execution boundary is stricter than
@@ -4870,16 +4905,31 @@ async def select_llm_runtime_for_task(
         if failure_reasons is not None:
             failure_reasons.extend(_reasons)
 
-    explicit_model = _extract_task_model(task)
+    task_context = _task_context(task)
+    exact_route = resolve_exact_model_route(task_context)
+    exact_route_is_valid = exact_route is not None
+    if exact_route is not None:
+        exact_provider, exact_model, _exact_effort = exact_route
+    else:
+        exact_provider = None
+        exact_model = None
+    explicit_model = exact_model if exact_route_is_valid else _extract_task_model(task)
     mode = provider_selection_mode(runtime_config)
-    allow_fallback = mode in ("balanced", "preferred")
+    allow_fallback = not exact_route_is_valid and mode in ("balanced", "preferred")
     model_preferences = (
         [] if explicit_model else resolve_task_model_preferences(task, runtime_config)
     )
-    provider_preference = resolve_task_provider_preference(task, runtime_config)
+    provider_preference = (
+        [exact_provider]
+        if exact_route_is_valid
+        else resolve_task_provider_preference(task, runtime_config)
+    )
     quality_tier = resolve_task_quality_tier(task, runtime_config)
-    explicit_provider = get_task_llm_provider(task) or infer_provider_for_model(
-        explicit_model, runtime_config
+    explicit_provider = (
+        exact_provider
+        if exact_route_is_valid
+        else get_task_llm_provider(task)
+        or infer_provider_for_model(explicit_model, runtime_config)
     )
     routing_task_type = _task_type(task)
     capability = get_task_capability(routing_task_type)
@@ -5186,7 +5236,7 @@ async def select_llm_runtime_for_task(
         # admin UI / logs surface the downgrade explicitly — silently
         # running a different tier than the user asked for is a trust-losing
         # failure mode.
-        fallback = provider.fallback_model(model)
+        fallback = None if exact_route_is_valid else provider.fallback_model(model)
         if fallback and fallback != model:
             sub_reasons = _sub_reasons()
             account = await select_max_plan_account(
@@ -5231,14 +5281,15 @@ async def select_llm_runtime_for_task(
 
     if explicit_provider and explicit_model:
         _flush_reasons("no pool account (returning account-less explicit result)")
-        _record_routing_fallback(
-            task,
-            intended_provider=intended_provider,
-            intended_model=intended_model,
-            effective_provider=explicit_provider,
-            effective_model=explicit_model,
-            reason="no_account",
-        )
+        if not exact_route_is_valid:
+            _record_routing_fallback(
+                task,
+                intended_provider=intended_provider,
+                intended_model=intended_model,
+                effective_provider=explicit_provider,
+                effective_model=explicit_model,
+                reason="no_account",
+            )
         return LLMSelectionResult(
             provider=explicit_provider,
             auth_mode=get_task_llm_auth_mode(task) or LLMAuthMode.OAUTH.value,

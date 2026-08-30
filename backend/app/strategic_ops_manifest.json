@@ -335,6 +335,8 @@
                 "prompt",
                 "direction_id",
                 "criterion_ids",
+                "model",
+                "effort",
                 "acceptance_evidence",
                 "debt_id",
                 "idempotency_key",
@@ -375,6 +377,7 @@
             },
             "notes": [
                 "Use this operation for bounded implementation, research, plan, design, and compute work under an existing strategic outcome.",
+                "model and effort are an exact pair: supply both to pin one provider-qualified model/effort route, or omit both to retain the project routing defaults. A pinned route never falls through to a different provider/model.",
                 "Split implementation across multiple tasks under one direction as the work naturally divides; do not create file-, PR-, or phase-sharded directions.",
                 "To author an ORDERED sequence — the norm when a successor builds on a foundation's contract (shared types, schema, API surface) — spawn the foundation first, then pass depends_on: [<foundation task_id>] on each successor spawn. The edge waits for the foundation to complete AND merge before the successor dispatches (same-base dependency semantics).",
                 "depends_on entries are validated at authoring time: each must be a same-project task id (the foundation you spawned, never a cross-project or cross-base task), and the declaration is rejected if it references the calling task itself, lists a task twice, names a terminal-failed task, or forms a cyclic prerequisite set — the spawn returns a clear 400 instead of silently dropping a bad edge.",

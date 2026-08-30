@@ -4642,6 +4642,60 @@ class TestModifyTaskApplySeam:
         assert "acceptance_evidence" in payload_error.value.detail
 
     @pytest.mark.asyncio
+    async def test_apply_simple_mutations_protects_exact_model_route(
+        self, db_session
+    ):
+        from fastapi import HTTPException
+
+        from app.admin_task_mutations import _apply_simple_mutations
+        from app.max_plan_pool import EXACT_MODEL_ROUTE_CONTEXT_KEY
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id)
+        exact_route = {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "effort": "high",
+        }
+
+        with pytest.raises(HTTPException) as injected:
+            await _apply_simple_mutations(
+                task,
+                {"context": {EXACT_MODEL_ROUTE_CONTEXT_KEY: exact_route}},
+                db_session,
+                {},
+            )
+        assert injected.value.status_code == 400
+        assert EXACT_MODEL_ROUTE_CONTEXT_KEY in injected.value.detail
+
+        task.payloads = [
+            {
+                "type": "create",
+                "prompt": "bounded work",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "provider_preference": ["openai"],
+            }
+        ]
+        task.context = {EXACT_MODEL_ROUTE_CONTEXT_KEY: exact_route}
+        for field, forged in (
+            ("model", "gpt-5.6-terra"),
+            ("effort", "low"),
+            ("provider_preference", ["deepseek"]),
+        ):
+            proposed = [dict(task.first_payload)]
+            proposed[0][field] = forged
+            with pytest.raises(HTTPException) as retargeted:
+                await _apply_simple_mutations(
+                    task,
+                    {"payloads": proposed},
+                    db_session,
+                    {},
+                )
+            assert retargeted.value.status_code == 400
+            assert field in retargeted.value.detail
+
+    @pytest.mark.asyncio
     async def test_apply_simple_mutations_no_op_when_keys_absent(self, db_session):
         """_apply_simple_mutations does nothing when payload has no recognised keys."""
         from app.admin_task_mutations import _apply_simple_mutations
@@ -11164,7 +11218,7 @@ class TestStrategistSpawnableRegistry:
 
     @pytest.mark.asyncio
     async def test_strategist_spawn_compute_experiment_persists_launch_contract(
-        self, client: AsyncClient, db_session
+        self, client: AsyncClient, db_session, monkeypatch
     ):
         """Strategic spawn_task for compute_experiment persists launch contract fields
         in the task payload, applies the spend-gate, and does not require a prompt
@@ -11201,6 +11255,16 @@ class TestStrategistSpawnableRegistry:
 
         prev_threshold = _shared_state.runtime_config.get(
             "compute_experiment_spend_threshold_usd"
+        )
+        monkeypatch.setitem(
+            _shared_state.runtime_config.setdefault("task_type_models", {}),
+            "compute_experiment",
+            "stale-unused-model",
+        )
+        monkeypatch.setitem(
+            _shared_state.runtime_config.setdefault("task_type_efforts", {}),
+            "compute_experiment",
+            "low",
         )
         _shared_state.runtime_config["compute_experiment_spend_threshold_usd"] = 5.0
         try:
@@ -11244,6 +11308,8 @@ class TestStrategistSpawnableRegistry:
             assert payload["success_criterion"]["metric"] == "p99_latency_ms"
             assert payload["success_criterion"]["operator"] == "<"
             assert payload["success_criterion"]["threshold"] == 200
+            assert "model" not in payload
+            assert "effort" not in payload
 
             # Spend gate: 8.0 > threshold 5.0 → requires_approval=True
             assert child.requires_approval is True
@@ -11265,10 +11331,8 @@ class TestStrategistSpawnableRegistry:
 class TestStrategistSpawnCriterionIds:
     """Guard: spawn_task accepts explicit criterion_ids and acceptance_evidence.
 
-    Explicit criterion_ids must be validated against active criteria (inactive
-    keys silently dropped, exactly like direction-row inheritance).  An
-    acceptance_evidence dict is forwarded into the task payload unchanged when
-    well-formed, and rejected with a warning when malformed.
+    Explicit criterion_ids are exact task authority: invalid keys fail closed
+    and a direction never widens a caller-selected subset.
     """
 
     @pytest.mark.asyncio
@@ -11276,7 +11340,7 @@ class TestStrategistSpawnCriterionIds:
         self, client: AsyncClient, db_session
     ):
         """criterion_ids passed to spawn_task land on the new task after
-        filtering to active keys only (inactive / unknown keys are dropped)."""
+        exact validation against the open release version."""
         import uuid as _uuid
         from app.auth import create_agent_token
         from app.models import VersionAcceptanceCriterion
@@ -11338,8 +11402,7 @@ class TestStrategistSpawnCriterionIds:
                     "type": "research",
                     "title": "Investigate criterion coverage gap",
                     "prompt": "Research the coverage gap for the active criterion",
-                    # Active key should survive; inactive should be dropped.
-                    "criterion_ids": [active_key, inactive_key],
+                    "criterion_ids": [active_key],
                     "acceptance_evidence": {
                         "kind": "named_test",
                         "test_path": "testing/test_admin_routers.py",
@@ -11353,17 +11416,36 @@ class TestStrategistSpawnCriterionIds:
 
         child = await db_session.get(Task, _uuid.UUID(body["task_id"]))
         assert child is not None
-        # Only the active key survives the filter.
-        assert child.criterion_ids == [active_key], (
-            f"expected [{active_key!r}], got {child.criterion_ids!r}"
+        assert child.criterion_ids == [active_key]
+        assert child.context["criterion_ids_explicit"] is True
+        assert child.context["criterion_release_version_id"] == str(rv.id)
+
+        rejected = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Reject inactive criterion",
+                    "prompt": "This request must fail closed",
+                    "criterion_ids": [inactive_key],
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_admin_routers.py",
+                    },
+                },
+            },
         )
+        assert rejected.status_code == 400, rejected.text
+        assert "criterion_ids_invalid" in rejected.text
 
     @pytest.mark.asyncio
-    async def test_criterion_ids_merged_with_direction_keys(
+    async def test_explicit_criterion_ids_are_exact_direction_subset(
         self, client: AsyncClient, db_session
     ):
-        """When both direction_id and explicit criterion_ids are supplied, the
-        spawned task receives the union of both sources (filtered to active)."""
+        """Direction ownership validates but never widens an explicit subset."""
         import uuid as _uuid
         from app.auth import create_agent_token
         from app.models import VersionAcceptanceCriterion
@@ -11395,8 +11477,13 @@ class TestStrategistSpawnCriterionIds:
             direction_key=direction_id_str,
             status="active",
             text="Direction with criterion",
-            data={"id": direction_id_str, "status": "active", "text": "Direction with criterion"},
-            criterion_keys=[dir_key],
+            data={
+                "id": direction_id_str,
+                "status": "active",
+                "text": "Direction with criterion",
+                "criterion_release_version_id": str(rv.id),
+            },
+            criterion_keys=[dir_key, explicit_key],
         )
         db_session.add(direction)
         await db_session.commit()
@@ -11453,10 +11540,83 @@ class TestStrategistSpawnCriterionIds:
 
         child = await db_session.get(Task, _uuid.UUID(body["task_id"]))
         assert child is not None
-        # Both the explicit key and the direction-derived key must be present.
-        assert set(child.criterion_ids) == {dir_key, explicit_key}, (
-            f"expected both keys, got {child.criterion_ids!r}"
+        assert child.criterion_ids == [explicit_key]
+        assert child.context["criterion_ids_explicit"] is True
+        assert child.context["criterion_release_version_id"] == str(rv.id)
+
+    @pytest.mark.asyncio
+    async def test_explicit_empty_criteria_freezes_no_inheritance(
+        self, client: AsyncClient, db_session
+    ):
+        from app.auth import create_agent_token
+
+        project = Project(name="ExplicitEmptyCriterionSpawn", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        direction_id = "d-explicit-empty"
+        db_session.add(
+            Direction(
+                project_id=project.id,
+                direction_key=direction_id,
+                status="active",
+                text="Direction with no current criteria",
+                data={
+                    "id": direction_id,
+                    "status": "active",
+                    "text": "Direction with no current criteria",
+                },
+                criterion_keys=[],
+            )
         )
+        project.directions = [
+            {
+                "id": direction_id,
+                "status": "active",
+                "text": "Direction with no current criteria",
+            }
+        ]
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(project, "directions")
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for empty criterion spawn",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-empty-crit-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-empty-crit-test",
+            task_type="strategic_review",
+        )
+
+        response = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Freeze an empty acceptance subset",
+                    "prompt": "Do not inherit later direction criteria.",
+                    "direction_id": direction_id,
+                    "criterion_ids": [],
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        child = await db_session.get(
+            Task, uuid.UUID(response.json()["task_id"])
+        )
+        assert child is not None
+        assert child.criterion_ids == []
+        assert child.context["criterion_ids_explicit"] is True
+        assert "criterion_release_version_id" not in child.context
 
     @pytest.mark.asyncio
     async def test_acceptance_evidence_forwarded_to_task_payload(

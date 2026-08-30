@@ -12825,6 +12825,76 @@ async def test_external_api_provider_model_config_falls_back_without_backoff(
 
 
 @pytest.mark.asyncio
+async def test_exact_route_provider_model_config_failure_never_downgrades(
+    client: AsyncClient, db_session, mocker
+):
+    from app.max_plan_pool import EXACT_MODEL_ROUTE_CONTEXT_KEY
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=mocker.AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    project = Project(name="Exact Gemini Route Failure", user_id="test-user-exact")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    requested_model = "gemini-3.1-pro-preview"
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do exact work",
+                "model": requested_model,
+                "effort": "high",
+                "provider_preference": ["gemini"],
+            }
+        ],
+        vm_instance_id="agent-vm-exact-gemini",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            EXACT_MODEL_ROUTE_CONTEXT_KEY: {
+                "provider": "gemini",
+                "model": requested_model,
+                "effort": "high",
+            },
+            "llm_provider": "gemini",
+            "llm_auth_mode": "api_key",
+            "llm_model": requested_model,
+            "llm_execution_mode": "default",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-exact-gemini")
+    response = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "fatal",
+            "logs": "ModelNotFoundError: gemini preview model is not found",
+        },
+    )
+    assert response.status_code == 200
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.payloads[0]["model"] == requested_model
+    assert task.payloads[0]["effort"] == "high"
+    assert task.context[EXACT_MODEL_ROUTE_CONTEXT_KEY]["model"] == requested_model
+    assert "model_fallback" not in task.context
+
+
+@pytest.mark.asyncio
 async def test_external_api_provider_model_config_without_fallback_does_not_requeue(
     client: AsyncClient, db_session, mocker
 ):
