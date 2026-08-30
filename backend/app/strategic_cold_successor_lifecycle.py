@@ -25,7 +25,10 @@ from app.models import (
 )
 from app.max_plan_pool import get_task_llm_account_id, release_max_plan_account
 from app.payload_schemas import validate_internal_payload
-from app.strategic_cold_successor import serialize_cold_successor_contract
+from app.strategic_cold_successor import (
+    load_locked_cold_successor_contract,
+    serialize_cold_successor_contract,
+)
 from app.strategic_cold_successor_authority import (
     COLD_SUCCESSOR_CONTEXT_KEY,
     COLD_SUCCESSOR_LAUNCH_MODE,
@@ -48,6 +51,7 @@ from app.strategic_resident_session import (
     resident_session_is_active,
     resident_worker_incarnation_is_current,
 )
+from app.strategic_memory_sources import canonical_json_bytes
 from app.task_locking import project_lock, task_lock, with_vision_locked
 from app.time_utils import _utcnow
 
@@ -67,6 +71,7 @@ class ColdSuccessorStartRequest(BaseModel):
     expected_predecessor_session_id: str = Field(min_length=1, max_length=255)
     expected_predecessor_task_id: uuid.UUID | None = None
     expected_predecessor_worker_generation: int = Field(ge=1)
+    expected_core_sha256: str
 
     @field_validator("idempotency_key", "expected_predecessor_session_id")
     @classmethod
@@ -74,6 +79,14 @@ class ColdSuccessorStartRequest(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("value must not be blank")
+        return value
+
+    @field_validator("expected_core_sha256")
+    @classmethod
+    def _lower_core_sha256(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not _HASH_RE.fullmatch(value):
+            raise ValueError("value must be lower-case SHA-256")
         return value
 
 
@@ -171,6 +184,7 @@ def _launch_effect_sha256(
         "expected_predecessor_worker_generation": (
             request.expected_predecessor_worker_generation
         ),
+        "expected_core_sha256": request.expected_core_sha256,
     }
     return hashlib.sha256(
         json.dumps(effect, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -207,6 +221,27 @@ def is_cold_successor_blob(blob: dict[str, Any] | None) -> bool:
         isinstance(blob, dict)
         and blob.get("launch_mode") == COLD_SUCCESSOR_LAUNCH_MODE
     )
+
+
+async def preview_cold_successor(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, Any]:
+    payload = await load_locked_cold_successor_contract(session, project_id)
+    contract = payload["cold_successor_contract"]
+    manifest = contract["manifest"]
+    return {
+        "kind": "blueprint.cold_successor_preview.v1",
+        "project_id": str(project_id),
+        "core_sha256": manifest["core"]["sha256"],
+        "problem_model_sha256": manifest["problem_model"]["sha256"],
+        "running_update_sha256": manifest["running_update"]["sha256"],
+        "strategic_memory_sha256": manifest["strategic_memory"]["sha256"],
+        "strategic_memory_document_count": manifest["strategic_memory"][
+            "document_count"
+        ],
+        "payload_byte_count": len(canonical_json_bytes(payload)),
+    }
 
 
 def _manifest(task: Task) -> dict[str, Any]:
@@ -444,13 +479,20 @@ async def launch_cold_successor(
             project,
             await _load_memory(session, project.id),
         )
+        core_sha256 = payload["cold_successor_contract"]["manifest"]["core"][
+            "sha256"
+        ]
+        if core_sha256 != request.expected_core_sha256:
+            raise HTTPException(
+                status_code=409,
+                detail="Cold successor durable source core changed",
+            )
         payload = validate_internal_payload(
             payload,
             "strategic_cold_successor_lifecycle:launch_cold_successor",
         )
         session_id = new_session_id()
         generation = 1
-        core_sha256 = payload["cold_successor_contract"]["manifest"]["core"]["sha256"]
         context = {
             "_resident_session": True,
             RESIDENT_INFRASTRUCTURE_CONTEXT_KEY: True,

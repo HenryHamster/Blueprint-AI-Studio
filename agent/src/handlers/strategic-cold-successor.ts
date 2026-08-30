@@ -209,6 +209,31 @@ export function preflightColdSuccessorClaim(
   if (!Array.isArray(parsedMemory)) {
     throw new Error('cold successor strategic memory source is invalid');
   }
+  if (problemModel !== canonicalJson(parsedProblemModel)
+      || strategicMemory !== canonicalJson(parsedMemory)) {
+    throw new Error('cold successor canonical source JSON is not canonical');
+  }
+  if (parsedMemory.length !== 1) {
+    throw new Error('cold successor strategic memory must contain one handoff document');
+  }
+  const handoffMemory = object(parsedMemory[0], 'strategic memory document');
+  exactKeys(handoffMemory, [
+    'id', 'title', 'summary', 'body', 'topic', 'direction_id', 'tags', 'created_at',
+  ], 'strategic memory document');
+  if (
+    typeof handoffMemory.id !== 'string'
+    || typeof handoffMemory.title !== 'string'
+    || typeof handoffMemory.summary !== 'string'
+    || typeof handoffMemory.body !== 'string'
+    || (handoffMemory.topic !== null && typeof handoffMemory.topic !== 'string')
+    || (handoffMemory.direction_id !== null && typeof handoffMemory.direction_id !== 'string')
+    || typeof handoffMemory.created_at !== 'string'
+    || !Array.isArray(handoffMemory.tags)
+    || handoffMemory.tags.some(tag => typeof tag !== 'string')
+    || !handoffMemory.tags.includes('handoff')
+  ) {
+    throw new Error('cold successor strategic memory handoff document is invalid');
+  }
   const running = object(core.running_update, 'running update');
   exactKeys(running, ['present', 'text'], 'running update');
   if (typeof running.present !== 'boolean'

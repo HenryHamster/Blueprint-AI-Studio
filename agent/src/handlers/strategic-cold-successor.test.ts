@@ -97,7 +97,16 @@ function exactFixture(): { payload: JsonObject; task: JsonObject; semanticJson: 
   const projectId = '11111111-1111-4111-8111-111111111111';
   const problemModel = '{"checkpoint":"v57","unicode":"🐹"}';
   const runningUpdate = 'Release repair in progress.';
-  const strategicMemory = '[]';
+  const strategicMemory = canonicalJson([{
+    id: '44444444-4444-4444-8444-444444444444',
+    title: 'v57 handoff',
+    summary: 'Exact durable authority',
+    body: 'Resume from the canonical release checkpoint.',
+    topic: 'release',
+    direction_id: null,
+    tags: ['handoff'],
+    created_at: '2026-08-30T12:00:00+00:00',
+  }]);
   const core = {
     schema_version: 1,
     project_id: projectId,
@@ -121,7 +130,7 @@ function exactFixture(): { payload: JsonObject; task: JsonObject; semanticJson: 
         running_update: section('utf-8', runningUpdate),
         strategic_memory: {
           ...section('canonical-json', strategicMemory),
-          document_count: 0,
+          document_count: 1,
         },
         core: section('canonical-json', canonicalJson(core)),
       },
@@ -271,6 +280,83 @@ describe('strategic cold successor', () => {
         agent_mode: 'read_only',
       },
     })).toThrow('task capability has unexpected fields');
+    const contract = payload.cold_successor_contract as JsonObject;
+    const core = contract.core as JsonObject;
+    const withMemory = (
+      memory: unknown,
+      count: number,
+      strategicMemory = canonicalJson(memory),
+    ): JsonObject => {
+      const changedCore = { ...core, strategic_memory_canonical_json: strategicMemory };
+      const manifest = contract.manifest as JsonObject;
+      return {
+        ...payload,
+        cold_successor_contract: {
+          core: changedCore,
+          manifest: {
+            ...manifest,
+            strategic_memory: {
+              encoding: 'canonical-json',
+              byte_count: Buffer.byteLength(strategicMemory, 'utf8'),
+              sha256: sha256(strategicMemory),
+              document_count: count,
+            },
+            core: {
+              encoding: 'canonical-json',
+              byte_count: Buffer.byteLength(canonicalJson(changedCore), 'utf8'),
+              sha256: sha256(canonicalJson(changedCore)),
+            },
+          },
+        },
+      };
+    };
+    const exactMemory = JSON.parse(core.strategic_memory_canonical_json as string) as JsonObject[];
+    for (const changedMemory of [
+      [],
+      [exactMemory[0], exactMemory[0]],
+      [{ ...exactMemory[0], tags: ['archive'] }],
+      [{ ...exactMemory[0], forbidden: true }],
+    ]) {
+      const changedPayload = withMemory(changedMemory, changedMemory.length);
+      expect(() => preflightColdSuccessorClaim(changedPayload, {
+        ...task,
+        payloads: [changedPayload],
+      })).toThrow('strategic memory');
+    }
+    const noncanonicalMemory = JSON.stringify(exactMemory, null, 2);
+    const noncanonicalPayload = withMemory(exactMemory, 1, noncanonicalMemory);
+    expect(() => preflightColdSuccessorClaim(noncanonicalPayload, {
+      ...task,
+      payloads: [noncanonicalPayload],
+    })).toThrow('canonical source JSON is not canonical');
+    const noncanonicalProblem = JSON.stringify(JSON.parse(
+      core.problem_model_canonical_json as string,
+    ), null, 2);
+    const problemCore = { ...core, problem_model_canonical_json: noncanonicalProblem };
+    const manifest = contract.manifest as JsonObject;
+    const noncanonicalProblemPayload = {
+      ...payload,
+      cold_successor_contract: {
+        core: problemCore,
+        manifest: {
+          ...manifest,
+          problem_model: {
+            encoding: 'canonical-json',
+            byte_count: Buffer.byteLength(noncanonicalProblem, 'utf8'),
+            sha256: sha256(noncanonicalProblem),
+          },
+          core: {
+            encoding: 'canonical-json',
+            byte_count: Buffer.byteLength(canonicalJson(problemCore), 'utf8'),
+            sha256: sha256(canonicalJson(problemCore)),
+          },
+        },
+      },
+    };
+    expect(() => preflightColdSuccessorClaim(noncanonicalProblemPayload, {
+      ...task,
+      payloads: [noncanonicalProblemPayload],
+    })).toThrow('canonical source JSON is not canonical');
     expect(mocks.apiPost).not.toHaveBeenCalled();
     expect(mocks.runTextOnly).not.toHaveBeenCalled();
     expect(mocks.mkdtempSync).not.toHaveBeenCalled();

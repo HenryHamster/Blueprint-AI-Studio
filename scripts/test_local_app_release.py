@@ -976,6 +976,9 @@ class LocalAppReleaseTests(unittest.TestCase):
                     ),
                 ],
             )
+            self.assertEqual(mocks["database_schema"].call_count, 2)
+            success_receipt = mocks["evidence"].call_args.args[1]
+            self.assertEqual(success_receipt["database_schema_after"], "0742")
 
     def test_nonmigration_deploy_does_not_stop_units(self):
         """The established hot-swap path remains untouched when schemas match."""
@@ -1334,6 +1337,151 @@ class LocalAppReleaseTests(unittest.TestCase):
                 release.release("example/image:latest", REVISION)
             with self.assertRaisesRegex(ValueError, "expected-revision"):
                 release.release(IMAGE_REF, "short")
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            evidence_root = Path(raw_directory)
+            operation_id = "1" * 64
+            executions = []
+
+            def successful_release(image_ref, revision, *, operation_id=None):
+                executions.append((image_ref, revision, operation_id))
+                return release._write_evidence(
+                    evidence_root,
+                    {
+                        "kind": "blueprint.local_app_release.v1",
+                        "operation_id": operation_id,
+                        "image_ref": image_ref,
+                        "revision": revision,
+                        "outcome": "success",
+                    },
+                )
+
+            @contextlib.contextmanager
+            def operation_environment():
+                with (
+                    patch.object(release, "_EVIDENCE_ROOT", evidence_root),
+                    patch.object(
+                        release,
+                        "_exclusive_lock",
+                        return_value=contextlib.nullcontext(),
+                    ),
+                    patch.object(release, "_prepare_evidence_root"),
+                    patch.object(release, "_validate_release_identity"),
+                ):
+                    yield
+
+            with operation_environment(), patch.object(
+                release, "release", side_effect=successful_release
+            ) as execute:
+                first = release._locked_release(
+                    IMAGE_REF, REVISION, operation_id=operation_id
+                )
+                replay = release._locked_release(
+                    IMAGE_REF, REVISION, operation_id=operation_id
+                )
+                queried = release._locked_release(
+                    IMAGE_REF,
+                    REVISION,
+                    operation_id=operation_id,
+                    receipt_only=True,
+                )
+            self.assertEqual(first, replay)
+            self.assertEqual(replay, queried)
+            self.assertEqual(execute.call_count, 1)
+            self.assertEqual(len(executions), 1)
+            self.assertTrue(
+                (evidence_root / f"operation-{operation_id}.request.json").exists()
+            )
+
+            pending_id = "2" * 64
+            release._write_immutable_json(
+                evidence_root / f"operation-{pending_id}.request.json",
+                {
+                    "kind": "blueprint.local_app_release_request.v1",
+                    "operation_id": pending_id,
+                    "image_ref": IMAGE_REF,
+                    "revision": REVISION,
+                },
+            )
+            with operation_environment(), patch.object(
+                release,
+                "_reconcile_claimed_success",
+                side_effect=RuntimeError("not objectively serving"),
+            ), patch.object(release, "release") as execute:
+                with self.assertRaises(release._OperationPending):
+                    release._locked_release(
+                        IMAGE_REF,
+                        REVISION,
+                        operation_id=pending_id,
+                        receipt_only=True,
+                    )
+                with self.assertRaisesRegex(RuntimeError, "refusing ambiguous replay"):
+                    release._locked_release(
+                        IMAGE_REF, REVISION, operation_id=pending_id
+                    )
+                with self.assertRaisesRegex(ValueError, "conflicting"):
+                    release._locked_release(
+                        release._IMAGE_PREFIX + "@sha256:" + "e" * 64,
+                        REVISION,
+                        operation_id=pending_id,
+                        receipt_only=True,
+                    )
+            execute.assert_not_called()
+
+            reconciled_id = "4" * 64
+            release._write_immutable_json(
+                evidence_root / f"operation-{reconciled_id}.request.json",
+                {
+                    "kind": "blueprint.local_app_release_request.v1",
+                    "operation_id": reconciled_id,
+                    "image_ref": IMAGE_REF,
+                    "revision": REVISION,
+                },
+            )
+            reconciliation = {
+                "image_id": NEW_IMAGE,
+                "target_schema_revision": "0742",
+                "database_schema_before": "0742",
+                "database_schema_after": "0742",
+            }
+            with operation_environment(), patch.object(
+                release, "_reconcile_claimed_success", return_value=reconciliation
+            ), patch.object(release, "release") as execute:
+                reconciled = release._locked_release(
+                    IMAGE_REF,
+                    REVISION,
+                    operation_id=reconciled_id,
+                    receipt_only=True,
+                )
+                replayed = release._locked_release(
+                    IMAGE_REF,
+                    REVISION,
+                    operation_id=reconciled_id,
+                    receipt_only=True,
+                )
+            execute.assert_not_called()
+            self.assertEqual(reconciled, replayed)
+            reconciled_payload = json.loads(reconciled.read_text())
+            self.assertTrue(reconciled_payload["reconciled_claim"])
+            self.assertEqual(reconciled_payload["database_schema_after"], "0742")
+
+            failed_id = "3" * 64
+            with operation_environment(), patch.object(
+                release, "release", side_effect=RuntimeError("candidate pull failed")
+            ) as execute:
+                with self.assertRaisesRegex(RuntimeError, "evidence="):
+                    release._locked_release(
+                        IMAGE_REF, REVISION, operation_id=failed_id
+                    )
+                with self.assertRaisesRegex(RuntimeError, "terminal outcome"):
+                    release._locked_release(
+                        IMAGE_REF, REVISION, operation_id=failed_id
+                    )
+            self.assertEqual(execute.call_count, 1)
+            terminal = json.loads(
+                (evidence_root / f"operation-{failed_id}.json").read_text()
+            )
+            self.assertEqual(terminal["outcome"], "execution_failed")
 
 
 if __name__ == "__main__":

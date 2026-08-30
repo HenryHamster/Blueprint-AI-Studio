@@ -5666,12 +5666,35 @@ async def strategic_operation(
         fact_tags: list[str] = []
         if isinstance(raw_tags, list):
             fact_tags = [str(t).strip()[:64] for t in raw_tags if str(t).strip()][:20]
+        is_handoff = "handoff" in fact_tags
+
+        expected_head_present = "expected_head_id" in data
+        expected_head_id = None
+        raw_expected_head = data.get("expected_head_id")
+        if raw_expected_head is not None:
+            try:
+                expected_head_id = uuid.UUID(str(raw_expected_head))
+            except (ValueError, AttributeError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_memory data.expected_head_id must be null or a valid document UUID",
+                ) from None
+        if is_handoff and not expected_head_present:
+            raise HTTPException(
+                status_code=400,
+                detail="handoff set_memory requires data.expected_head_id",
+            )
+        if not is_handoff and expected_head_present:
+            raise HTTPException(
+                status_code=400,
+                detail="set_memory data.expected_head_id is only valid for handoff memory",
+            )
 
         # supersedes_id: optionally mark an existing strategic_memory fact as
         # dismissed (superseded) in the same transaction.
         superseded_id = None
         raw_supersedes = data.get("supersedes_id")
-        if raw_supersedes:
+        if raw_supersedes is not None:
             try:
                 superseded_id = uuid.UUID(str(raw_supersedes))
             except (ValueError, AttributeError, TypeError):
@@ -5780,6 +5803,58 @@ async def strategic_operation(
                     "duplicate": True,
                 }
             )
+
+        if superseded_id is not None and (
+            superseded_doc is None
+            or superseded_doc.lifecycle_status != "consumed"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="set_memory supersedes target is not an active strategic memory",
+            )
+        if (
+            not is_handoff
+            and superseded_doc is not None
+            and "handoff" in list(superseded_doc.tags or [])
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="set_memory handoff head changed",
+            )
+
+        if is_handoff:
+            active_memory = (
+                (
+                    await session.execute(
+                        select(KnowledgeDocument).where(
+                            KnowledgeDocument.project_id == project.id,
+                            KnowledgeDocument.source_kind
+                            == SourceKind.STRATEGIC_MEMORY.value,
+                            KnowledgeDocument.lifecycle_status == "consumed",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            handoff_heads = [
+                candidate
+                for candidate in active_memory
+                if "handoff" in list(candidate.tags or [])
+            ]
+            if expected_head_id is None:
+                handoff_matches = not handoff_heads and superseded_id is None
+            else:
+                handoff_matches = (
+                    len(handoff_heads) == 1
+                    and handoff_heads[0].id == expected_head_id
+                    and superseded_id == expected_head_id
+                )
+            if not handoff_matches:
+                raise HTTPException(
+                    status_code=409,
+                    detail="set_memory handoff head changed",
+                )
 
         doc = KnowledgeDocument(
             project_id=project.id,

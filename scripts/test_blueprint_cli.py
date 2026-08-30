@@ -9128,8 +9128,7 @@ def test_deploy_force_remains_unbound_without_promoted_version(monkeypatch):
 
 
 def test_invoke_release_shim_remote_exit_codes(monkeypatch, capsys):
-    """The remote socket client's exit codes map to the shim contract:
-    0 = completed, 3 = accepted-but-unverified (parked, no receipt), else error."""
+    """Remote exit codes preserve completed, ambiguous, unsent, and no-claim."""
     digest = "sha256:" + "a" * 64
     revision = "b" * 40
     monkeypatch.setattr(blueprint, "_resolve_windows_cli", lambda name: name)
@@ -9139,15 +9138,16 @@ def test_invoke_release_shim_remote_exit_codes(monkeypatch, capsys):
 
     monkeypatch.setattr(blueprint.subprocess, "run", run_with(0))
     assert blueprint._invoke_release_shim(digest, revision, host="h") is True
-
     monkeypatch.setattr(blueprint.subprocess, "run", run_with(3))
     assert blueprint._invoke_release_shim(digest, revision, host="h") is False
     assert "verdict was not observed" in capsys.readouterr().err
-
+    for code, error in ((4, blueprint._ReleaseRequestNotSent), (5, blueprint._ReleaseOperationNotAccepted)):
+        monkeypatch.setattr(blueprint.subprocess, "run", run_with(code))
+        with pytest.raises(error):
+            blueprint._invoke_release_shim(digest, revision, "c" * 64, host="h")
     monkeypatch.setattr(blueprint.subprocess, "run", run_with(2))
     with pytest.raises(blueprint_api.APIError):
         blueprint._invoke_release_shim(digest, revision, host="h")
-
 
 def test_deploy_refuses_non_descendant_without_force(monkeypatch, capsys):
     """deploy refuses a build that is behind/diverged from the promoted SHA."""
@@ -9338,11 +9338,11 @@ def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch, t
     api_fake = _deploy_api_fake(calls)
     agent_revision = _DEPLOY_PROMOTED_SHA
     _deploy_env(monkeypatch, api_fake, revision=agent_revision)
-    socket_calls = []
+    release_calls = []
     monkeypatch.setattr(
         blueprint,
-        "_request_release_socket",
-        lambda digest, revision: socket_calls.append((digest, revision)),
+        "_invoke_release_shim",
+        lambda *args, **kwargs: release_calls.append((args, kwargs)) or True,
     )
     promoted = {
         "version_number": 7,
@@ -9354,13 +9354,17 @@ def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch, t
     monkeypatch.setattr(blueprint, "_read_live_approved_activation", lambda args: promoted)
     monkeypatch.setattr(blueprint, "_local_served_sha", lambda: _DEPLOY_PROMOTED_SHA)
 
-    poll_path = tmp_path / "deploy-agent.poll"
+    poll_path, state_path = tmp_path / "deploy-agent.poll", tmp_path / "deploy-agent.state"
     assert blueprint._deploy_agent_once(
-        argparse.Namespace(project_id=None, poll_state_path=str(poll_path))
+        argparse.Namespace(project_id=None, poll_state_path=str(poll_path),
+                           state_path=str(state_path))
     ) is True
     assert json.loads(poll_path.read_text(encoding="utf-8"))["polled_at"]
 
-    assert socket_calls == [(f"sha256:{'0' * 64}", agent_revision)]
+    operation_id = blueprint._activation_operation_id("proj-1", promoted)
+    assert release_calls == [
+        ((f"sha256:{'0' * 64}", agent_revision, operation_id), {"host": None}),
+    ]
     receipt = next(
         body for method, path, body in calls
         if method == "POST" and path.endswith("/activation-receipt")
@@ -9372,12 +9376,10 @@ def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch, t
     }
 
 
-def test_deploy_agent_retries_failed_activation_phase_then_confirms(
+def test_deploy_agent_retries_authoritative_no_claim_then_confirms(
     monkeypatch, tmp_path
 ):
-    """A transient root failure is retried before one receipt is posted."""
-    from blueprint_api import APIError
-
+    """Only an exact root no-claim verdict safely rearms the same operation."""
     calls = []
     promoted = {
         "version_number": 7,
@@ -9391,13 +9393,7 @@ def test_deploy_agent_retries_failed_activation_phase_then_confirms(
         _deploy_api_fake(calls, promoted=promoted),
         revision=_DEPLOY_PROMOTED_SHA,
     )
-    release_results = iter(
-        [
-            APIError("release executor failed: transient one"),
-            APIError("release executor failed: transient two"),
-            True,
-        ]
-    )
+    release_results = iter([blueprint._ReleaseOperationNotAccepted("no claim"), True, True])
     release_calls = []
     monkeypatch.setattr(
         blueprint,
@@ -9408,17 +9404,17 @@ def test_deploy_agent_retries_failed_activation_phase_then_confirms(
              if isinstance(result, Exception) else result)(next(release_results)),
         )[1],
     )
-    sleeps = []
-    monkeypatch.setattr(blueprint.time, "sleep", sleeps.append)
     monkeypatch.setattr(blueprint, "_local_served_sha", lambda: _DEPLOY_PROMOTED_SHA)
 
     state_path = tmp_path / "deploy-agent.state"
-    assert blueprint._deploy_agent_once(
-        argparse.Namespace(project_id=None, state_path=str(state_path))
-    ) is True
-
-    assert len(release_calls) == 3
-    assert sleeps == [5.0, 10.0]
+    args = argparse.Namespace(project_id=None, state_path=str(state_path))
+    assert blueprint._deploy_agent_once(args) is False
+    assert json.loads(state_path.read_text())["phase"] == "not_sent"
+    assert blueprint._deploy_agent_once(args) is True
+    operation_id = blueprint._activation_operation_id("proj-1", promoted)
+    expected_args = (f"sha256:{'0' * 64}", _DEPLOY_PROMOTED_SHA, operation_id)
+    assert [args for args, _ in release_calls] == [expected_args] * 3
+    assert [kwargs for _, kwargs in release_calls] == [{"host": None}, {"host": None}, {"host": None, "receipt_only": True}]
     assert not state_path.exists()
     receipts = [
         body for method, path, body in calls
@@ -9432,9 +9428,11 @@ def test_deploy_agent_retries_failed_activation_phase_then_confirms(
 
 
 def _write_accepted_activation_state(state_path):
+    approved = _approved_activation()
     state_path.write_text(json.dumps({
         "version_number": 7, "promoted_sha": _DEPLOY_PROMOTED_SHA,
-        "revision": _DEPLOY_PROMOTED_SHA,
+        "revision": _DEPLOY_PROMOTED_SHA, "digest": "sha256:" + "0" * 64,
+        "operation_id": blueprint._activation_operation_id("proj-1", approved),
         "activation_requested_at": "2026-06-15T00:00:00Z",
         "phase": "accepted",
     }), encoding="utf-8")
@@ -9464,6 +9462,9 @@ def _root_activation_retry(monkeypatch, state_path, served_sha, now=None):
     posted, promoted = [], _approved_activation()
     monkeypatch.setattr(blueprint, "_require_write_config", lambda _action: None)
     monkeypatch.setattr(blueprint, "_read_live_approved_activation", lambda _args: promoted)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda _args=None: "proj-1")
+    monkeypatch.setattr(blueprint, "_invoke_release_shim", lambda *args, **kwargs:
+                        True if kwargs.get("receipt_only") is True else pytest.fail("activation replay"))
     monkeypatch.setattr(blueprint, "_local_served_sha", lambda: served_sha)
     if now is not None:
         monkeypatch.setattr(blueprint, "_activation_confirmation_now", lambda: now[0])
@@ -9472,13 +9473,13 @@ def _root_activation_retry(monkeypatch, state_path, served_sha, now=None):
 
 
 def test_deploy_agent_does_not_confirm_when_served_sha_mismatches(monkeypatch, tmp_path):
-    """An accepted handoff stays unconfirmed, then terminally fails, when the old image serves."""
+    """Root success stays unconfirmed, then terminally fails, when the old image serves."""
     state_path, now = tmp_path / "deploy-agent.state", [datetime(2026, 6, 15, tzinfo=timezone.utc)]
     _write_accepted_activation_state(state_path)
     posted, args = _root_activation_retry(monkeypatch, state_path, "b" * 40, now)
     assert blueprint._deploy_agent_once(args) is False
     pending = json.loads(state_path.read_text(encoding="utf-8"))
-    assert pending["phase"] == "accepted"
+    assert pending["phase"] == "completed"
     assert pending["confirmation_deadline_at"]
     assert posted == []
 
@@ -9524,7 +9525,7 @@ def test_deploy_agent_lock_reports_posix_requirement_without_fcntl(
 def test_deploy_agent_does_not_post_receipt_when_shim_raises(
     monkeypatch, tmp_path, failure
 ):
-    """A failed release retries three times and records its terminal reason."""
+    """A terminal release failure is attempted once and durably fenced."""
     from blueprint_api import APIError
 
     promoted = {
@@ -9546,7 +9547,6 @@ def test_deploy_agent_does_not_post_receipt_when_shim_raises(
         "_invoke_release_shim",
         lambda *args, **kwargs: (_ for _ in ()).throw(APIError(failure)),
     )
-    monkeypatch.setattr(blueprint.time, "sleep", lambda _seconds: None)
     state_path = tmp_path / "deploy-agent.state"
     args = argparse.Namespace(
         project_id=None,
@@ -9558,9 +9558,9 @@ def test_deploy_agent_does_not_post_receipt_when_shim_raises(
     assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
     failed = json.loads(state_path.read_text(encoding="utf-8"))
     assert failed["phase"] == "failed"
-    assert failed["activation_attempts"] == 3
+    assert failed["activation_attempts"] == 1
     assert failed["root_release"]["status"] == "failed"
-    assert failed["root_release"]["attempts"] == 3
+    assert failed["root_release"]["attempts"] == 1
     assert failure in failed["root_release"]["failure_reason"]
 
     monkeypatch.setattr(blueprint, "_local_served_sha", lambda: None)

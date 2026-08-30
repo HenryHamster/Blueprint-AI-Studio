@@ -130,6 +130,11 @@ describe('generated ./strategic CLI derives from the registry', () => {
     expect(script).toContain('"require_deps_landed_on"');
     expect(script).toContain('"release_base_branch"');
     expect(script).toContain('"required":["text","success_evidence","retirement_condition"]');
+    const memory = cliOpInput('set-memory');
+    expect(memory?.fields).toContain('expected_head_id');
+    expect(memory?.fields).toContain('supersedes_id');
+    expect(memory?.notes?.join('\n')).toContain('tagged handoff must include expected_head_id');
+    expect(memory?.notes?.join('\n')).toContain('expected_head_id and supersedes_id to the same exact');
   });
 
   it('spawn-task advertises depends_on and documents its authoring-time rejection cases', () => {

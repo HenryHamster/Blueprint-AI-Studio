@@ -506,7 +506,34 @@
         "description": "Persist a behavioral lesson or operator preference for future sessions.",
         "cli": true,
         "prompt": true,
-        "internal_reason": null
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "fields": [
+                "body",
+                "note",
+                "title",
+                "summary",
+                "topic",
+                "tags",
+                "supersedes_id",
+                "expected_head_id"
+            ],
+            "example": {
+                "title": "Current durable handoff",
+                "body": "Resume from the exact canonical checkpoint.",
+                "tags": [
+                    "handoff"
+                ],
+                "supersedes_id": null,
+                "expected_head_id": null
+            },
+            "notes": [
+                "A write tagged handoff must include expected_head_id. Use null only when no active handoff exists.",
+                "To replace a handoff, set expected_head_id and supersedes_id to the same exact current handoff document UUID.",
+                "Ordinary memory must omit expected_head_id. Every non-null supersedes_id must name an active same-project strategic-memory document."
+            ]
+        }
     },
     {
         "op": "set_session_summary",

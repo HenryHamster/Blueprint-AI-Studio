@@ -13,11 +13,12 @@ python scripts/blueprint.py deploy             # confirm interactively
 python scripts/blueprint.py deploy --yes       # scripted
 python scripts/blueprint.py deploy --sha 74bf87c  # a specific main build
 python scripts/blueprint.py deploy --local --yes  # when already on hamsterwheel
+python scripts/blueprint.py deploy --local --receipt-only  # exact root receipt; no activation
 ```
 
 The client finds the newest successful "Deploy Blueprint" run on `main`,
 downloads its `local-app-release.json` + `.sha256` artifact, verifies the
-checksum, and submits the digest + revision to the host's root-owned release
+checksum, and submits the digest, revision, and approval-derived operation ID to the host's root-owned release
 socket by piping `scripts/release_socket_submit.py` over SSH to the host's
 `python3` (the SSH account only needs the socket group ACL — no sudoers
 grant exists, the bootstrap removes the legacy one). This remains the
@@ -33,10 +34,11 @@ the command must run as an account admitted by the release socket ACL on the
 actual control-plane host.
 
 If the socket request is sent but its verdict is not observed, the manual CLI
-returns nonzero and labels acceptance ambiguous. Do not rerun the activation.
-Reconcile the root executor journal and durable receipt, the local/public
-`/api/version`, health, and the active image digest before deciding whether only
-the activation receipt remains to be recorded.
+returns nonzero and labels acceptance ambiguous. Do not rerun activation. Use
+the same approval with `--receipt-only`; it never invokes activation and accepts
+only the exact operation/digest/revision receipt. A pending claim remains
+no-replay. Root-side objective reconciliation may close it only when installed
+digest/revision, health, worker readiness, and schema all match.
 
 ## Host-side shim and root release service (one-time install)
 
@@ -74,8 +76,9 @@ sudo env -i SUDO_USER=henry_hamster PATH=/usr/sbin:/usr/bin:/sbin:/bin \
 sudo systemctl status blueprint-deploy-agent.service
 ```
 
-The bootstrap installs the root-owned shim, the ACL-limited release socket,
-and `blueprint-deploy-agent.service`, then explicitly restarts that auxiliary
+Bootstrap first stops the old deploy agent and refuses unless the root release
+service is exactly inactive. It then installs the root-owned shim, the
+ACL-limited release socket, and `blueprint-deploy-agent.service`, then explicitly restarts that auxiliary
 unit so an update cannot leave an old immutable bundle running. The service runs as `henry_hamster` (the
 user that invoked bootstrap via `sudo`), reads that account's existing Blueprint
 admin configuration and copies its owner-only `~/.config/gh/hosts.yml`
@@ -92,12 +95,12 @@ that version is both still `unconfirmed` and has an
 `activation_requested_at` approval. It downloads and pins the successful CI
 manifest whose revision exactly equals the approved promoted SHA, verifies the
 checksum/digest/revision, rereads the approval before invoking
-`/usr/local/sbin/blueprint-release` locally, and posts the existing activation
-receipt only after that shim succeeds. A failed shim posts no receipt; a failed
-receipt stays visible as an approved-but-unconfirmed lifecycle state and is
-retried from `/var/lib/blueprint-deploy-agent/deploy-agent.state` on the next poll
-without re-running the privileged release. The backend receipt guard is the
-final protection against a superseding promotion racing the local shim.
+`/usr/local/sbin/blueprint-release` locally exactly once. Before effects, root
+writes `operation-<id>.request.json`; at completion it writes at most one
+`operation-<id>.json`. Restarts and ambiguous handoffs use only the bound
+receipt query. The backend activation receipt is posted only after root success
+and exact local serving SHA are both proven. Corrupt, mismatched, or legacy
+state without digest/operation ID is preserved and fails closed.
 
 The unit's lock is `/run/blueprint-deploy-agent/deploy-agent.lock`. Its parent
 directory is created by systemd's `RuntimeDirectory`, owned for the unprivileged
@@ -112,8 +115,9 @@ sudo journalctl -u blueprint-deploy-agent.service -f
 
 The trust chain never depends on the caller:
 
-1. **The shim validates everything.** Exactly two arguments, matched against
-   anchored regexes (`sha256:` digest, 40-hex revision). The registry,
+1. **The shim validates everything.** Legacy requests have exactly two fields;
+   approval-bound requests add an exact 64-hex operation ID. Receipt queries
+   use a distinct `receipt` prefix. All values use anchored regexes. The registry,
    project, repository, and image name are hardcoded in the root-owned shim —
    a caller cannot aim the release at a different registry or image.
 2. **Only CI can mint deployable artifacts.** The pinned Artifact Registry
@@ -192,16 +196,13 @@ Each poll cycle the agent:
    approval cannot authorize a different or historical artifact.
 4. Re-runs the shared binding check (`_resolve_deploy_binding`) and refuses if
    a newer promotion superseded the approved version since polling.
-5. Sends `<digest> <revision>` to `/run/blueprint-release.sock` locally (no SSH
-   and no sudo — the agent runs ON the control-plane host), then posts the
-   activation receipt. A root-release handoff failure (`APIError`) is retried in
-   the activation phase at most three times: 5 seconds before the second
-   attempt and 10 seconds before the third. An accepted or ambiguous socket
-   handoff is never
-   replayed. If all three attempts fail, the agent durably records
-   `phase=failed`, the attempt count, and `root_release.failure_reason`; it
-   reports that reason and does not turn the failure into a confirmation
-   timeout or `no_new_revision`.
+5. Sends `<digest> <revision> <operation-id>` once to the local release socket.
+   The ID is SHA-256 over canonical project/version/promoted-SHA/approval-time
+   JSON. Only a proven pre-connect `not_sent` state or an exact identity-bound
+   `NOT_ACCEPTED`/no-claim result for an unresolved handoff may retry that exact
+   operation on a later poll. Pending, terminal, completed, and ambiguous states
+   never resubmit. Root success must be identity-bound before the serving probe
+   and backend activation receipt.
 
 Serialization is an `flock` on `/run/blueprint-deploy-agent/deploy-agent.lock`
 and receipt-retry state is stored at
@@ -228,14 +229,14 @@ poll cadence; the agent never crashes a poll cycle into the service.
   `sudo systemctl reset-failed blueprint-deploy-agent.service` (clears the
   StartLimitBurst cap) and
   `sudo systemctl restart blueprint-deploy-agent.service`.
-- **A cycle fails conservatively:** transient root-release failures receive the
-  bounded 5s/10s retry sequence above. The agent never posts a receipt for a
-  failed activation. If the release succeeds but receipt delivery fails, a
-  host-local marker retries only the receipt and never invokes the release
-  executor again for that approval. If the activation retry budget is
-  exhausted, inspect the durable marker and journal for
-  `root_release.failure_reason`; the approval remains unconfirmed and requires
-  operator reconciliation before another activation approval is attempted.
+- **A cycle fails conservatively:** the agent never posts a backend receipt for
+  a failed or merely serving-looking activation. A host-local marker preserves
+  the exact operation and retries only the root receipt query after any
+  accepted or ambiguous handoff. `NOT_ACCEPTED` is the only root result that can
+  return an unresolved `started`/`accepted` operation to `not_sent`; a completed
+  success fence remains no-replay. `PENDING` remains no-replay and terminal
+  outcomes remain failed. Inspect the immutable claim/receipt and journal before
+  re-arming.
 - **Manual rollback:** run `python scripts/blueprint.py deploy --sha
   <earlier-main-sha> --force` when an operator must select the earlier image.
   The release tool permits the rollback only when that image has the same

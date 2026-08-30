@@ -152,6 +152,21 @@ async def test_set_memory_rejects_empty_and_bad_topic(db_session):
         assert (
             await _post_set_memory({"note": "x", "topic": "not_a_real_topic"}, task_id)
         ).status_code == 400
+        assert (
+            await _post_set_memory({"note": "handoff", "tags": ["handoff"]}, task_id)
+        ).status_code == 400
+        assert (
+            await _post_set_memory({"note": "ordinary", "expected_head_id": None}, task_id)
+        ).status_code == 400
+        assert (
+            await _post_set_memory(
+                {"note": "handoff", "tags": ["handoff"], "expected_head_id": "bad"},
+                task_id,
+            )
+        ).status_code == 400
+        assert (
+            await _post_set_memory({"note": "x", "supersedes_id": ""}, task_id)
+        ).status_code == 400
     finally:
         _cleanup_strategic_overrides()
 
@@ -210,6 +225,114 @@ async def test_set_memory_rich_fields_and_supersede(db_session):
         assert len(index) == 1
         assert index[0]["topic"] == "operator_preference"
         assert index[0]["title"]
+
+        bootstrap_data = {
+            "title": "v57 handoff",
+            "body": "Resume from the exact durable checkpoint.",
+            "tags": ["handoff"],
+            "expected_head_id": None,
+        }
+        bootstrap = await _post_set_memory(bootstrap_data, task_id)
+        assert bootstrap.status_code == 200, bootstrap.text
+        handoff_id = bootstrap.json()["doc_id"]
+        before_failed_cas = (
+            await db_session.execute(
+                select(KnowledgeDocument).where(KnowledgeDocument.project_id == project.id)
+            )
+        ).scalars().all()
+        state_before_failed_cas = {
+            row.id: (row.lifecycle_status, row.dismissed_at, row.dismissed_reason)
+            for row in before_failed_cas
+        }
+        task = await db_session.get(Task, uuid.UUID(task_id))
+        context_before_failed_cas = dict(task.context or {})
+        stale_requests = [
+            {**bootstrap_data, "body": "stale null"},
+            {
+                **bootstrap_data,
+                "body": "stale uuid",
+                "expected_head_id": str(uuid.uuid4()),
+                "supersedes_id": handoff_id,
+            },
+            {
+                **bootstrap_data,
+                "body": "missing supersedes",
+                "expected_head_id": handoff_id,
+            },
+        ]
+        for request in stale_requests:
+            rejected = await _post_set_memory(request, task_id)
+            assert rejected.status_code == 409
+            assert rejected.json()["error"]["message"] == "set_memory handoff head changed"
+        bypass = await _post_set_memory(
+            {"body": "ordinary CAS bypass", "supersedes_id": handoff_id}, task_id
+        )
+        assert bypass.status_code == 409
+        assert bypass.json()["error"]["message"] == "set_memory handoff head changed"
+        after_failed_cas = (
+            await db_session.execute(
+                select(KnowledgeDocument).where(KnowledgeDocument.project_id == project.id)
+            )
+        ).scalars().all()
+        await db_session.refresh(task)
+        assert len(after_failed_cas) == len(before_failed_cas)
+        assert {
+            row.id: (row.lifecycle_status, row.dismissed_at, row.dismissed_reason)
+            for row in after_failed_cas
+        } == state_before_failed_cas
+        assert task.context == context_before_failed_cas
+
+        replacement_data = {
+            **bootstrap_data,
+            "body": "Resume from the replacement durable checkpoint.",
+            "expected_head_id": handoff_id,
+            "supersedes_id": handoff_id,
+        }
+        replacement = await _post_set_memory(replacement_data, task_id)
+        assert replacement.status_code == 200, replacement.text
+        replacement_id = replacement.json()["doc_id"]
+        replay = await _post_set_memory(replacement_data, task_id)
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["duplicate"] is True
+        assert replay.json()["doc_id"] == replacement_id
+        active_handoffs = [
+            row
+            for row in (
+                await db_session.execute(
+                    select(KnowledgeDocument).where(
+                        KnowledgeDocument.project_id == project.id,
+                        KnowledgeDocument.source_kind == SourceKind.STRATEGIC_MEMORY.value,
+                        KnowledgeDocument.lifecycle_status == "consumed",
+                    )
+                )
+            ).scalars().all()
+            if "handoff" in (row.tags or [])
+        ]
+        assert [str(row.id) for row in active_handoffs] == [replacement_id]
+
+        corrupt_head = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=uuid.UUID(task_id),
+            source_kind=SourceKind.STRATEGIC_MEMORY.value,
+            title="Corrupt second handoff",
+            summary="Corrupt second handoff",
+            body="Must make cold launch and replacement fail closed.",
+            tags=["handoff"],
+            lifecycle_status="consumed",
+        )
+        db_session.add(corrupt_head)
+        await db_session.commit()
+        ambiguous = await _post_set_memory(
+            {
+                **bootstrap_data,
+                "body": "Must not replace an ambiguous head.",
+                "expected_head_id": replacement_id,
+                "supersedes_id": replacement_id,
+            },
+            task_id,
+        )
+        assert ambiguous.status_code == 409
+        assert ambiguous.json()["error"]["message"] == "set_memory handoff head changed"
     finally:
         _cleanup_strategic_overrides()
 
@@ -241,5 +364,53 @@ async def test_set_memory_never_writes_legacy_jsonb_column(db_session):
         # The legacy JSONB column is frozen — no append, no cap mutation.
         await db_session.refresh(project)
         assert project.strategic_memory_notes == preexisting
+
+        foreign = Project(name="P-foreign-memory", user_id="u1")
+        db_session.add(foreign)
+        await db_session.flush()
+        wrong_kind = KnowledgeDocument(
+            project_id=project.id, source_kind=SourceKind.DESIGN.value,
+            title="Wrong kind", summary="Wrong kind", body="Wrong kind",
+            lifecycle_status="consumed",
+        )
+        dismissed = KnowledgeDocument(
+            project_id=project.id, source_kind=SourceKind.STRATEGIC_MEMORY.value,
+            title="Dismissed", summary="Dismissed", body="Dismissed",
+            lifecycle_status="dismissed",
+        )
+        foreign_memory = KnowledgeDocument(
+            project_id=foreign.id, source_kind=SourceKind.STRATEGIC_MEMORY.value,
+            title="Foreign", summary="Foreign", body="Foreign",
+            lifecycle_status="consumed",
+        )
+        db_session.add_all([wrong_kind, dismissed, foreign_memory])
+        await db_session.commit()
+        own_rows_before = (
+            await db_session.execute(
+                select(KnowledgeDocument).where(KnowledgeDocument.project_id == project.id)
+            )
+        ).scalars().all()
+        own_state_before = {
+            row.id: (row.lifecycle_status, row.dismissed_at, row.dismissed_reason)
+            for row in own_rows_before
+        }
+        for target_id in (uuid.uuid4(), wrong_kind.id, dismissed.id, foreign_memory.id):
+            rejected = await _post_set_memory(
+                {"note": f"invalid target {target_id}", "supersedes_id": str(target_id)},
+                task_id,
+            )
+            assert rejected.status_code == 409
+            assert rejected.json()["error"]["message"] == (
+                "set_memory supersedes target is not an active strategic memory"
+            )
+        own_rows_after = (
+            await db_session.execute(
+                select(KnowledgeDocument).where(KnowledgeDocument.project_id == project.id)
+            )
+        ).scalars().all()
+        assert {
+            row.id: (row.lifecycle_status, row.dismissed_at, row.dismissed_reason)
+            for row in own_rows_after
+        } == own_state_before
     finally:
         _cleanup_strategic_overrides()

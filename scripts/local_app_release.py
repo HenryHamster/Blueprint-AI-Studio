@@ -44,6 +44,7 @@ _IMAGE_PREFIX = (
 _IMAGE_REF_RE = re.compile(rf"^{re.escape(_IMAGE_PREFIX)}@sha256:[0-9a-f]{{64}}$")
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_OPERATION_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _SCHEMA_REVISION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _EXPECTED_SCHEMA_REVISION_LINE_RE = re.compile(
     r"^EXPECTED_SCHEMA_REVISION\s*=\s*(['\"])(?P<revision>[A-Za-z0-9_.-]+)\1$"
@@ -101,13 +102,7 @@ print('reachable' if reachable else 'unreachable')
 _SYSTEM_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _SERVICES = ("blueprint-api.service", "blueprint-worker.service")
 _ACTIVATION_ORDER = ("blueprint-worker.service", "blueprint-api.service")
-# App units may legitimately be crash-looping (activating/failed) or absent
-# (inactive) when a release runs — e.g. a migration-carrying deploy left the
-# prior image unable to satisfy the new schema-version gate.  Replacing that
-# broken image is exactly what a release does, so these states must not block
-# it; the image validation in _validate_managed_container stays the hard safety
-# gate against acting on an unexpected image.  Any other ActiveState is
-# unexpected and still refuses the release.
+# Crash-looping/inactive app units are replaceable; image validation remains the safety gate.
 _RECOVERABLE_APP_STATES = frozenset(
     {"active", "activating", "deactivating", "inactive", "failed"}
 )
@@ -126,6 +121,10 @@ _DATABASE_CONTAINER = "blueprint-local-postgres"
 _BACKGROUND_LOCK_CLASSID = 2_984_976_049
 _BACKGROUND_LOCK_OBJID = 3_944_657_387
 _EVIDENCE_ROOT = Path("/var/lib/blueprint/local-app-releases")
+_MAX_EVIDENCE_BYTES = 64 * 1024
+_TERMINAL_OUTCOMES = frozenset({"success", "precondition_failed", "migration_failed",
+    "rollback_refused", "rolled_back", "rollback_incomplete", "execution_failed",
+})
 _LOCK_PATH = Path("/run/lock/blueprint-local-app-release.lock")
 _PROTECTED_UNIT_FILES = (
     Path("/etc/systemd/system/blueprint-database.service"),
@@ -144,6 +143,14 @@ RUNBOOK_ENTRYPOINT = "release"
 
 class _TransientNotReady(RuntimeError):
     """A bounded readiness poll may retry this state."""
+
+
+class _OperationPending(RuntimeError):
+    pass
+
+
+class _OperationNotAccepted(RuntimeError):
+    pass
 
 
 def _is_root() -> bool:
@@ -1431,13 +1438,10 @@ def _prepare_evidence_root(directory: Path) -> None:
         raise ValueError("unsafe local app release evidence directory")
 
 
-def _write_evidence(directory: Path, payload: dict[str, object]) -> Path:
-    destination = directory / (
-        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ-")
-        + str(payload["revision"])[:12]
-        + ".json"
-    )
+def _write_immutable_json(destination: Path, payload: dict[str, object]) -> Path:
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    if len(encoded) > _MAX_EVIDENCE_BYTES:
+        raise ValueError("local app release evidence exceeds the size limit")
     fd = os.open(
         destination,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -1448,7 +1452,7 @@ def _write_evidence(directory: Path, payload: dict[str, object]) -> Path:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
-        parent_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(parent_fd)
         finally:
@@ -1462,13 +1466,153 @@ def _write_evidence(directory: Path, payload: dict[str, object]) -> Path:
     return destination
 
 
-def release(image_ref: str, revision: str) -> Path:
+def _write_evidence(directory: Path, payload: dict[str, object]) -> Path:
+    operation_id = payload.get("operation_id")
+    if operation_id is None:
+        name = (
+            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ-")
+            + str(payload["revision"])[:12]
+            + ".json"
+        )
+    elif isinstance(operation_id, str) and _OPERATION_ID_RE.fullmatch(operation_id):
+        name = f"operation-{operation_id}.json"
+    else:
+        raise ValueError("invalid local app release operation id")
+    return _write_immutable_json(directory / name, payload)
+
+
+def _read_immutable_json(path: Path) -> dict[str, object] | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size > _MAX_EVIDENCE_BYTES
+        ):
+            raise ValueError(f"unsafe local app release artifact: {path.name}")
+        chunks: list[bytes] = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(encoded) != info.st_size:
+        raise ValueError(f"unstable local app release artifact: {path.name}")
+    try:
+        payload = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid local app release artifact: {path.name}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"invalid local app release artifact: {path.name}")
+    return payload
+
+
+def _operation_artifact(
+    directory: Path, operation_id: str, suffix: str, *, image_ref: str, revision: str
+) -> tuple[Path, dict[str, object] | None]:
+    path = directory / f"operation-{operation_id}{suffix}.json"
+    payload = _read_immutable_json(path)
+    if payload is None:
+        return path, None
+    expected_kind = (
+        "blueprint.local_app_release_request.v1"
+        if suffix == ".request"
+        else "blueprint.local_app_release.v1"
+    )
+    if (
+        payload.get("kind") != expected_kind
+        or payload.get("operation_id") != operation_id
+        or payload.get("image_ref") != image_ref
+        or payload.get("revision") != revision
+    ):
+        raise ValueError(f"conflicting local app release artifact: {path.name}")
+    if suffix == "" and payload.get("outcome") not in _TERMINAL_OUTCOMES:
+        raise ValueError(f"invalid local app release outcome: {path.name}")
+    return path, payload
+
+
+def _validate_release_identity(image_ref: str, revision: str, operation_id: str | None) -> None:
     if not _is_root():
         raise PermissionError("local app release must run as root")
     if not _IMAGE_REF_RE.fullmatch(image_ref):
         raise ValueError("image-ref must be the approved Artifact Registry digest")
     if not _REVISION_RE.fullmatch(revision):
         raise ValueError("expected-revision must be a full lowercase git SHA")
+    if operation_id is not None and not _OPERATION_ID_RE.fullmatch(operation_id):
+        raise ValueError("operation-id must be 64 lowercase hexadecimal characters")
+
+
+def _inspect_existing_candidate(image_ref: str, revision: str) -> str:
+    record = json.loads(_run(["/usr/bin/docker", "image", "inspect", image_ref]).stdout)[0]
+    image_id = record.get("Id", "")
+    labels = (record.get("Config") or {}).get("Labels") or {}
+    if (
+        not _IMAGE_ID_RE.fullmatch(image_id)
+        or image_ref not in (record.get("RepoDigests") or [])
+        or labels.get("org.opencontainers.image.revision") != revision
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", labels.get("com.blueprint.frontend.bundle-sha256") or ""
+        )
+        or record.get("Architecture") != "amd64"
+    ):
+        raise RuntimeError("installed candidate identity does not match the operation")
+    return image_id
+
+
+def _reconcile_claimed_success(image_ref: str, revision: str) -> dict[str, object]:
+    """Objectively close a claim after a crash without invoking activation."""
+    install_user = os.environ.get("SUDO_USER", "")
+    if not _SYSTEM_USER_RE.fullmatch(install_user) or install_user == "root":
+        raise ValueError("SUDO_USER must identify the non-root service account")
+    node_root = Path("/etc/blueprint/nodes") / install_user
+    role_dirs = tuple(node_root / "roles" / role for role in ("api", "worker"))
+    for directory in (
+        Path("/etc/blueprint"), Path("/etc/blueprint/nodes"), node_root,
+        node_root / "roles", *role_dirs,
+    ):
+        _trusted_root_directory(directory)
+    _validate_manifest(node_root / "manifest.json", install_user, node_root)
+    install_uid = _uid_for_user(install_user)
+    api_payload = _secure_role_file(node_root / "roles/api/role.env")
+    worker_payload = _secure_role_file(node_root / "roles/worker/role.env")
+    image_id = _inspect_existing_candidate(image_ref, revision)
+    if (
+        _role_value(api_payload, "BLUEPRINT_API_IMAGE_ID") != image_id
+        or _role_value(worker_payload, "BLUEPRINT_WORKER_IMAGE_ID") != image_id
+        or _role_value(api_payload, "BLUEPRINT_API_DEPLOY_SHA") != revision
+        or _role_value(worker_payload, "BLUEPRINT_WORKER_DEPLOY_SHA") != revision
+    ):
+        raise RuntimeError("installed role state does not match the operation")
+    for unit in _UNTOUCHED_UNITS:
+        if _service_marker(unit)[0] != "active":
+            raise RuntimeError(f"{unit} is not active during receipt reconciliation")
+    _assert_edge_is_decoupled()
+    _verify_health(_public_origin(api_payload, install_uid), revision, image_id)
+    target_schema = _image_schema_revision(image_id)
+    live_schema = _database_schema_revision()
+    if live_schema != target_schema:
+        raise RuntimeError("live schema does not match the installed candidate")
+    return {
+        "image_id": image_id,
+        "target_schema_revision": target_schema,
+        "database_schema_before": live_schema,
+        "database_schema_after": live_schema,
+    }
+
+
+def release(image_ref: str, revision: str, *, operation_id: str | None = None) -> Path:
+    _validate_release_identity(image_ref, revision, operation_id)
     install_user = os.environ.get("SUDO_USER", "")
     if not _SYSTEM_USER_RE.fullmatch(install_user) or install_user == "root":
         raise ValueError("SUDO_USER must identify the non-root service account")
@@ -1536,10 +1680,11 @@ def release(image_ref: str, revision: str) -> Path:
     allowed_images = frozenset({prior_api, image_id})
     target_schema_revision = _image_schema_revision(image_id)
     database_schema_before = _database_schema_revision()
+    database_schema_after = database_schema_before
     migration_required = target_schema_revision != database_schema_before
 
     def receipt(outcome: str, error: str, markers_match: bool) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "kind": "blueprint.local_app_release.v1",
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "revision": revision,
@@ -1549,6 +1694,7 @@ def release(image_ref: str, revision: str) -> Path:
             "retained_prior_tag": retained_tag,
             "target_schema_revision": target_schema_revision,
             "database_schema_before": database_schema_before,
+            "database_schema_after": database_schema_after,
             "migration_required": migration_required,
             "outcome": outcome,
             "error_sha256": (
@@ -1557,6 +1703,9 @@ def release(image_ref: str, revision: str) -> Path:
             "untouched_units": list(_UNTOUCHED_UNITS),
             "untouched_unit_markers_match": markers_match,
         }
+        if operation_id is not None:
+            payload["operation_id"] = operation_id
+        return payload
 
     try:
         _run_pre_stop_rehearsal(
@@ -1589,10 +1738,8 @@ def release(image_ref: str, revision: str) -> Path:
     migration_choreography_started = False
     try:
         if migration_required:
-            # A schema-changing deploy cannot hot-swap: the old image rejects
-            # the advanced DB and the candidate rejects the old DB.  Stop both
-            # Restart=always units first, wait for each managed container to be
-            # gone, then use the existing hardened migration transaction.
+            # Stop both app units before the hardened migration transaction;
+            # old and new images reject the opposite schema.
             migration_choreography_started = True
             for unit in _ACTIVATION_ORDER:
                 _stop_unit_container(unit, _CONTAINERS[unit], allowed_images)
@@ -1637,6 +1784,9 @@ def release(image_ref: str, revision: str) -> Path:
                     timeout=120,
                 )
         _verify_health(public_url, revision, image_id)
+        database_schema_after = _database_schema_revision()
+        if database_schema_after != target_schema_revision:
+            raise RuntimeError("post-health database schema does not match the candidate")
         if _hash_protected_tree(node_root) != protected_before:
             raise RuntimeError("release changed protected database/backup/edge files")
         if {
@@ -1650,6 +1800,10 @@ def release(image_ref: str, revision: str) -> Path:
     except Exception as exc:
         error = str(exc)
         if migration_choreography_started:
+            try:
+                database_schema_after = _database_schema_revision()
+            except Exception:
+                database_schema_after = None
             hold_message = (
                 "migration deploy failed after bounded downtime began "
                 f"({error}); app units are intentionally left stopped; "
@@ -1772,15 +1926,98 @@ def release(image_ref: str, revision: str) -> Path:
         raise RuntimeError(f"{rollback_message}; evidence={evidence}") from exc
 
 
-def _locked_release(image_ref: str, revision: str) -> Path:
+def _locked_release(
+    image_ref: str, revision: str, *, operation_id: str | None = None,
+    receipt_only: bool = False,
+) -> Path:
+    _validate_release_identity(image_ref, revision, operation_id)
+    if receipt_only and operation_id is None:
+        raise ValueError("receipt-only requires an operation id")
     with _exclusive_lock():
-        return release(image_ref, revision)
+        if operation_id is None:
+            return release(image_ref, revision)
+        _prepare_evidence_root(_EVIDENCE_ROOT)
+        receipt_path, receipt_payload = _operation_artifact(
+            _EVIDENCE_ROOT, operation_id, "", image_ref=image_ref, revision=revision,
+        )
+        if receipt_payload is not None:
+            if receipt_payload["outcome"] == "success":
+                return receipt_path
+            raise RuntimeError(
+                "local app release operation recorded terminal outcome "
+                f"{receipt_payload['outcome']}; evidence={receipt_path}"
+            )
+        claim_path, claim_payload = _operation_artifact(
+            _EVIDENCE_ROOT, operation_id, ".request",
+            image_ref=image_ref, revision=revision,
+        )
+        if receipt_only:
+            if claim_payload is not None:
+                try:
+                    reconciled = _reconcile_claimed_success(image_ref, revision)
+                except (OSError, ValueError, RuntimeError, PermissionError):
+                    raise _OperationPending(
+                        "local app release operation is still pending"
+                    ) from None
+                return _write_evidence(
+                    _EVIDENCE_ROOT,
+                    {
+                        "kind": "blueprint.local_app_release.v1",
+                        "captured_at": datetime.now(timezone.utc).isoformat(),
+                        "operation_id": operation_id,
+                        "revision": revision,
+                        "image_ref": image_ref,
+                        "outcome": "success",
+                        "error_sha256": None,
+                        "reconciled_claim": True,
+                        **reconciled,
+                    },
+                )
+            raise _OperationNotAccepted("local app release operation was not accepted")
+        if claim_payload is not None:
+            raise RuntimeError(
+                "local app release operation has an immutable request claim but no "
+                "terminal receipt; refusing ambiguous replay"
+            )
+        _write_immutable_json(
+            claim_path,
+            {
+                "kind": "blueprint.local_app_release_request.v1",
+                "requested_at": datetime.now(timezone.utc).isoformat(),
+                "operation_id": operation_id,
+                "image_ref": image_ref,
+                "revision": revision,
+            },
+        )
+        try:
+            return release(image_ref, revision, operation_id=operation_id)
+        except Exception as exc:
+            receipt_path, receipt_payload = _operation_artifact(
+                _EVIDENCE_ROOT, operation_id, "", image_ref=image_ref, revision=revision,
+            )
+            if receipt_payload is None:
+                error = str(exc)
+                receipt_path = _write_evidence(
+                    _EVIDENCE_ROOT,
+                    {
+                        "kind": "blueprint.local_app_release.v1",
+                        "captured_at": datetime.now(timezone.utc).isoformat(),
+                        "operation_id": operation_id,
+                        "revision": revision,
+                        "image_ref": image_ref,
+                        "outcome": "execution_failed",
+                        "error_sha256": hashlib.sha256(error.encode()).hexdigest(),
+                    },
+                )
+            raise RuntimeError(f"{exc}; evidence={receipt_path}") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-revision", required=True)
+    parser.add_argument("--operation-id")
+    parser.add_argument("--receipt-only", action="store_true")
     parser.add_argument(
         "--rehearse",
         action="store_true",
@@ -1800,11 +2037,62 @@ def main() -> int:
                 + json.dumps(report.as_dict(), sort_keys=True)
             )
             return 0
-        evidence = _locked_release(args.image, args.expected_revision)
+        evidence = _locked_release(
+            args.image,
+            args.expected_revision,
+            operation_id=args.operation_id,
+            receipt_only=args.receipt_only,
+        )
     except (OSError, ValueError, RuntimeError, PermissionError) as exc:
+        if args.operation_id is not None:
+            status = None
+            if isinstance(exc, _OperationPending):
+                status = "pending"
+            elif isinstance(exc, _OperationNotAccepted):
+                status = "not_accepted"
+            if status is not None:
+                print(
+                    "LOCAL_APP_RELEASE_STATUS "
+                    + json.dumps(
+                        {
+                            "operation_id": args.operation_id,
+                            "image_ref": args.image,
+                            "revision": args.expected_revision,
+                            "status": status,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                )
+            else:
+                try:
+                    _, terminal = _operation_artifact(
+                        _EVIDENCE_ROOT,
+                        args.operation_id,
+                        "",
+                        image_ref=args.image,
+                        revision=args.expected_revision,
+                    )
+                except (OSError, ValueError):
+                    terminal = None
+                if terminal is not None:
+                    print(
+                        "LOCAL_APP_RELEASE_RECEIPT "
+                        + json.dumps(terminal, separators=(",", ":"), sort_keys=True)
+                    )
         print(f"ERROR: {exc}", file=os.sys.stderr)
         return 1
-    print(f"LOCAL_APP_RELEASE_COMPLETE evidence={evidence}")
+    if args.operation_id is None:
+        print(f"LOCAL_APP_RELEASE_COMPLETE evidence={evidence}")
+    else:
+        terminal = _read_immutable_json(evidence)
+        if terminal is None:
+            print("ERROR: immutable operation receipt disappeared", file=os.sys.stderr)
+            return 1
+        print(
+            "LOCAL_APP_RELEASE_RECEIPT "
+            + json.dumps(terminal, separators=(",", ":"), sort_keys=True)
+        )
     return 0
 
 

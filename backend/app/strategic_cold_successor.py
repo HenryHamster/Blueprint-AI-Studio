@@ -21,6 +21,7 @@ from app.strategic_memory_sources import canonical_json_bytes, sha256_hex
 
 
 COLD_SUCCESSOR_SCHEMA_VERSION = 1
+_HANDOFF_MEMORY_TAG = "handoff"
 _PAYLOAD_CONTEXT = "strategic_cold_successor:strategic_review"
 
 
@@ -104,7 +105,15 @@ def serialize_cold_successor_contract(
     ):
         raise ColdSuccessorContractError("running_update must be text or null")
 
-    memory = [_memory_document(document) for document in memory_documents]
+    active_memory = [_memory_document(document) for document in memory_documents]
+    memory = [
+        item for item in active_memory if _HANDOFF_MEMORY_TAG in item["tags"]
+    ]
+    if len(memory) != 1:
+        raise ColdSuccessorContractError(
+            "cold successor requires exactly one active strategic memory tagged "
+            f"'handoff'; found {len(memory)}"
+        )
     memory.sort(key=lambda item: (item["created_at"], item["id"]))
 
     problem_model_bytes = canonical_json_bytes(project.problem_model)

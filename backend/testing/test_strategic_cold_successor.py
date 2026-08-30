@@ -45,6 +45,7 @@ from app.strategic_cold_successor_lifecycle import (
     cold_successor_status,
     heartbeat_cold_successor,
     launch_cold_successor,
+    preview_cold_successor,
     read_cold_successor_receipt,
     terminal_cold_successor,
 )
@@ -75,7 +76,7 @@ def _memory(project_id, *, document_id, created_at, **overrides):
         "body": "Never infer from a transcript.",
         "topic": "operator_preference",
         "direction_id": "d-cold",
-        "tags": ["authority", "exact"],
+        "tags": ["authority", "exact", "handoff"],
         "lifecycle_status": "consumed",
         "created_at": created_at,
     }
@@ -97,7 +98,6 @@ async def test_locked_contract_is_exact_ordered_and_excludes_session_sources(db_
     foreign = _project(name="Foreign")
     db_session.add_all([project, foreign])
     await db_session.flush()
-
     source_task = Task(
         project_id=project.id,
         title="Forbidden session source",
@@ -116,7 +116,6 @@ async def test_locked_contract_is_exact_ordered_and_excludes_session_sources(db_
             context={"cursor": "CURSOR_SENTINEL"},
         )
     )
-
     at = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
     first_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
     second_id = uuid.UUID("00000000-0000-0000-0000-000000000002")
@@ -125,8 +124,8 @@ async def test_locked_contract_is_exact_ordered_and_excludes_session_sources(db_
         document_id=second_id,
         created_at=at,
         title="Second by UUID",
-        source_task_id=source_task.id,
-        source_citations=[{"secret": "CITATION_SENTINEL"}],
+        body="UNSELECTED_MEMORY_SENTINEL",
+        tags=["archive"],
         consumed_at=None,
     )
     included_first = _memory(
@@ -135,6 +134,8 @@ async def test_locked_contract_is_exact_ordered_and_excludes_session_sources(db_
         created_at=at,
         title="First by UUID",
         body="Full body 🐹",
+        source_task_id=source_task.id,
+        source_citations=[{"secret": "CITATION_SENTINEL"}],
     )
     excluded = [
         _memory(
@@ -167,31 +168,29 @@ async def test_locked_contract_is_exact_ordered_and_excludes_session_sources(db_
     ]
     db_session.add_all([included_second, included_first, *excluded])
     await db_session.commit()
-
     payload = await load_locked_cold_successor_contract(db_session, project.id)
+    preview = await preview_cold_successor(db_session, project.id)
     contract = payload["cold_successor_contract"]
     core = contract["core"]
     manifest = contract["manifest"]
-
     problem_model_bytes = core["problem_model_canonical_json"].encode("utf-8")
     memory_bytes = core["strategic_memory_canonical_json"].encode("utf-8")
     running_update_bytes = core["running_update"]["text"].encode("utf-8")
     memories = json.loads(memory_bytes)
-
     assert json.loads(problem_model_bytes) == project.problem_model
     assert core["running_update"] == {
         "present": True,
         "text": project.running_update,
     }
-    assert [item["id"] for item in memories] == [str(first_id), str(second_id)]
+    assert [item["id"] for item in memories] == [str(first_id)]
     assert memories[0]["body"] == "Full body 🐹"
-    assert memories[1]["title"] == "Second by UUID"
-    assert manifest["strategic_memory"]["document_count"] == 2
+    assert manifest["strategic_memory"]["document_count"] == 1
+    assert preview["core_sha256"] == manifest["core"]["sha256"]
+    assert preview["payload_byte_count"] == len(canonical_json_bytes(payload))
     _assert_section(manifest["problem_model"], problem_model_bytes)
     _assert_section(manifest["running_update"], running_update_bytes)
     _assert_section(manifest["strategic_memory"], memory_bytes)
     _assert_section(manifest["core"], canonical_json_bytes(core))
-
     rendered = json.dumps(payload, default=str)
     assert len(rendered.encode()) <= _MAX_PAYLOAD_BYTES
     for sentinel in (
@@ -202,6 +201,7 @@ async def test_locked_contract_is_exact_ordered_and_excludes_session_sources(db_
         "TRANSCRIPT_SENTINEL",
         "CURSOR_SENTINEL",
         "CITATION_SENTINEL",
+        "UNSELECTED_MEMORY_SENTINEL",
         "DISMISSED_SENTINEL",
         "PENDING_SENTINEL",
         "DESIGN_SENTINEL",
@@ -222,18 +222,18 @@ async def test_locked_contract_is_exact_ordered_and_excludes_session_sources(db_
 def test_contract_fails_closed_outside_safety_fence(override, message):
     project = _project(**override)
     original = project.model_dump()
-
     with pytest.raises(ColdSuccessorContractError, match=message):
         serialize_cold_successor_contract(project, [])
-
     assert project.model_dump() == original
 
 
 @pytest.mark.parametrize("running_update", [None, ""])
 def test_contract_preserves_null_versus_empty_running_update(running_update):
     project = _project(running_update=running_update)
-
-    payload = serialize_cold_successor_contract(project, [])
+    memory = _memory(
+        project.id, document_id=uuid.uuid4(), created_at=datetime.now(timezone.utc)
+    )
+    payload = serialize_cold_successor_contract(project, [memory])
     contract = payload["cold_successor_contract"]
     running = contract["core"]["running_update"]
     section = contract["manifest"]["running_update"]
@@ -245,13 +245,30 @@ def test_contract_preserves_null_versus_empty_running_update(running_update):
 
 def test_contract_rejects_oversize_without_trimming():
     project = _project()
+    at = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
     memory = _memory(
         project.id,
         document_id=uuid.uuid4(),
-        created_at=datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc),
-        body="x" * (_MAX_PAYLOAD_BYTES + 1),
+        created_at=at,
     )
-
+    archive = [
+        memory.model_copy(update={"id": uuid.uuid4(), "body": "x" * 9_800, "tags": ["archive"]})
+        for _ in range(20)
+    ]
+    payload = serialize_cold_successor_contract(project, [memory, *archive])
+    assert len(json.dumps(payload).encode()) <= _MAX_PAYLOAD_BYTES
+    invalid = _memory(project.id, document_id=uuid.uuid4(), created_at=at, tags=[1])
+    with pytest.raises(ColdSuccessorContractError, match="tags must be text"):
+        serialize_cold_successor_contract(project, [memory, invalid])
+    memory.tags = ["archive"]
+    with pytest.raises(ColdSuccessorContractError, match="found 0"):
+        serialize_cold_successor_contract(project, [memory])
+    memory.tags = ["handoff"]
+    with pytest.raises(ColdSuccessorContractError, match="found 2"):
+        serialize_cold_successor_contract(
+            project, [memory, memory.model_copy(update={"id": uuid.uuid4()})]
+        )
+    memory.body = "x" * (_MAX_PAYLOAD_BYTES + 1)
     with pytest.raises(PayloadTooLargeError) as raised:
         serialize_cold_successor_contract(project, [memory])
 
@@ -261,10 +278,7 @@ def test_contract_rejects_oversize_without_trimming():
 
 async def _ended_predecessor(db_session):
     project = _project(
-        vision={
-            "unrelated": "PRESERVE_ME",
-            "_strategic_failures": 2,
-        }
+        vision={"unrelated": "PRESERVE_ME", "_strategic_failures": 2}
     )
     db_session.add(project)
     await db_session.flush()
@@ -305,17 +319,18 @@ async def _ended_predecessor(db_session):
     )
     db_session.add_all([project, memory])
     await db_session.commit()
-    return project, predecessor
+    await db_session.refresh(project)
+    await db_session.refresh(memory)
+    preview = await preview_cold_successor(db_session, project.id)
+    return project, predecessor, preview["core_sha256"]
 
 
 async def _launch_active_cold_successor(db_session, monkeypatch, *, key: str):
-    project, predecessor = await _ended_predecessor(db_session)
+    project, predecessor, core_sha256 = await _ended_predecessor(db_session)
     runner_id = uuid.uuid4()
     monkeypatch.setattr(
-        lifecycle,
-        "_resolve_override_runner",
-        AsyncMock(return_value=SimpleNamespace(id=runner_id)),
-    )
+        lifecycle, "_resolve_override_runner",
+        AsyncMock(return_value=SimpleNamespace(id=runner_id)))
     monkeypatch.setattr(lifecycle, "_resident_runner_is_available", lambda _runner: True)
     launch_request = ColdSuccessorStartRequest(
         runner_id=runner_id,
@@ -323,13 +338,10 @@ async def _launch_active_cold_successor(db_session, monkeypatch, *, key: str):
         expected_predecessor_session_id="ss-ended-predecessor",
         expected_predecessor_task_id=predecessor.id,
         expected_predecessor_worker_generation=4,
+        expected_core_sha256=core_sha256,
     )
     launched = await launch_cold_successor(
-        db_session,
-        project.id,
-        launch_request,
-        operator_user_id="owner",
-    )
+        db_session, project.id, launch_request, operator_user_id="owner")
     assert launched["launch_effect_sha256"] == lifecycle._launch_effect_sha256(
         project.id, launch_request
     )
@@ -366,7 +378,6 @@ async def test_cold_receipt_read_is_pure_exact_and_incarnation_fenced(
             select(TaskHistory.id).where(TaskHistory.task_id == task.id)
         )
     ).scalars().all()
-
     pending = await read_cold_successor_receipt(db_session, project.id, request)
     repeated = await read_cold_successor_receipt(db_session, project.id, request)
 
@@ -481,13 +492,11 @@ async def test_cold_launch_is_force_fresh_idempotent_and_attested(
     db_session,
     monkeypatch,
 ):
-    project, predecessor = await _ended_predecessor(db_session)
+    project, predecessor, core_sha256 = await _ended_predecessor(db_session)
     runner_id = uuid.uuid4()
     monkeypatch.setattr(
-        lifecycle,
-        "_resolve_override_runner",
-        AsyncMock(return_value=SimpleNamespace(id=runner_id)),
-    )
+        lifecycle, "_resolve_override_runner",
+        AsyncMock(return_value=SimpleNamespace(id=runner_id)))
     monkeypatch.setattr(lifecycle, "_resident_runner_is_available", lambda _runner: True)
     start = ColdSuccessorStartRequest(
         runner_id=runner_id,
@@ -495,14 +504,20 @@ async def test_cold_launch_is_force_fresh_idempotent_and_attested(
         expected_predecessor_session_id="ss-ended-predecessor",
         expected_predecessor_task_id=predecessor.id,
         expected_predecessor_worker_generation=4,
+        expected_core_sha256=core_sha256,
     )
-
+    before_vision = json.loads(json.dumps(project.vision))
+    with pytest.raises(HTTPException) as stale_core:
+        await launch_cold_successor(
+            db_session,
+            project.id,
+            start.model_copy(update={"expected_core_sha256": "f" * 64}),
+            operator_user_id="owner",
+        )
+    assert stale_core.value.status_code == 409
+    assert project.vision == before_vision
     launched = await launch_cold_successor(
-        db_session,
-        project.id,
-        start,
-        operator_user_id="owner",
-    )
+        db_session, project.id, start, operator_user_id="owner")
     task = await db_session.get(Task, uuid.UUID(launched["task_id"]))
     assert task is not None
     assert task.id != predecessor.id
@@ -533,12 +548,11 @@ async def test_cold_launch_is_force_fresh_idempotent_and_attested(
     ).scalar_one()
     assert history.details["spawned_by"] == "COLD_SUCCESSOR"
 
+    project.running_update = "Changed after the committed launch."
+    db_session.add(project)
+    await db_session.commit()
     replay = await launch_cold_successor(
-        db_session,
-        project.id,
-        start,
-        operator_user_id="owner",
-    )
+        db_session, project.id, start, operator_user_id="owner")
     assert replay["task_id"] == launched["task_id"]
     with pytest.raises(HTTPException) as changed:
         await launch_cold_successor(
@@ -711,7 +725,7 @@ async def test_cold_terminal_without_attestation_is_durable_failure(
     db_session,
     monkeypatch,
 ):
-    project, predecessor = await _ended_predecessor(db_session)
+    project, predecessor, core_sha256 = await _ended_predecessor(db_session)
     runner_id = uuid.uuid4()
     monkeypatch.setattr(
         lifecycle,
@@ -728,6 +742,7 @@ async def test_cold_terminal_without_attestation_is_durable_failure(
             expected_predecessor_session_id="ss-ended-predecessor",
             expected_predecessor_task_id=predecessor.id,
             expected_predecessor_worker_generation=4,
+            expected_core_sha256=core_sha256,
         ),
         operator_user_id="owner",
     )
@@ -784,7 +799,7 @@ async def test_dedicated_terminal_requires_attestation_and_accepts_exact_failure
     db_session,
     monkeypatch,
 ):
-    project, predecessor = await _ended_predecessor(db_session)
+    project, predecessor, core_sha256 = await _ended_predecessor(db_session)
     runner_id = uuid.uuid4()
     monkeypatch.setattr(
         lifecycle,
@@ -801,6 +816,7 @@ async def test_dedicated_terminal_requires_attestation_and_accepts_exact_failure
             expected_predecessor_session_id="ss-ended-predecessor",
             expected_predecessor_task_id=predecessor.id,
             expected_predecessor_worker_generation=4,
+            expected_core_sha256=core_sha256,
         ),
         operator_user_id="owner",
     )

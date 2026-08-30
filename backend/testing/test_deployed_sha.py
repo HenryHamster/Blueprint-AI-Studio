@@ -468,7 +468,7 @@ class TestApprovedActivationExecutor:
         "activation_requested_at": "2026-08-09T00:00:00Z",
     }
 
-    def test_records_receipt_with_deployed_sha(self, monkeypatch):
+    def test_records_receipt_with_deployed_sha(self, monkeypatch, tmp_path):
         calls = []
         monkeypatch.setattr(deploy_blueprint, "_require_write_config", lambda _role: None)
         monkeypatch.setattr(
@@ -495,9 +495,9 @@ class TestApprovedActivationExecutor:
         monkeypatch.setattr(
             deploy_blueprint,
             "_invoke_release_shim",
-            lambda digest, revision, *, host: calls.append(
-                ("shim", digest, revision, host)
-            ),
+            lambda digest, revision, operation_id, *, host: calls.append(
+                ("shim", digest, revision, operation_id, host)
+            ) or True,
         )
         monkeypatch.setattr(deploy_blueprint, "_local_served_sha", lambda: _GIT_SHA)
         monkeypatch.setattr(
@@ -517,10 +517,16 @@ class TestApprovedActivationExecutor:
         monkeypatch.setattr(deploy_blueprint, "api", fake_api)
 
         assert deploy_blueprint._deploy_agent_once(
-            type("Args", (), {"project_id": None})()
+            type("Args", (), {
+                "project_id": None,
+                "state_path": str(tmp_path / "deploy-agent.state"),
+            })()
         ) is True
+        operation_id = deploy_blueprint._activation_operation_id(
+            "project-1", self._PROMOTED
+        )
         assert calls == [
-            ("shim", "sha256:" + "0" * 64, _GIT_SHA, None),
+            ("shim", "sha256:" + "0" * 64, _GIT_SHA, operation_id, None),
             (
                 "POST",
                 "/api/admin/projects/project-1/activation-receipt",
@@ -558,11 +564,15 @@ class TestApprovedActivationExecutor:
         )
         handoffs = []
 
-        def fail_release(digest, revision):
-            handoffs.append((digest, revision))
+        def fail_release(digest, revision, operation_id, *, receipt_only=False):
+            assert receipt_only is False
+            handoffs.append((digest, revision, operation_id))
             raise APIError("release failed with exit code 17")
 
         monkeypatch.setattr(deploy_blueprint, "_request_release_socket", fail_release)
+        monkeypatch.setattr(
+            deploy_blueprint, "get_project_id", lambda _args=None: "project-1"
+        )
         receipt_calls = []
         monkeypatch.setattr(
             deploy_blueprint,
@@ -579,13 +589,16 @@ class TestApprovedActivationExecutor:
                 {"project_id": None, "state_path": str(tmp_path / "deploy-agent.state")},
             )()
         ) is False
-        assert handoffs == [("sha256:" + "0" * 64, _GIT_SHA)] * 3
+        operation_id = deploy_blueprint._activation_operation_id(
+            "project-1", self._PROMOTED
+        )
+        assert handoffs == [("sha256:" + "0" * 64, _GIT_SHA, operation_id)]
         assert not receipt_calls
         failure_state = json.loads(
             (tmp_path / "deploy-agent.state").read_text(encoding="utf-8")
         )
         assert failure_state["phase"] == "failed"
-        assert failure_state["activation_attempts"] == 3
+        assert failure_state["activation_attempts"] == 1
         assert "release failed with exit code 17" in failure_state["failure_reason"]
 
 
@@ -667,36 +680,60 @@ class TestAtMostOnceReleaseFence:
     def test_slow_release_is_accepted_exactly_once(self, monkeypatch, tmp_path):
         import socket as _sock
         import threading
-        import time as _time
 
         socket_path = str(tmp_path / "release.sock")
         state_path = str(tmp_path / "deploy-agent.state")
         digest = "sha256:" + "0" * 64
+        operation_id = deploy_blueprint._activation_operation_id(
+            "project-1", self._PROMOTED
+        )
 
         # Real Unix socket server: accepts the client request, then sleeps past
         # the patched 1-second client timeout before responding.
         server_ready = threading.Event()
+        release_finished = threading.Event()
         requests_received: list[str] = []
+
+        def _read_request(conn) -> str:
+            data = b""
+            while b"\n" not in data:
+                chunk = conn.recv(256)
+                if not chunk:
+                    break
+                data += chunk
+            return data.decode("ascii").strip()
 
         def _slow_server() -> None:
             srv = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
             try:
                 srv.bind(socket_path)
-                srv.listen(1)
+                srv.listen(2)
                 server_ready.set()
                 conn, _ = srv.accept()
+                requests_received.append(_read_request(conn))
+
+                def _late_reply() -> None:
+                    release_finished.wait()
+                    try:
+                        conn.sendall(
+                            f"OK {operation_id} {digest} {_GIT_SHA} success\n".encode()
+                        )
+                    except OSError:
+                        pass
+                    finally:
+                        conn.close()
+
+                late_reply = threading.Thread(target=_late_reply)
+                late_reply.start()
+                receipt_conn, _ = srv.accept()
                 try:
-                    data = b""
-                    while b"\n" not in data:
-                        chunk = conn.recv(256)
-                        if not chunk:
-                            break
-                        data += chunk
-                    requests_received.append(data.decode("ascii").strip())
-                    _time.sleep(3.0)  # outlives the patched 1-second client timeout
-                    conn.sendall(b"OK\n")
+                    requests_received.append(_read_request(receipt_conn))
+                    receipt_conn.sendall(
+                        f"OK {operation_id} {digest} {_GIT_SHA} success\n".encode()
+                    )
                 finally:
-                    conn.close()
+                    receipt_conn.close()
+                late_reply.join(timeout=1)
             finally:
                 srv.close()
 
@@ -764,12 +801,16 @@ class TestAtMostOnceReleaseFence:
         persisted = deploy_blueprint._read_deploy_agent_state(state_path)
         assert persisted is not None
         assert persisted.get("phase") == "accepted"
+        release_finished.set()
 
-        # --- Second invocation: must not re-invoke the shim ---
-        deploy_blueprint._deploy_agent_once(args)
+        # --- Second invocation: exact receipt query, never activation replay ---
+        assert deploy_blueprint._deploy_agent_once(args) is True
 
-        # 3. The socket received exactly one request across both invocations.
-        assert len(requests_received) == 1
+        # 3. The socket received one activation and one exact receipt query.
+        assert requests_received == [
+            f"{digest} {_GIT_SHA} {operation_id}",
+            f"receipt {digest} {_GIT_SHA} {operation_id}",
+        ]
 
         # 4. Exactly one receipt was posted.
         receipt_posts = [
