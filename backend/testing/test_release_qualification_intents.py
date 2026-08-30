@@ -215,6 +215,7 @@ async def test_paused_intent_stays_due_then_applies_once(db_session, mocker):
         phase="stabilize",
     )
     task = await _source_task(db_session, project)
+    source_task_id = task.id
     intent = await prepare_qualification_intent(
         db_session,
         request={"reason": "apply after resume", "probes": []},
@@ -294,7 +295,7 @@ async def test_paused_intent_stays_due_then_applies_once(db_session, mocker):
     assert intent.result["intent_id"] == str(intent.id)
     assert intent.result["project_id"] == str(project.id)
     assert intent.result["release_version_id"] == str(version.id)
-    assert intent.result["source_task_id"] == str(task.id)
+    assert intent.result["source_task_id"] == str(source_task_id)
     assert intent.result["claim_id"]
     assert intent.result["attempt_count"] == 1
     assert intent.result["specification_hash"] == intent.specification_hash
@@ -305,6 +306,61 @@ async def test_paused_intent_stays_due_then_applies_once(db_session, mocker):
         session_factory=factory,
     )
     assert apply_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fresh_committed_refresh_arms_once_without_losing_vision(
+    db_session,
+    mocker,
+):
+    project, _version = await _make_project_and_version(
+        db_session,
+        phase="stabilize",
+    )
+    project.vision = {"unrelated": {"preserve": True}}
+    task = await _source_task(db_session, project)
+    intent = await prepare_qualification_intent(
+        db_session,
+        request={"reason": "fresh actionable block", "probes": []},
+        task=task,
+        project=project,
+    )
+    assert intent is not None
+    await db_session.commit()
+
+    async def _apply(*_args, result_out, **_kwargs):
+        result_out.update(status="ci_compliance_blocked")
+        return True
+
+    apply_mock = mocker.patch(
+        "app.strategic_completion._apply_qualify_request",
+        side_effect=_apply,
+    )
+    factory = _shared_session_factory(db_session)
+
+    assert await drain_qualification_intent(
+        intent.id,
+        session_factory=factory,
+    )
+    await db_session.refresh(intent)
+    await db_session.refresh(project)
+    assert intent.status == "applied"
+    assert intent.result["status"] == "ci_compliance_blocked"
+    assert intent.result["refresh_required"] is True
+    assert intent.result["refresh_delivery_state"] == "delivered"
+    assert project.vision["unrelated"] == {"preserve": True}
+    assert project.vision["_strategic_refresh"]["origin"] == "qualification"
+    assert project.vision["_strategic_refresh"]["count"] == 1
+    apply_mock.assert_awaited_once()
+
+    assert not await drain_qualification_intent(
+        intent.id,
+        session_factory=factory,
+    )
+    await db_session.refresh(project)
+    assert project.vision["unrelated"] == {"preserve": True}
+    assert project.vision["_strategic_refresh"]["count"] == 1
+    apply_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1014,6 +1070,11 @@ async def test_classified_non_authorizing_result_clears_dirty_json_before_receip
     )
     assert intent is not None
     await db_session.commit()
+    intent_id = intent.id
+    project_id = project.id
+    release_version_id = version.id
+    source_task_id = task.id
+    specification_hash = intent.specification_hash
 
     async def _classified_apply(
         request,
@@ -1036,7 +1097,7 @@ async def test_classified_non_authorizing_result_clears_dirty_json_before_receip
     )
 
     assert await drain_qualification_intent(
-        intent.id,
+        intent_id,
         session_factory=_shared_session_factory(db_session),
     )
     await db_session.refresh(intent)
@@ -1044,16 +1105,16 @@ async def test_classified_non_authorizing_result_clears_dirty_json_before_receip
     assert intent.status == "superseded"
     assert intent.result["status"] == "superseded"
     assert intent.result["delivery_state"] == "committed"
-    assert intent.result["intent_id"] == str(intent.id)
-    assert intent.result["project_id"] == str(project.id)
-    assert intent.result["release_version_id"] == str(version.id)
-    assert intent.result["source_task_id"] == str(task.id)
+    assert intent.result["intent_id"] == str(intent_id)
+    assert intent.result["project_id"] == str(project_id)
+    assert intent.result["release_version_id"] == str(release_version_id)
+    assert intent.result["source_task_id"] == str(source_task_id)
     assert intent.result["attempt_count"] == 1
     assert intent.result["claim_id"]
-    assert intent.result["specification_hash"] == intent.specification_hash
+    assert intent.result["specification_hash"] == specification_hash
     assert version.last_qualification is None
     assert not await drain_qualification_intent(
-        intent.id,
+        intent_id,
         session_factory=_shared_session_factory(db_session),
     )
     assert apply_mock.await_count == 1

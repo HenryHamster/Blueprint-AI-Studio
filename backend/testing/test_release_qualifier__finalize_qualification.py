@@ -124,7 +124,7 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_finalize_absent_integration_branch_candidate_ci_self_clears_ci_unresolved(
+async def test_finalize_explicit_integration_branch_candidate_ci_self_clears_ci_unresolved(
     db_session,
     mocker,
 ):
@@ -134,6 +134,8 @@ async def test_finalize_absent_integration_branch_candidate_ci_self_clears_ci_un
     shared_state.runtime_config["promotion_enabled"] = False
     _patch_finalize_ci_test_incidental_gates(mocker)
     project, version = await _make_project_and_version(db_session)
+    project.integration_branch = "automain"
+    project.promotion_target = "main"
     project.build_config = {
         "requires_ci_checks": False,
         "has_ci": True,
@@ -163,7 +165,7 @@ async def test_finalize_absent_integration_branch_candidate_ci_self_clears_ci_un
     async def _is_ancestor(token, owner, repo, ancestor, descendant, **kwargs):
         if descendant == "automain":
             return True
-        return False  # main idempotency check should not be reached in dry_run path
+        return False
 
     ancestry = mocker.patch(
         "app.github.is_ancestor_of",
@@ -175,14 +177,14 @@ async def test_finalize_absent_integration_branch_candidate_ci_self_clears_ci_un
     await db_session.commit()
 
     assert result["status"] == "dry_run", result
-    ancestry.assert_awaited_once_with(
-        "gh-token",
-        "acme",
-        "widget",
-        candidate_sha,
-        "automain",
-        project_id=str(project.id),
-    )
+    assert [entry.args for entry in ancestry.await_args_list] == [
+        ("gh-token", "acme", "widget", candidate_sha, "automain"),
+        ("gh-token", "acme", "widget", candidate_sha, "main"),
+    ]
+    assert [entry.kwargs for entry in ancestry.await_args_list] == [
+        {"project_id": str(project.id)},
+        {"project_id": str(project.id)},
+    ]
     promote_spy.assert_not_called()
 
     await db_session.refresh(version)

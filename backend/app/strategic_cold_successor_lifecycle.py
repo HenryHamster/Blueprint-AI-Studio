@@ -24,6 +24,7 @@ from app.models import (
     TaskStatus,
 )
 from app.max_plan_pool import get_task_llm_account_id, release_max_plan_account
+from app.payload_schemas import validate_internal_payload
 from app.strategic_cold_successor import serialize_cold_successor_contract
 from app.strategic_cold_successor_authority import (
     COLD_SUCCESSOR_CONTEXT_KEY,
@@ -47,7 +48,7 @@ from app.strategic_resident_session import (
     resident_session_is_active,
     resident_worker_incarnation_is_current,
 )
-from app.task_locking import project_lock, task_lock
+from app.task_locking import project_lock, task_lock, with_vision_locked
 from app.time_utils import _utcnow
 
 
@@ -443,6 +444,10 @@ async def launch_cold_successor(
             project,
             await _load_memory(session, project.id),
         )
+        payload = validate_internal_payload(
+            payload,
+            "strategic_cold_successor_lifecycle:launch_cold_successor",
+        )
         session_id = new_session_id()
         generation = 1
         core_sha256 = payload["cold_successor_contract"]["manifest"]["core"]["sha256"]
@@ -504,9 +509,15 @@ async def launch_cold_successor(
             "core_sha256": core_sha256,
             "proof_state": "pending",
         }
-        project.vision = vision
-        flag_modified(project, "vision")
-        session.add(project)
+        await with_vision_locked(
+            session,
+            project.id,
+            lambda current_vision: current_vision.__setitem__(
+                RESIDENT_SESSION_KEY,
+                vision[RESIDENT_SESSION_KEY],
+            ),
+            _locked_project=project,
+        )
         await session.commit()
         await session.refresh(task)
         return cold_successor_projection(vision[RESIDENT_SESSION_KEY], task)
@@ -553,10 +564,17 @@ async def heartbeat_cold_successor(
                 updated_at=now.isoformat(),
             )
             vision[RESIDENT_SESSION_KEY] = current
-            project.vision = vision
-            flag_modified(project, "vision")
+            await with_vision_locked(
+                session,
+                project.id,
+                lambda current_vision: current_vision.__setitem__(
+                    RESIDENT_SESSION_KEY,
+                    current,
+                ),
+                _locked_project=project,
+            )
             task.last_heartbeat = now
-            session.add_all([project, task])
+            session.add(task)
             await session.commit()
             return {
                 "authority_held": True,
@@ -977,9 +995,16 @@ async def terminal_cold_successor(
                 updated_at=now_iso,
             )
             vision[RESIDENT_SESSION_KEY] = ended
-            project.vision = vision
-            flag_modified(project, "vision")
-            session.add_all([project, task])
+            await with_vision_locked(
+                session,
+                project.id,
+                lambda current_vision: current_vision.__setitem__(
+                    RESIDENT_SESSION_KEY,
+                    ended,
+                ),
+                _locked_project=project,
+            )
+            session.add(task)
             session.add(
                 TaskHistory(
                     task_id=task.id,
@@ -1091,9 +1116,15 @@ async def reconcile_cold_successor_terminal(
                 updated_at=now_iso,
             )
             vision[RESIDENT_SESSION_KEY] = ended
-            project.vision = vision
-            flag_modified(project, "vision")
-            session.add(project)
+            await with_vision_locked(
+                session,
+                project.id,
+                lambda current_vision: current_vision.__setitem__(
+                    RESIDENT_SESSION_KEY,
+                    ended,
+                ),
+                _locked_project=project,
+            )
             await session.commit()
             return True
 

@@ -2440,9 +2440,9 @@ async def test_run_qualification_managed_check_wait_is_noop(db_session, mocker):
 async def test_run_qualification_refreshes_stale_check_wait_under_lock(
     db_session, mocker
 ):
-    """Regression (re-qual serialization): a re-qualify must no-op even when the
-    caller passes a STALE in-memory version whose last_qualification predates the
-    promote() that set managed_check_wait in another session.
+    """Regression (re-qual serialization): a re-qualify must fail its exact CAS
+    when the caller passes a STALE in-memory version whose last_qualification
+    predates the promote() that set managed_check_wait in another session.
 
     This reproduces the redundant-audit incident: the strategic qualify_request
     path loads the open version via current_open_version() and may hold a copy
@@ -2450,9 +2450,8 @@ async def test_run_qualification_refreshes_stale_check_wait_under_lock(
     populate_existing on the under-lock FOR UPDATE re-select, that SELECT acquires
     the row lock but returns the SAME stale identity-map instance, so the
     managed-promotion guard reads non-blocking state and spawns a fresh audit +
-    merge-grade while the promotion PR is genuinely open.  With the fix the
-    re-select overwrites the cached attributes, so the guard sees the committed
-    check_wait and no-ops."""
+    merge-grade while the promotion PR is genuinely open.  Exact authority now
+    rejects that stale caller fingerprint before any duplicate work is spawned."""
     from sqlalchemy import update as _sa_update
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -2525,10 +2524,9 @@ async def test_run_qualification_refreshes_stale_check_wait_under_lock(
     )
     await db_session.commit()
 
-    # The under-lock re-select refreshed the stale instance, so the
-    # managed-promotion guard caught the check_wait — no fresh spawn.
-    assert result["status"] == "promotion_check_wait"
-    assert result["promotion_pr_number"] == 909
+    # The under-lock re-select refreshed the stale instance, so exact authority
+    # superseded the stale request — no fresh spawn.
+    assert result["status"] == "superseded_qualification_state"
 
     await db_session.refresh(version)
     assert version.last_qualification["promotion_pending"]["pr_number"] == 909

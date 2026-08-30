@@ -2004,9 +2004,34 @@ async def _handle_infra_failure(
         or child_failures_total > len(child_failures)
     )
     signature = _infra_failure_signature(infra_error, child_failures)
-    previous_signature = qual.get("previous_infra_failure_signature") or qual.get(
-        "prior_infra_failure_signature"
-    )
+    raw_prior_history = qual.get("infra_attempt_history")
+    prior_history = _bounded_infra_history(raw_prior_history)
+    explicit_previous_signature = qual.get("previous_infra_failure_signature")
+    if explicit_previous_signature is None:
+        explicit_previous_signature = qual.get("prior_infra_failure_signature")
+    if explicit_previous_signature is None:
+        raw_previous_entry = (
+            raw_prior_history[-1]
+            if isinstance(raw_prior_history, list) and raw_prior_history
+            else None
+        )
+        history_signature = (
+            raw_previous_entry.get("signature")
+            if isinstance(raw_previous_entry, dict)
+            else None
+        )
+        previous_signature = (
+            history_signature
+            if isinstance(history_signature, str) and history_signature
+            else None
+        )
+    else:
+        previous_signature = (
+            explicit_previous_signature
+            if isinstance(explicit_previous_signature, str)
+            and explicit_previous_signature
+            else None
+        )
     previous_candidate_sha = qual.get("previous_infra_failure_candidate_sha")
     same_error_as_prior = bool(previous_signature and signature == previous_signature)
     same_error_different_candidate = bool(
@@ -2016,7 +2041,6 @@ async def _handle_infra_failure(
         and previous_candidate_sha != qual.get("candidate_sha")
     )
     engine_sha = get_serving_sha()
-    prior_history = _bounded_infra_history(qual.get("infra_attempt_history"))
     previous_engine_sha = next(
         (
             entry.get("engine_sha")

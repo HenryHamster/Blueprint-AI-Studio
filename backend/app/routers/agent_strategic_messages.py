@@ -2458,35 +2458,56 @@ async def claim_next_workday_continuation(
             row=claim.message,
         )
         try:
-            if (
-                server_lineage is None
-                or not server_lineage.projections_valid
-                or result_context.get("_workday_consultation_atomic_reply_id")
-                != str(server_lineage.public_source_id)
-            ):
+            if server_lineage is None or not server_lineage.projections_valid:
                 raise HTTPException(
                     status_code=409,
                     detail="Workday continuation server lineage is invalid",
                 )
-            mutation_receipts, mutation_receipts_have_more = (
-                await _reconciled_workday_continuation_receipts(
-                    session,
-                    project_id=project_id,
-                    result_content=claim.message.content,
-                    result_context=result_context,
-                    source_packet_id=(
-                        server_lineage.authority_row_id
-                        if server_lineage is not None
-                        else None
-                    ),
+            if server_lineage.kind == "autonomous_handoff":
+                forbidden_provenance_keys = (
+                    "_workday_consultation_atomic_reply_id",
+                    "source_packet_id",
+                    "_workday_consultation_operation_ledger",
+                    "_workday_consultation_mutation_receipts",
+                    "_workday_consultation_mutation_receipts_has_more",
                 )
-            )
+                if (
+                    server_lineage.public_source_id is not None
+                    or server_lineage.authority_row_id != claim.message.id
+                    or any(key in result_context for key in forbidden_provenance_keys)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Autonomous Workday continuation provenance is invalid",
+                    )
+                mutation_receipts = []
+                mutation_receipts_have_more = False
+            else:
+                if (
+                    server_lineage.public_source_id is None
+                    or result_context.get("_workday_consultation_atomic_reply_id")
+                    != str(server_lineage.public_source_id)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Workday continuation server lineage is invalid",
+                    )
+                mutation_receipts, mutation_receipts_have_more = (
+                    await _reconciled_workday_continuation_receipts(
+                        session,
+                        project_id=project_id,
+                        result_content=claim.message.content,
+                        result_context=result_context,
+                        source_packet_id=server_lineage.authority_row_id,
+                    )
+                )
         except HTTPException as exc:
             if exc.status_code != 409:
                 raise
             neutral_source_id = (
                 server_lineage.public_source_id
                 if server_lineage is not None
+                and server_lineage.kind != "autonomous_handoff"
                 else await _terminal_recovery_source_candidate_from_server_key(
                     session,
                     row=claim.message,

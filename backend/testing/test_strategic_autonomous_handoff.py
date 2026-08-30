@@ -154,15 +154,23 @@ async def _end(client, task, incarnation, lease):
     )
 
 
-async def _claim_continuation(client, project, task, incarnation):
+async def _claim_continuation(
+    client,
+    project,
+    task,
+    incarnation,
+    *,
+    session_id=SESSION_ID,
+    generation=GENERATION,
+):
     return await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/"
         "continuations/claim-next",
         headers=_headers(task),
         json={
             "task_id": str(task.id),
-            "session_id": SESSION_ID,
-            "worker_generation": GENERATION,
+            "session_id": session_id,
+            "worker_generation": generation,
             "incarnation_id": str(incarnation),
             "lease_seconds": 45,
         },
@@ -307,6 +315,11 @@ async def test_autonomous_handoff_fast_continuation_is_sole_public_delivery(
     assert continuation["result_packet_id"] == report.json()["result_packet_id"]
     assert continuation["consultation_id"] is None
     assert "A durable blocker exists." in continuation["result_summary"]
+    live_authority = continuation["current_live_work_authority"]
+    assert live_authority["consultation_mutation_receipts"] == []
+    assert live_authority["collection_metadata"][
+        "consultation_mutation_receipts"
+    ] == {"returned_count": 0, "has_more": False}
     complete_payload = {
         "task_id": str(task.id),
         "session_id": SESSION_ID,
@@ -346,6 +359,355 @@ async def test_autonomous_handoff_fast_continuation_is_sole_public_delivery(
     assert public_rows[0].context["_workday_result_packet_id"] == continuation[
         "result_packet_id"
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "forged_public_source",
+        "producer_incarnation",
+        "resident_session",
+        "malformed_server_key",
+        "missing_source_task",
+    ],
+)
+async def test_autonomous_handoff_provenance_tamper_is_quarantined(
+    client: AsyncClient,
+    db_session,
+    tamper: str,
+):
+    project, task, incarnation = await _make_worker(db_session)
+    client_turn_id = uuid.uuid4()
+    begun = await _begin(
+        client,
+        task,
+        incarnation,
+        client_turn_id=client_turn_id,
+    )
+    assert begun.status_code == 200, begun.text
+    report = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task),
+        json=_report_payload(task, incarnation, begun.json()),
+    )
+    assert report.status_code == 200, report.text
+    assert (await _end(client, task, incarnation, begun.json())).status_code == 200
+
+    result_id = uuid.UUID(report.json()["result_packet_id"])
+    result = await db_session.get(ProjectMessage, result_id)
+    assert result is not None
+    original_key = f"autonomous-workday-handoff:{task.id}:{client_turn_id}"
+    assert result.idempotency_key == original_key
+    expected_key = original_key
+    result_context = dict(result.context or {})
+    if tamper == "forged_public_source":
+        forged_source_id = uuid.uuid4()
+        result_context["source_packet_id"] = str(forged_source_id)
+        result_context["_workday_consultation_atomic_reply_id"] = str(
+            forged_source_id
+        )
+    elif tamper == "producer_incarnation":
+        result_context["autonomous_worker_incarnation"] = str(uuid.uuid4())
+    elif tamper == "resident_session":
+        result.resident_session_id = f"forged-session-{uuid.uuid4()}"
+    elif tamper == "malformed_server_key":
+        expected_key = (
+            f"autonomous-workday-handoff:not-a-uuid:{client_turn_id}"
+        )
+        result.idempotency_key = expected_key
+    else:
+        expected_key = (
+            f"autonomous-workday-handoff:{uuid.uuid4()}:{client_turn_id}"
+        )
+        result.idempotency_key = expected_key
+    result.context = result_context
+    db_session.add(result)
+    await db_session.commit()
+
+    claimed = await _claim_continuation(client, project, task, incarnation)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["status"] == "empty"
+
+    quarantined = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == result_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert quarantined.idempotency_key == expected_key
+    assert quarantined.status == "resolved"
+    assert quarantined.handling_state == MessageHandlingState.SUPERSEDED
+    assert quarantined.handled_by_task_id is None
+    assert (
+        quarantined.resolution
+        == "private_handoff_continuation_provenance_invalid"
+    )
+    quarantined_context = dict(quarantined.context or {})
+    assert quarantined_context["_private_handoff_retirement"]["reason"] == (
+        "continuation_provenance_invalid"
+    )
+    assert not any(
+        key.startswith("_workday_continuation_claim_")
+        for key in quarantined_context
+    )
+
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    assert not any(
+        row.from_type == "strategic"
+        and isinstance(row.context, dict)
+        and row.context.get("message_role") == "workday_consultation_continuation"
+        for row in rows
+    )
+    assert not any(
+        str(row.idempotency_key or "").startswith(
+            "workday-consultation-terminal-recovery:"
+        )
+        or str(row.idempotency_key or "").startswith(
+            "workday-consultation-terminal-recovery-replacement:"
+        )
+        for row in rows
+    )
+    replay = await _claim_continuation(client, project, task, incarnation)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["status"] == "empty"
+
+
+@pytest.mark.asyncio
+async def test_autonomous_handoff_rebound_retry_rejects_producer_tamper(
+    client: AsyncClient,
+    db_session,
+):
+    project, source_task, source_incarnation = await _make_worker(db_session)
+    client_turn_id = uuid.uuid4()
+    begun = await _begin(
+        client,
+        source_task,
+        source_incarnation,
+        client_turn_id=client_turn_id,
+    )
+    assert begun.status_code == 200, begun.text
+    report = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(source_task),
+        json=_report_payload(source_task, source_incarnation, begun.json()),
+    )
+    assert report.status_code == 200, report.text
+    assert (
+        await _end(client, source_task, source_incarnation, begun.json())
+    ).status_code == 200
+    result_id = uuid.UUID(report.json()["result_packet_id"])
+    original_key = (
+        f"autonomous-workday-handoff:{source_task.id}:{client_turn_id}"
+    )
+    source_result = await db_session.get(ProjectMessage, result_id)
+    assert source_result is not None
+    original_snapshot_id = uuid.UUID(
+        source_result.context["envelope"]["snapshot_id"]
+    )
+
+    successor_session_id = "autonomous-handoff-successor-session"
+    successor_generation = GENERATION + 1
+    successor_task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=VM_ID,
+        payloads=[
+            {
+                "type": "strategic_review",
+                "prompt": "successor typed Fast",
+                "typed_fast_enabled": True,
+            }
+        ],
+        context={
+            "_resident_session": True,
+            "strategic_session_id": successor_session_id,
+            "_resident_worker_generation": successor_generation,
+        },
+    )
+    db_session.add(successor_task)
+    await db_session.commit()
+    await db_session.refresh(successor_task)
+    successor_incarnation = uuid.uuid4()
+    project = (
+        await db_session.execute(
+            select(Project)
+            .where(Project.id == project.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    vision = dict(project.vision or {})
+    resident = dict(vision.get("_resident_strategic_session") or {})
+    resident.update(
+        session_id=successor_session_id,
+        task_id=str(successor_task.id),
+        worker_generation=successor_generation,
+        worker_incarnation_id=str(successor_incarnation),
+        worker_incarnation_expires_at=(
+            _utcnow() + timedelta(minutes=10)
+        ).isoformat(),
+        status="active",
+    )
+    vision["_resident_strategic_session"] = resident
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    first_claim = await _claim_continuation(
+        client,
+        project,
+        successor_task,
+        successor_incarnation,
+        session_id=successor_session_id,
+        generation=successor_generation,
+    )
+    assert first_claim.status_code == 200, first_claim.text
+    first_body = first_claim.json()
+    assert first_body["status"] == "claimed"
+    continuation = first_body["continuation"]
+    assert continuation["result_packet_id"] == str(result_id)
+
+    rebound_result = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == result_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    rebound_context = dict(rebound_result.context or {})
+    assert rebound_result.resident_session_id == successor_session_id
+    assert rebound_result.handling_state == MessageHandlingState.CLAIMED
+    assert rebound_result.handled_by_task_id == successor_task.id
+    assert "_resident_handoff_from_session_id" not in rebound_context
+    assert rebound_context["_workday_continuation_claim_id"] == continuation[
+        "continuation_claim_id"
+    ]
+    rebound_snapshot_id = uuid.UUID(rebound_context["envelope"]["snapshot_id"])
+    assert rebound_snapshot_id != original_snapshot_id
+    rebound_snapshot = await db_session.get(
+        StrategicContextEnvelopeSnapshot,
+        rebound_snapshot_id,
+    )
+    assert rebound_snapshot is not None
+    assert rebound_snapshot.session_id == successor_session_id
+    assert rebound_snapshot.worker_generation == successor_generation
+    assert rebound_snapshot.worker_incarnation == successor_incarnation
+    rebound_trace = dict(rebound_snapshot.retrieval_trace or {})
+    assert rebound_trace["workday_worker_rebind"] is True
+    assert rebound_trace["source_snapshot_id"] == str(original_snapshot_id)
+    assert rebound_trace["source_session_id"] == SESSION_ID
+    assert rebound_trace["target_session_id"] == successor_session_id
+    assert rebound_trace["workday_rebind_depth"] == 1
+    assert rebound_trace["workday_rebind_root_snapshot_id"] == str(
+        original_snapshot_id
+    )
+    assert rebound_trace["workday_rebind_root_session_id"] == SESSION_ID
+    assert rebound_trace["workday_rebind_root_worker_generation"] == GENERATION
+    assert rebound_trace["workday_rebind_root_worker_incarnation"] == str(
+        source_incarnation
+    )
+
+    original_snapshot = await db_session.get(
+        StrategicContextEnvelopeSnapshot,
+        original_snapshot_id,
+    )
+    assert original_snapshot is not None
+    await db_session.delete(original_snapshot)
+    await db_session.commit()
+    assert (
+        await db_session.get(
+            StrategicContextEnvelopeSnapshot,
+            original_snapshot_id,
+        )
+        is None
+    )
+
+    clean_retry = await _claim_continuation(
+        client,
+        project,
+        successor_task,
+        successor_incarnation,
+        session_id=successor_session_id,
+        generation=successor_generation,
+    )
+    assert clean_retry.status_code == 200, clean_retry.text
+    assert clean_retry.json()["status"] == "claimed"
+    clean_continuation = clean_retry.json()["continuation"]
+    assert clean_continuation["result_packet_id"] == str(result_id)
+    assert clean_continuation["continuation_claim_id"] == continuation[
+        "continuation_claim_id"
+    ]
+
+    rebound_result = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == result_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    rebound_context = dict(rebound_result.context or {})
+    rebound_context["autonomous_worker_incarnation"] = str(uuid.uuid4())
+    rebound_result.context = rebound_context
+    db_session.add(rebound_result)
+    await db_session.commit()
+
+    retried = await _claim_continuation(
+        client,
+        project,
+        successor_task,
+        successor_incarnation,
+        session_id=successor_session_id,
+        generation=successor_generation,
+    )
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["status"] == "empty"
+
+    quarantined = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == result_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert quarantined.idempotency_key == original_key
+    assert quarantined.status == "resolved"
+    assert quarantined.handling_state == MessageHandlingState.SUPERSEDED
+    assert quarantined.handled_by_task_id is None
+    assert quarantined.resolution == "private_handoff_continuation_provenance_invalid"
+    quarantined_context = dict(quarantined.context or {})
+    assert quarantined_context["_private_handoff_retirement"]["reason"] == (
+        "continuation_provenance_invalid"
+    )
+    assert not any(
+        key.startswith("_workday_continuation_claim_")
+        for key in quarantined_context
+    )
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    assert not any(
+        row.from_type == "strategic"
+        and isinstance(row.context, dict)
+        and row.context.get("message_role") == "workday_consultation_continuation"
+        for row in rows
+    )
+    assert not any(
+        str(row.idempotency_key or "").startswith(
+            "workday-consultation-terminal-recovery:"
+        )
+        or str(row.idempotency_key or "").startswith(
+            "workday-consultation-terminal-recovery-replacement:"
+        )
+        for row in rows
+    )
 
 
 @pytest.mark.asyncio

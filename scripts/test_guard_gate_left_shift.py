@@ -705,6 +705,7 @@ case "${1:-}" in
   image) exit 0 ;;
   exec)
     for arg in "$@"; do
+      if [ "$arg" = "/proc/1/comm" ]; then printf 'postgres\n'; exit 0; fi
       if [ "$arg" = "psql" ]; then printf '1\n'; break; fi
     done
     exit 0
