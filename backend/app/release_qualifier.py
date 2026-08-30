@@ -10659,9 +10659,6 @@ async def _finalize_locked_version(
         )
         return None
 
-    # ``rollback()`` expires ORM state.  Keep the immutable display value as a
-    # scalar so the diagnostic-only exits below never lazy-load ``version``
-    # after ending their transaction.
     locked_version_number = version.version_number
 
     qual = version.last_qualification or {}
