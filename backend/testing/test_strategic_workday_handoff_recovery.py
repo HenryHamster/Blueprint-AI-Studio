@@ -481,11 +481,38 @@ async def test_retired_session_packet_and_result_rebind_to_current_resident(
             )
         )
     ).scalars().one()
-    original_result_snapshot_id = await _move_private_handoff_to_retired_session(
-        db_session,
-        result,
-        retired_session_id="retired-result-session",
+    result_context = dict(result.context or {})
+    original_result_snapshot_id = uuid.UUID(
+        str(result_context["envelope"]["snapshot_id"])
     )
+    origin_session_id = identity["session_id"]
+    changed = await handoff_session_messages(
+        db_session,
+        project.id,
+        origin_session_id,
+        replacement_resident_active=True,
+    )
+    assert changed >= 1
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+    replacement_session_id = "replacement-result-session"
+    task_context = dict(task.context or {})
+    task_context["strategic_session_id"] = replacement_session_id
+    task_context["_resident_worker_generation"] = 3
+    task.context = task_context
+    flag_modified(task, "context")
+    resident = dict(project.vision["_resident_strategic_session"])
+    resident["session_id"] = replacement_session_id
+    resident["worker_generation"] = 3
+    project.vision = {**project.vision, "_resident_strategic_session": resident}
+    flag_modified(project, "vision")
+    db_session.add_all([project, task])
+    await db_session.commit()
+    identity = {
+        **identity,
+        "session_id": replacement_session_id,
+        "worker_generation": 3,
+    }
 
     continuation = await _claim_continuation(client, project, task, identity)
     assert continuation.status_code == 200, continuation.text
@@ -506,7 +533,7 @@ async def test_retired_session_packet_and_result_rebind_to_current_resident(
     )
     assert original_result_snapshot is not None
     assert rebound_result_snapshot is not None
-    assert original_result_snapshot.session_id == "retired-result-session"
+    assert original_result_snapshot.session_id == origin_session_id
     assert rebound_result_snapshot.session_id == identity["session_id"]
     assert original_result_snapshot.canonical_sha256 == (
         rebound_result_snapshot.canonical_sha256
@@ -661,6 +688,19 @@ async def test_retired_owner_receipts_replay_and_reach_current_continuation(
         replacement_resident_active=True,
     )
     assert changed >= 1
+    await db_session.refresh(durable_packet)
+    assert durable_packet.context["_workday_consultation_operation_ledger"] == [
+        old_receipt
+    ]
+    assert durable_packet.context["_workday_consultation_claim_attempt"] == 1
+    for key in (
+        "_workday_consultation_claim_id",
+        "_workday_consultation_claim_generation",
+        "_workday_consultation_claim_incarnation",
+        "_workday_consultation_claim_expires_at",
+        "_workday_consultation_claim_started_at",
+    ):
+        assert key not in durable_packet.context
     await db_session.refresh(project)
     await db_session.refresh(task)
     replacement_session_id = "replacement-receipt-session"
@@ -689,6 +729,9 @@ async def test_retired_owner_receipts_replay_and_reach_current_continuation(
     assert replacement_claim.status_code == 200, replacement_claim.text
     assert replacement_claim.json()["status"] == "claimed"
     claimed = replacement_claim.json()["packet"]
+    assert len(claimed["prior_receipts"]) == 1
+    for key, value in old_receipt.items():
+        assert claimed["prior_receipts"][0][key] == value
 
     await db_session.execute(
         update(Project)

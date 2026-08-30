@@ -1385,6 +1385,21 @@ def retain_workday_consultation_attempt_for_session_handoff(
         pass
     else:
         raise ValueError("consultation handoff attempt history conflicts")
+    # The authority row and attempt diagnostic above are the durable record of
+    # the displaced claim.  Its mutable lease fields must not survive after
+    # session_message_handoff clears the row owner: a replacement Resident
+    # would otherwise be forced to reconstruct the predecessor from owner
+    # columns that are intentionally NULL at the handoff boundary.  Historical
+    # receipts remain bound to the immutable authority row; only the next live
+    # claimant may mint new lease authority.
+    for key in (
+        _WORKDAY_CLAIM_ID_CONTEXT_KEY,
+        _WORKDAY_CLAIM_GENERATION_CONTEXT_KEY,
+        _WORKDAY_CLAIM_INCARNATION_CONTEXT_KEY,
+        _WORKDAY_CLAIM_EXPIRES_CONTEXT_KEY,
+        _WORKDAY_CLAIM_STARTED_CONTEXT_KEY,
+    ):
+        normalized.pop(key, None)
     return normalized
 
 
