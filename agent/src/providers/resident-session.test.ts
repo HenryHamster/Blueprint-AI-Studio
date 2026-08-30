@@ -521,6 +521,48 @@ describe('startResidentClaudeSession', () => {
     session.close();
   });
 
+  it('counts long-running nested sub-agent output as parent-turn activity', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({
+      turnTimeoutMs: 7 * 60_000,
+      hardTurnTimeoutMs: 15 * 60_000,
+    });
+    const turn = session.sendTurn('parent delegates a long bounded audit');
+    let lastActivity = session.activeTurnProgress?.()?.lastActivityAtMs ?? 0;
+
+    for (let minute = 1; minute <= 7; minute += 1) {
+      await vi.advanceTimersByTimeAsync(60_000);
+      ctl.pushLine({
+        type: 'assistant',
+        parent_tool_use_id: 'task-long-audit',
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: `nested-tool-${minute}`,
+            name: 'Read',
+            input: { path: `/private/path/${minute}` },
+          }],
+        },
+      });
+      const currentActivity = session.activeTurnProgress?.()?.lastActivityAtMs ?? 0;
+      expect(currentActivity).toBeGreaterThan(lastActivity);
+      lastActivity = currentActivity;
+    }
+
+    ctl.pushLine({ type: 'result', result: 'parent succeeded', is_error: false });
+    const result = await turn;
+    expect(result).toMatchObject({
+      timedOut: false,
+      hardTimedOut: false,
+      resultText: 'parent succeeded',
+      toolCallCount: 7,
+    });
+    expect(result.trace?.filter(event => event.kind === 'tool')).toHaveLength(7);
+    expect(JSON.stringify(result.trace)).not.toContain('/private/path/');
+    session.close();
+  });
+
   it('ignores a nested type:error event for parent provider classification', async () => {
     const ctl = makeControllableChild();
     vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
@@ -534,11 +576,15 @@ describe('startResidentClaudeSession', () => {
     });
     ctl.pushLine({ type: 'result', result: 'parent succeeded', is_error: false });
 
-    await expect(turn).resolves.toMatchObject({
+    const result = await turn;
+    expect(result).toMatchObject({
       providerFailed: false,
       failureCategory: null,
       resultText: 'parent succeeded',
     });
+    expect(result.trace).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'error', label: 'nested_error', isError: true }),
+    ]));
     expect(session.failureCategory?.()).toBeNull();
     session.close();
   });

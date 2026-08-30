@@ -3539,6 +3539,8 @@ export async function handleStrategicResident(
         attempt_diagnostic: attemptDiagnostic,
         ...(resultSummary ? { result_summary: resultSummary } : {}),
       },
+      TYPED_COORDINATOR_API_ATTEMPTS,
+      TYPED_COORDINATOR_API_TIMEOUT_MS,
     );
   };
 
@@ -3558,12 +3560,115 @@ export async function handleStrategicResident(
           Math.max(45, Math.ceil(cfg.autonomousTurnTimeoutMs / 1_000) + 15),
         ),
       },
+      TYPED_COORDINATOR_API_ATTEMPTS,
+      TYPED_COORDINATOR_API_TIMEOUT_MS,
     ) as { workday_claim_id?: string; lease_expires_at?: string };
     // A renewal response is authoritative only when it proves that this exact
     // claim still owns a fresh lease.  Do not treat a syntactically-successful
     // response for another claimant as permission to keep private work running.
     return response.workday_claim_id === packet.workday_claim_id
       && typeof response.lease_expires_at === 'string';
+  };
+
+  const typedConsultationDiagnosticMatches = (
+    value: unknown,
+    expected: TypedConsultationAttemptDiagnostic,
+  ): boolean => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const candidate = value as Record<string, unknown>;
+    const normalizedTime = (raw: unknown): string | null => {
+      if (typeof raw !== 'string') return null;
+      const parsed = Date.parse(raw);
+      return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+    };
+    return JSON.stringify({
+      ...candidate,
+      started_at: normalizedTime(candidate.started_at),
+      ended_at: normalizedTime(candidate.ended_at),
+    }) === JSON.stringify({
+      ...expected,
+      started_at: normalizedTime(expected.started_at),
+      ended_at: normalizedTime(expected.ended_at),
+    });
+  };
+
+  const recordTypedConsultationAttemptDiagnostic = async (
+    packet: ClaimedTypedConsultation,
+    attemptDiagnostic: TypedConsultationAttemptDiagnostic,
+  ): Promise<void> => {
+    const basePath = (
+      `/api/agent/projects/${projectId}/workday-consultations/`
+      + `${packet.packet_id}/attempt-diagnostic`
+    );
+    const payload = {
+      task_id: taskId,
+      session_id: sessionId,
+      worker_generation: workerGeneration,
+      incarnation_id: residentProcessIncarnation,
+      workday_claim_id: packet.workday_claim_id,
+      attempt_diagnostic: attemptDiagnostic,
+    };
+    const postExact = async (): Promise<void> => {
+      const response = await apiPost(
+        basePath,
+        payload,
+        TYPED_COORDINATOR_API_ATTEMPTS,
+        TYPED_COORDINATOR_API_TIMEOUT_MS,
+      ) as { status?: string; attempt_diagnostic?: unknown };
+      if (
+        !['recorded', 'upgraded', 'duplicate'].includes(response.status ?? '')
+        || !typedConsultationDiagnosticMatches(
+          response.attempt_diagnostic,
+          attemptDiagnostic,
+        )
+      ) {
+        throw new Error('typed consultation diagnostic receipt did not match');
+      }
+    };
+    const readReceipt = async (): Promise<{ status?: string; attempt_diagnostic?: unknown }> => {
+      const params = new URLSearchParams({
+        task_id: taskId,
+        session_id: sessionId,
+        worker_generation: String(workerGeneration),
+        incarnation_id: residentProcessIncarnation,
+      });
+      return await apiGet(
+        `${basePath}/${packet.workday_claim_id}?${params.toString()}`,
+        TYPED_COORDINATOR_API_ATTEMPTS,
+        TYPED_COORDINATOR_API_TIMEOUT_MS,
+      ) as { status?: string; attempt_diagnostic?: unknown };
+    };
+    const receiptMatches = (
+      receipt: { status?: string; attempt_diagnostic?: unknown },
+    ): boolean => (
+      ['recorded', 'acknowledged'].includes(receipt.status ?? '')
+      && typedConsultationDiagnosticMatches(
+        receipt.attempt_diagnostic,
+        attemptDiagnostic,
+      )
+    );
+    const isAuthoritativeDiagnosticRejection = (error: unknown): boolean => (
+      /\(4\d\d\)/.test(String(error)) && !/\(429\)/.test(String(error))
+    );
+    try {
+      await postExact();
+      return;
+    } catch (initialError) {
+      if (isAuthoritativeDiagnosticRejection(initialError)) throw initialError;
+      const receipt = await readReceipt();
+      if (receiptMatches(receipt)) return;
+      if (receipt.status === 'missing' || receipt.status === 'server_missing') {
+        try {
+          await postExact();
+          return;
+        } catch (retryError) {
+          if (isAuthoritativeDiagnosticRejection(retryError)) throw retryError;
+          if (receiptMatches(await readReceipt())) return;
+          throw retryError;
+        }
+      }
+      throw initialError;
+    }
   };
 
   const awaitTypedConsultationTurn = async (
@@ -3650,6 +3755,7 @@ export async function handleStrategicResident(
         );
         let resultSummary: string | undefined;
         let result: ResidentTurnResult | undefined;
+        let leaseHeld = false;
         let terminalPredicate = 'turn_setup_failed';
         let turnExceptionDetail: string | null = null;
         const attemptStartedAtMs = Date.now();
@@ -3695,10 +3801,12 @@ export async function handleStrategicResident(
           const awaited = await awaitTypedConsultationTurn(packet, workdayTurn);
           result = awaited.result;
           terminalPredicate = awaited.terminalPredicate;
-          const { leaseHeld } = awaited;
+          leaseHeld = awaited.leaseHeld;
           resultSummary = result.resultText.trim().slice(0, 20_000) || undefined;
           const usableResult = leaseHeld
             && resultSummary !== undefined
+            && !result.providerFailed
+            && !result.interrupted
             && !result.processGone
             && !result.timedOut
             && !result.hardTimedOut
@@ -3706,7 +3814,10 @@ export async function handleStrategicResident(
           if (leaseHeld && !usableResult) {
             if (result.sentOperatorMessage) {
               terminalPredicate = 'private_reply_capability_violation';
-            } else if (resultSummary === undefined) {
+            } else if (
+              resultSummary === undefined
+              && terminalPredicate === 'provider_result'
+            ) {
               terminalPredicate = 'empty_provider_result';
             }
           }
@@ -3753,6 +3864,37 @@ export async function handleStrategicResident(
           trace_truncated: result?.traceTruncated ?? false,
         };
 
+        const retainAttemptAfterAuthorityLoss = async (
+          terminalPredicateAfterLoss: string,
+        ): Promise<void> => {
+          const diagnosticAfterLoss: TypedConsultationAttemptDiagnostic = (
+            attemptDiagnostic.outcome === 'completed'
+              ? {
+                  ...attemptDiagnostic,
+                  outcome: packet.attempt >= 2 ? 'failed' : 'abandoned',
+                  terminal_predicate: terminalPredicateAfterLoss,
+                }
+              : attemptDiagnostic
+          );
+          try {
+            await recordTypedConsultationAttemptDiagnostic(packet, diagnosticAfterLoss);
+          } catch (error) {
+            sendLog(
+              ws,
+              `[resident] typed Workday attempt diagnostic deferred: ${sanitize(String(error))}\n`,
+            );
+          }
+          typedConsultationDelivery.phase = 'deferred';
+        };
+
+        // An authoritative renewal loss revokes completion authority. Preserve
+        // the bounded provider evidence through the diagnostic-only receipt,
+        // then send zero acknowledgements for the displaced claim.
+        if (!leaseHeld) {
+          await retainAttemptAfterAuthorityLoss(terminalPredicate);
+          return;
+        }
+
         // Persist a non-running delivery state before the ack can create the
         // private result packet which Fast will later turn into a public
         // continuation. If the heartbeat is unavailable, do not ack: a result
@@ -3766,7 +3908,45 @@ export async function handleStrategicResident(
           'consultation_delivering',
           typedConsultationDelivery.consultationId,
         );
+        let nextDeliveryLeaseRenewAt = leaseHeld
+          ? Date.now() + CONVERSATION_CLAIM_RENEW_MS
+          : 0;
+        const keepDeliveryLease = async (): Promise<'held' | 'retry' | 'lost'> => {
+          if (Date.now() < nextDeliveryLeaseRenewAt) return 'held';
+          try {
+            if (await renewTypedConsultation(packet)) {
+              nextDeliveryLeaseRenewAt = Date.now() + CONVERSATION_CLAIM_RENEW_MS;
+              return 'held';
+            }
+            typedConsultationDelivery.phase = 'deferred';
+            return 'lost';
+          } catch (error) {
+            // A transport failure is ambiguous. Keep the exact diagnostic in
+            // memory and retry renewal/ack; only an authoritative ownership
+            // mismatch or ack 409 may discard this delivery attempt.
+            if (/\(409\)/.test(String(error))) {
+              typedConsultationDelivery.phase = 'deferred';
+              return 'lost';
+            }
+            sendLog(
+              ws,
+              `[resident] typed Workday delivery renewal deferred: ${sanitize(String(error))}\n`,
+            );
+            return 'retry';
+          }
+        };
         for (;;) {
+          const leaseState = await keepDeliveryLease();
+          if (leaseState === 'lost') {
+            await retainAttemptAfterAuthorityLoss('consultation_delivery_lease_lost');
+            return;
+          }
+          if (leaseState === 'retry') {
+            const retryHeartbeat = await livenessHeartbeat();
+            if (retryHeartbeat?.stop_requested || !residentIncarnationStillHeld()) return;
+            await sleep(Math.max(250, cfg.messagePollMs));
+            continue;
+          }
           const deliveryHeartbeat = await livenessHeartbeat();
           if (deliveryHeartbeat?.stop_requested || !residentIncarnationHeld) return;
           if (deliveryHeartbeat !== null) break;
@@ -3778,6 +3958,17 @@ export async function handleStrategicResident(
         // success. Only an explicit 409 proves this lease can no longer commit;
         // then preserve `delivering` while claim-next safely reclaims the packet.
         for (;;) {
+          const leaseState = await keepDeliveryLease();
+          if (leaseState === 'lost') {
+            await retainAttemptAfterAuthorityLoss('consultation_delivery_lease_lost');
+            return;
+          }
+          if (leaseState === 'retry') {
+            const retryHeartbeat = await livenessHeartbeat();
+            if (retryHeartbeat?.stop_requested || !residentIncarnationStillHeld()) return;
+            await sleep(Math.max(250, cfg.messagePollMs));
+            continue;
+          }
           try {
             await ackTypedConsultation(
               packet,
@@ -3793,7 +3984,7 @@ export async function handleStrategicResident(
               `[resident] typed Workday consultation ack deferred: ${detail}\n`,
             );
             if (/\(409\)/.test(String(error))) {
-              typedConsultationDelivery.phase = 'deferred';
+              await retainAttemptAfterAuthorityLoss('consultation_ack_authority_lost');
               return;
             }
             const retryHeartbeat = await livenessHeartbeat();
@@ -3852,6 +4043,8 @@ export async function handleStrategicResident(
             Math.max(45, Math.ceil(cfg.autonomousTurnTimeoutMs / 1_000) + 15),
           ),
         },
+        TYPED_COORDINATOR_API_ATTEMPTS,
+        TYPED_COORDINATOR_API_TIMEOUT_MS,
       ) as { status?: 'empty' | 'claimed'; packet?: ClaimedTypedConsultation };
       if (response.status === 'claimed' && response.packet) {
         typedConsultationAwaitingClaim = false;
@@ -4093,11 +4286,12 @@ export async function handleStrategicResident(
   const maybeClaimTypedContinuation = async (): Promise<
     'none' | 'completed' | 'deferred'
   > => {
+    if (!typedFastConfig.activated) return 'none';
     if (
       typedFastDispatching
       || Date.now() < typedFastCircuitOpenUntil
       || callCoordinator.suppressOrdinaryWorkday()
-    ) return 'none';
+    ) return 'deferred';
     if (
       !typedFastReady
       || foregroundTyped === null
@@ -4111,7 +4305,7 @@ export async function handleStrategicResident(
       // provisioning retry gates permit it.  The released result packet remains
       // durable and will be reclaimed on a later loop by the fresh controller.
       if (Date.now() >= typedFastProvisionRetryAt) kickTypedFastProvisioning();
-      return 'none';
+      return 'deferred';
     }
     try {
       const response = await apiPost(
@@ -4125,6 +4319,8 @@ export async function handleStrategicResident(
           // commit margin without requiring a second continuation lease API.
           lease_seconds: 120,
         },
+        TYPED_COORDINATOR_API_ATTEMPTS,
+        TYPED_COORDINATOR_API_TIMEOUT_MS,
       ) as { status?: 'empty' | 'claimed'; continuation?: ClaimedTypedContinuation };
       if (response.status !== 'claimed' || !response.continuation) return 'none';
       typedConsultationDelivery.phase = 'settling';
@@ -4177,7 +4373,7 @@ export async function handleStrategicResident(
         ws,
         `[resident] typed Workday continuation poll deferred: ${sanitize(String(error))}\n`,
       );
-      return 'none';
+      return 'deferred';
     }
   };
 

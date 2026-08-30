@@ -254,13 +254,22 @@ describe('isolated receipt-only runner contract', () => {
       buildRunCommand: () => ({
         command: 'claude',
         args: [
-          '-p', '--dangerously-skip-permissions', '--include-partial-messages',
+          '-p', '--output-format', 'stream-json', '--verbose',
+          '--model', 'claude-sonnet-4-6', '--effort', 'high',
+          '--dangerously-skip-permissions',
+          '--permission-mode', 'bypassPermissions', '--include-partial-messages',
+          '--allow-dangerously-skip-permissions',
+          '--permission-mode=bypassPermissions',
+          '--dangerously-skip-permissions=true',
+          '--tools=Bash,Read', '--mcp-config=/ambient/inline-mcp.json',
+          '--plugin-dir', '/ambient/plugin', '--settings', '/ambient/settings.json',
           '--tools', 'Bash,Read', '--mcp-config', '/ambient/mcp.json',
           '--strict-mcp-config', '--allowedTools', 'Bash', '--max-turns', '9',
         ],
         env: {
           HOME: '/ambient-home', PATH: '/bin', AGENT_API_TOKEN: 'must-not-leak',
           ANTHROPIC_API_KEY: 'provider-only', GITHUB_TOKEN: 'must-not-leak',
+          CLAUDE_CODE_EFFORT_LEVEL: 'high',
           BLUEPRINT_SANDBOX_PYTHON: '/opt/blueprint-backend-venv/bin/python',
           BLUEPRINT_SANDBOX_PG_BINDIR: '/opt/blueprint-backend-venv/pg/bin',
         },
@@ -279,14 +288,24 @@ describe('isolated receipt-only runner contract', () => {
     );
 
     expect(command.args).not.toContain('--dangerously-skip-permissions');
+    expect(command.args).not.toContain('--permission-mode');
+    expect(command.args).not.toContain('bypassPermissions');
     expect(command.args).not.toContain('--include-partial-messages');
-    expect(command.args).toEqual(expect.arrayContaining([
-      '--tools', '', '--strict-mcp-config', '--allowedTools', '', '--max-turns', '1',
-      '--mcp-config', path.join('/isolated', '.memory-empty-mcp.json'),
-    ]));
+    expect(command.args).toEqual([
+      '-p', '--output-format', 'stream-json', '--verbose',
+      '--model', 'claude-sonnet-4-6',
+      '--tools', '', '--mcp-config', path.join('/isolated', '.memory-empty-mcp.json'),
+      '--strict-mcp-config', '--allowedTools', '', '--max-turns', '1',
+    ]);
+    expect(command.args.some(arg => (
+      arg.startsWith('--permission-mode=')
+      || arg.startsWith('--dangerously-skip-permissions=')
+      || arg.startsWith('--tools=')
+      || arg.startsWith('--mcp-config=')
+    ))).toBe(false);
     expect(command.env).toEqual({
       HOME: '/isolated', PATH: '/bin', LANG: 'en_US.UTF-8', TERM: 'xterm-256color',
-      ANTHROPIC_API_KEY: 'provider-only',
+      ANTHROPIC_API_KEY: 'provider-only', CLAUDE_CODE_EFFORT_LEVEL: 'high',
     });
     expect(command.timeoutMs).toBe(90_000);
     expect(fs.writeFileSync).toHaveBeenCalledWith(
@@ -465,6 +484,49 @@ describe('drainJsonChunks — result event dispatch', () => {
       clearTimeoutSpy.mockRestore();
     }
   });
+
+  it.each([
+    [
+      'true/direct numeric status',
+      { is_error: true, subtype: 'error', terminal_reason: 'completed', api_error_status: 201 },
+      { isError: true, subtype: 'error', reason: 'completed', status: 201 },
+    ],
+    [
+      'false/nested numeric-string status',
+      { is_error: false, subtype: 'success', terminal_reason: 'completed', api_error: { status: '200' } },
+      { isError: false, subtype: 'success', reason: 'completed', status: 200 },
+    ],
+    [
+      'invalid direct status falls back to nested status',
+      { is_error: false, subtype: 'success', terminal_reason: 'completed', api_error_status: 'bad', api_error: { status: '403' } },
+      { isError: false, subtype: 'success', reason: 'completed', status: 403 },
+    ],
+    [
+      'absent or malformed metadata',
+      { is_error: 'false', subtype: 7, terminal_reason: null, api_error_status: 'bad', api_error: { status: '' } },
+      { isError: undefined, subtype: undefined, reason: undefined, status: undefined },
+    ],
+  ])('extracts top-level provider terminal metadata (%s)', async (_label, top, expected) => {
+    emitStream([
+      JSON.stringify({
+        type: 'result',
+        parent_tool_use_id: 'toolu_nested',
+        result: 'nested',
+        is_error: !expected.isError,
+        subtype: 'nested-poison',
+        terminal_reason: 'nested-poison',
+        api_error_status: 599,
+      }),
+      JSON.stringify({ type: 'result', result: 'top', ...top }),
+    ]);
+    const out = await runProviderAgent('prompt', null, { value: '' });
+    expect(out.providerResultEventSeen).toBe(true);
+    expect(out.providerResultIsError).toBe(expected.isError);
+    expect(out.providerResultSubtype).toBe(expected.subtype);
+    expect(out.providerTerminalReason).toBe(expected.reason);
+    expect(out.providerApiErrorStatus).toBe(expected.status);
+    expect(out.lastResultText).toBe('top');
+  });
 });
 
 describe('drainJsonChunks — check-runaway detection (assistant + user events)', () => {
@@ -638,6 +700,31 @@ describe('structured provider-run error report', () => {
     await runProviderAgent('prompt', null, { value: '' });
 
     expect(getLastProviderRunErrorReport()?.provider_errors).toHaveLength(5);
+  });
+
+  it('retains exact result metadata when a later matcher throws a typed failure', async () => {
+    emitStream([
+      JSON.stringify({
+        type: 'result',
+        result: 'rate limited',
+        is_error: true,
+        subtype: 'error',
+        terminal_reason: 'api_error',
+        api_error_status: '429',
+      }),
+    ], 1);
+
+    await expect(runProviderAgent('prompt', null, { value: '' })).rejects.toMatchObject({
+      name: 'RateLimitError',
+    });
+    expect(getLastProviderRunErrorReport()).toMatchObject({
+      classified: 'rate_limit',
+      result_event_seen: true,
+      provider_result_is_error: true,
+      provider_result_subtype: 'error',
+      provider_terminal_reason: 'api_error',
+      provider_api_error_status: 429,
+    });
   });
 });
 
