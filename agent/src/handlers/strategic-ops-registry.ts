@@ -334,6 +334,25 @@ const INPUTS = {
       'Same implementation as the operator lever POST /api/admin/projects/{id}/directions/{direction_id}/unhold.',
     ],
   },
+  set_memory: {
+    kind: 'json' as const,
+    fields: [
+      'body', 'note', 'title', 'summary', 'topic', 'tags',
+      'supersedes_id', 'expected_head_id',
+    ],
+    example: {
+      title: 'Current durable handoff',
+      body: 'Resume from the exact canonical checkpoint.',
+      tags: ['handoff'],
+      supersedes_id: null,
+      expected_head_id: null,
+    },
+    notes: [
+      'A write tagged handoff must include expected_head_id. Use null only when no active handoff exists.',
+      'To replace a handoff, set expected_head_id and supersedes_id to the same exact current handoff document UUID.',
+      'Ordinary memory must omit expected_head_id. Every non-null supersedes_id must name an active same-project strategic-memory document.',
+    ],
+  },
   set_running_update: markdownInput(),
 } satisfies Record<string, StrategicOpInputContract>;
 
@@ -409,7 +428,7 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'record_finding_resolution', alias: 'record-finding-resolution', cli: true, prompt: true, internalReason: null,
     description: 'Record a carried audit finding as resolved or code-verified stale in the re-qualification resolution ledger.' },
   { op: 'set_memory', alias: 'set-memory', cli: true, prompt: true, internalReason: null,
-    description: 'Persist a behavioral lesson or operator preference for future sessions.' },
+    description: 'Persist a behavioral lesson or operator preference for future sessions.', input: inputFor('set_memory') },
   { op: 'set_session_summary', alias: 'set-session-summary', cli: true, prompt: true, internalReason: null,
     description: 'Record a running summary of session context and progress for continuity across restarts.' },
   { op: 'report_autonomous_finding', alias: 'report-autonomous-finding', cli: true, prompt: false, internalReason: null,
