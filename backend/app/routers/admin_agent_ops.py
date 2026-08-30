@@ -5882,6 +5882,13 @@ async def strategic_operation(
             superseded_doc.dismissed_at = _utcnow()
             superseded_doc.dismissed_reason = f"superseded by {doc.id}"
             session.add(superseded_doc)
+            await workday_operation.record_child_entity(
+                op="dismiss_knowledge",
+                key=str(superseded_doc.id),
+                entity_kind="knowledge_document",
+                entity_id=str(superseded_doc.id),
+                effect="updated",
+            )
 
         # The KnowledgeDocument row is now the SOLE write path for strategic
         # memory. The legacy Project.strategic_memory_notes JSONB list is no
@@ -7708,17 +7715,113 @@ async def strategic_operation(
                 status_code=404,
                 detail=f"Knowledge document {doc_id} not found in this project",
             )
-        reason = str(data.get("reason") or "").strip() or None
+        raw_reason = data.get("reason")
+        reason = str(raw_reason or "").strip() or None
+        handoff_fields = {
+            "expected_handoff_head_ids",
+            "superseded_by_id",
+        }
+        has_handoff_fields = any(field in data for field in handoff_fields)
+        is_handoff = (
+            doc.source_kind == SourceKind.STRATEGIC_MEMORY.value
+            and "handoff" in list(doc.tags or [])
+        )
+        superseded_by_id = None
+        if is_handoff:
+            if workday_operation.binding is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="dismiss_knowledge handoff cleanup requires Workday receipt authority",
+                )
+            raw_heads = data.get("expected_handoff_head_ids")
+            raw_keeper = data.get("superseded_by_id")
+            if not isinstance(raw_reason, str) or not raw_reason.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "dismiss_knowledge handoff cleanup requires a non-empty "
+                        "string reason"
+                    ),
+                )
+            if (
+                not isinstance(raw_heads, list)
+                or len(raw_heads) != 2
+                or not all(isinstance(item, str) for item in raw_heads)
+                or not isinstance(raw_keeper, str)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="dismiss_knowledge handoff cleanup requires two expected_handoff_head_ids",
+                )
+            try:
+                expected_heads = [str(uuid.UUID(item)) for item in raw_heads]
+                superseded_by_id = uuid.UUID(raw_keeper)
+            except (ValueError, AttributeError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="dismiss_knowledge handoff cleanup identity is invalid",
+                ) from None
+            if (
+                expected_heads != sorted(set(expected_heads))
+                or doc.lifecycle_status != "consumed"
+                or doc.id == superseded_by_id
+                or str(doc.id) not in expected_heads
+                or str(superseded_by_id) not in expected_heads
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="dismiss_knowledge handoff head changed",
+                )
+            active_docs = (
+                (
+                    await session.execute(
+                        select(KnowledgeDocument).where(
+                            KnowledgeDocument.project_id == project.id,
+                            KnowledgeDocument.source_kind
+                            == SourceKind.STRATEGIC_MEMORY.value,
+                            KnowledgeDocument.lifecycle_status == "consumed",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            active_heads = sorted(
+                str(candidate.id)
+                for candidate in active_docs
+                if "handoff" in list(candidate.tags or [])
+            )
+            if expected_heads != active_heads:
+                raise HTTPException(
+                    status_code=409,
+                    detail="dismiss_knowledge handoff head changed",
+                )
+            prefix = f"superseded by {superseded_by_id}: "
+            dismissed_reason = prefix + reason[: 500 - len(prefix)]
+        elif workday_operation.binding is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "dismiss_knowledge Workday receipt authority is limited to "
+                    "split-handoff cleanup"
+                ),
+            )
+        elif has_handoff_fields:
+            raise HTTPException(
+                status_code=400,
+                detail="dismiss_knowledge handoff fields require a handoff document",
+            )
+        else:
+            dismissed_reason = reason[:500] if reason else None
         doc.lifecycle_status = "dismissed"
         doc.dismissed_at = _utcnow()
-        doc.dismissed_reason = (
-            reason[:500] if reason else None
-        )
+        doc.dismissed_reason = dismissed_reason
         session.add(doc)
         ctx = task.context or {}
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
         session.add(task)
+        await _record_workday_entity("knowledge_document", doc.id, "updated")
         await session.commit()
         logger.info(
             "[STRATEGIC API] Dismissed knowledge document %s for project %s (reason=%s)",

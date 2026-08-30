@@ -645,7 +645,30 @@
         "description": "Mark a knowledge document as dismissed — not actionable, with an optional reason.",
         "cli": true,
         "prompt": true,
-        "internal_reason": null
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "fields": [
+                "knowledge_document_id",
+                "reason",
+                "expected_handoff_head_ids",
+                "superseded_by_id"
+            ],
+            "example": {
+                "knowledge_document_id": "e0969761-6bd8-45fd-b50e-f8c97e390197",
+                "reason": "Retire the stale predecessor handoff after exact reconciliation.",
+                "expected_handoff_head_ids": [
+                    "9f4b8987-07fc-4bfd-81fc-eaacb372b95e",
+                    "e0969761-6bd8-45fd-b50e-f8c97e390197"
+                ],
+                "superseded_by_id": "9f4b8987-07fc-4bfd-81fc-eaacb372b95e"
+            },
+            "notes": [
+                "Ordinary knowledge dismissal omits expected_handoff_head_ids and superseded_by_id.",
+                "Dismissing a handoff requires private Workday receipt authority, the exact sorted two-head set, and the surviving head UUID.",
+                "Stale, sole-head, direct, or mismatched handoff cleanup is rejected without mutation."
+            ]
+        }
     },
     {
         "op": "request_qualification",
