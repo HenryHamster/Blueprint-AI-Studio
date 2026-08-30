@@ -25551,6 +25551,10 @@ async def test_two_failed_retries_bank_distinct_attempt_diagnostics(
                 "provider_errors": [],
                 "stderr_tail": "first structured stderr",
                 "last_stream_event": "result",
+                "provider_result_is_error": False,
+                "provider_result_subtype": "success",
+                "provider_terminal_reason": "completed",
+                "provider_api_error_status": 200,
             },
         },
         headers={"x-agent-token": create_agent_token(task_id_str, first_vm_id)},
@@ -25579,6 +25583,12 @@ async def test_two_failed_retries_bank_distinct_attempt_diagnostics(
     assert first_snapshot["agent_error_report"]["stderr_tail"] == (
         "first structured stderr"
     )
+    assert first_snapshot["agent_error_report"]["provider_result_is_error"] is False
+    assert first_snapshot["agent_error_report"]["provider_result_subtype"] == "success"
+    assert first_snapshot["agent_error_report"]["provider_terminal_reason"] == (
+        "completed"
+    )
+    assert first_snapshot["agent_error_report"]["provider_api_error_status"] == 200
 
     # Model a fresh dispatch of the queued retry.  The first report was stripped
     # by reset_task_for_fresh_attempt; the second status deliberately omits one.

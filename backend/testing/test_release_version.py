@@ -3799,6 +3799,10 @@ async def test_approved_activation_receipt_recorded_on_host_pull(
             now=now,
         )
         await db_session.commit()
+        from app.release_reconciliation import _confirm_serving_or_fail
+
+        assert receipt["serving_status"] == "unconfirmed"
+        assert await _confirm_serving_or_fail(version.id) is True
         await db_session.refresh(version)
 
         assert receipt["mode"] == "approved_activation"
