@@ -590,7 +590,7 @@ When criteria are warranted, write \`${PROPOSED_CRITERIA_PATH_TOKEN}\` ${READ_ON
 Each \`criteria\` item has:
 - \`text\`: a short, concrete, independently verifiable criterion statement for the VERSION, not a direction description.
 - \`direction_keys\`: the \`d-xxx\` identifiers of directions that contribute to that criterion; use an empty array only when no active direction maps cleanly yet.
-- \`evidence_contract\` is optional structured machine policy. The release system seeds the candidate-authorship contract with a zero-commit default for every new version; preserve that contract unless the operator has explicitly changed the budget. Never use free-form prose to imply a machine gate.
+- \`evidence_contract\` is optional structured machine policy. The release system does NOT implicitly seed a candidate-authorship contract. When the version requires autonomous-release authorship proof, explicitly author the unbound \`operator_authored_commits\` criterion with \`{"max_count":0}\` if it is absent, and preserve the exact existing contract unless the operator has explicitly changed the budget. Never attach that machine gate to a direction, and never use free-form prose to imply it.
 
 The optional top-level \`retract\` array lets you retract or supersede an existing **active** criterion that has become permanently uncoverable — for example, when every direction that could produce covering evidence has been retired and no realistic path to covering the criterion remains. Each retraction item has:
 - \`criterion_key\` (required): the \`c-xxx\` key of the active criterion to retract.

@@ -4448,6 +4448,12 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           stop_requested: heartbeatCount > 2,
         });
       }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true,
+          lease: { lease_id: `lease-${_label.replace(/\s+/g, '-')}`, generation: 1 },
+        });
+      }
       if (url === '/api/agent/strategic' && body?.op === 'begin_autonomous_turn') {
         return Promise.reject(leaseError);
       }

@@ -671,6 +671,26 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     // Nested (sub-agent) events are sub-progress: surface their text but never
     // let a nested result close the parent's turn.
     if (ev.nested) {
+      const t = activeTurn;
+      if (t) {
+        noteTurnActivity(t);
+        if (ev.kind === 'tool') {
+          t.sawToolUse = true;
+          t.toolCallCount += 1;
+          traceTurn(t, 'tool', ev.toolName || 'nested_tool');
+        } else if (ev.kind === 'tool_result') {
+          traceTurn(t, 'tool_result', 'nested_tool_result', ev.isError === true);
+        } else if (ev.kind === 'error') {
+          traceTurn(t, 'error', 'nested_error', true);
+        } else if (ev.kind === 'result') {
+          traceTurn(
+            t,
+            'result',
+            ev.terminalReason || 'nested_result',
+            ev.isError === true,
+          );
+        }
+      }
       if (ev.kind === 'text' && ev.text) emit({ kind: 'text', text: ev.text });
       return;
     }

@@ -350,6 +350,7 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
     // failure signal in that shape; treating it as ordinary success makes the
     // Resident keep waiting/retrying the same dead account until hard timeout.
     const structuredApiError = terminalReason === 'api_error'
+      || terminalReason === 'aborted_streaming'
       || (apiErrorStatus !== undefined && apiErrorStatus >= 400);
     events.push({
       kind: 'result', text: result, isError: obj.is_error === true || structuredApiError,

@@ -21,6 +21,7 @@ from app.models import (
     VersionAcceptanceCriterion,
 )
 from app.routers.admin_agent_ops import STRATEGIC_AGENT_OPS
+from app.strategic_consultation_detail import project_consultation_detail
 from app.time_utils import _utcnow
 from app.strategic_autonomous_handoff import AUTONOMOUS_HANDOFF_OPS
 import app.strategic_workday_mutation_rebind as mutation_rebind
@@ -202,6 +203,24 @@ def test_authoritative_receipt_ledgers_reject_duplicate_operation_ids():
             validator({key: [first, contradictory]}, packet_id=packet_id)
         assert duplicate.value.status_code == 409
         assert "history is invalid" in duplicate.value.detail
+
+
+def test_authoritative_receipt_ledgers_reject_divergent_semantic_effects():
+    packet_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    first = _receipt(index=1, packet_id=packet_id, task_id=task_id)
+    contradictory = _receipt(index=2, packet_id=packet_id, task_id=task_id)
+    contradictory["operation_fingerprint"] = first["operation_fingerprint"]
+    contradictory["entity_id"] = "different-direction"
+
+    for key, validator in (
+        (WORKDAY_OPERATION_LEDGER_CONTEXT_KEY, authoritative_workday_operation_receipts),
+        (WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY, authoritative_workday_result_receipts),
+    ):
+        with pytest.raises(HTTPException) as ambiguous:
+            validator({key: [first, contradictory]}, packet_id=packet_id)
+        assert ambiguous.value.status_code == 409
+        assert "history is invalid" in ambiguous.value.detail
 
 
 def test_completion_debt_replay_projects_the_exact_debt_id():
@@ -878,6 +897,37 @@ async def test_direct_acceptance_criteria_is_composite_receipted_and_replay_safe
         },
     )
     assert acknowledged.status_code == 200, acknowledged.text
+    consultation_id = uuid.UUID(
+        str(
+            (replay_packet.context or {})[
+                "_workday_consultation_atomic_reply_id"
+            ]
+        )
+    )
+    detail = await project_consultation_detail(
+        db_session,
+        project_id=project.id,
+        consultation_id=consultation_id,
+    )
+    assert detail is not None
+    assert detail["state"] == "delivering"
+    assert detail["outcome"] == "completed"
+    assert detail["steps_truncated"] is False
+    assert detail["result"]["receipts_have_more"] is False
+    for receipts in (detail["steps"][:3], detail["result"]["receipts"][:3]):
+        assert [receipt["op"] for receipt in receipts] == [
+            "create_acceptance_criterion",
+            "update_direction",
+            "set_acceptance_criteria",
+        ]
+        assert receipts[0]["entity_kind"] == "acceptance_criterion"
+        assert receipts[0]["entity_id"] == criterion_key
+        assert receipts[0]["effect"] == "created"
+        assert receipts[1]["entity_kind"] == "direction"
+        assert receipts[1]["entity_id"] == direction.direction_key
+        assert receipts[2]["target_kind"] == "acceptance_criteria"
+        assert receipts[2]["target_revision"] == 57
+
     continuation = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/continuations/claim-next",
         headers=_headers(task, vm="agent-vm-resident-poll"),

@@ -438,6 +438,7 @@ def _authoritative_workday_receipt_list(
         raise _conflict("Workday operation history is invalid")
     receipts: list[dict[str, Any]] = []
     operation_ids: set[str] = set()
+    semantic_effects: dict[tuple[str, str], tuple[object, ...]] = {}
     for value in raw:
         receipt = _bounded_receipt(value)
         if receipt is None or receipt["packet_id"] != str(packet_id):
@@ -446,6 +447,29 @@ def _authoritative_workday_receipt_list(
         if operation_id in operation_ids:
             raise _conflict("Workday operation history is invalid")
         operation_ids.add(operation_id)
+        semantic_key = (receipt["op"], receipt["operation_fingerprint"])
+        effect_identity = (
+            (
+                "state",
+                receipt["target_kind"],
+                receipt["target_revision"],
+                receipt["target_sha256"],
+            )
+            if "target_kind" in receipt
+            else (
+                "entity",
+                receipt["entity_kind"],
+                receipt["entity_id"],
+                receipt["effect"],
+            )
+        )
+        prior_effect = semantic_effects.get(semantic_key)
+        if prior_effect is not None and prior_effect != effect_identity:
+            # A stable semantic operation may legitimately be observed under a
+            # later claim/operation UUID, but it cannot have two authoritative
+            # outcomes.  Never let list order choose between divergent effects.
+            raise _conflict("Workday operation history is invalid")
+        semantic_effects[semantic_key] = effect_identity
         receipts.append(receipt)
     return receipts
 

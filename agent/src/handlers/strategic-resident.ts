@@ -3908,9 +3908,7 @@ export async function handleStrategicResident(
           'consultation_delivering',
           typedConsultationDelivery.consultationId,
         );
-        let nextDeliveryLeaseRenewAt = leaseHeld
-          ? Date.now() + CONVERSATION_CLAIM_RENEW_MS
-          : 0;
+        let nextDeliveryLeaseRenewAt = Date.now() + CONVERSATION_CLAIM_RENEW_MS;
         const keepDeliveryLease = async (): Promise<'held' | 'retry' | 'lost'> => {
           if (Date.now() < nextDeliveryLeaseRenewAt) return 'held';
           try {

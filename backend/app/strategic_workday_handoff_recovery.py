@@ -8,12 +8,14 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import String, literal_column, text, tuple_
+from sqlalchemy import and_, func, or_, text, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.message_audience import PIPELINE_LOG, STRATEGIST_INTERNAL, stamp_message_audience
+from app.database import resolve_dialect_name
 from app.models import (
     MessageHandlingState,
     MessageSurface,
@@ -78,6 +80,7 @@ class WorkdayResultServerLineage:
     public_source_id: uuid.UUID
     authority_row_id: uuid.UUID
     kind: str
+    projections_valid: bool = True
 
 
 def _recovery_retry_source_ids(context: dict[str, object]) -> list[uuid.UUID]:
@@ -163,23 +166,6 @@ def _source_receipt_is_current(
         and (receipt.source_metadata or {}).get("surface") == "conversation"
         and receipt.content_hash
         == hashlib.sha256(source.content.encode("utf-8")).hexdigest()
-    )
-
-
-def _internal_handoff_is_live(row: ProjectMessage) -> bool:
-    context = row.context if isinstance(row.context, dict) else {}
-    return bool(
-        row.from_type == "system"
-        and row.surface == MessageSurface.CONVERSATION
-        and row.status == "open"
-        and row.handling_state
-        in {MessageHandlingState.PENDING, MessageHandlingState.CLAIMED}
-        and context.get("audience") == STRATEGIST_INTERNAL
-        and context.get("public_reply_owner") == "fast"
-        and (
-            context.get(_PACKET_MARKER) is True
-            or context.get(_RESULT_MARKER) is True
-        )
     )
 
 
@@ -321,39 +307,200 @@ async def _source_is_settled_or_live(
     *,
     source: ProjectMessage,
 ) -> bool:
-    linked = (
-        (
-            await session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.project_id == source.project_id,
-                    ProjectMessage.context[_ATOMIC_REPLY_ID].as_string()
-                    == str(source.id),
-                )
+    settled_by_source = await _relational_settlement_by_source(
+        session,
+        project_id=source.project_id,
+        source_ids={source.id},
+    )
+    return settled_by_source.get(source.id, False)
+
+
+def _json_boolean_true(row: object, key: str, *, dialect: str) -> object:
+    context = row.context  # type: ignore[attr-defined]
+    if dialect == "postgresql":
+        value = context[key]
+        return and_(
+            func.jsonb_typeof(value) == "boolean",
+            value.as_boolean().is_(True),
+        )
+    if dialect == "sqlite":
+        return func.json_type(context, f"$.{key}") == "true"
+    raise RuntimeError(f"Unsupported handoff recovery SQL dialect: {dialect}")
+
+
+def _json_nonempty_string(row: object, key: str, *, dialect: str) -> object:
+    context = row.context  # type: ignore[attr-defined]
+    if dialect == "postgresql":
+        value = context[key]
+        return and_(
+            func.jsonb_typeof(value) == "string",
+            value.as_string() != "",
+        )
+    if dialect == "sqlite":
+        return and_(
+            func.json_type(context, f"$.{key}") == "text",
+            func.json_extract(context, f"$.{key}") != "",
+        )
+    raise RuntimeError(f"Unsupported handoff recovery SQL dialect: {dialect}")
+
+
+def _json_string_equals(
+    row: object,
+    key: str,
+    expected: str,
+    *,
+    dialect: str,
+) -> object:
+    context = row.context  # type: ignore[attr-defined]
+    if dialect == "postgresql":
+        value = context[key]
+        return and_(
+            func.jsonb_typeof(value) == "string",
+            value.as_string() == expected,
+        )
+    if dialect == "sqlite":
+        return and_(
+            func.json_type(context, f"$.{key}") == "text",
+            func.json_extract(context, f"$.{key}") == expected,
+        )
+    raise RuntimeError(f"Unsupported handoff recovery SQL dialect: {dialect}")
+
+
+def _privacy_state_is_public(row: object, *, dialect: str) -> object:
+    context = row.context  # type: ignore[attr-defined]
+    if dialect == "postgresql":
+        value = context["privacy_state"]
+        value_type = func.jsonb_typeof(value)
+        return or_(
+            value_type.is_(None),
+            value_type == "null",
+            and_(
+                value_type == "string",
+                value.as_string().not_in(("redacted", "deleted")),
+            ),
+        )
+    if dialect == "sqlite":
+        value_type = func.json_type(context, "$.privacy_state")
+        return or_(
+            value_type.is_(None),
+            value_type == "null",
+            and_(
+                value_type == "text",
+                func.json_extract(context, "$.privacy_state").not_in(
+                    ("redacted", "deleted")
+                ),
+            ),
+        )
+    raise RuntimeError(f"Unsupported handoff recovery SQL dialect: {dialect}")
+
+
+def _settled_or_live_predicate(row: object, *, dialect: str) -> object:
+    public_continuation = and_(
+        row.from_type == "strategic",  # type: ignore[attr-defined]
+        row.surface == MessageSurface.CONVERSATION,  # type: ignore[attr-defined]
+        _json_string_equals(
+            row,
+            "message_role",
+            "workday_consultation_continuation",
+            dialect=dialect,
+        ),
+        _privacy_state_is_public(row, dialect=dialect),
+    )
+    completed_result = and_(
+        row.from_type == "system",  # type: ignore[attr-defined]
+        row.surface == MessageSurface.CONVERSATION,  # type: ignore[attr-defined]
+        row.status == "handled",  # type: ignore[attr-defined]
+        row.handling_state == MessageHandlingState.RESPONDED,  # type: ignore[attr-defined]
+        _json_boolean_true(row, _RESULT_MARKER, dialect=dialect),
+        _json_nonempty_string(
+            row,
+            "_workday_continuation_completion_idempotency_key",
+            dialect=dialect,
+        ),
+    )
+    live_private_handoff = and_(
+        row.from_type == "system",  # type: ignore[attr-defined]
+        row.surface == MessageSurface.CONVERSATION,  # type: ignore[attr-defined]
+        row.status == "open",  # type: ignore[attr-defined]
+        row.handling_state.in_(  # type: ignore[attr-defined]
+            (MessageHandlingState.PENDING, MessageHandlingState.CLAIMED)
+        ),
+        _json_string_equals(
+            row,
+            "audience",
+            STRATEGIST_INTERNAL,
+            dialect=dialect,
+        ),
+        _json_string_equals(
+            row,
+            "public_reply_owner",
+            "fast",
+            dialect=dialect,
+        ),
+        or_(
+            _json_boolean_true(row, _PACKET_MARKER, dialect=dialect),
+            _json_boolean_true(row, _RESULT_MARKER, dialect=dialect),
+        ),
+    )
+    return or_(public_continuation, completed_result, live_private_handoff)
+
+
+async def _relational_settlement_by_source(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    source_ids: set[uuid.UUID],
+) -> dict[uuid.UUID, bool]:
+    """Project bounded packet/result settlement from immutable reply lineage."""
+
+    settled: dict[uuid.UUID, bool] = {
+        source_id: False for source_id in source_ids
+    }
+    if not source_ids:
+        return settled
+    dialect = resolve_dialect_name(session)
+    source = aliased(ProjectMessage)
+    direct = aliased(ProjectMessage)
+    child = aliased(ProjectMessage)
+    child_matches = (
+        select(child.id)
+        .where(
+            child.project_id == project_id,
+            child.reply_to_message_id == direct.id,
+            _settled_or_live_predicate(child, dialect=dialect),
+        )
+        .correlate(direct)
+        .exists()
+    )
+    direct_matches = (
+        select(direct.id)
+        .where(
+            direct.project_id == project_id,
+            direct.reply_to_message_id == source.id,
+            or_(
+                _settled_or_live_predicate(direct, dialect=dialect),
+                child_matches,
+            ),
+        )
+        .correlate(source)
+        .exists()
+    )
+    rows = (
+        await session.execute(
+            select(
+                source.id,
+                direct_matches.label("settled_or_live"),
+            )
+            .where(
+                source.project_id == project_id,
+                source.id.in_(source_ids),
             )
         )
-        .scalars()
-        .all()
-    )
-    return _source_has_settled_or_live_link(source=source, linked=linked)
-
-
-def _source_has_settled_or_live_link(
-    *,
-    source: ProjectMessage,
-    linked: list[ProjectMessage],
-) -> bool:
-    for row in linked:
-        context = row.context if isinstance(row.context, dict) else {}
-        if (
-            row.from_type == "strategic"
-            and row.surface == MessageSurface.CONVERSATION
-            and context.get("message_role") == "workday_consultation_continuation"
-            and context.get("privacy_state") not in {"redacted", "deleted"}
-        ):
-            return True
-        if _internal_handoff_is_live(row):
-            return True
-    return False
+    ).all()
+    for source_id, is_settled in rows:
+        if source_id in settled:
+            settled[source_id] = bool(is_settled)
+    return settled
 
 
 async def _create_recovery_result(
@@ -422,6 +569,12 @@ async def _create_recovery_result(
             and existing.handling_state
             in {MessageHandlingState.PENDING, MessageHandlingState.CLAIMED}
         ):
+            if existing.reply_to_message_id is None:
+                existing.reply_to_message_id = source.id
+                session.add(existing)
+                await session.flush()
+            elif existing.reply_to_message_id != source.id:
+                raise ValueError("terminal Workday recovery relational lineage conflicts")
             return existing
         if canonical_existing and _retired_terminal_recovery_is_restorable(
             existing,
@@ -493,6 +646,9 @@ async def _create_recovery_result(
         restore_existing.resolution = None
         restore_existing.resolved_at = None
         restore_existing.updated_at = _utcnow()
+        if restore_existing.reply_to_message_id not in {None, source.id}:
+            raise ValueError("terminal Workday recovery relational lineage conflicts")
+        restore_existing.reply_to_message_id = source.id
         session.add(restore_existing)
         await session.flush()
         return restore_existing
@@ -525,6 +681,7 @@ async def _create_recovery_result(
         ),
         idempotency_key=idempotency_key,
         resident_session_id=session_id,
+        reply_to_message_id=source.id,
     )
     session.add(result)
     await session.flush()
@@ -659,22 +816,63 @@ async def recover_retired_private_handoff(
     return recovered is not None
 
 
+def _workday_packet_claim_id_from_server_key(
+    row: ProjectMessage,
+) -> uuid.UUID | None:
+    """Parse the claim identity from the server-owned packet key prefix."""
+
+    key_parts = str(row.idempotency_key or "").split(":", 2)
+    if len(key_parts) != 3 or key_parts[0] != "workday-consultation":
+        return None
+    try:
+        return uuid.UUID(key_parts[1])
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+async def workday_packet_immutable_source_id(
+    session: AsyncSession,
+    *,
+    row: ProjectMessage,
+) -> uuid.UUID | None:
+    """Resolve neutral-recovery authority from server key plus relational FK."""
+
+    claim_id = _workday_packet_claim_id_from_server_key(row)
+    source_id = row.reply_to_message_id
+    if (
+        claim_id is None
+        or row.from_type != "system"
+        or row.surface != MessageSurface.CONVERSATION
+        or row.message_type != MessageType.NOTE
+    ):
+        return None
+    if not isinstance(source_id, uuid.UUID):
+        return None
+    if await _canonical_public_workday_source(
+        session,
+        project_id=row.project_id,
+        source_id=source_id,
+        claim_id=claim_id,
+    ) is None:
+        return None
+    return source_id
+
+
 async def workday_packet_source_id_from_server_lineage(
     session: AsyncSession,
     *,
     row: ProjectMessage,
 ) -> uuid.UUID | None:
-    """Resolve a packet's public source without trusting its operation ledger."""
+    """Validate packet projections against immutable relational authority."""
 
     context = row.context if isinstance(row.context, dict) else {}
     from app.conversation_coordinator import (
         workday_consultation_packet_idempotency_key,
     )
 
-    try:
-        claim_id = uuid.UUID(str(context.get("claim_id")))
-        atomic_reply_id = uuid.UUID(str(context.get(_ATOMIC_REPLY_ID)))
-    except (TypeError, ValueError, AttributeError):
+    claim_id = _workday_packet_claim_id_from_server_key(row)
+    source_id = await workday_packet_immutable_source_id(session, row=row)
+    if claim_id is None or source_id is None:
         return None
     delivery_key = context.get("delivery_key")
     continuation_key = context.get("_conversation_consultation_continuation")
@@ -683,6 +881,8 @@ async def workday_packet_source_id_from_server_lineage(
         and bool(delivery_key)
         and isinstance(continuation_key, str)
         and bool(continuation_key)
+        and context.get("claim_id") == str(claim_id)
+        and context.get(_ATOMIC_REPLY_ID) == str(source_id)
         and row.from_type == "system"
         and row.surface == MessageSurface.CONVERSATION
         and row.message_type == MessageType.NOTE
@@ -702,14 +902,7 @@ async def workday_packet_source_id_from_server_lineage(
         and context.get("public_reply_owner") == "fast"
     ):
         return None
-    if await _canonical_public_workday_source(
-        session,
-        project_id=row.project_id,
-        source_id=atomic_reply_id,
-        claim_id=claim_id,
-    ) is None:
-        return None
-    return atomic_reply_id
+    return source_id
 
 
 async def workday_result_server_lineage(
@@ -794,6 +987,7 @@ async def workday_result_server_lineage(
             row.from_type == "system"
             and row.surface == MessageSurface.CONVERSATION
             and row.message_type == MessageType.NOTE
+            and row.reply_to_message_id == terminal_source_id
             and row_context.get(_RESULT_MARKER) is True
             and row_context.get("audience") == STRATEGIST_INTERNAL
             and row_context.get("message_role") == "workday_consultation_result"
@@ -844,18 +1038,25 @@ async def workday_result_server_lineage(
         return None
     context = packet.context if isinstance(packet.context, dict) else {}
     row_context = row.context if isinstance(row.context, dict) else {}
+    if row.reply_to_message_id != packet_id:
+        return None
     from app.conversation_coordinator import (
         workday_consultation_packet_idempotency_key,
     )
 
+    packet_claim_id = _workday_packet_claim_id_from_server_key(packet)
+    immutable_source_id = await workday_packet_immutable_source_id(
+        session,
+        row=packet,
+    )
+    if packet_claim_id is None or immutable_source_id is None:
+        return None
     try:
-        packet_claim_id = uuid.UUID(str(context.get("claim_id")))
         ack_claim_id = uuid.UUID(
             str(context.get("_workday_consultation_ack_claim_id"))
         )
-        atomic_reply_id = uuid.UUID(str(context.get(_ATOMIC_REPLY_ID)))
     except (TypeError, ValueError, AttributeError):
-        return None
+        ack_claim_id = None
     delivery_key = context.get("delivery_key")
     continuation_key = context.get("_conversation_consultation_continuation")
     expected_packet_key = (
@@ -870,12 +1071,14 @@ async def workday_result_server_lineage(
         and bool(continuation_key)
         else None
     )
-    if not (
+    projections_valid = bool(
         packet.from_type == "system"
         and packet.surface == MessageSurface.CONVERSATION
         and packet.message_type == MessageType.NOTE
         and packet.status == "handled"
         and packet.handling_state == MessageHandlingState.RESPONDED
+        and context.get("claim_id") == str(packet_claim_id)
+        and context.get(_ATOMIC_REPLY_ID) == str(immutable_source_id)
         and packet.idempotency_key == expected_packet_key
         and packet.content == context.get("question")
         and context.get(_PACKET_MARKER) is True
@@ -892,19 +1095,13 @@ async def workday_result_server_lineage(
         and row_context.get("audience") == STRATEGIST_INTERNAL
         and row_context.get("message_role") == "workday_consultation_result"
         and row_context.get("public_reply_owner") == "fast"
-    ):
-        return None
-    if await _canonical_public_workday_source(
-        session,
-        project_id=row.project_id,
-        source_id=atomic_reply_id,
-        claim_id=packet_claim_id,
-    ) is None:
-        return None
+        and row_context.get("source_packet_id") == str(packet_id)
+    )
     return WorkdayResultServerLineage(
-        public_source_id=atomic_reply_id,
+        public_source_id=immutable_source_id,
         authority_row_id=packet_id,
         kind="consultation_packet",
+        projections_valid=projections_valid,
     )
 
 
@@ -986,7 +1183,11 @@ async def workday_result_source_id_from_server_lineage(
     """Compatibility projection of the canonical public source identity."""
 
     lineage = await workday_result_server_lineage(session, row=row)
-    return lineage.public_source_id if lineage is not None else None
+    return (
+        lineage.public_source_id
+        if lineage is not None and lineage.projections_valid
+        else None
+    )
 
 
 async def recover_one_missing_workday_request(
@@ -1124,9 +1325,7 @@ async def recover_one_missing_workday_request(
     receipts_by_source: dict[str, list[StrategicMemorySource]] = {
         source_id: [] for source_id in source_ids
     }
-    linked_by_source: dict[str, list[ProjectMessage]] = {
-        source_id: [] for source_id in source_ids
-    }
+    settled_by_source: dict[uuid.UUID, bool] = {}
     if source_ids:
         source_receipt_identities = [
             (str(source.id), str(source.sequence)) for source in sources
@@ -1150,38 +1349,11 @@ async def recover_one_missing_workday_request(
         for receipt in receipts:
             if receipt.source_key in receipts_by_source:
                 receipts_by_source[receipt.source_key].append(receipt)
-        atomic_reply_value = (
-            literal_column(
-                "projectmessage.context ->> "
-                f"'{_ATOMIC_REPLY_ID}'",
-                type_=String(),
-            )
-            if postgres
-            else ProjectMessage.context[_ATOMIC_REPLY_ID].as_string()
+        settled_by_source = await _relational_settlement_by_source(
+            session,
+            project_id=project.id,
+            source_ids={source.id for source in sources},
         )
-        linked_statement = select(ProjectMessage).where(
-            ProjectMessage.project_id == project.id,
-            atomic_reply_value.in_(source_ids),
-        )
-        if postgres:
-            linked_statement = linked_statement.where(
-                text(
-                    "projectmessage.context "
-                    "? '_workday_consultation_atomic_reply_id'"
-                )
-            )
-        linked = (
-            (
-                await session.execute(linked_statement)
-            )
-            .scalars()
-            .all()
-        )
-        for row in linked:
-            row_context = row.context if isinstance(row.context, dict) else {}
-            linked_source_id = row_context.get(_ATOMIC_REPLY_ID)
-            if isinstance(linked_source_id, str) and linked_source_id in linked_by_source:
-                linked_by_source[linked_source_id].append(row)
     for source in sources:
         source_id = str(source.id)
         if source.id in retry_source_ids:
@@ -1194,10 +1366,7 @@ async def recover_one_missing_workday_request(
         if (
             not _source_shape_is_canonical(source)
             or len(source_receipts) != 1
-            or _source_has_settled_or_live_link(
-                source=source,
-                linked=linked_by_source.get(source_id, []),
-            )
+            or settled_by_source.get(source.id, False)
         ):
             continue
         try:
@@ -1270,6 +1439,7 @@ __all__ = [
     "retire_unavailable_private_handoff",
     "terminal_recovery_source_candidate_from_server_key",
     "workday_handoff_source_id",
+    "workday_packet_immutable_source_id",
     "workday_packet_source_id_from_server_lineage",
     "workday_result_server_lineage",
     "workday_result_source_id_from_server_lineage",
