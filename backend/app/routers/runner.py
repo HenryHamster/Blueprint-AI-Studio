@@ -2262,6 +2262,19 @@ async def heartbeat(
             caps["previous_version"] = previous_version
         runner.version = new_version
     if "git_sha" in payload.model_fields_set:
+        # A genuine empty active-work report is the daemon's checkout epoch
+        # boundary: no task or compute job can still be serving the older
+        # agent-reported SHA. Retire that stale override before persisting the
+        # runner checkout identity. Preflight/non-report heartbeats and any
+        # active work must preserve it because they cannot prove the old
+        # process has stopped serving.
+        if (
+            payload.active_work_report is True
+            and not payload.active_task_ids
+            and not payload.active_compute_job_ids
+            and payload.git_sha != runner.agent_source_sha
+        ):
+            runner.agent_source_sha = None
         runner.source_sha = payload.git_sha
     runner.capabilities = caps
     session.add(runner)

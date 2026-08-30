@@ -1013,24 +1013,70 @@ async def test_heartbeat_no_version_stamp_when_unchanged(db_session):
 
 @pytest.mark.asyncio
 async def test_heartbeat_persists_and_clears_checkout_source_identity(db_session):
-    """A clean SHA is durable, while an explicit unknown/dirty report clears it."""
+    """An idle daemon retires an older serving override at its epoch boundary."""
     _project, runner = await _make_runner(db_session)
+    runner.agent_source_sha = "a" * 40
+    runner.source_sha = "a" * 40
+    db_session.add(runner)
+    await db_session.commit()
 
     await heartbeat(
-        payload=HeartbeatRequest(git_sha="a" * 40),
+        payload=HeartbeatRequest(
+            git_sha="b" * 40,
+            active_task_ids=["still-serving-old-checkout"],
+            active_work_report=True,
+        ),
         runner=runner,
         session=db_session,
     )
     await db_session.refresh(runner)
-    assert runner.source_sha == "a" * 40
+    assert runner.agent_source_sha == "a" * 40
+    assert runner.source_sha == "b" * 40
 
     await heartbeat(
-        payload=HeartbeatRequest(git_sha=None),
+        payload=HeartbeatRequest(git_sha="b" * 40, active_work_report=True),
         runner=runner,
         session=db_session,
     )
     await db_session.refresh(runner)
+    assert runner.agent_source_sha is None
+    assert runner.source_sha == "b" * 40
+
+    runner.agent_source_sha = "b" * 40
+    await db_session.commit()
+    await heartbeat(
+        payload=HeartbeatRequest(git_sha=None, active_work_report=True),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.agent_source_sha is None
     assert runner.source_sha is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected_source_sha"),
+    [
+        (HeartbeatRequest(git_sha="b" * 40, active_compute_job_ids=["job"]), "b" * 40),
+        (HeartbeatRequest(git_sha="b" * 40, active_work_report=False), "b" * 40),
+        (HeartbeatRequest(active_work_report=True), "a" * 40),
+    ],
+    ids=["active-compute", "preflight", "git-sha-omitted"],
+)
+async def test_heartbeat_preserves_agent_source_without_idle_epoch_proof(
+    db_session, payload, expected_source_sha
+):
+    _project, runner = await _make_runner(db_session)
+    runner.agent_source_sha = "a" * 40
+    runner.source_sha = "a" * 40
+    db_session.add(runner)
+    await db_session.commit()
+
+    await heartbeat(payload=payload, runner=runner, session=db_session)
+    await db_session.refresh(runner)
+    assert runner.agent_source_sha == "a" * 40
+    assert runner.source_sha == expected_source_sha
 
 
 @pytest.mark.asyncio
