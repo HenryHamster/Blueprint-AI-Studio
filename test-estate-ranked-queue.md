@@ -543,7 +543,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | admin-ui | `admin-ui/src/components/ProjectToolHost.test.tsx` | 789 | 28 | under 1500 LOC | 1.289s measured | — |
 | G | backend | `backend/testing/test_acceptance_gate__test_corroboration.py` | 1,058 | 26 | under 1500 LOC | 1.289s measured | — |
 | G | backend | `backend/testing/test_acceptance_gate__rule_version.py` | 708 | 4 | under 1500 LOC | 1.288s measured | — |
-| G | backend | `backend/testing/test_release_qualification_intents.py` | 1,202 | 22 | under 1500 LOC | 1.287s measured | protected; declared floor 21 |
+| G | backend | `backend/testing/test_release_qualification_intents.py` | 1,202 | 22 | under 1500 LOC | 1.287s measured | protected; declared floor 22 |
 | G | backend | `backend/testing/test_digest_precompute.py` | 848 | 25 | under 1500 LOC | 1.258s measured | — |
 | G | admin-ui | `admin-ui/src/components/PRMonitorSection.test.tsx` | 411 | 24 | under 1500 LOC | 1.249s measured | — |
 | G | backend | `backend/testing/test_vm_heartbeat_image.py` | 506 | 13 | under 1500 LOC | 1.240s measured | — |
