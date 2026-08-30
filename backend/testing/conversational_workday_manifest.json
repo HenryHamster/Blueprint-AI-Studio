@@ -64,6 +64,7 @@
       "test_ids": [
         "test_workday_operation_replay_survives_projection_window_and_is_packet_scoped",
         "test_authoritative_receipt_ledgers_reject_duplicate_operation_ids",
+        "test_authoritative_receipt_ledgers_reject_divergent_semantic_effects",
         "test_completion_debt_replay_projects_the_exact_debt_id",
         "test_qualification_intent_replay_projects_exact_intent_id",
         "test_retry_with_new_claim_incarnation_and_operation_id_replays_exact_semantics",
@@ -75,7 +76,7 @@
         "test_direct_acceptance_criteria_is_composite_receipted_and_replay_safe",
         "test_composite_receipt_capacity_failure_rolls_back_every_write"
       ],
-      "test_count": 12
+      "test_count": 13
     },
     {
       "path": "backend/testing/test_release_qualification_intents.py",
@@ -99,9 +100,19 @@
         "test_null_phase_epoch_remains_exact_authority",
         "test_exact_null_epoch_fences_no_credentials_write_after_drift",
         "test_exact_null_epoch_fences_sha_error_write_after_drift",
-        "test_execution_timeout_rolls_back_and_releases_claim"
+        "test_execution_timeout_rolls_back_and_releases_claim",
+        "test_classified_non_authorizing_result_clears_dirty_json_before_receipt"
       ],
-      "test_count": 19
+      "test_count": 20
+    },
+    {
+      "path": "backend/testing/test_agent_access_release_spawns.py",
+      "completeness": "all",
+      "reason": "Protects the app-native v57 canary evidence boundary: one-snapshot release-window cardinality, canonical acceptance criteria, private Workday provenance, exact task and parent lineage, fail-closed authority diagnostics, and the two-task spawn-chain predicate used with exact task readback.",
+      "test_ids": [
+        "test_release_spawn_evidence_is_exact_private_and_fail_closed"
+      ],
+      "test_count": 1
     },
     {
       "path": "backend/testing/test_strategic_consultation_detail.py",
@@ -113,9 +124,10 @@
         "test_operation_ledger_is_projected_without_identity_fields",
         "test_result_receipts_and_have_more_flag_are_carried",
         "test_quarantined_private_rows_never_win_detail_or_index_projection",
-        "test_recorded_gate_failure_travels_with_the_consultation"
+        "test_recorded_gate_failure_travels_with_the_consultation",
+        "test_newer_gate_failure_wins_without_erasing_attempt_history"
       ],
-      "test_count": 17
+      "test_count": 18
     },
     {
       "path": "backend/testing/test_strategic_workday_handoff_recovery.py",
@@ -143,13 +155,15 @@
         "test_broad_recovery_savepoint_rolls_back_complete_partial_result",
         "test_invalid_continuation_provenance_is_quarantined_without_starvation",
         "test_result_lineage_requires_exact_packet_and_ack_authority",
+        "test_packet_source_context_tamper_recovers_relational_source_not_decoy",
+        "test_result_source_context_tamper_recovers_packet_relational_source_not_decoy",
         "test_invalid_terminal_recovery_is_replaced_neutrally_exactly_once",
         "test_terminal_recovery_replacement_requires_exact_root_chain",
         "test_missing_recovery_select_count_is_constant_across_candidate_cardinality",
         "test_retired_session_missing_handoff_recovers_exactly_once",
         "test_operator_turn_park_is_committed_and_returned_by_the_claim_route"
       ],
-      "test_count": 8
+      "test_count": 10
     },
     {
       "path": "backend/testing/test_conversation_coordinator_two_speed.py",
@@ -173,6 +187,34 @@
         "test_dead_resident_process_remains_reapable_without_heartbeat"
       ],
       "test_count": 8
+    },
+    {
+      "path": "backend/testing/test_strategic_cold_successor.py",
+      "completeness": "all",
+      "reason": "Protects the server-owned cold-successor release-canary authority boundary: exact durable-source contract assembly, fenced launch and incarnation receipts, attestation-before-terminal settlement, idempotent recovery, least-privilege claim shape, direct-token route denial, and repository-credential isolation.",
+      "test_ids": [
+        "test_attested_out_of_band_completion_without_terminal_receipt_fails",
+        "test_cold_launch_is_force_fresh_idempotent_and_attested",
+        "test_cold_receipt_read_is_pure_exact_and_incarnation_fenced",
+        "test_cold_successor_claim_is_exact_minimal_durable_and_replayable",
+        "test_cold_successor_generic_status_fails_closed",
+        "test_cold_successor_http_denies_all_repository_credentials",
+        "test_cold_successor_http_rejects_malformed_sub_and_wrong_vm",
+        "test_cold_successor_jwt_cannot_escape_through_direct_token_surfaces",
+        "test_cold_successor_jwt_closes_websocket_before_any_data_surface",
+        "test_cold_successor_jwt_is_centrally_fenced_to_exact_boot_protocol",
+        "test_cold_successor_malformed_durable_receipt_is_never_overwritten",
+        "test_cold_successor_terminal_http_allows_same_vm_inactive_duplicate",
+        "test_cold_terminal_release_failure_keeps_committed_receipt",
+        "test_cold_terminal_releases_slot_only_after_durable_commit",
+        "test_cold_terminal_without_attestation_is_durable_failure",
+        "test_contract_fails_closed_outside_safety_fence",
+        "test_contract_preserves_null_versus_empty_running_update",
+        "test_contract_rejects_oversize_without_trimming",
+        "test_dedicated_terminal_requires_attestation_and_accepts_exact_failure",
+        "test_locked_contract_is_exact_ordered_and_excludes_session_sources"
+      ],
+      "test_count": 20
     },
     {
       "path": "backend/testing/test_strategic_resident_pipeline_projection.py",
@@ -392,6 +434,37 @@
       "test_count": 102
     },
     {
+      "path": "agent/src/handlers/strategic-cold-successor.test.ts",
+      "completeness": "all",
+      "reason": "Protects the isolated cold-successor release-canary executor: exact minimal claim preflight, lease renewal, strict provider terminal predicates, one attestation and terminal effect, runtime-unavailable requeue, ambiguous-response reconciliation without provider replay, and cross-incarnation recovery.",
+      "test_ids": [
+        "strategic cold successor > attests and settles one dedicated successful terminal effect",
+        "strategic cold successor > classifies a provider execution rejection as terminal provider failure",
+        "strategic cold successor > fails closed on partial markers and a non-none workspace capability",
+        "strategic cold successor > leaves a transport-ambiguous pending attestation for exact recovery",
+        "strategic cold successor > preserves runtime-unavailable requeue semantics without terminalizing",
+        "strategic cold successor > reconciles a lost attestation response without replaying provider work",
+        "strategic cold successor > reconciles a lost initial heartbeat response through the pure receipt",
+        "strategic cold successor > reconciles an ambiguous successful terminal delivery without FAILED",
+        "strategic cold successor > recovers durable effects across ambiguous responses and new incarnations",
+        "strategic cold successor > rejects the provider terminal predicate: %s [case 1]",
+        "strategic cold successor > rejects the provider terminal predicate: %s [case 2]",
+        "strategic cold successor > rejects the provider terminal predicate: %s [case 3]",
+        "strategic cold successor > rejects the provider terminal predicate: %s [case 4]",
+        "strategic cold successor > rejects the provider terminal predicate: %s [case 5]",
+        "strategic cold successor > rejects the provider terminal predicate: %s [case 6]",
+        "strategic cold successor > rejects the provider terminal predicate: %s [case 7]",
+        "strategic cold successor > rejects the provider terminal predicate: %s [case 8]",
+        "strategic cold successor > rejects the provider terminal predicate: %s [case 9]",
+        "strategic cold successor > rejects the provider terminal predicate: %s [case 10]",
+        "strategic cold successor > renews the exact lease during the provider run",
+        "strategic cold successor > resumes an exact attested incarnation without rerunning the provider",
+        "strategic cold successor > terminalizes a definitively rejected attestation after an exact pending readback",
+        "strategic cold successor > uses a distinct failed effect for an invalid semantic result"
+      ],
+      "test_count": 23
+    },
+    {
       "path": "agent/src/providers/resident-session.test.ts",
       "reason": "Covers startResidentClaudeSession \u2014 the long-running process that drives the conversational Workday session loop (stdin/stdout NDJSON protocol, turn lifecycle, rate-limit classification). Removing these tests leaves the session provider contract unguarded.",
       "test_ids": [
@@ -399,9 +472,10 @@
         "startResidentClaudeSession > sendTurn writes a user NDJSON line and resolves on the top-level result",
         "startResidentClaudeSession > classifies provider rate limits from bounded stderr evidence",
         "startResidentClaudeSession > allows foreground Fast without append support while identity-bound Workday stays fail-closed",
+        "startResidentClaudeSession > counts long-running nested sub-agent output as parent-turn activity",
         "startResidentClaudeSession > exposes meaningful progress and retains bounded head-plus-tail terminal trace evidence"
       ],
-      "test_count": 49
+      "test_count": 50
     },
     {
       "path": "scripts/test_runner_isolation.py",
@@ -446,9 +520,10 @@
       "reason": "Covers the stream utility functions (isStrategicMutation, isMessageSend) that classify events during a conversational Workday session turn. Removing these tests leaves the event classification contract unguarded.",
       "test_ids": [
         "isStrategicMutation > detects mutating ./strategic verbs",
-        "isMessageSend > detects ./messages send in various shells"
+        "isMessageSend > detects ./messages send in various shells",
+        "parseResidentLine > marks aborted_streaming as failed when the provider omits is_error"
       ],
-      "test_count": 45
+      "test_count": 46
     },
     {
       "path": "backend/testing/test_workday_resident_invariants.py",
@@ -733,6 +808,15 @@
         "handleStrategicResident \u2014 operator-turn responsiveness > gives only a server-qualified direct Workday execution the bounded $label [case 1]",
         "handleStrategicResident \u2014 operator-turn responsiveness > gives only a server-qualified direct Workday execution the bounded $label [case 2]",
         "handleStrategicResident \u2014 operator-turn responsiveness > renews the Resident heartbeat while a slow operator reply is in flight",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > delivers a durable continuation before claiming newer consultation work while Fast warms",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > does not complete a failed typed consultation after $label [case 1]",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > does not complete a failed typed consultation after $label [case 2]",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > does not complete a failed typed consultation after $label [case 3]",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > does not complete a failed typed consultation after $label [case 4]",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > does not complete a failed typed consultation after $label [case 5]",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > does not complete a failed typed consultation after $label [case 6]",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > does not complete a failed typed consultation after $label [case 7]",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > renews the typed consultation lease through a long failed-result delivery heartbeat stall",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > abandons a nonterminal normal Fast claim without provider dispatch",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > abandons an exact cold Fast claim when required attachment materialization fails before dispatch",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > acquires the fenced slot before readiness and releases it on normal shutdown",
@@ -780,6 +864,7 @@
         "handleStrategicResident \u2014 typed Fast lease lifecycle > replaces invalid Fast staging and completes the same exact claim",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > reprovisions Fast after two continuation protocol failures and completes without new operator input",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > retires Fast and abandons once after two invalid staging attempts",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > retries an identical consultation ack after a post-commit transport loss without rerunning private Workday",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > retries the same Fast claim when the first dispatch settles processGone with a dead child",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > revokes Fast when the exact active lease heartbeat returns typed_fast null",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > rewinds and immediately repolls when the server advertises an older open-message floor",
@@ -806,7 +891,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 143
+      "test_count": 153
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
@@ -1228,7 +1313,7 @@
         "test_classify_orphan_resident_session_exempt_from_progress_staleness",
         "test_classify_resident_session_warm_idle_not_reaped"
       ],
-      "test_count": 505
+      "test_count": 506
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",

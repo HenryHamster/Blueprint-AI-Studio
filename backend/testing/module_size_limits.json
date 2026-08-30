@@ -291,6 +291,7 @@
     "test_compute.py": 13600,
     "test_research_completion.py": 27550,
     "test_strategic_completion.py": 30000,
+    "test_conversation_coordinator_two_speed.py": 1850,
     "test_reaper.py": 29650,
     "test_review_pipeline.py": 28600,
     "test_autonomous_research.py": 28350,
