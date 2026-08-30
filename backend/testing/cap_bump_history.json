@@ -6106,14 +6106,6 @@
           "new_cap": 1300
         }
       ],
-      "blueprint.py": [
-        {
-          "commit_sha": "812de7000850fee3c9ae4c7857f1235506561861",
-          "commit_date": "2026-08-25T17:01:30+00:00",
-          "old_cap": 9900,
-          "new_cap": 11950
-        }
-      ],
       "test_blueprint_cli.py": [
         {
           "commit_sha": "a7e1e5e80df53c05d567710f82bedc7fe0744fdd",
@@ -6136,6 +6128,20 @@
           "commit_date": "2026-08-26T02:34:18-07:00",
           "old_cap": 1700,
           "new_cap": 2300
+        }
+      ],
+      "blueprint.py": [
+        {
+          "commit_sha": "812de7000850fee3c9ae4c7857f1235506561861",
+          "commit_date": "2026-08-25T17:01:30+00:00",
+          "old_cap": 9900,
+          "new_cap": 11950
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-30T10:10:40.001843+00:00",
+          "old_cap": 11950,
+          "new_cap": 14000
         }
       ]
     }

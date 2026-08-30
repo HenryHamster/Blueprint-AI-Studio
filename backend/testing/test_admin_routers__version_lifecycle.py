@@ -10,17 +10,21 @@ Split from test_admin_routers.py. Covers version phase/goal mutations, acceptanc
 criteria router, cut-version, clear-deploy-failed, agent-serving-SHAs, and all
 version-lifecycle field tests."""
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from httpx import AsyncClient, ASGITransport
 from sqlmodel import select
 
 from app.main import app
 from app import release_version as rv
+from app.release_version_cut import VersionCutIntegrationIdentity
+from app import release_version_cut as rvc
 from app.models import (
     Alert,
     Artifact,
@@ -29,6 +33,7 @@ from app.models import (
     PoolVm,
     PoolVmState,
     Project,
+    ProjectMessage,
     ProjectMember,
     ReleaseQualificationIntent,
     ReleaseVersion,
@@ -43,6 +48,58 @@ from app.auth import get_current_user, require_admin
 
 TEST_USER_ID = "test-user-123"
 TEST_USER_EMAIL = "test@example.com"
+_CUT_SHA = "a" * 40
+_CUT_VERSION_ID = uuid.UUID(int=1)
+_MISSING = object()
+_CUT_IDENTITY = VersionCutIntegrationIdentity(
+    owner="example-owner",
+    repo="example-repo",
+    branch="main",
+    head_sha=_CUT_SHA,
+    observed_at=datetime(2026, 8, 30, tzinfo=timezone.utc),
+)
+
+
+def _cut_body(
+    reason=_MISSING,
+    *,
+    key: str = "cut-test-key",
+    version_id: uuid.UUID = _CUT_VERSION_ID,
+    version_number: int = 1,
+    sha: str = _CUT_SHA,
+):
+    body = {
+        "idempotency_key": key,
+        "expected_version_id": str(version_id),
+        "expected_version_number": version_number,
+        "expected_integration_sha": sha,
+        "expected_integration_identity": _CUT_IDENTITY.identity_token(),
+    }
+    if reason is not _MISSING:
+        body["reason"] = reason
+    return body
+
+
+def _api_error_code(response) -> str:
+    return response.json()["error"]["message"]["code"]
+
+
+def _mock_exact_cut_boundary(mocker):
+    resolve = mocker.patch(
+        "app.release_version_cut.resolve_version_cut_integration_identity",
+        new_callable=AsyncMock,
+        return_value=_CUT_IDENTITY,
+    )
+    repository = mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new_callable=AsyncMock,
+        return_value=("test-token", _CUT_IDENTITY.owner, _CUT_IDENTITY.repo),
+    )
+    followups = mocker.patch(
+        "app.release_version.run_version_cut_followups",
+        new_callable=AsyncMock,
+    )
+    return resolve, repository, followups
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -230,7 +287,7 @@ class TestSetVersionPhase:
 
     @pytest.mark.asyncio
     async def test_version_cut_rejects_managed_check_wait(
-        self, client: AsyncClient, db_session
+        self, client: AsyncClient, db_session, mocker
     ):
         """A version cut while a migration-carrying promotion PR is held in
         managed check-wait is rejected with a 409 carrying distinct copy."""
@@ -246,10 +303,11 @@ class TestSetVersionPhase:
         }
         db_session.add(version)
         await db_session.commit()
+        _mock_exact_cut_boundary(mocker)
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/version-cut",
-            json={"reason": "operator cut attempt"},
+            json=_cut_body("operator cut attempt", version_id=version.id),
         )
         assert resp.status_code == 409
         assert "will wait for required checks" in resp.text
@@ -406,7 +464,7 @@ class TestSetVersionPhase:
 
     @pytest.mark.asyncio
     async def test_version_cut_allows_cut_when_verdict_finalized(
-        self, client: AsyncClient, db_session
+        self, client: AsyncClient, db_session, mocker
     ):
         """Stale-pending window: last_qualification has promotion_pending but the
         newest QualificationVerdict row already carries a finalized terminal_status.
@@ -433,10 +491,11 @@ class TestSetVersionPhase:
         )
         db_session.add(verdict)
         await db_session.commit()
+        _mock_exact_cut_boundary(mocker)
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/version-cut",
-            json={"reason": "cut after promotion resolved"},
+            json=_cut_body("cut after promotion resolved", version_id=version.id),
         )
         assert resp.status_code == 200, (
             f"Expected 200 for stale-pending+finalized-verdict but got {resp.status_code}: "
@@ -791,24 +850,76 @@ class TestAcceptanceCriteriaRouter:
 
 
 class TestCutVersion:
+    @pytest.fixture(autouse=True)
+    def _exact_cut_boundary(self, mocker):
+        (
+            self.resolve_cut_identity,
+            self.resolve_cut_repository,
+            self.run_cut_followups,
+        ) = _mock_exact_cut_boundary(
+            mocker,
+        )
+
     @pytest.mark.asyncio
     async def test_version_cut_member_can_cut(self, client: AsyncClient, db_session):
         """Member can cut the open version; both versions are returned and the
         old row flips to abandoned while a fresh build version opens."""
         project = await _make_project(db_session)
-        await _make_open_version(db_session, project.id, phase="stabilize")
+        version = await _make_open_version(
+            db_session,
+            project.id,
+            phase="stabilize",
+        )
+        warm = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+        assert warm.status_code == 200
+        assert warm.json()["current_version"]["id"] == str(version.id)
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/version-cut",
-            json={"reason": "candidate can never pass"},
+            json=_cut_body("candidate can never pass", version_id=version.id),
         )
         assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "no-store, private"
         data = resp.json()
+        assert data["replayed"] is False
+        assert data["receipt"]["status"] == "committed"
+        assert data["receipt"]["idempotency_key"] == "cut-test-key"
+        assert data["receipt"]["operator_id"] == TEST_USER_ID
+        assert data["receipt"]["operator_display"] == TEST_USER_EMAIL
+        assert data["receipt"]["expected_integration_sha"] == _CUT_SHA
+        assert data["receipt"]["observed_repository_owner"] == _CUT_IDENTITY.owner
+        assert data["receipt"]["observed_repository_name"] == _CUT_IDENTITY.repo
+        assert data["receipt"]["observed_integration_branch"] == _CUT_IDENTITY.branch
+        assert data["receipt"]["observed_integration_sha"] == _CUT_SHA
+        assert data["receipt"]["expected_integration_identity"] == (
+            _CUT_IDENTITY.identity_token()
+        )
+        for field in (
+            "observed_at",
+            "abandoned_opened_at",
+            "successor_opened_at",
+            "committed_at",
+        ):
+            parsed = datetime.fromisoformat(data["receipt"][field])
+            assert parsed.tzinfo is not None
+            assert data["receipt"][field].endswith("+00:00")
+        assert data["followups"] == {
+            "schema_version": 1,
+            "status": "pending",
+            "attempts": 0,
+            "created_at": data["receipt"]["committed_at"],
+            "last_attempt_at": None,
+            "completed_at": None,
+            "last_error": None,
+            "lease_expires_at": None,
+        }
         assert data["abandoned_version"]["version_number"] == 1
         assert data["abandoned_version"]["status"] == "abandoned"
         assert data["abandoned_version"]["abandoned_at"]
         assert data["new_version"]["version_number"] == 2
         assert data["new_version"]["phase"] == "build"
+        assert data["new_version"]["base_sha"] == _CUT_SHA
+        assert data["new_version"]["candidate_sha"] is None
         assert data["new_version"]["opened_at"]
 
         # Persisted: the old row carries operator provenance.
@@ -827,14 +938,85 @@ class TestCutVersion:
         await db_session.refresh(old)
         assert old.status == "abandoned"
         assert old.last_qualification["operator"] == TEST_USER_EMAIL
+        assert old.last_qualification["operator_id"] == TEST_USER_ID
         assert old.last_qualification["reason"] == "candidate can never pass"
-        history = (
+        messages = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        ).scalars().all()
+        abandoned_messages = [
+            message
+            for message in messages
+            if (message.context or {}).get("event_type") == "release_version_abandoned"
+        ]
+        assert len(abandoned_messages) == 1
+        message_context = abandoned_messages[0].context or {}
+        assert message_context["version_number"] == 1
+        assert message_context["next_version_number"] == 2
+        assert message_context["operator_id"] == TEST_USER_ID
+        assert message_context["reason"] == "candidate can never pass"
+        lifecycle = (
             await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
-        ).json()["recent_versions"]
+        ).json()
+        assert lifecycle["current_version"]["version_number"] == 2
+        assert lifecycle["current_version"]["base_sha"] == _CUT_SHA
+        assert lifecycle["current_version"]["candidate_sha"] is None
+        history = lifecycle["recent_versions"]
         abandoned = next(row for row in history if row["version_number"] == 1)
         assert abandoned["abandoned_by"] == TEST_USER_EMAIL
         assert abandoned["abandon_reason"] == "candidate can never pass"
         assert abandoned["abandoned_at"]
+        assert abandoned["base_sha"] is None
+        assert abandoned["candidate_sha"] is None
+        assert abandoned["version_cut_receipt"] == data["receipt"]
+        assert abandoned["version_cut_followups"] == data["followups"]
+
+    @pytest.mark.asyncio
+    async def test_version_cut_terminal_message_failure_rolls_back_cut(
+        self,
+        client: AsyncClient,
+        db_session,
+        mocker,
+    ):
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        project_id = project.id
+        mocker.patch(
+            "app.notification_dispatch.post_release_version_abandoned_message",
+            new=AsyncMock(side_effect=RuntimeError("terminal receipt write failed")),
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+            headers={"Authorization": "Bearer exact-cut-test"},
+        ) as failure_client:
+            response = await failure_client.post(
+                f"/api/admin/projects/{project.id}/version-cut",
+                json=_cut_body(
+                    "atomic terminal receipt",
+                    key="cut-terminal-receipt-failure",
+                    version_id=version.id,
+                ),
+            )
+        assert response.status_code == 500
+        assert response.headers["cache-control"] == "no-store, private"
+        await db_session.rollback()
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(ReleaseVersion).where(
+                        ReleaseVersion.project_id == project_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [(row.version_number, row.status) for row in rows] == [(1, "open")]
+        assert self.run_cut_followups.await_count == 0
 
     @pytest.mark.asyncio
     async def test_version_cut_idempotent_on_repeat_key(
@@ -843,28 +1025,169 @@ class TestCutVersion:
         """A repeat cut carrying the same idempotency key returns the original
         cut's result and does NOT open a further version."""
         project = await _make_project(db_session)
-        await _make_open_version(db_session, project.id, phase="stabilize")
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
 
         first = await client.post(
             f"/api/admin/projects/{project.id}/version-cut",
-            json={"reason": "pivot", "idempotency_key": "cut-abc"},
+            json=_cut_body("pivot", key="cut-abc", version_id=version.id),
         )
         assert first.status_code == 200
         first_data = first.json()
         assert first_data["abandoned_version"]["version_number"] == 1
         assert first_data["new_version"]["version_number"] == 2
+        assert first_data["replayed"] is False
+
+        successor = await db_session.get(
+            ReleaseVersion,
+            uuid.UUID(first_data["new_version"]["id"]),
+        )
+        assert successor is not None
+        successor.phase = "stabilize"
+        successor.goal = "later mutable goal"
+        successor.candidate_sha = "c" * 40
+        db_session.add(successor)
+        await db_session.commit()
 
         # Replay with the same key: same result, no second cut.
         second = await client.post(
             f"/api/admin/projects/{project.id}/version-cut",
-            json={"reason": "pivot", "idempotency_key": "cut-abc"},
+            json=_cut_body("pivot", key="cut-abc", version_id=version.id),
         )
         assert second.status_code == 200
         second_data = second.json()
         assert second_data["abandoned_version"]["version_number"] == 1
         assert second_data["new_version"]["version_number"] == 2
+        assert second_data["replayed"] is True
+        assert second_data["receipt"] == first_data["receipt"]
+        assert second_data["abandoned_version"] == first_data["abandoned_version"]
+        assert second_data["new_version"] == first_data["new_version"]
+        # Receipt-first recovery must not require a second provider read.
+        assert self.resolve_cut_identity.await_count == 2
 
         # Only v2 is open; no v3 was opened by the retry.
+        rows = (
+            (
+                await db_session.execute(
+                    select(ReleaseVersion).where(
+                        ReleaseVersion.project_id == project.id
+                    ).execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(v.version_number for v in rows) == [1, 2]
+        open_rows = [v for v in rows if v.status == "open"]
+        assert [v.version_number for v in open_rows] == [2]
+        messages = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        ).scalars().all()
+        assert sum(
+            (message.context or {}).get("event_type") == "release_version_abandoned"
+            for message in messages
+        ) == 1
+
+    @pytest.mark.asyncio
+    async def test_version_cut_context_is_exact_and_uncached(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        version = await _make_open_version(
+            db_session,
+            project.id,
+            phase="stabilize",
+        )
+        version.base_sha = "b" * 40
+        version.candidate_sha = "c" * 40
+        db_session.add(version)
+        await db_session.commit()
+
+        endpoint = f"/api/admin/projects/{project.id}/version-cut-context"
+        first = await client.get(endpoint)
+        second = await client.get(endpoint)
+        assert first.status_code == second.status_code == 200
+        assert first.headers["cache-control"] == "no-store, private"
+        assert second.headers["cache-control"] == "no-store, private"
+        assert first.json() == second.json()
+        assert first.json()["version"] == {
+            "id": str(version.id),
+            "version_number": 1,
+            "phase": "stabilize",
+            "status": "open",
+            "base_sha": "b" * 40,
+            "candidate_sha": "c" * 40,
+        }
+        assert first.json()["integration"]["head_sha"] == _CUT_SHA
+        assert first.json()["integration"] == _CUT_IDENTITY.projection()
+        assert self.resolve_cut_identity.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_version_cut_context_recovers_receipt_without_provider_read(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        sent = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body(
+                "recover receipt",
+                key="recover-cut",
+                version_id=version.id,
+            ),
+        )
+        assert sent.status_code == 200, sent.text
+        assert self.resolve_cut_identity.await_count == 2
+
+        recovered = await client.get(
+            f"/api/admin/projects/{project.id}/version-cut-context",
+            params={"idempotency_key": "recover-cut"},
+        )
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json() == {
+            "status": "committed",
+            "replayed": True,
+            "receipt": sent.json()["receipt"],
+            "followups": sent.json()["followups"],
+        }
+        assert recovered.headers["cache-control"] == "no-store, private"
+        assert self.resolve_cut_identity.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_version_cut_same_key_different_request_conflicts_without_cut(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body(
+                "first request",
+                key="conflict-cut",
+                version_id=version.id,
+            ),
+        )
+        assert first.status_code == 200, first.text
+
+        conflict = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body(
+                "changed request",
+                key="conflict-cut",
+                version_id=version.id,
+            ),
+        )
+        assert conflict.status_code == 409
+        assert _api_error_code(conflict) == (
+            "version_cut_idempotency_conflict"
+        )
         rows = (
             (
                 await db_session.execute(
@@ -876,12 +1199,692 @@ class TestCutVersion:
             .scalars()
             .all()
         )
-        assert sorted(v.version_number for v in rows) == [1, 2]
-        open_rows = [v for v in rows if v.status == "open"]
-        assert [v.version_number for v in open_rows] == [2]
+        assert sorted(row.version_number for row in rows) == [1, 2]
+        assert self.resolve_cut_identity.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_version_cut_no_open_version_returns_404(
+    async def test_version_cut_replay_binds_stable_user_not_mutable_email(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        body = _cut_body("stable actor", key="stable-actor", version_id=version.id)
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=body,
+        )
+        assert first.status_code == 200, first.text
+
+        original_override = app.dependency_overrides[get_current_user]
+
+        async def renamed_user():
+            return {
+                "user_id": TEST_USER_ID,
+                "email": "renamed@example.com",
+                "role": "admin",
+            }
+
+        app.dependency_overrides[get_current_user] = renamed_user
+        try:
+            replay = await client.post(
+                f"/api/admin/projects/{project.id}/version-cut",
+                json=body,
+            )
+        finally:
+            app.dependency_overrides[get_current_user] = original_override
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["replayed"] is True
+        assert replay.json()["receipt"] == first.json()["receipt"]
+        assert replay.json()["receipt"]["operator_id"] == TEST_USER_ID
+        assert replay.json()["receipt"]["operator_display"] == TEST_USER_EMAIL
+        assert self.resolve_cut_identity.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_version_cut_corrupt_receipt_is_typed_conflict_not_500(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        sent = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body("tamper proof", key="tampered-cut", version_id=version.id),
+        )
+        assert sent.status_code == 200, sent.text
+        await db_session.refresh(version)
+        qualification = dict(version.last_qualification or {})
+        receipt = dict(qualification["version_cut_receipt"])
+        receipt["expected_integration_sha"] = "not-a-sha"
+        qualification["version_cut_receipt"] = receipt
+        version.last_qualification = qualification
+        db_session.add(version)
+        await db_session.commit()
+
+        recovered = await client.get(
+            f"/api/admin/projects/{project.id}/version-cut-context",
+            params={"idempotency_key": "tampered-cut"},
+        )
+        assert recovered.status_code == 409, recovered.text
+        assert _api_error_code(recovered) == "version_cut_idempotency_conflict"
+        assert self.resolve_cut_identity.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_version_cut_missing_followup_marker_is_typed_and_visible(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        body = _cut_body("missing marker", key="missing-marker", version_id=version.id)
+        sent = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=body,
+        )
+        assert sent.status_code == 200, sent.text
+        await db_session.refresh(version)
+        qualification = dict(version.last_qualification or {})
+        qualification.pop("version_cut_followups")
+        version.last_qualification = qualification
+        db_session.add(version)
+        await db_session.commit()
+
+        recovered = await client.get(
+            f"/api/admin/projects/{project.id}/version-cut-context",
+            params={"idempotency_key": "missing-marker"},
+        )
+        assert recovered.status_code == 409, recovered.text
+        assert _api_error_code(recovered) == "version_cut_idempotency_conflict"
+        replay = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=body,
+        )
+        assert replay.status_code == 409, replay.text
+        assert _api_error_code(replay) == "version_cut_idempotency_conflict"
+
+        lifecycle = await client.get(
+            f"/api/admin/projects/{project.id}/version-lifecycle"
+        )
+        assert lifecycle.status_code == 200, lifecycle.text
+        abandoned = next(
+            row
+            for row in lifecycle.json()["recent_versions"]
+            if row["version_number"] == 1
+        )
+        assert abandoned["version_cut_followups"]["status"] == "invalid"
+        assert "missing" in abandoned["version_cut_followups"]["last_error"]
+
+    @pytest.mark.asyncio
+    async def test_version_cut_context_rejects_whitespace_key_without_caching(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+        response = await client.get(
+            f"/api/admin/projects/{project.id}/version-cut-context",
+            params={"idempotency_key": "   "},
+        )
+        assert response.status_code == 422, response.text
+        assert _api_error_code(response) == "version_cut_invalid_request"
+        assert response.headers["cache-control"] == "no-store, private"
+
+    @pytest.mark.asyncio
+    async def test_version_cut_prehandler_failures_are_uncached(
+        self,
+        client: AsyncClient,
+    ):
+        malformed_post = await client.post(
+            "/api/admin/projects/not-a-uuid/version-cut",
+            json=_cut_body("malformed project"),
+        )
+        missing_authority = await client.post(
+            f"/api/admin/projects/{uuid.uuid4()}/version-cut",
+            json={"reason": "missing exact authority"},
+        )
+        malformed_get = await client.get(
+            "/api/admin/projects/not-a-uuid/version-cut-context"
+        )
+        for response in (malformed_post, missing_authority, malformed_get):
+            assert response.status_code == 422
+            assert response.headers["cache-control"] == "no-store, private"
+
+        original_auth = app.dependency_overrides[get_current_user]
+
+        async def reject_auth():
+            raise HTTPException(status_code=401, detail="authentication rejected")
+
+        app.dependency_overrides[get_current_user] = reject_auth
+        try:
+            rejected = await client.get(
+                f"/api/admin/projects/{uuid.uuid4()}/version-cut-context"
+            )
+        finally:
+            app.dependency_overrides[get_current_user] = original_auth
+        assert rejected.status_code == 401
+        assert rejected.headers["cache-control"] == "no-store, private"
+
+        unrelated = await client.get(
+            "/api/admin/projects/not-a-uuid/version-lifecycle"
+        )
+        assert unrelated.status_code == 422
+        assert "cache-control" not in unrelated.headers
+
+    @pytest.mark.asyncio
+    async def test_version_cut_csrf_failure_is_uncached(self):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as raw_client:
+            response = await raw_client.post(
+                f"/api/admin/projects/{uuid.uuid4()}/version-cut",
+                json=_cut_body("csrf rejected"),
+            )
+        assert response.status_code == 403
+        assert response.json()["error"]["message"] == "CSRF token missing"
+        assert response.headers["cache-control"] == "no-store, private"
+
+    @pytest.mark.asyncio
+    async def test_version_cut_distinct_key_cannot_target_predicted_successor(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body("first cut", key="first-cut", version_id=version.id),
+        )
+        assert first.status_code == 200, first.text
+        successor_id = uuid.UUID(first.json()["new_version"]["id"])
+
+        speculative = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body(
+                "predicted successor",
+                key="different-key",
+                version_id=uuid.uuid4(),
+                version_number=2,
+            ),
+        )
+        assert speculative.status_code == 409, speculative.text
+        assert _api_error_code(speculative) == "version_cut_precondition_failed"
+        current = await rv.current_open_version(db_session, project.id)
+        assert current is not None
+        assert current.id == successor_id
+        assert current.status == "open"
+        assert current.version_number == 2
+
+    @pytest.mark.asyncio
+    async def test_version_cut_followup_sweep_recovers_crash_and_retry(
+        self,
+        client: AsyncClient,
+        db_session,
+        mocker,
+    ):
+        from conftest import TestingSessionLocal
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        sent = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body("durable followups", key="followup-cut", version_id=version.id),
+        )
+        assert sent.status_code == 200, sent.text
+        immutable_receipt = sent.json()["receipt"]
+        await db_session.refresh(version)
+        assert version.last_qualification["version_cut_followups"]["status"] == (
+            "pending"
+        )
+
+        mocker.patch("app.database.AsyncSessionLocal", TestingSessionLocal)
+        activate = mocker.patch(
+            "app.directions_repo.activate_eligible_staged_directions",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        refresh = mocker.patch(
+            "app.strategic_trigger.request_strategic_refresh",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        baseline = mocker.patch(
+            "app.lane_baseline_snapshot.persist_version_lane_baseline",
+            new_callable=AsyncMock,
+            return_value={"stored": True},
+        )
+        supersede = mocker.patch(
+            "app.message_supersession.supersede_stale_messages_on_version_close",
+            new_callable=AsyncMock,
+            return_value={"acted": False, "broadcasts": []},
+        )
+
+        async with TestingSessionLocal() as sweep_session:
+            assert await rvc.sweep_pending_version_cut_followups(sweep_session) == 0
+
+        await db_session.refresh(version)
+        failed_marker = version.last_qualification["version_cut_followups"]
+        assert failed_marker["status"] == "pending"
+        assert failed_marker["attempts"] == 1
+        assert failed_marker["last_error"].startswith("strategic_refresh:")
+        assert version.last_qualification["version_cut_receipt"] == immutable_receipt
+        assert activate.await_count == 1
+        assert activate.await_args.kwargs["terminal_status"] == "abandoned"
+        assert baseline.await_count == 0
+        assert supersede.await_count == 0
+
+        refresh.return_value = True
+        async with TestingSessionLocal() as sweep_session:
+            assert await rvc.sweep_pending_version_cut_followups(sweep_session) == 1
+        await db_session.refresh(version)
+        complete_marker = version.last_qualification["version_cut_followups"]
+        assert complete_marker["status"] == "complete"
+        assert complete_marker["attempts"] == 2
+        assert complete_marker["completed_at"]
+        assert complete_marker["last_error"] is None
+        assert version.last_qualification["version_cut_receipt"] == immutable_receipt
+        assert activate.await_count == 2
+        assert all(
+            call.kwargs["terminal_status"] == "abandoned"
+            for call in activate.await_args_list
+        )
+        assert refresh.await_count == 2
+        assert baseline.await_count == 1
+        assert supersede.await_count == 1
+
+        async with TestingSessionLocal() as sweep_session:
+            assert await rvc.sweep_pending_version_cut_followups(sweep_session) == 0
+
+    @pytest.mark.asyncio
+    async def test_version_cut_followup_sweep_isolates_one_row_failure(
+        self,
+        client: AsyncClient,
+        db_session,
+        mocker,
+    ):
+        first_project = await _make_project(db_session, name="First cut")
+        second_project = await _make_project(db_session, name="Second cut")
+        first_version = await _make_open_version(db_session, first_project.id)
+        second_version = await _make_open_version(db_session, second_project.id)
+        first = await client.post(
+            f"/api/admin/projects/{first_project.id}/version-cut",
+            json=_cut_body("first", key="first-row", version_id=first_version.id),
+        )
+        second = await client.post(
+            f"/api/admin/projects/{second_project.id}/version-cut",
+            json=_cut_body("second", key="second-row", version_id=second_version.id),
+        )
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        receipts = {
+            first.json()["receipt"]["request_fingerprint"],
+            second.json()["receipt"]["request_fingerprint"],
+        }
+        followups = mocker.patch.object(
+            rvc,
+            "_run_version_cut_followups",
+            new=AsyncMock(
+                side_effect=[
+                    RuntimeError("first row failed unexpectedly"),
+                    rvc.VersionCutFollowupResult(complete=True, executed=True),
+                ]
+            ),
+        )
+
+        assert await rvc.sweep_pending_version_cut_followups(db_session) == 1
+        assert followups.await_count == 2
+        attempted = {
+            call.args[0]["request_fingerprint"] for call in followups.await_args_list
+        }
+        assert attempted == receipts
+
+    @pytest.mark.asyncio
+    async def test_version_cut_followup_lease_allows_only_one_executor(
+        self,
+        client: AsyncClient,
+        db_session,
+        mocker,
+    ):
+        from conftest import TestingSessionLocal
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        sent = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body("single executor", key="lease-cut", version_id=version.id),
+        )
+        assert sent.status_code == 200, sent.text
+        receipt = sent.json()["receipt"]
+        mocker.patch("app.database.AsyncSessionLocal", TestingSessionLocal)
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_activation(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return []
+
+        activate = mocker.patch(
+            "app.directions_repo.activate_eligible_staged_directions",
+            new=AsyncMock(side_effect=blocked_activation),
+        )
+        mocker.patch(
+            "app.strategic_trigger.request_strategic_refresh",
+            new=AsyncMock(return_value=True),
+        )
+        mocker.patch(
+            "app.lane_baseline_snapshot.persist_version_lane_baseline",
+            new=AsyncMock(return_value={"stored": True}),
+        )
+        mocker.patch(
+            "app.message_supersession.supersede_stale_messages_on_version_close",
+            new=AsyncMock(return_value={"acted": False, "broadcasts": []}),
+        )
+
+        first = asyncio.create_task(rvc._run_version_cut_followups(receipt))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        second = await asyncio.wait_for(
+            rvc._run_version_cut_followups(receipt),
+            timeout=5,
+        )
+        assert second.complete is False
+        assert second.executed is False
+        assert activate.await_count == 1
+        release.set()
+        first_result = await asyncio.wait_for(first, timeout=5)
+        assert first_result.complete is True
+        assert first_result.executed is True
+        assert activate.await_count == 1
+
+        await db_session.refresh(version)
+        marker = version.last_qualification["version_cut_followups"]
+        assert marker["status"] == "complete"
+        assert marker["attempts"] == 1
+        assert marker["claim_token"] is None
+        assert marker["claim_expires_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_version_cut_followup_lost_completion_claim_is_not_complete(
+        self,
+        client: AsyncClient,
+        db_session,
+        mocker,
+    ):
+        from conftest import TestingSessionLocal
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        sent = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body("lost claim", key="lost-claim-cut", version_id=version.id),
+        )
+        assert sent.status_code == 200, sent.text
+        receipt = sent.json()["receipt"]
+        claim_token = str(uuid.uuid4())
+        settle = mocker.patch.object(
+            rvc,
+            "_update_version_cut_followup_marker",
+            new=AsyncMock(side_effect=[f"claim:{claim_token}", "lost"]),
+        )
+        mocker.patch("app.database.AsyncSessionLocal", TestingSessionLocal)
+        mocker.patch(
+            "app.directions_repo.activate_eligible_staged_directions",
+            new=AsyncMock(return_value=[]),
+        )
+        mocker.patch(
+            "app.strategic_trigger.request_strategic_refresh",
+            new=AsyncMock(return_value=True),
+        )
+        mocker.patch(
+            "app.lane_baseline_snapshot.persist_version_lane_baseline",
+            new=AsyncMock(return_value={"stored": True}),
+        )
+        mocker.patch(
+            "app.message_supersession.supersede_stale_messages_on_version_close",
+            new=AsyncMock(return_value={"acted": False, "broadcasts": []}),
+        )
+
+        result = await rvc._run_version_cut_followups(receipt)
+        assert result.executed is True
+        assert result.complete is False
+        assert settle.await_args_list[-1].kwargs == {
+            "completed": True,
+            "claim_token": claim_token,
+        }
+
+    @pytest.mark.asyncio
+    async def test_version_cut_serializes_with_promotion_failure(
+        self,
+        db_session,
+        mocker,
+    ):
+        from conftest import TestingSessionLocal, USE_POSTGRES
+        from app import release_promotion
+
+        if not USE_POSTGRES:
+            pytest.skip("row-lock ordering requires PostgreSQL")
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        version_id = version.id
+        mocker.patch(
+            "app.notification_dispatch.post_release_version_abandoned_message",
+            new=AsyncMock(return_value=None),
+        )
+
+        cut_holds_project = asyncio.Event()
+        promotion_attempted = asyncio.Event()
+        allow_cut = asyncio.Event()
+        cut_order = []
+        promotion_order = []
+
+        def locked_entity(statement):
+            if getattr(statement, "_for_update_arg", None) is None:
+                return None
+            descriptions = getattr(statement, "column_descriptions", ())
+            return descriptions[0].get("entity") if descriptions else None
+
+        async with TestingSessionLocal() as cut_session, TestingSessionLocal() as promotion_session:
+            promotion_version = await promotion_session.get(ReleaseVersion, version_id)
+            cut_execute = cut_session.execute
+            promotion_execute = promotion_session.execute
+
+            async def gated_cut_execute(statement, *args, **kwargs):
+                entity = locked_entity(statement)
+                result = await cut_execute(statement, *args, **kwargs)
+                if entity is not None:
+                    cut_order.append(entity)
+                if entity is Project:
+                    cut_holds_project.set()
+                    await allow_cut.wait()
+                return result
+
+            async def observed_promotion_execute(statement, *args, **kwargs):
+                entity = locked_entity(statement)
+                if entity is not None:
+                    promotion_order.append(entity)
+                if entity is Project:
+                    promotion_attempted.set()
+                return await promotion_execute(statement, *args, **kwargs)
+
+            mocker.patch.object(
+                cut_session,
+                "execute",
+                new=AsyncMock(side_effect=gated_cut_execute),
+            )
+            mocker.patch.object(
+                promotion_session,
+                "execute",
+                new=AsyncMock(side_effect=observed_promotion_execute),
+            )
+
+            async def cut_and_commit():
+                outcome = await rvc.abandon_current_version(
+                    cut_session,
+                    project.id,
+                    reason="authority race",
+                    operator_id=TEST_USER_ID,
+                    operator_display=TEST_USER_EMAIL,
+                    idempotency_key="cut-promotion-race",
+                    expected_version_id=version_id,
+                    expected_version_number=1,
+                    expected_integration_sha=_CUT_SHA,
+                    expected_integration_identity=_CUT_IDENTITY.identity_token(),
+                )
+                await cut_session.commit()
+                return outcome
+
+            cut_task = asyncio.create_task(cut_and_commit())
+            await asyncio.wait_for(cut_holds_project.wait(), timeout=5)
+            promotion_task = asyncio.create_task(
+                release_promotion._record_promotion_failure(
+                    promotion_session,
+                    promotion_version,
+                    {"candidate_sha": "b" * 40},
+                    "merge_failed",
+                    candidate_sha="b" * 40,
+                    lock_released=True,
+                )
+            )
+            await asyncio.wait_for(promotion_attempted.wait(), timeout=5)
+            assert promotion_order == [Project]
+            allow_cut.set()
+            cut_outcome, promotion_result = await asyncio.wait_for(
+                asyncio.gather(cut_task, promotion_task),
+                timeout=10,
+            )
+            await promotion_session.rollback()
+
+        assert cut_order[:2] == [Project, ReleaseVersion]
+        assert promotion_order[:2] == [Project, ReleaseVersion]
+        assert cut_outcome.abandoned.status == "abandoned"
+        assert cut_outcome.successor.version_number == 2
+        assert promotion_result["already_promoted"] is True
+        assert promotion_result["status"] == "abandoned"
+        async with TestingSessionLocal() as verify_session:
+            rows = (
+                await verify_session.execute(
+                    select(ReleaseVersion).where(
+                        ReleaseVersion.project_id == project.id
+                    )
+                )
+            ).scalars().all()
+            assert sorted((row.version_number, row.status) for row in rows) == [
+                (1, "abandoned"),
+                (2, "open"),
+            ]
+            abandoned = next(row for row in rows if row.version_number == 1)
+            assert abandoned.last_qualification["version_cut_receipt"] == cut_outcome.receipt
+            assert abandoned.last_qualification["status"] == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_version_cut_live_head_mismatch_writes_nothing(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        self.resolve_cut_identity.return_value = VersionCutIntegrationIdentity(
+            owner=_CUT_IDENTITY.owner,
+            repo=_CUT_IDENTITY.repo,
+            branch=_CUT_IDENTITY.branch,
+            head_sha="d" * 40,
+            observed_at=datetime(2026, 8, 30, tzinfo=timezone.utc),
+        )
+
+        response = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body("stale head", version_id=version.id),
+        )
+        assert response.status_code == 409
+        assert response.headers["cache-control"] == "no-store, private"
+        assert _api_error_code(response) == (
+            "version_cut_precondition_failed"
+        )
+        await db_session.refresh(version)
+        assert version.status == "open"
+        assert await rv.current_open_version(db_session, project.id) == version
+        self.run_cut_followups.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_version_cut_post_lock_head_advance_writes_nothing(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        advanced = VersionCutIntegrationIdentity(
+            owner=_CUT_IDENTITY.owner,
+            repo=_CUT_IDENTITY.repo,
+            branch=_CUT_IDENTITY.branch,
+            head_sha="d" * 40,
+            observed_at=datetime(2026, 8, 30, 0, 1, tzinfo=timezone.utc),
+        )
+        self.resolve_cut_identity.side_effect = [_CUT_IDENTITY, advanced]
+
+        response = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body("head advanced", version_id=version.id),
+        )
+        assert response.status_code == 409
+        assert _api_error_code(response) == "version_cut_precondition_failed"
+        assert response.json()["error"]["message"]["current"] == {
+            "integration": advanced.projection()
+        }
+        await db_session.refresh(version)
+        assert version.status == "open"
+        assert await rv.current_open_version(db_session, project.id) == version
+        self.run_cut_followups.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_version_cut_identity_unavailable_fails_closed(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        self.resolve_cut_identity.side_effect = rv.VersionCutIdentityUnavailable(
+            "provider unavailable"
+        )
+        response = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json=_cut_body("no identity", version_id=version.id),
+        )
+        assert response.status_code == 503
+        assert response.headers["cache-control"] == "no-store, private"
+        assert _api_error_code(response) == (
+            "version_cut_identity_unavailable"
+        )
+        await db_session.refresh(version)
+        assert version.status == "open"
+        self.run_cut_followups.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_version_cut_requires_exact_request_identity(
+        self,
+        client: AsyncClient,
+        db_session,
+    ):
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+        response = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "missing authority"},
+        )
+        assert response.status_code == 422
+        assert response.headers["cache-control"] == "no-store, private"
+        self.resolve_cut_identity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_version_cut_no_open_version_returns_stale_precondition(
         self, client: AsyncClient, db_session
     ):
         """Returns 404 when there is no open release version to cut."""
@@ -889,9 +1892,10 @@ class TestCutVersion:
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/version-cut",
-            json={"reason": "nothing here"},
+            json=_cut_body("nothing here"),
         )
-        assert resp.status_code == 404
+        assert resp.status_code == 409
+        assert _api_error_code(resp) == "version_cut_precondition_failed"
 
     @pytest.mark.asyncio
     async def test_version_cut_requires_member_role(
@@ -913,9 +1917,10 @@ class TestCutVersion:
 
         resp = await client.post(
             f"/api/admin/projects/{other.id}/version-cut",
-            json={"reason": "not allowed"},
+            json=_cut_body("not allowed"),
         )
         assert resp.status_code == 403
+        assert resp.headers["cache-control"] == "no-store, private"
 
     @pytest.mark.asyncio
     async def test_version_cut_rejects_cross_project(
@@ -933,19 +1938,20 @@ class TestCutVersion:
 
         resp = await client.post(
             f"/api/admin/projects/{other.id}/version-cut",
-            json={"reason": "intrusion"},
+            json=_cut_body("intrusion"),
         )
         assert resp.status_code == 404
+        assert resp.headers["cache-control"] == "no-store, private"
 
     @pytest.mark.asyncio
     async def test_version_cut_reason_optional(self, client: AsyncClient, db_session):
         """A cut with no reason still succeeds and records a null reason."""
         project = await _make_project(db_session)
-        await _make_open_version(db_session, project.id)
+        version = await _make_open_version(db_session, project.id)
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/version-cut",
-            json={},
+            json=_cut_body(version_id=version.id),
         )
         assert resp.status_code == 200
         assert resp.json()["new_version"]["version_number"] == 2
@@ -960,9 +1966,10 @@ class TestCutVersion:
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/version-cut",
-            json={"reason": "x" * 501},
+            json=_cut_body("x" * 501),
         )
         assert resp.status_code == 422
+        assert resp.headers["cache-control"] == "no-store, private"
 
     @pytest.mark.asyncio
     async def test_version_cut_rejects_promotion_check_wait(
@@ -988,7 +1995,7 @@ class TestCutVersion:
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/version-cut",
-            json={"reason": "too early"},
+            json=_cut_body("too early", version_id=version.id),
         )
         assert resp.status_code == 409
         assert "managed promotion PR is open" in resp.text

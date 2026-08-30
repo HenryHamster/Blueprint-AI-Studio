@@ -315,6 +315,7 @@ from app.reaper_evaluating_sweeps import (
     sweep_orphaned_direction_provider_tasks,
 )
 from app.review_park_disposition import sweep_dispose_expired_review_parks
+from app.release_version_cut import sweep_pending_version_cut_followups
 from app.reaper_sweeps import (
     sweep_queued_age_alerts,
     sweep_stalled_strategic_cycles,
@@ -3179,6 +3180,20 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Staged-direction activation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 13b: exact version cuts arm a durable follow-up marker in
+                # the cut transaction. Replay any marker left pending by a
+                # process loss between commit and post-commit delivery.
+                _mark_reaper_progress()
+                try:
+                    await sweep_pending_version_cut_followups(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Version-cut follow-up sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

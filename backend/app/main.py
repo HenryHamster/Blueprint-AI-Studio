@@ -1041,6 +1041,58 @@ class RequestDurationMiddleware(BaseHTTPMiddleware):
         return response
 
 
+_VERSION_CUT_NO_STORE = "no-store, private"
+
+
+def _is_exact_version_cut_path(path: str) -> bool:
+    """Match only the two authority-bearing version-cut HTTP surfaces."""
+
+    normalized = path[:-1] if path.endswith("/") else path
+    parts = normalized.split("/")
+    return (
+        len(parts) == 6
+        and parts[:4] == ["", "api", "admin", "projects"]
+        and bool(parts[4])
+        and parts[5] in {"version-cut", "version-cut-context"}
+    )
+
+
+def _apply_version_cut_no_store(response: Response, request: Request) -> Response:
+    if _is_exact_version_cut_path(request.url.path):
+        response.headers["Cache-Control"] = _VERSION_CUT_NO_STORE
+    return response
+
+
+class VersionCutNoStoreMiddleware:
+    """Keep exact-cut identities and receipts uncached on every HTTP outcome."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or not _is_exact_version_cut_path(
+            str(scope.get("path") or "")
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_no_store(message):
+            if message.get("type") == "http.response.start":
+                message = dict(message)
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"cache-control"
+                ]
+                headers.append(
+                    (b"cache-control", _VERSION_CUT_NO_STORE.encode("ascii"))
+                )
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_no_store)
+
+
 app = FastAPI(
     title="Blueprint Orchestrator",
     description="Secure Orchestration & State Management",
@@ -2152,7 +2204,7 @@ def _cors_aware_rate_limit_handler(request: Request, exc: RateLimitExceeded):
         },
         headers={"Retry-After": "5"},
     )
-    return _apply_cors_headers(resp, request)
+    return _apply_version_cut_no_store(_apply_cors_headers(resp, request), request)
 
 
 app.add_exception_handler(RateLimitExceeded, _cors_aware_rate_limit_handler)
@@ -2165,7 +2217,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={"error": {"code": exc.status_code, "message": exc.detail}},
         headers=exc.headers,
     )
-    return _apply_cors_headers(resp, request)
+    return _apply_version_cut_no_store(_apply_cors_headers(resp, request), request)
 
 
 @app.exception_handler(RequestValidationError)
@@ -2184,7 +2236,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "error": {"code": 422, "message": "Validation Error", "details": errors}
         },
     )
-    return _apply_cors_headers(resp, request)
+    return _apply_version_cut_no_store(_apply_cors_headers(resp, request), request)
 
 
 @app.exception_handler(Exception)
@@ -2196,7 +2248,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"detail": "Internal Server Error"},
     )
-    return _apply_cors_headers(resp, request)
+    return _apply_version_cut_no_store(_apply_cors_headers(resp, request), request)
 
 
 # Add CORS Middleware so the frontend can call these APIs
@@ -2251,6 +2303,7 @@ app.add_middleware(
 )
 
 app.add_middleware(RequestDurationMiddleware)
+app.add_middleware(VersionCutNoStoreMiddleware)
 
 
 static_dir = os.path.join(os.path.dirname(__file__), "..", "static")

@@ -4,10 +4,9 @@ import asyncio
 import logging
 import re
 import uuid
-from datetime import datetime
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Response
 from pydantic import BaseModel, Field as _Field
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,10 +46,16 @@ from app.qualification_state_resolver import (
     resolve_dimension_states_from_ledger,
     patch_qualification_state_from_dimension_states,
 )
-from app.time_utils import _coerce_naive_utc, utc_iso
+from app.time_utils import utc_iso
 from app import release_version as _release_version
 from app import compute as _compute
 from app.digest_cache import DigestCache
+from app.routers.admin_release_version_projections import (
+    _closed_version_until,
+    _compose_serving_block,
+    _format_qualification,
+    _qualification_intent_projection,
+)
 
 router = APIRouter()
 
@@ -64,80 +69,26 @@ _agent_serving_shas_cache = DigestCache(default_ttl=300.0, stale_retry_ttl=60.0)
 # version-lifecycle: multi-step DB computation polled every 30s+; 30s TTL keeps
 # it fresh enough while collapsing burst polls into a single DB round-trip.
 _version_lifecycle_cache = DigestCache(default_ttl=30.0, stale_retry_ttl=15.0)
+_version_lifecycle_generation: dict[str, int] = {}
+
+
+def _invalidate_version_lifecycle(project_id: uuid.UUID) -> None:
+    """Advance one project's cache generation after a canonical mutation."""
+
+    key = str(project_id)
+    _version_lifecycle_generation[key] = _version_lifecycle_generation.get(key, 0) + 1
+    _version_lifecycle_cache.invalidate_matching(
+        lambda cached_key: (
+            cached_key == key
+            or (
+                isinstance(cached_key, tuple)
+                and bool(cached_key)
+                and cached_key[0] == key
+            )
+        )
+    )
 
 _MAX_RETIREMENT_CRITIQUES = 100
-
-
-def _qualification_intent_projection(
-    row: ReleaseQualificationIntent,
-) -> dict[str, Any]:
-    """Bounded exact receipt projection for qualification delivery recovery."""
-
-    return {
-        "id": str(row.id),
-        "project_id": str(row.project_id),
-        "release_version_id": str(row.release_version_id),
-        "source_task_id": str(row.source_task_id),
-        "authority_kind": row.authority_kind,
-        "authority_key": row.authority_key,
-        "idempotency_key": row.idempotency_key,
-        "specification_hash": row.specification_hash,
-        "reason": row.reason,
-        "requested_probes": list(row.requested_probes or []),
-        "expected_phase_changed_at": utc_iso(row.expected_phase_changed_at),
-        "status": row.status,
-        "attempt_count": int(row.attempt_count or 0),
-        "claim_id": str(row.claim_id) if row.claim_id is not None else None,
-        "lease_expires_at": utc_iso(row.lease_expires_at),
-        "next_attempt_at": utc_iso(row.next_attempt_at),
-        "result": dict(row.result or {}),
-        "last_error": row.last_error,
-        "created_at": utc_iso(row.created_at),
-        "updated_at": utc_iso(row.updated_at),
-        "completed_at": utc_iso(row.completed_at),
-    }
-
-
-def _compose_serving_block(
-    aggregate: dict,
-    artifacts: list,
-    version: "ReleaseVersion",
-) -> dict:
-    """Build the resolved serving block from aggregate + artifact evidence.
-
-    Mirrors system_state.compute_system_state so every read site resolves
-    serving state identically: sha from the first confirmed artifact
-    (fallback to the legacy scalar), confirmed_at from that same artifact,
-    failure_reason only when the aggregate status is deploy_failed.
-    """
-    aggregate_status = aggregate.get("serving_status")
-    serving_sha = next(
-        (
-            e["served_identifier"]
-            for e in artifacts
-            if e.get("serving_status") == "serving_confirmed"
-            and e.get("served_identifier") is not None
-        ),
-        getattr(version, "served_sha", None),
-    )
-    confirmed_at = next(
-        (
-            e["served_at"]
-            for e in artifacts
-            if e.get("serving_status") == "serving_confirmed" and e.get("served_at")
-        ),
-        utc_iso(version.served_at),
-    )
-    return {
-        "status": aggregate_status,
-        "sha": serving_sha,
-        "confirmed_at": confirmed_at,
-        "failure_reason": aggregate.get("reason_code")
-        if aggregate_status == "deploy_failed"
-        else None,
-        "fleet_freshness": aggregate.get("fleet_freshness"),
-        "artifacts": artifacts,
-    }
 
 
 @router.get("/projects/{project_id}/retirement-critiques")
@@ -200,80 +151,6 @@ async def get_retirement_critiques(
                 break
 
     return {"critiques": critiques_out, "total": len(critiques_out)}
-
-
-def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract operator-facing fields from a last_qualification record."""
-    from app.release_readiness import format_qualification_for_api  # noqa: PLC0415
-
-    out = format_qualification_for_api(qual)
-    candidate_gate = qual.get("candidate_operator_authorship_gate")
-    if not isinstance(candidate_gate, dict):
-        sub_scores = qual.get("sub_scores")
-        candidate_gate = (
-            sub_scores.get("candidate_operator_authorship")
-            if isinstance(sub_scores, dict)
-            else None
-        )
-    out.update(
-        {
-            "status": qual.get("status"),
-            "qualification_attempt_id": qual.get("qualification_attempt_id"),
-            "retry_episode": qual.get("retry_episode"),
-            "retry_episode_cap": qual.get("retry_episode_cap"),
-            "confidence": qual.get("confidence"),
-            "threshold": qual.get("threshold"),
-            "sub_scores": qual.get("sub_scores"),
-            "ci_resolution": qual.get("ci_resolution"),
-            "blocker": qual.get("blocker"),
-            "finalized_at": qual.get("finalized_at"),
-            # The candidate commit this qualification was evaluated against. Lets the
-            # operator UI detect when the latest release_audit's findings were computed
-            # against a different (older) commit than the version's evaluated candidate.
-            "candidate_sha": qual.get("candidate_sha"),
-            # Candidate-range authorship is a promotion gate, not the
-            # historical serving receipt. Preserve its explicit unconfigured
-            # state and null budget so the operator can declare policy.
-            "candidate_operator_authorship_gate": candidate_gate,
-            # Infra-failure context (populated only when status=infra_failure).
-            "error": qual.get("error"),
-            "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
-            # True when the same migration-apply gate failure has repeated
-            # _MIN_INFRA_ERROR_STREAK+ times with an identical signature —
-            # the operator hotfix-deploy channel is the sanctioned remedy.
-            "is_permanent_gate_incapacity": qual.get("is_permanent_gate_incapacity"),
-            # Audit observability: why the audit sub-score is missing/unscoreable.
-            "audit_missing_reason": qual.get("audit_missing_reason"),
-            # Audit reconciliation: model-reported vs findings-derived score delta
-            # and excluded findings count (populated by _compute_audit_reconciliation).
-            "audit_reconciliation": qual.get("audit_reconciliation"),
-        }
-    )
-    return out
-
-
-def _closed_version_until(version: ReleaseVersion) -> Optional[datetime]:
-    """Return the upper-bound timestamp for a closed version's merged-task window.
-
-    For promoted versions returns ``promoted_at``.  For abandoned versions
-    returns the ``abandoned_at`` ISO string stored in ``last_qualification``.
-    Returns ``None`` for open versions (unbounded window).
-    """
-    if version.status == "promoted" and version.promoted_at is not None:
-        return version.promoted_at
-    if version.status == "abandoned":
-        lq = version.last_qualification or {}
-        raw = lq.get("abandoned_at")
-        if isinstance(raw, str):
-            try:
-                # _coerce_naive_utc converts any stored offset (including a
-                # 'Z'-suffix from a tz-aware writer) to naive UTC rather than
-                # dropping it, keeping the window bound consistent with the
-                # naive-UTC timestamps the merged-task queries compare against.
-                return _coerce_naive_utc(datetime.fromisoformat(raw))
-            except (ValueError, TypeError):
-                pass
-    return None
 
 
 async def _serialize_version_history_entry(
@@ -344,6 +221,8 @@ async def _serialize_version_history_entry(
         "version_number": version.version_number,
         "status": version.status,
         "phase": version.phase,
+        "base_sha": version.base_sha,
+        "candidate_sha": version.candidate_sha,
         "opened_at": utc_iso(version.opened_at),
         "promoted_at": utc_iso(version.promoted_at),
         "promoted_sha": version.promoted_sha,
@@ -387,6 +266,16 @@ async def _serialize_version_history_entry(
         "abandon_reason": (
             (version.last_qualification or {}).get("reason")
             if version.status == "abandoned"
+            else None
+        ),
+        "version_cut_receipt": (
+            (version.last_qualification or {}).get("version_cut_receipt")
+            if version.status == "abandoned"
+            else None
+        ),
+        "version_cut_followups": (
+            _version_cut_followups_for_read(version)
+            if (version.last_qualification or {}).get("version_cut_receipt")
             else None
         ),
         # Out-of-band promotion provenance: non-null when an operator force-merged
@@ -884,8 +773,12 @@ async def get_version_lifecycle(
                 live_current_focus = intent.get("current_focus")
 
             current_version_out = {
+                "id": str(open_row.id),
                 "version_number": open_row.version_number,
+                "status": open_row.status,
                 "phase": open_row.phase,
+                "base_sha": open_row.base_sha,
+                "candidate_sha": open_row.candidate_sha,
                 "phase_changed_at": utc_iso(open_row.phase_changed_at),
                 "phase_reasoning": open_row.phase_reasoning,
                 "goal": open_row.goal,
@@ -1088,7 +981,10 @@ async def get_version_lifecycle(
         }
 
     result, served_stale = await _version_lifecycle_cache.get_or_compute_meta(
-        str(project_id),
+        (
+            str(project_id),
+            _version_lifecycle_generation.get(str(project_id), 0),
+        ),
         _compute_lifecycle,
     )
     current_effective_policy = current_effective_policy_projection(project_row)
@@ -1268,23 +1164,126 @@ async def set_version_goal(
 
 class _AbandonVersionBody(BaseModel):
     reason: str | None = _Field(default=None, max_length=500)
-    # Client-generated idempotency key. When supplied, a repeat cut (double-click
-    # / lost-response retry) carrying the same key returns the original cut's
-    # result instead of abandoning the freshly-opened next version a second time,
-    # mirroring the message and direction composers.
-    idempotency_key: str | None = _Field(default=None, max_length=255)
+    idempotency_key: str = _Field(min_length=1, max_length=255)
+    expected_version_id: uuid.UUID
+    expected_version_number: int = _Field(ge=1)
+    expected_integration_sha: str = _Field(
+        min_length=40,
+        max_length=40,
+        pattern=r"^[0-9a-f]{40}$",
+    )
+    expected_integration_identity: str = _Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+
+def _version_cut_error(
+    code: str,
+    message: str,
+    *,
+    current: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    detail: dict[str, Any] = {"code": code, "message": message}
+    if current:
+        detail["current"] = current
+    return detail
+
+
+def _version_cut_followups_for_read(version: ReleaseVersion) -> dict[str, Any] | None:
+    try:
+        return _release_version.version_cut_followup_projection(version)
+    except _release_version.VersionCutIdempotencyConflict as exc:
+        return {
+            "schema_version": None,
+            "status": "invalid",
+            "attempts": 0,
+            "created_at": None,
+            "last_attempt_at": None,
+            "completed_at": None,
+            "last_error": str(exc)[:500],
+            "lease_expires_at": None,
+        }
+
+
+@router.get("/projects/{project_id}/version-cut-context")
+async def get_version_cut_context(
+    project_id: uuid.UUID,
+    response: Response,
+    idempotency_key: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return uncached exact cut identity or one frozen prior receipt."""
+
+    response.headers["Cache-Control"] = "no-store, private"
+    try:
+        await _get_user_project_with_role(
+            project_id,
+            current_user["user_id"],
+            session,
+            "member",
+        )
+        return await _release_version.get_version_cut_context(
+            session,
+            project_id,
+            idempotency_key=idempotency_key,
+        )
+    except HTTPException as exc:
+        headers = dict(exc.headers or {})
+        headers["Cache-Control"] = "no-store, private"
+        exc.headers = headers
+        raise
+    except _release_version.VersionCutIdentityUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=_version_cut_error(
+                "version_cut_identity_unavailable",
+                str(exc),
+            ),
+            headers={"Cache-Control": "no-store, private"},
+        ) from exc
+    except _release_version.VersionCutPreconditionFailed as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=_version_cut_error(
+                "version_cut_precondition_failed",
+                str(exc),
+                current=exc.current,
+            ),
+            headers={"Cache-Control": "no-store, private"},
+        ) from exc
+    except _release_version.VersionCutIdempotencyConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=_version_cut_error(
+                "version_cut_idempotency_conflict",
+                str(exc),
+            ),
+            headers={"Cache-Control": "no-store, private"},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=_version_cut_error("version_cut_invalid_request", str(exc)),
+            headers={"Cache-Control": "no-store, private"},
+        ) from exc
 
 
 @router.post("/projects/{project_id}/version-cut")
 async def cut_version(
     project_id: uuid.UUID,
     payload: _AbandonVersionBody,
+    response: Response,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Operator-initiated version cut: abandon the open version, open the next.
 
-    Member+ role required.  Returns 404 when there is no open version to cut.
+    Member+ role required. Exact idempotency, version, and live integration-SHA
+    preconditions are mandatory; stale or conflicting requests fail without a
+    write and must be preflighted again.
     Abandons the current open ``ReleaseVersion`` (status ``abandoned``, recording
     the operator reason + identity in ``last_qualification`` and
     ``phase_reasoning``) and opens a fresh next-numbered version in the ``build``
@@ -1292,19 +1291,30 @@ async def cut_version(
     a genuinely-stuck version (wrong goal, pivoted work, un-passable candidate)
     that the existing stall detection only alerts on.
     """
-    await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
-    )
-
-    operator_id = current_user.get("email") or current_user["user_id"]
+    response.headers["Cache-Control"] = "no-store, private"
     try:
-        abandoned, new_version = await _release_version.abandon_current_version(
+        await _get_user_project_with_role(
+            project_id, current_user["user_id"], session, "member"
+        )
+        operator_id = str(current_user["user_id"])
+        operator_display = current_user.get("email") or operator_id
+        outcome = await _release_version.cut_current_version_exact(
             session,
             project_id,
             reason=payload.reason,
             operator_id=operator_id,
+            operator_display=operator_display,
             idempotency_key=payload.idempotency_key,
+            expected_version_id=payload.expected_version_id,
+            expected_version_number=payload.expected_version_number,
+            expected_integration_sha=payload.expected_integration_sha,
+            expected_integration_identity=payload.expected_integration_identity,
         )
+    except HTTPException as exc:
+        headers = dict(exc.headers or {})
+        headers["Cache-Control"] = "no-store, private"
+        exc.headers = headers
+        raise
     except _release_version.VersionCutBlockedByPromotion as exc:
         if exc.promotion_pr_number is not None:
             detail = (
@@ -1323,27 +1333,84 @@ async def cut_version(
                 detail += f" {exc.promotion_pr_url}"
             detail += ")"
         detail += _release_version.format_promotion_freshness(exc.promotion_freshness)
-        raise HTTPException(status_code=409, detail=detail) from exc
-    if abandoned is None or new_version is None:
         raise HTTPException(
-            status_code=404,
-            detail="No open release version found for this project.",
-        )
+            status_code=409,
+            detail=_version_cut_error(
+                "version_cut_promotion_blocked",
+                detail,
+            ),
+            headers={"Cache-Control": "no-store, private"},
+        ) from exc
+    except _release_version.VersionCutIdentityUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=_version_cut_error(
+                "version_cut_identity_unavailable",
+                str(exc),
+            ),
+            headers={"Cache-Control": "no-store, private"},
+        ) from exc
+    except _release_version.VersionCutPreconditionFailed as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=_version_cut_error(
+                "version_cut_precondition_failed",
+                str(exc),
+                current=exc.current,
+            ),
+            headers={"Cache-Control": "no-store, private"},
+        ) from exc
+    except _release_version.VersionCutIdempotencyConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=_version_cut_error(
+                "version_cut_idempotency_conflict",
+                str(exc),
+            ),
+            headers={"Cache-Control": "no-store, private"},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=_version_cut_error("version_cut_invalid_request", str(exc)),
+            headers={"Cache-Control": "no-store, private"},
+        ) from exc
 
     await session.commit()
+    abandoned = outcome.abandoned
+    new_version = outcome.successor
     await session.refresh(abandoned)
     await session.refresh(new_version)
+    _invalidate_version_lifecycle(project_id)
+    followup_result = await _release_version.run_version_cut_followups(outcome)
+    if getattr(followup_result, "executed", False) is True:
+        _invalidate_version_lifecycle(project_id)
+    await session.refresh(abandoned)
+    receipt = outcome.receipt
     return {
+        "replayed": outcome.replayed,
+        "receipt": receipt,
+        "followups": _release_version.version_cut_followup_projection(
+            abandoned,
+            receipt,
+        ),
         "abandoned_version": {
-            "version_number": abandoned.version_number,
-            "status": abandoned.status,
-            "abandoned_at": (abandoned.last_qualification or {}).get("abandoned_at"),
+            "id": receipt["abandoned_version_id"],
+            "version_number": receipt["abandoned_version_number"],
+            "status": receipt["abandoned_status"],
+            "base_sha": receipt["abandoned_base_sha"],
+            "candidate_sha": receipt["abandoned_candidate_sha"],
+            "abandoned_at": receipt["committed_at"],
         },
         "new_version": {
-            "version_number": new_version.version_number,
-            "phase": new_version.phase,
-            "goal": new_version.goal,
-            "opened_at": utc_iso(new_version.opened_at),
+            "id": receipt["successor_version_id"],
+            "version_number": receipt["successor_version_number"],
+            "status": receipt["successor_status"],
+            "phase": receipt["successor_phase"],
+            "goal": receipt["successor_goal"],
+            "base_sha": receipt["successor_base_sha"],
+            "candidate_sha": receipt["successor_candidate_sha"],
+            "opened_at": receipt["successor_opened_at"],
         },
     }
 
@@ -1611,9 +1678,22 @@ async def get_version_summary(
 
     return {
         # Version identity
+        "id": str(version.id),
         "version_number": version.version_number,
         "phase": version.phase,
         "status": version.status,
+        "base_sha": version.base_sha,
+        "candidate_sha": version.candidate_sha,
+        "version_cut_receipt": (
+            (version.last_qualification or {}).get("version_cut_receipt")
+            if version.status == "abandoned"
+            else None
+        ),
+        "version_cut_followups": (
+            _version_cut_followups_for_read(version)
+            if (version.last_qualification or {}).get("version_cut_receipt")
+            else None
+        ),
         "goal": version.goal,
         # Timestamps (isoformat, null-safe)
         "opened_at": utc_iso(version.opened_at),

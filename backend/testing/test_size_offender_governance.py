@@ -326,6 +326,10 @@ def test_self_heal_clamps_governed_release_qualifier_cap(tmp_path, mocker):
     ("module_key", "source_path"),
     (
         (
+            "routers/admin_release_version_projections.py",
+            "backend/app/routers/admin_release_version_projections.py",
+        ),
+        (
             "release_prepromotion_gradeability.py",
             "backend/app/release_prepromotion_gradeability.py",
         ),
@@ -340,6 +344,7 @@ def test_self_heal_clamps_governed_release_qualifier_cap(tmp_path, mocker):
             "backend/app/release_qualification_observation_protocol.py",
         ),
         ("release_serving_observation.py", "backend/app/release_serving_observation.py"),
+        ("release_version_cut.py", "backend/app/release_version_cut.py"),
     ),
 )
 def test_new_release_modules_have_paired_governing_cap_repairs(

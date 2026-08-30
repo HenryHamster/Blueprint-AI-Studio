@@ -1,5 +1,5 @@
 /* eslint-disable react-hooks/set-state-in-effect */
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ReleaseQualificationFindings } from './ReleaseQualificationFindings';
 import { VersionSummaryPanel } from './VersionSummaryPanel';
@@ -8,6 +8,7 @@ import {
   approveActivation,
   clearDeployFailed,
   cutVersion,
+  getVersionCutContext,
   fetchQualificationVerdicts,
   getHotfixPreview,
   linkCriteriaToDirection,
@@ -28,8 +29,11 @@ import {
   type QualificationState,
   type QualificationTriggerState,
   type OperatorAuthorshipEvidenceContract,
+  type VersionCutContext,
+  type VersionCutRequest,
 } from '../api';
 import { timeAgo } from '../utils/time';
+import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import {
   QUAL_VERDICT_COLOR,
   QUAL_STATE_STYLE,
@@ -93,13 +97,98 @@ function QualificationTriggerRow({ state }: { state: QualificationTriggerState }
   );
 }
 
-// Generate a client idempotency key for a version cut. Prefers the native UUID
-// generator and falls back to a timestamp+random token for older runtimes (and
-// JSDOM, where crypto.randomUUID may be absent). Mirrors MessagesPanel.
-function generateIdempotencyKey(): string {
-  const c = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
-  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
-  return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+interface StoredVersionCutAttempt {
+  schema_version: 1;
+  project_id: string;
+  request: VersionCutRequest;
+  raw_body: string;
+  created_at: string;
+}
+
+const versionCutStorageKey = (projectId: string) => `blueprint:version-cut:${projectId}`;
+
+function exactCutIdentityMatches(
+  attempt: StoredVersionCutAttempt,
+  context: VersionCutContext,
+): boolean {
+  if (context.status !== 'ready') return false;
+  const { request } = attempt;
+  return context.version.id === request.expected_version_id
+    && context.version.version_number === request.expected_version_number
+    && context.integration.head_sha === request.expected_integration_sha
+    && context.integration.identity_token === request.expected_integration_identity;
+}
+
+function exactCutReceiptMatches(
+  attempt: StoredVersionCutAttempt,
+  context: VersionCutContext,
+): boolean {
+  if (context.status !== 'committed') return false;
+  const { request } = attempt;
+  const { receipt } = context;
+  return receipt.project_id === attempt.project_id
+    && receipt.idempotency_key === request.idempotency_key
+    && receipt.reason === request.reason
+    && receipt.expected_version_id === request.expected_version_id
+    && receipt.expected_version_number === request.expected_version_number
+    && receipt.expected_integration_sha === request.expected_integration_sha
+    && receipt.expected_integration_identity === request.expected_integration_identity;
+}
+
+function parseStoredVersionCutAttempt(
+  projectId: string,
+  raw: string | null,
+): StoredVersionCutAttempt | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as StoredVersionCutAttempt;
+    const request = parsed?.request;
+    if (
+      parsed?.schema_version !== 1
+      || parsed.project_id !== projectId
+      || typeof parsed.raw_body !== 'string'
+      || typeof parsed.created_at !== 'string'
+      || !request
+      || typeof request.idempotency_key !== 'string'
+      || !request.idempotency_key.trim()
+      || request.idempotency_key.length > 255
+      || typeof request.expected_version_id !== 'string'
+      || typeof request.expected_version_number !== 'number'
+      || typeof request.expected_integration_sha !== 'string'
+      || typeof request.expected_integration_identity !== 'string'
+    ) return null;
+    const body = JSON.parse(parsed.raw_body) as VersionCutRequest;
+    const exactRequestKeys = [
+      'expected_integration_identity',
+      'expected_integration_sha',
+      'expected_version_id',
+      'expected_version_number',
+      'idempotency_key',
+      'reason',
+    ];
+    if (
+      typeof body !== 'object'
+      || body === null
+      || Array.isArray(body)
+      || Object.keys(body).sort().join('|') !== exactRequestKeys.join('|')
+      || Object.keys(request).sort().join('|') !== exactRequestKeys.join('|')
+      || (body.reason !== null && (typeof body.reason !== 'string' || body.reason.length > 500))
+      || !Number.isInteger(body.expected_version_number)
+      || body.expected_version_number < 1
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.expected_version_id)
+      || !/^[0-9a-f]{40}$/.test(body.expected_integration_sha)
+      || !/^[0-9a-f]{64}$/.test(body.expected_integration_identity)
+      || body.reason !== request.reason
+      || body.idempotency_key !== request.idempotency_key
+      || body.expected_version_id !== request.expected_version_id
+      || body.expected_version_number !== request.expected_version_number
+      || body.expected_integration_sha !== request.expected_integration_sha
+      || body.expected_integration_identity !== request.expected_integration_identity
+    ) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 function DebtEnforcePreview({
@@ -172,6 +261,10 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
   const [promotionEnabledOverride, setPromotionEnabledOverride] = useState<boolean | null>(null);
   const [cuttingVersion, setCuttingVersion] = useState<boolean>(false);
   const [cutReason, setCutReason] = useState<string>('');
+  const [pendingCutAttempt, setPendingCutAttempt] = useState<StoredVersionCutAttempt | null>(null);
+  const [cutAttemptRetryable, setCutAttemptRetryable] = useState<boolean>(false);
+  const [cutAttemptDiscardable, setCutAttemptDiscardable] = useState<boolean>(false);
+  const [cutRecoveryBlocked, setCutRecoveryBlocked] = useState<boolean>(false);
   const [hotfixPanelOpen, setHotfixPanelOpen] = useState<boolean>(false);
   const [hotfixPreview, setHotfixPreview] = useState<HotfixPreviewResponse | null>(null);
   const [hotfixPreviewLoading, setHotfixPreviewLoading] = useState<boolean>(false);
@@ -179,9 +272,6 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
   const [hotfixAck, setHotfixAck] = useState<boolean>(false);
   const [expandedVersionId, setExpandedVersionId] = useState<string | null>(null);
   const [changelogExpanded, setChangelogExpanded] = useState<boolean>(false);
-  // One idempotency key per confirmed cut: generated on confirm, reused across
-  // a lost-response retry, cleared on success so the next cut gets a fresh key.
-  const cutIdempotencyKeyRef = useRef<string | null>(null);
   useEffect(() => {
     if (!projectId) { setVerdicts([]); setVerdictsError(null); return; }
     fetchQualificationVerdicts(projectId, 10)
@@ -199,6 +289,83 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
   useEffect(() => {
     setPromotionEnabledOverride(null);
   }, [data?.promotion_enabled]);
+  useEffect(() => {
+    if (!projectId || typeof window === 'undefined') {
+      setPendingCutAttempt(null);
+      setCutAttemptRetryable(false);
+      setCutAttemptDiscardable(false);
+      setCutRecoveryBlocked(false);
+      return;
+    }
+    let cancelled = false;
+    let storedRaw: string | null = null;
+    try {
+      storedRaw = window.sessionStorage.getItem(versionCutStorageKey(projectId));
+    } catch {
+      setCutRecoveryBlocked(true);
+      setActionMsg('Unable to read the durable local version-cut attempt. No cut was sent.');
+      return;
+    }
+    const attempt = parseStoredVersionCutAttempt(projectId, storedRaw);
+    if (!attempt) {
+      if (storedRaw) {
+        setCutRecoveryBlocked(true);
+        setActionMsg('Stored version-cut attempt is invalid. Refusing to send or replace it.');
+      } else {
+        setCutRecoveryBlocked(false);
+      }
+      setPendingCutAttempt(null);
+      setCutAttemptRetryable(false);
+      setCutAttemptDiscardable(false);
+      return;
+    }
+    setPendingCutAttempt(attempt);
+    setCutAttemptRetryable(false);
+    setCutAttemptDiscardable(false);
+    setCutRecoveryBlocked(false);
+    getVersionCutContext(projectId, attempt.request.idempotency_key)
+      .then((context) => {
+        if (cancelled) return;
+        if (context.status === 'committed' && exactCutReceiptMatches(attempt, context)) {
+          onRefresh();
+          if (context.followups.status === 'complete') {
+            window.sessionStorage.removeItem(versionCutStorageKey(projectId));
+            setPendingCutAttempt(null);
+            setCutAttemptDiscardable(false);
+            setActionMsg(
+              `Recovered committed cut v${context.receipt.abandoned_version_number} → v${context.receipt.successor_version_number}.`,
+            );
+          } else {
+          setActionMsg(context.followups.status === 'invalid'
+            ? `Cut v${context.receipt.abandoned_version_number} is committed, but its follow-up state is corrupt. Operator repair is required.`
+            : `Cut v${context.receipt.abandoned_version_number} is committed; follow-up delivery is pending (attempt ${context.followups.attempts}).`);
+          }
+          return;
+        }
+        if (context.status === 'ready' && exactCutIdentityMatches(attempt, context)) {
+          setCutAttemptRetryable(true);
+          setCutAttemptDiscardable(false);
+          setActionMsg('The prior cut is not committed. Retry is available with the exact same frozen request.');
+          return;
+        }
+        if (context.status === 'ready') {
+          setCutAttemptDiscardable(true);
+          setActionMsg('No receipt exists and version-cut authority changed. Discard the stale request before a fresh preflight.');
+          return;
+        }
+        setActionMsg('The committed version-cut receipt mismatched the frozen request. Refusing to discard or retry it.');
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setActionMsg(
+            error instanceof Error
+              ? `Unable to reconcile the stored version cut: ${error.message}`
+              : 'Unable to reconcile the stored version cut.',
+          );
+        }
+      });
+    return () => { cancelled = true; };
+  }, [projectId]);
   useEffect(() => {
     const dialogAllowed = !localDialog
       || (localDialog.requiredAccess === 'manage-platform'
@@ -377,9 +544,177 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
     }
   };
 
-  const handleCutVersion = () => {
+  const reconcileCutAttempt = async (
+    attempt: StoredVersionCutAttempt,
+    postError?: unknown,
+  ) => {
+    if (!projectId || attempt.project_id !== projectId) return;
+    const context = await getVersionCutContext(
+      projectId,
+      attempt.request.idempotency_key,
+    );
+    if (context.status === 'committed') {
+      setCutAttemptDiscardable(false);
+      if (!exactCutReceiptMatches(attempt, context)) {
+        setCutAttemptRetryable(false);
+        setActionMsg('Committed version-cut receipt does not match the frozen request. Refusing to continue.');
+        return;
+      }
+      setCutAttemptRetryable(false);
+      if (context.followups.status !== 'complete') {
+        setPendingCutAttempt(attempt);
+        setActionMsg(context.followups.status === 'invalid'
+          ? `Cut v${context.receipt.abandoned_version_number} is committed, but its follow-up state is corrupt. Operator repair is required.`
+          : `Cut v${context.receipt.abandoned_version_number} is committed; follow-up delivery is pending (attempt ${context.followups.attempts}).`);
+        onRefresh();
+        return;
+      }
+      try {
+        window.sessionStorage.removeItem(versionCutStorageKey(projectId));
+      } catch {
+        setPendingCutAttempt(attempt);
+        setActionMsg('Cut is committed and delivered, but the local recovery record could not be cleared.');
+        return;
+      }
+      setPendingCutAttempt(null);
+      setCuttingVersion(false);
+      setCutReason('');
+      setActionMsg(
+        `Cut v${context.receipt.abandoned_version_number} → opened v${context.receipt.successor_version_number}`,
+      );
+      onRefresh();
+      return;
+    }
+    setPendingCutAttempt(attempt);
+    if (exactCutIdentityMatches(attempt, context)) {
+      setCutAttemptRetryable(true);
+      setCutAttemptDiscardable(false);
+      setActionMsg(
+        postError instanceof Error
+          ? `The request failed without a committed receipt (${postError.message}). Retry will reuse the exact frozen body.`
+          : 'No committed receipt exists. Retry will reuse the exact frozen body.',
+      );
+      return;
+    }
+    setCutAttemptRetryable(false);
+    setCutAttemptDiscardable(true);
+    setActionMsg('No receipt exists and version or integration identity changed. Discard the stale request before a fresh preflight.');
+  };
+
+  const executeCutAttempt = async (attempt: StoredVersionCutAttempt) => {
+    if (!projectId || attempt.project_id !== projectId) return;
+    setActionLoading('cut');
+    setActionMsg(null);
+    setCutAttemptRetryable(false);
+    setCutAttemptDiscardable(false);
+    try {
+      const stored = JSON.stringify(attempt);
+      window.sessionStorage.setItem(versionCutStorageKey(projectId), stored);
+      setPendingCutAttempt(attempt);
+    } catch {
+      setActionMsg('Unable to persist the exact version-cut request. No cut was sent.');
+      setActionLoading(null);
+      return;
+    }
+
+    let postError: unknown;
+    try {
+      await cutVersion(projectId, attempt.raw_body);
+    } catch (error) {
+      postError = error;
+    }
+    try {
+      await reconcileCutAttempt(attempt, postError);
+    } catch (error) {
+      setActionMsg(
+        error instanceof Error
+          ? `Version-cut outcome is ambiguous; the frozen request was retained for readback: ${error.message}`
+          : 'Version-cut outcome is ambiguous; the frozen request was retained for readback.',
+      );
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const discardStaleCutAttempt = async (attempt: StoredVersionCutAttempt) => {
+    if (!projectId || attempt.project_id !== projectId) return;
+    setActionLoading('cut-discard');
+    try {
+      const context = await getVersionCutContext(
+        projectId,
+        attempt.request.idempotency_key,
+      );
+      if (context.status !== 'ready' || exactCutIdentityMatches(attempt, context)) {
+        await reconcileCutAttempt(attempt);
+        return;
+      }
+      window.sessionStorage.removeItem(versionCutStorageKey(projectId));
+      setPendingCutAttempt(null);
+      setCutAttemptDiscardable(false);
+      setCutAttemptRetryable(false);
+      setActionMsg('Stale uncommitted cut request discarded. Run a fresh preflight before cutting.');
+    } catch (error) {
+      setActionMsg(
+        error instanceof Error
+          ? `Unable to verify and discard the stale cut request: ${error.message}`
+          : 'Unable to verify and discard the stale cut request.',
+      );
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleCutVersion = async () => {
     if (readOnly || !projectId || !cv) return;
-    const activating = stagedActivatedByCut(data?.staged_directions ?? [], cv.version_number);
+    if (cutRecoveryBlocked) {
+      setActionMsg('Resolve or explicitly discard the invalid local recovery record before starting another cut.');
+      return;
+    }
+    if (pendingCutAttempt) {
+      setActionLoading('cut-reconcile');
+      try {
+        await reconcileCutAttempt(pendingCutAttempt);
+      } catch (error) {
+        setActionMsg(error instanceof Error ? error.message : 'Unable to reconcile the stored cut.');
+      } finally {
+        setActionLoading(null);
+      }
+      return;
+    }
+    setActionLoading('cut-preflight');
+    setActionMsg(null);
+    let context: VersionCutContext;
+    try {
+      context = await getVersionCutContext(projectId);
+    } catch (error) {
+      setActionMsg(error instanceof Error ? error.message : 'Version-cut preflight failed.');
+      setActionLoading(null);
+      return;
+    }
+    if (context.status !== 'ready') {
+      setActionMsg('Version-cut preflight returned an unexpected committed receipt.');
+      setActionLoading(null);
+      return;
+    }
+    const request: VersionCutRequest = {
+      reason: cutReason.trim() || null,
+      idempotency_key: generateIdempotencyKey(),
+      expected_version_id: context.version.id,
+      expected_version_number: context.version.version_number,
+      expected_integration_sha: context.integration.head_sha,
+      expected_integration_identity: context.integration.identity_token,
+    };
+    const attempt: StoredVersionCutAttempt = {
+      schema_version: 1,
+      project_id: projectId,
+      request,
+      raw_body: JSON.stringify(request),
+      created_at: new Date().toISOString(),
+    };
+    const activating = stagedActivatedByCut(
+      data?.staged_directions ?? [],
+      context.version.version_number,
+    );
     const inFlight = cv.in_flight_task_count ?? 0;
     const qualState: QualificationState | null = cv.qualification_state ?? null;
     const cutPromotionFreshness = formatPromotionFreshnessContext(qualState);
@@ -394,32 +729,19 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
         ? `promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open in Blueprint's exact-head check wait${cutPromotionFreshness ? ` (${cutPromotionFreshness.detailText})` : ''} (only the revalidated checked head can merge)`
         : null,
     ].filter(Boolean);
-    const msg = consequences.length
-      ? `Abandon v${cv.version_number} and open a fresh version?\n\nThis will: ${consequences.join('; ')}.`
-      : `Abandon v${cv.version_number} and open a fresh version?`;
+    const exactIdentity = `${context.integration.owner}/${context.integration.repo}:${context.integration.branch}\nHEAD ${context.integration.head_sha}\nVersion v${context.version.version_number} (${context.version.id})`;
+    const msg = (consequences.length
+      ? `Abandon v${context.version.version_number} and open a fresh version?\n\nThis will: ${consequences.join('; ')}.`
+      : `Abandon v${context.version.version_number} and open a fresh version?`)
+      + `\n\nExact authority:\n${exactIdentity}`;
+    setActionLoading(null);
     setLocalDialog({
-      title: `Abandon v${cv.version_number}?`,
+      title: `Abandon v${context.version.version_number}?`,
       message: msg,
       confirmLabel: 'Abandon',
-      onConfirm: async () => {
+      onConfirm: () => {
         setLocalDialog(null);
-        setActionLoading('cut');
-        setActionMsg(null);
-        if (!cutIdempotencyKeyRef.current) {
-          cutIdempotencyKeyRef.current = generateIdempotencyKey();
-        }
-        try {
-          const result = await cutVersion(projectId, cutReason || undefined, cutIdempotencyKeyRef.current);
-          setActionMsg(`Cut v${result.abandoned_version.version_number} → opened v${result.new_version.version_number}`);
-          setCuttingVersion(false);
-          setCutReason('');
-          cutIdempotencyKeyRef.current = null;
-          onRefresh();
-        } catch (error) {
-          setActionMsg(error instanceof Error ? error.message : 'Request failed');
-        } finally {
-          setActionLoading(null);
-        }
+        void executeCutAttempt(attempt);
       },
       requiredAccess: 'operate',
     });
@@ -714,6 +1036,11 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
           <div className="space-y-1">
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-bold text-neutral-200">v{cv.version_number}</span>
+              {cv.id && (
+                <span data-testid="current-version-id" className="text-ui-xs text-neutral-600 font-mono" title={cv.id}>
+                  {cv.id}
+                </span>
+              )}
               <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${cv.phase === 'stabilize' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-400'}`}>{cv.phase}</span>
               {cv.phase_changed_at && <span className="text-ui-sm text-neutral-500">{timeAgo(cv.phase_changed_at)}</span>}
               <span className="text-ui-sm text-neutral-500">{cv.merged_task_count} tasks merged</span>
@@ -725,6 +1052,16 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                   title={`candidate under evaluation: ${cv.active_candidate_sha}`}
                 >
                   candidate @{cv.active_candidate_sha.slice(0, 7)}
+                </span>
+              )}
+              {cv.base_sha && (
+                <span data-testid="current-version-base-sha" className="text-ui-sm text-neutral-500 font-mono" title={cv.base_sha}>
+                  base @{cv.base_sha.slice(0, 7)}
+                </span>
+              )}
+              {cv.candidate_sha && (
+                <span data-testid="current-version-canonical-candidate-sha" className="text-ui-sm text-neutral-500 font-mono" title={cv.candidate_sha}>
+                  recorded candidate @{cv.candidate_sha.slice(0, 7)}
                 </span>
               )}
             </div>
@@ -1208,7 +1545,60 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                     Promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open in Blueprint&apos;s exact-head check wait{promotionLockContext}; Blueprint revalidates the target and merges only the checked head after required checks pass. Qualify &amp; phase locked until it lands or is canceled — no fresh qualification needed.
                   </span>
                 )}
-                {cuttingVersion ? (
+                {cutRecoveryBlocked ? (
+                  <div className="flex flex-wrap items-center gap-1" data-testid="version-cut-recovery-blocked">
+                    <span className="text-ui-sm text-red-400">Invalid local cut recovery record blocks new cuts.</span>
+                    <button
+                      onClick={() => {
+                        if (!projectId) return;
+                        try {
+                          window.sessionStorage.removeItem(versionCutStorageKey(projectId));
+                          setCutRecoveryBlocked(false);
+                          setActionMsg('Invalid local cut recovery record discarded explicitly. Run a fresh preflight before cutting.');
+                        } catch {
+                          setActionMsg('Unable to discard the invalid local cut recovery record.');
+                        }
+                      }}
+                      disabled={actionLoading !== null}
+                      className="text-ui-sm px-2 py-0.5 min-h-[44px] rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      Discard local record
+                    </button>
+                  </div>
+                ) : pendingCutAttempt ? (
+                  <div className="flex flex-wrap items-center gap-1" data-testid="version-cut-recovery-controls">
+                    <button
+                      onClick={() => { void handleCutVersion(); }}
+                      disabled={actionLoading !== null}
+                      className="text-ui-sm px-2 py-0.5 min-h-[44px] rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      {actionLoading === 'cut-reconcile' ? '…' : 'Reconcile cut'}
+                    </button>
+                    {cutAttemptRetryable && (
+                      <button
+                        onClick={() => { void executeCutAttempt(pendingCutAttempt); }}
+                        disabled={actionLoading !== null}
+                        className="text-ui-sm px-2 py-0.5 min-h-[44px] rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        data-testid="version-cut-exact-retry"
+                      >
+                        {actionLoading === 'cut' ? '…' : 'Retry exact cut'}
+                      </button>
+                    )}
+                    {cutAttemptDiscardable && (
+                      <button
+                        onClick={() => { void discardStaleCutAttempt(pendingCutAttempt); }}
+                        disabled={actionLoading !== null}
+                        className="text-ui-sm px-2 py-0.5 min-h-[44px] rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        data-testid="version-cut-stale-discard"
+                      >
+                        Discard stale request
+                      </button>
+                    )}
+                    <span className="text-ui-xs text-neutral-500 font-mono">
+                      key {pendingCutAttempt.request.idempotency_key}
+                    </span>
+                  </div>
+                ) : cuttingVersion ? (
                   <div className="flex flex-col gap-1 w-full">
                     <CutConsequences
                       cv={cv}
@@ -1225,12 +1615,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                         className="text-ui-sm flex-1 bg-workbench-panel border border-neutral-700 text-neutral-300 rounded px-2 py-0.5 disabled:opacity-50 disabled:cursor-not-allowed workbench-focus"
                       />
                       <button
-                        onClick={handleCutVersion}
+                        onClick={() => { void handleCutVersion(); }}
                         disabled={actionLoading !== null}
                         className="text-ui-sm px-2 py-0.5 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                         data-viewport-allow-small-target
                       >
-                        {actionLoading === 'cut' ? '…' : 'Cut'}
+                        {actionLoading === 'cut' || actionLoading === 'cut-preflight' ? '…' : 'Cut'}
                       </button>
                       <button
                         onClick={() => {
@@ -1344,6 +1734,14 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                           {v.abandoned_at ? ` · ${timeAgo(v.abandoned_at)}` : ''}
                         </span>
                       )}
+                      {v.version_cut_followups && (
+                        <span
+                          data-testid={`version-cut-followups-${v.version_number}`}
+                          className={v.version_cut_followups.status === 'complete' ? 'text-emerald-500' : 'text-amber-400'}
+                        >
+                          follow-ups {v.version_cut_followups.status} · {v.version_cut_followups.attempts} attempt{v.version_cut_followups.attempts === 1 ? '' : 's'}
+                        </span>
+                      )}
                       {v.id && (
                         <button
                           onClick={() => setExpandedVersionId(isExpanded ? null : v.id ?? null)}
@@ -1356,6 +1754,29 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                     </div>
                     {v.out_of_band_promotion && (
                       <OutOfBandPromotionBadge oob={v.out_of_band_promotion} />
+                    )}
+                    {v.version_cut_receipt && (
+                      <div
+                        data-testid={`version-cut-receipt-${v.version_number}`}
+                        className="ml-8 pl-2 border-l border-neutral-700/50 text-ui-xs text-neutral-500 space-y-0.5"
+                      >
+                        <p>
+                          cut by {v.version_cut_receipt.operator_display}
+                          {v.version_cut_receipt.reason ? `: ${v.version_cut_receipt.reason}` : ''}
+                          {' · '}{timeAgo(v.version_cut_receipt.committed_at)}
+                        </p>
+                        <p className="font-mono break-all">
+                          {v.version_cut_receipt.observed_repository_owner}/{v.version_cut_receipt.observed_repository_name}:{v.version_cut_receipt.observed_integration_branch}
+                          {' @ '}{v.version_cut_receipt.observed_integration_sha}
+                        </p>
+                        <p className="font-mono break-all">
+                          key {v.version_cut_receipt.idempotency_key} · fingerprint {v.version_cut_receipt.request_fingerprint}
+                        </p>
+                        <p className="font-mono break-all">
+                          {v.version_cut_receipt.abandoned_version_id} → {v.version_cut_receipt.successor_version_id}
+                          {' · base '}{v.version_cut_receipt.successor_base_sha}
+                        </p>
+                      </div>
                     )}
                     {!isExpanded && v.highlights && (
                       <VersionHighlightsLine

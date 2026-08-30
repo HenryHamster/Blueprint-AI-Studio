@@ -74,6 +74,7 @@ CONVERSATION_EVENT_TYPES = frozenset(
         "release_build_stalled",
         "release_stabilize_stalled",
         "release_ci_unresolved_stall",
+        "release_version_abandoned",
         "direction_outcome_stalled",
         "direction_staged_activated",
         "promotion_readiness_reached",

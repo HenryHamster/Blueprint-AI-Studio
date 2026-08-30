@@ -2456,11 +2456,12 @@ def test_promote_recover_qualify_fires_with_yes(mock_api, monkeypatch, capsys):
 
 
 def test_promote_recover_cut_discloses_staged_activation_consequences(monkeypatch):
-    """promote-recover cut should disclose lifecycle consequences before confirm."""
     calls = []
 
-    def fake_api(method, path, body=None, timeout=30):
+    def fake_api(method, path, body=None, timeout=30, **kwargs):
         calls.append((method, path, body))
+        if method == "GET" and "version-cut-context" in path:
+            return {"status": "ready", "version": {"id": "0000000c-0000-4000-8000-000000000000", "version_number": 12}, "integration": {"owner": "owner", "repo": "repo", "branch": "automain", "head_sha": "a" * 40, "identity_token": "b" * 64}}
         if method == "GET" and "version-lifecycle" in path:
             return {
                 "current_version": {
@@ -2504,11 +2505,12 @@ def test_promote_recover_cut_discloses_staged_activation_consequences(monkeypatc
 
 
 def test_promote_recover_cut_falls_back_when_lifecycle_read_fails(monkeypatch):
-    """promote-recover cut uses the generic confirmation when lifecycle fetch fails."""
     calls = []
 
-    def fake_api(method, path, body=None, timeout=30):
+    def fake_api(method, path, body=None, timeout=30, **kwargs):
         calls.append((method, path, body))
+        if method == "GET" and "version-cut-context" in path:
+            return {"status": "ready", "version": {"id": "00000001-0000-4000-8000-000000000000", "version_number": 1}, "integration": {"owner": "owner", "repo": "repo", "branch": "automain", "head_sha": "a" * 40, "identity_token": "b" * 64}}
         if method == "GET" and "version-lifecycle" in path:
             raise RuntimeError("boom")
         if method == "POST" and "version-cut" in path:
@@ -2527,7 +2529,7 @@ def test_promote_recover_cut_falls_back_when_lifecycle_read_fails(monkeypatch):
     rc = blueprint.main(["promote-recover", "cut"])
     assert rc == 0
     assert prompts, "expected a confirmation prompt"
-    assert prompts[0] == "About to abandon the open version and open the next. Proceed? [y/N] "
+    assert "Lifecycle consequence read unavailable (boom)" in prompts[0]
     assert not any(method == "POST" and "version-cut" in path for method, path, _ in calls)
 
 def _force_promote_harness(monkeypatch, lifecycle, answer="n"):

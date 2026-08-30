@@ -2480,6 +2480,7 @@ async def _record_promotion_success(
                 _staged_session,
                 version.project_id,
                 version.version_number,
+                terminal_status="promoted",
             )
             if _activated:
                 await request_strategic_refresh(

@@ -14,6 +14,8 @@ import {
   fetchAlerts,
   fetchProjectAlertDomains,
   updateProjectAlertDomains,
+  cutVersion,
+  VersionCutRequestError,
 } from './api';
 import { getIdToken } from './firebase';
 
@@ -99,6 +101,30 @@ describe('apiFetch cancellation', () => {
     await expect(firstRequest).rejects.toMatchObject({ name: 'AbortError' });
     await expect(secondRequest).resolves.toMatchObject({ ok: true });
     expect(second.signal.aborted).toBe(false);
+  });
+});
+
+describe('exact version-cut transport', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('preserves the frozen body and never retries a POST on HTTP 5xx', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        error: { message: { code: 'version_cut_identity_unavailable', message: 'provider unavailable' } },
+      }), { status: 503 }),
+    );
+    const frozen = '{"reason":null,"idempotency_key":"cut-1"}';
+
+    await expect(cutVersion('project-1', frozen)).rejects.toMatchObject({
+      status: 503,
+      code: 'version_cut_identity_unavailable',
+      message: 'provider unavailable',
+    } satisfies Partial<VersionCutRequestError>);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBe(frozen);
   });
 });
 

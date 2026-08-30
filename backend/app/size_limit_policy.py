@@ -261,6 +261,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
         source_path="backend/app/approved_pr_stranding.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "routers/admin_release_version_projections.py"): GoverningCap(
+        source_path="backend/app/routers/admin_release_version_projections.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_activation.py"): GoverningCap(
         source_path="backend/app/release_activation.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
@@ -379,6 +383,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
     ),
     ("backend", "release_version.py"): GoverningCap(
         source_path="backend/app/release_version.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_version_cut.py"): GoverningCap(
+        source_path="backend/app/release_version_cut.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
 }

@@ -29,6 +29,8 @@ vi.mock('../../api', () => ({
   approveActivation: vi.fn(),
   recordFindingResolution: vi.fn(),
   updateAcceptanceCriterionEvidenceContract: vi.fn(),
+  VersionCutRequestError: class VersionCutRequestError extends Error {},
+  getVersionCutContext: vi.fn(),
 }));
 
 class MockWebSocket {

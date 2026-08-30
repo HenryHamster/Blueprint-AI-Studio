@@ -36,6 +36,7 @@
     "routers/admin_operator_triggers.py": 2000,
     "routers/admin_digest.py": 2600,
     "routers/admin_release_version.py": 2600,
+    "routers/admin_release_version_projections.py": 250,
     "routers/admin_pipeline_observability.py": 2350,
     "routers/admin_agent_ops.py": 10800,
     "routers/agent_strategic_messages.py": 5200,
@@ -452,7 +453,7 @@
   "scripts": {
     "test_local_runner.py": 16650,
     "local_runner.py": 15250,
-    "blueprint.py": 11950,
+    "blueprint.py": 14000,
     "test_blueprint_cli.py": 10250,
     "test_runner_isolation.py": 3400,
     "runner_isolation.py": 3400,

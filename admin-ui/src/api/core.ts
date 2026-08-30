@@ -141,14 +141,14 @@ export async function apiFetch(
     for (let i = 0; i <= maxAttempts; i++) {
       try {
         const res = await attemptFetch();
-        if (res.ok || res.status < 500) return res;
+        if (res.ok || res.status < 500 || i === maxAttempts) return res;
       } catch (e) {
         // Never retry on external abort — the caller already moved on.
         if (i === maxAttempts || signal?.aborted || (e instanceof Error && e.name === 'AbortError')) throw e;
       }
       await abortableDelay(1000 * (i + 1), signal);
     }
-    return attemptFetch();
+    throw new Error('apiFetch retry loop exhausted without a response');
   })();
 
   if (dedupKey) {

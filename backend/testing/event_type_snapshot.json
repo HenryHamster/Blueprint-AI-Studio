@@ -196,6 +196,13 @@
       "audience": "operator-fyi"
     },
     {
+      "name": "release_version_abandoned",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_release_version_abandoned_message",
+      "audience": "operator-fyi"
+    },
+    {
       "name": "direction_burn_pause",
       "classification": "escalation",
       "message_type": "BLOCKER",
