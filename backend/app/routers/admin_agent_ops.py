@@ -7417,7 +7417,17 @@ async def strategic_operation(
                     status_code=404,
                     detail=f"cancel_task: spawn request {spawn_request_id} not found",
                 )
-            if request.parent_task_id != task.id:
+            replay_parent_ids = {
+                str(parent_id)
+                for parent_id in list(
+                    (request.policy_snapshot or {}).get("replay_parent_task_ids")
+                    or []
+                )[:50]
+            }
+            if (
+                request.parent_task_id != task.id
+                and str(task.id) not in replay_parent_ids
+            ):
                 raise HTTPException(
                     status_code=403,
                     detail="cancel_task: spawn request was not created by this strategic session",

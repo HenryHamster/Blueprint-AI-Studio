@@ -419,6 +419,84 @@ async def test_agent_status_update_persists_runtime_identity(
 
 
 @pytest.mark.asyncio
+async def test_exact_route_rejects_mismatched_runtime_identity(
+    client: AsyncClient, db_session
+):
+    from app.max_plan_pool import EXACT_MODEL_ROUTE_CONTEXT_KEY
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Exact Runtime Telemetry", user_id="test-user-exact-runtime")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    exact_model = "gpt-5.6-sol"
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "model": exact_model,
+                "effort": "high",
+                "provider_preference": ["openai"],
+            }
+        ],
+        vm_instance_id="agent-vm-exact-runtime",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            EXACT_MODEL_ROUTE_CONTEXT_KEY: {
+                "provider": "openai",
+                "model": exact_model,
+                "effort": "high",
+            },
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+            "llm_model": exact_model,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(str(task.id), "agent-vm-exact-runtime")
+
+    reported_mismatch = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "IN_PROGRESS",
+            "provider": "openai",
+            "model": "gpt-5.5",
+        },
+    )
+    assert reported_mismatch.status_code == 409
+    assert "exact_route_runtime_mismatch" in reported_mismatch.text
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.context["llm_model"] == exact_model
+
+    stale_context = dict(task.context or {})
+    stale_context["llm_model"] = "gpt-5.5"
+    task.context = stale_context
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+    assigned_mismatch = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "IN_PROGRESS",
+        },
+    )
+    assert assigned_mismatch.status_code == 409
+    assert "exact_route_runtime_mismatch" in assigned_mismatch.text
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.context["llm_model"] == "gpt-5.5"
+    assert task.context[EXACT_MODEL_ROUTE_CONTEXT_KEY]["model"] == exact_model
+
+
+@pytest.mark.asyncio
 async def test_terminal_heartbeat_records_atomic_provider_model_pair(
     client: AsyncClient, db_session, mocker
 ):
@@ -12891,6 +12969,79 @@ async def test_exact_route_provider_model_config_failure_never_downgrades(
     assert task.payloads[0]["model"] == requested_model
     assert task.payloads[0]["effort"] == "high"
     assert task.context[EXACT_MODEL_ROUTE_CONTEXT_KEY]["model"] == requested_model
+    assert "model_fallback" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_exact_route_provider_model_config_failure_rejects_stale_identity(
+    client: AsyncClient, db_session, mocker
+):
+    from app.max_plan_pool import EXACT_MODEL_ROUTE_CONTEXT_KEY
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=mocker.AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    project = Project(name="Exact Stale Route Failure", user_id="test-user-exact-stale")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    requested_model = "gemini-3.1-pro-preview"
+    stale_model = "gemini-3-pro-preview"
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do exact work",
+                "model": stale_model,
+                "effort": "high",
+                "provider_preference": ["gemini"],
+            }
+        ],
+        vm_instance_id="agent-vm-exact-stale-gemini",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            EXACT_MODEL_ROUTE_CONTEXT_KEY: {
+                "provider": "gemini",
+                "model": requested_model,
+                "effort": "high",
+            },
+            "llm_provider": "gemini",
+            "llm_auth_mode": "api_key",
+            "llm_model": stale_model,
+            "llm_execution_mode": "default",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-exact-stale-gemini")
+    response = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "fatal",
+            "logs": "ModelNotFoundError: stale Gemini model is not found",
+        },
+    )
+    assert response.status_code == 409
+    assert "exact_route_runtime_mismatch" in response.text
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.payloads[0]["model"] == stale_model
+    assert task.payloads[0]["effort"] == "high"
+    assert task.context[EXACT_MODEL_ROUTE_CONTEXT_KEY]["model"] == requested_model
+    assert task.context["llm_model"] == stale_model
     assert "model_fallback" not in task.context
 
 

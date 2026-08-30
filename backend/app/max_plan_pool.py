@@ -574,6 +574,38 @@ def resolve_exact_model_route(context: Any) -> tuple[str, str, str] | None:
     return provider.strip(), model.strip(), effort
 
 
+def exact_model_route_marker_is_invalid(context: Any) -> bool:
+    """Return whether exact authority is present but structurally unusable."""
+
+    return bool(
+        isinstance(context, Mapping)
+        and EXACT_MODEL_ROUTE_CONTEXT_KEY in context
+        and resolve_exact_model_route(context) is None
+    )
+
+
+def _accountless_auth_mode(
+    provider_name: str,
+    requested_auth_mode: str | None = None,
+) -> str:
+    """Choose a provider-supported auth mode for an account-less selection."""
+
+    provider = get_provider(provider_name)
+    supported = tuple(provider.supported_auth_modes)
+    normalized_requested = _normalize_auth_mode(requested_auth_mode)
+    if normalized_requested and any(
+        mode.value == normalized_requested for mode in supported
+    ):
+        return normalized_requested
+    if LLMAuthMode.OAUTH in supported:
+        return LLMAuthMode.OAUTH.value
+    if LLMAuthMode.API_KEY in supported:
+        return LLMAuthMode.API_KEY.value
+    if supported:
+        return supported[0].value
+    raise ValueError(f"provider {provider_name!r} declares no supported auth modes")
+
+
 def _apply_routing_verdict(
     providers: list[str],
     task_type: str,
@@ -663,6 +695,8 @@ def _resolve_routing_core(
     layer doesn't shadow the other at a less specific layer.
     """
     runtime_config = _ensure_migrated(runtime_config)
+    if exact_model_route_marker_is_invalid(context):
+        return {"providers": [], "effort": DEFAULT_EFFORT_LEVEL}
     providers: list[str] | None = None
     effort: str | None = None
     exact_route = resolve_exact_model_route(context)
@@ -4906,6 +4940,18 @@ async def select_llm_runtime_for_task(
             failure_reasons.extend(_reasons)
 
     task_context = _task_context(task)
+    if exact_model_route_marker_is_invalid(task_context):
+        if failure_reasons is not None:
+            failure_reasons.append(
+                "invalid server-authored exact model route; execution refused"
+            )
+        logger.error(
+            "[LLM_SELECT] project=%s task_type=%s invalid exact model route; "
+            "execution refused",
+            project_id or getattr(task, "project_id", None),
+            _task_type(task),
+        )
+        return None
     exact_route = resolve_exact_model_route(task_context)
     exact_route_is_valid = exact_route is not None
     if exact_route is not None:
@@ -5292,7 +5338,10 @@ async def select_llm_runtime_for_task(
             )
         return LLMSelectionResult(
             provider=explicit_provider,
-            auth_mode=get_task_llm_auth_mode(task) or LLMAuthMode.OAUTH.value,
+            auth_mode=_accountless_auth_mode(
+                explicit_provider,
+                get_task_llm_auth_mode(task),
+            ),
             model=explicit_model,
             quality_tier=quality_tier,
             account=None,
@@ -5316,10 +5365,9 @@ async def select_llm_runtime_for_task(
         fallback_settings = _settings_for_selected_model(
             task, runtime_config, fallback_provider, fallback_model
         )
-        fallback_auth_mode = (
-            LLMAuthMode.API_KEY.value
-            if set(provider.supported_auth_modes) == {LLMAuthMode.API_KEY}
-            else LLMAuthMode.OAUTH.value
+        fallback_auth_mode = _accountless_auth_mode(
+            fallback_provider,
+            get_task_llm_auth_mode(task),
         )
         _record_routing_fallback(
             task,

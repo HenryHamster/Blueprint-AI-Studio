@@ -245,9 +245,45 @@ async def test_exact_route_preserves_provider_model_and_effort_without_fallback(
     assert result is not None
     assert result.provider == "gemini"
     assert result.model == "gemini-3.1-pro-preview"
+    assert result.auth_mode == "api_key"
     assert result.account is None
     assert "routing_fallback" not in task.context
     assert "model_fallback" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_malformed_exact_route_fails_closed(clean_runtime_pool):
+    task = _task(
+        payload={
+            "type": "create",
+            "model": "gpt-5.6-sol",
+            "effort": "high",
+            "provider_preference": ["openai"],
+        },
+        context={
+            EXACT_MODEL_ROUTE_CONTEXT_KEY: {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+            }
+        },
+    )
+    failure_reasons: list[str] = []
+
+    assert resolve_task_routing(task, {}) == {
+        "providers": [],
+        "effort": "medium",
+    }
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=task,
+        runtime_config={},
+        failure_reasons=failure_reasons,
+    )
+
+    assert result is None
+    assert failure_reasons == [
+        "invalid server-authored exact model route; execution refused"
+    ]
 
 
 @pytest.mark.asyncio

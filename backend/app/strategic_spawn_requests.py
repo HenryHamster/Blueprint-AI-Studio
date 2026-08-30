@@ -255,6 +255,45 @@ async def _dispatch_request(
         raise ValueError(
             f"strategic spawn request is no longer dispatchable ({request.state})"
         )
+    policy_snapshot = dict(request.policy_snapshot or {})
+    active_task_idempotency_key = str(
+        policy_snapshot.get("active_task_idempotency_key") or ""
+    )
+    work_specification_hash = str(
+        policy_snapshot.get("work_specification_hash") or ""
+    )
+    if active_task_idempotency_key:
+        active_task = await _active_task_for_work_key(
+            session,
+            project_id=request.project_id,
+            work_key=active_task_idempotency_key,
+        )
+        if active_task is not None:
+            if not work_specification_hash:
+                raise ValueError(
+                    "strategic spawn request is missing its work specification hash"
+                )
+            await _ensure_active_work_specification_compatible(
+                session,
+                active_task=active_task,
+                work_specification_hash=work_specification_hash,
+            )
+            request.task_id = active_task.id
+            request.state = "dispatched"
+            request.admission_reason = "active_work_deduplicated"
+            request.not_before = None
+            request.dispatched_at = _utcnow()
+            session.add(request)
+            await _register_request_watch(
+                session,
+                request=request,
+                task=active_task,
+            )
+            return active_task, await _link_request_debt(
+                session,
+                request=request,
+                task=active_task,
+            )
     cycle = None
     if request.discovery_cycle_id is not None:
         cycle = (
@@ -277,14 +316,8 @@ async def _dispatch_request(
         discovery_decision_successor=(
             (request.policy_snapshot or {}).get("source") == "discovery_decision"
         ),
-        active_task_idempotency_key=str(
-            (request.policy_snapshot or {}).get("active_task_idempotency_key") or ""
-        )
-        or None,
-        work_specification_hash=str(
-            (request.policy_snapshot or {}).get("work_specification_hash") or ""
-        )
-        or None,
+        active_task_idempotency_key=active_task_idempotency_key or None,
+        work_specification_hash=work_specification_hash or None,
     )
     session.add(task)
     await session.flush()
@@ -338,16 +371,27 @@ async def _register_request_watch(
     task_spec = dict((request.specification or {}).get("task") or {})
     if not bool(task_spec.get("watch", True)) or request.parent_task_id is None:
         return
-    await register_task_watch(
-        session,
-        project_id=request.project_id,
-        created_by_task_id=request.parent_task_id,
-        target_task_id=task.id,
-        purpose=str(
-            task_spec.get("watch_purpose")
-            or f"Report when Strategic child {task.title} reaches terminal state"
-        ),
-    )
+    parent_ids = [request.parent_task_id]
+    for raw_parent_id in list(
+        (request.policy_snapshot or {}).get("replay_parent_task_ids") or []
+    )[:50]:
+        try:
+            replay_parent_id = uuid.UUID(str(raw_parent_id))
+        except (TypeError, ValueError):
+            raise ValueError("strategic spawn replay parent id is invalid") from None
+        if replay_parent_id not in parent_ids:
+            parent_ids.append(replay_parent_id)
+    for parent_id in parent_ids:
+        await register_task_watch(
+            session,
+            project_id=request.project_id,
+            created_by_task_id=parent_id,
+            target_task_id=task.id,
+            purpose=str(
+                task_spec.get("watch_purpose")
+                or f"Report when Strategic child {task.title} reaches terminal state"
+            ),
+        )
 
 
 async def _active_task_for_work_key(
@@ -362,6 +406,49 @@ async def _active_task_for_work_key(
             )
         )
     ).scalar_one_or_none()
+
+
+async def _ensure_active_work_specification_compatible(
+    session,
+    *,
+    active_task: Task,
+    work_specification_hash: str,
+) -> None:
+    """Reject a reused work key unless its executable specification is exact."""
+
+    active_work_hash = str(
+        (active_task.context or {}).get("_strategic_work_specification_hash") or ""
+    )
+    if active_work_hash == work_specification_hash:
+        return
+    prior_request = (
+        await session.execute(
+            select(StrategicSpawnRequest)
+            .where(
+                StrategicSpawnRequest.project_id == active_task.project_id,
+                StrategicSpawnRequest.task_id == active_task.id,
+            )
+            .order_by(StrategicSpawnRequest.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    prior_specification = (
+        prior_request.specification if prior_request is not None else None
+    )
+    if (
+        not isinstance(prior_specification, dict)
+        or stable_work_specification_hash(prior_specification)
+        != work_specification_hash
+    ):
+        raise ValueError(
+            "idempotency_key already identifies different active work in "
+            "this direction"
+        )
+    active_context = dict(active_task.context or {})
+    active_context["_strategic_work_specification_hash"] = work_specification_hash
+    active_task.context = active_context
+    flag_modified(active_task, "context")
+    session.add(active_task)
 
 
 async def _budget_guard_for_request(
@@ -645,47 +732,86 @@ async def submit_strategic_spawn(
     # That keeps a replacement Resident generation from duplicating work which
     # is still queued/running/parked, while the partial Task index releases the
     # key after terminal completion so a later retry remains possible.
+    latent_request = (
+        await session.execute(
+            select(StrategicSpawnRequest)
+            .where(
+                StrategicSpawnRequest.project_id == project_id,
+                StrategicSpawnRequest.idempotency_key == normalized_key,
+                StrategicSpawnRequest.direction_id == direction_id,
+                StrategicSpawnRequest.state.in_({"accepted", "deferred"}),
+            )
+            .order_by(
+                StrategicSpawnRequest.created_at.asc(),
+                StrategicSpawnRequest.id.asc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if latent_request is not None:
+        latent_policy = dict(latent_request.policy_snapshot or {})
+        latent_work_key = str(
+            latent_policy.get("active_task_idempotency_key") or ""
+        )
+        latent_work_hash = str(latent_policy.get("work_specification_hash") or "")
+        if latent_work_key and latent_work_key != active_task_idempotency_key:
+            raise ValueError("strategic spawn request work identity is inconsistent")
+        if not latent_work_hash:
+            latent_specification = dict(latent_request.specification or {})
+            latent_work_hash = stable_work_specification_hash(latent_specification)
+        if latent_work_hash != work_specification_hash:
+            latent_specification = dict(latent_request.specification or {})
+            recomputed_work_hash = stable_work_specification_hash(
+                latent_specification
+            )
+            if recomputed_work_hash != work_specification_hash:
+                raise ValueError(
+                    "idempotency_key already identifies different queued work in "
+                    "this direction"
+                )
+            latent_work_hash = recomputed_work_hash
+            latent_policy["work_specification_hash"] = latent_work_hash
+        replay_parent_ids = list(latent_policy.get("replay_parent_task_ids") or [])
+        replay_parent_id = str(parent_task_id)
+        if (
+            parent_task_id != latent_request.parent_task_id
+            and replay_parent_id not in replay_parent_ids
+        ):
+            if len(replay_parent_ids) >= 50:
+                raise ValueError("strategic spawn request has too many replay parents")
+            replay_parent_ids.append(replay_parent_id)
+            latent_policy["replay_parent_task_ids"] = replay_parent_ids
+        if latent_request.policy_snapshot != latent_policy:
+            latent_request.policy_snapshot = latent_policy
+            flag_modified(latent_request, "policy_snapshot")
+            session.add(latent_request)
+        latent_task = None
+        linked_debt_id = None
+        if latent_request.state == "accepted":
+            latent_task, linked_debt_id = await _dispatch_request(
+                session,
+                request=latent_request,
+            )
+        if commit:
+            await session.commit()
+        return SpawnSubmission(
+            latent_request,
+            latent_task,
+            True,
+            linked_debt_id,
+        )
+
     active_task = await _active_task_for_work_key(
         session,
         project_id=project_id,
         work_key=active_task_idempotency_key,
     )
     if active_task is not None:
-        active_work_hash = str(
-            (active_task.context or {}).get("_strategic_work_specification_hash")
-            or ""
+        await _ensure_active_work_specification_compatible(
+            session,
+            active_task=active_task,
+            work_specification_hash=work_specification_hash,
         )
-        if active_work_hash != work_specification_hash:
-            prior_request = (
-                await session.execute(
-                    select(StrategicSpawnRequest)
-                    .where(
-                        StrategicSpawnRequest.project_id == project_id,
-                        StrategicSpawnRequest.task_id == active_task.id,
-                    )
-                    .order_by(StrategicSpawnRequest.created_at.desc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            prior_specification = (
-                prior_request.specification if prior_request is not None else None
-            )
-            if (
-                not isinstance(prior_specification, dict)
-                or stable_work_specification_hash(prior_specification)
-                != work_specification_hash
-            ):
-                raise ValueError(
-                    "idempotency_key already identifies different active work in "
-                    "this direction"
-                )
-            active_context = dict(active_task.context or {})
-            active_context["_strategic_work_specification_hash"] = (
-                work_specification_hash
-            )
-            active_task.context = active_context
-            flag_modified(active_task, "context")
-            session.add(active_task)
         request = StrategicSpawnRequest(
             project_id=project_id,
             parent_task_id=parent_task_id,

@@ -555,6 +555,171 @@ async def test_active_work_deduplicates_across_resident_generations(db_session):
 
 
 @pytest.mark.asyncio
+async def test_deferred_work_deduplicates_across_resident_generations(db_session):
+    project, first_owner = await _owner(db_session)
+    second_owner = await _next_owner(db_session, project, "Replacement Resident")
+    occupier = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=first_owner.id,
+        task_type="create",
+        specification=_spec("Occupy deferred window", watch=False),
+        idempotency_key="deferred-window-occupier",
+        direction_id=None,
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    assert occupier.task is not None
+    first_spec = _spec("Deferred stable work")
+    first_spec["task"]["context"]["parent_strategic_task_id"] = str(first_owner.id)
+    first_spec["task"]["context"]["_workday_consultation_provenance"] = {
+        "packet_id": str(uuid.uuid4()),
+        "workday_claim_id": str(uuid.uuid4()),
+    }
+    second_spec = _spec("Deferred stable work")
+    second_spec["task"]["context"]["parent_strategic_task_id"] = str(second_owner.id)
+    second_spec["task"]["context"]["_workday_consultation_provenance"] = {
+        "packet_id": str(uuid.uuid4()),
+        "workday_claim_id": str(uuid.uuid4()),
+    }
+    deferred = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=first_owner.id,
+        task_type="create",
+        specification=first_spec,
+        idempotency_key="deferred-stable-unit",
+        direction_id="d-deferred-stable",
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    replay = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=second_owner.id,
+        task_type="create",
+        specification=second_spec,
+        idempotency_key="deferred-stable-unit",
+        direction_id="d-deferred-stable",
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+
+    assert replay.replayed is True
+    assert replay.request.id == deferred.request.id
+    assert replay.task is None
+    assert replay.request.state == "deferred"
+    assert (replay.request.policy_snapshot or {})["replay_parent_task_ids"] == [
+        str(second_owner.id)
+    ]
+
+    occupier.request.dispatched_at = _utcnow() - timedelta(minutes=61)
+    replay.request.not_before = _utcnow() - timedelta(seconds=1)
+    db_session.add(occupier.request)
+    db_session.add(replay.request)
+    await db_session.commit()
+    drained = await drain_deferred_spawn_requests(
+        db_session,
+        project_id=project.id,
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    await db_session.commit()
+
+    assert [row.id for row in drained] == [deferred.request.id]
+    await db_session.refresh(deferred.request)
+    watches = (
+        (
+            await db_session.execute(
+                select(StrategicWatch).where(
+                    StrategicWatch.target_task_id == deferred.request.task_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {watch.created_by_task_id for watch in watches} == {
+        first_owner.id,
+        second_owner.id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_drain_reconciles_duplicate_due_work_to_one_task(db_session):
+    from app.strategic_spawn_requests import stable_replay_specification_hash
+
+    project, first_owner = await _owner(db_session)
+    second_owner = await _next_owner(db_session, project, "Duplicate queue Resident")
+    specification = _spec("Recover duplicate due work")
+    deferred = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=first_owner.id,
+        task_type="create",
+        specification=specification,
+        idempotency_key="duplicate-due-unit",
+        direction_id="d-duplicate-due",
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    # With no prior dispatch this request is immediate; convert it into the
+    # historical duplicate-deferred shape the drain repair must reconcile.
+    assert deferred.task is not None
+    await db_session.delete(deferred.task)
+    await db_session.flush()
+    deferred.request.task_id = None
+    deferred.request.state = "deferred"
+    deferred.request.not_before = _utcnow() - timedelta(seconds=1)
+    deferred.request.dispatched_at = None
+    duplicate = StrategicSpawnRequest(
+        project_id=project.id,
+        parent_task_id=second_owner.id,
+        idempotency_key=deferred.request.idempotency_key,
+        task_type=deferred.request.task_type,
+        specification=specification,
+        specification_hash=stable_replay_specification_hash(specification),
+        direction_id=deferred.request.direction_id,
+        state="deferred",
+        admission_reason="historical_duplicate",
+        policy_snapshot=dict(deferred.request.policy_snapshot or {}),
+        not_before=_utcnow() - timedelta(seconds=1),
+    )
+    db_session.add(deferred.request)
+    db_session.add(duplicate)
+    await db_session.commit()
+
+    drained = await drain_deferred_spawn_requests(
+        db_session,
+        project_id=project.id,
+        burst_cap=10,
+        burst_window_minutes=60,
+    )
+    await db_session.commit()
+    assert {row.id for row in drained} == {deferred.request.id, duplicate.id}
+    await db_session.refresh(deferred.request)
+    await db_session.refresh(duplicate)
+    assert deferred.request.task_id == duplicate.task_id
+    assert duplicate.admission_reason == "active_work_deduplicated"
+    tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.idempotency_key
+                    == (deferred.request.policy_snapshot or {})[
+                        "active_task_idempotency_key"
+                    ],
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [task.id for task in tasks] == [deferred.request.task_id]
+
+
+@pytest.mark.asyncio
 async def test_terminal_work_releases_identity_for_new_generation_retry(db_session):
     project, first_owner = await _owner(db_session)
     second_owner = await _next_owner(db_session, project, "Retrying Resident")

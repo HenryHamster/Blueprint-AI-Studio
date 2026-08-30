@@ -34,6 +34,7 @@ from app.landed_signal import (
 )
 from app.max_plan_pool import (
     EXACT_MODEL_ROUTE_CONTEXT_KEY,
+    exact_model_route_marker_is_invalid,
     resolve_exact_model_route,
 )
 from app.models import (
@@ -891,7 +892,10 @@ async def _apply_simple_mutations(
             immutable_identity_keys += ("acceptance_evidence",)
             if not isinstance(creation_authority, dict):
                 immutable_identity_keys += ("direction_id",)
-        if resolve_exact_model_route(task.context) is not None:
+        if (
+            resolve_exact_model_route(task.context) is not None
+            or exact_model_route_marker_is_invalid(task.context)
+        ):
             immutable_identity_keys += (
                 "model",
                 "effort",
