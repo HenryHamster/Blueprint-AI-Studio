@@ -353,6 +353,27 @@ const INPUTS = {
       'Ordinary memory must omit expected_head_id. Every non-null supersedes_id must name an active same-project strategic-memory document.',
     ],
   },
+  dismiss_knowledge: {
+    kind: 'json' as const,
+    fields: [
+      'knowledge_document_id', 'reason',
+      'expected_handoff_head_ids', 'superseded_by_id',
+    ],
+    example: {
+      knowledge_document_id: 'e0969761-6bd8-45fd-b50e-f8c97e390197',
+      reason: 'Retire the stale predecessor handoff after exact reconciliation.',
+      expected_handoff_head_ids: [
+        '9f4b8987-07fc-4bfd-81fc-eaacb372b95e',
+        'e0969761-6bd8-45fd-b50e-f8c97e390197',
+      ],
+      superseded_by_id: '9f4b8987-07fc-4bfd-81fc-eaacb372b95e',
+    },
+    notes: [
+      'Ordinary knowledge dismissal omits expected_handoff_head_ids and superseded_by_id.',
+      'Dismissing a handoff requires private Workday receipt authority, the exact sorted two-head set, and the surviving head UUID.',
+      'Stale, sole-head, direct, or mismatched handoff cleanup is rejected without mutation.',
+    ],
+  },
   set_running_update: markdownInput(),
 } satisfies Record<string, StrategicOpInputContract>;
 
@@ -463,7 +484,7 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'consume_knowledge', alias: 'consume-knowledge', cli: true, prompt: true, internalReason: null,
     description: 'Mark a knowledge document as consumed — the strategist has read and acted on it.' },
   { op: 'dismiss_knowledge', alias: 'dismiss-knowledge', cli: true, prompt: true, internalReason: null,
-    description: 'Mark a knowledge document as dismissed — not actionable, with an optional reason.' },
+    description: 'Mark a knowledge document as dismissed — not actionable, with an optional reason.', input: inputFor('dismiss_knowledge') },
   { op: 'request_qualification', alias: 'request-qualification', cli: true, prompt: true, internalReason: null,
     description: 'Request a fresh release qualification at a stable checkpoint, with only explicitly selected product probes.',
     input: INPUTS.request_qualification },
