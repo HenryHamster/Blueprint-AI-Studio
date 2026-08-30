@@ -27307,6 +27307,9 @@ async def test_agent_status_compute_park_callback_duplicate_parked_is_idempotent
     db_session.expire_all()
     await db_session.refresh(task)
     assert task.status == TaskStatus.PARKED
+    from app.task_blocked import PARKED_AGENT_VM_CONTEXT_KEY
+
+    assert (task.context or {}).get(PARKED_AGENT_VM_CONTEXT_KEY) == vm_id
 
     regs_after_first = (
         (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
@@ -27315,6 +27318,23 @@ async def test_agent_status_compute_park_callback_duplicate_parked_is_idempotent
     first_reg_id = regs_after_first[0].id
     first_reg_state = regs_after_first[0].delivery_state
     first_parked_at = task.parked_at
+
+    # A still-valid token for this task but a different historical VM cannot
+    # use the cleared DB VM identity as a wildcard.
+    wrong_vm_response = await client.post(
+        "/api/agent/status",
+        json=park_payload,
+        headers={
+            "x-agent-token": create_agent_token(
+                str(task.id), "agent-vm-wrong-park-retry"
+            )
+        },
+    )
+    assert wrong_vm_response.status_code == 403
+    wrong_vm_detail = wrong_vm_response.json().get("detail") or (
+        wrong_vm_response.json().get("error", {}).get("message")
+    )
+    assert wrong_vm_detail == "vm_instance_mismatch"
 
     # Second POST: duplicate retry — must be idempotent.
     resp2 = await client.post(

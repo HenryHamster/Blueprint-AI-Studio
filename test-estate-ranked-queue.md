@@ -21,7 +21,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P2 | backend | `backend/testing/test_release_qualifier__compute_composite.py` | 5,968 | 264 | critical (>5000 LOC) | 400.868s measured | — |
 | P2 | backend | `backend/testing/test_pipeline.py` | 6,841 | 277 | critical (>5000 LOC) | 318.896s measured | — |
 | P2 | backend | `backend/testing/test_review_pipeline.py` | 20,894 | 437 | critical (>5000 LOC) | 300.644s measured | — |
-| P2 | backend | `backend/testing/test_task_lifecycle.py` | 13,180 | 324 | critical (>5000 LOC) | 207.992s measured | — |
+| P2 | backend | `backend/testing/test_task_lifecycle.py` | 13,189 | 324 | critical (>5000 LOC) | 207.992s measured | — |
 | P2 | backend | `backend/testing/test_reaper.py` | 22,084 | 506 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 506 |
 | P2 | backend | `backend/testing/test_research_completion.py` | 24,236 | 536 | critical (>5000 LOC) | 137.469s measured | — |
 | P2 | backend | `backend/testing/test_autonomous_research.py` | 20,308 | 393 | critical (>5000 LOC) | 124.505s measured | — |
@@ -32,7 +32,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P2 | backend | `backend/testing/test_strategic_resident_session.py` | 6,021 | 98 | critical (>5000 LOC) | 77.770s measured | protected; declared floor 98 |
 | P2 | backend | `backend/testing/test_acceptance_criteria.py` | 13,541 | 286 | critical (>5000 LOC) | 74.580s measured | — |
 | P2 | backend | `backend/testing/test_release_qualifier__ci_unresolved_blocker.py` | 6,523 | 163 | critical (>5000 LOC) | 67.628s measured | — |
-| P2 | backend | `backend/testing/test_agent.py` | 29,833 | 520 | critical (>5000 LOC) | 65.904s measured | — |
+| P2 | backend | `backend/testing/test_agent.py` | 29,919 | 521 | critical (>5000 LOC) | 65.904s measured | — |
 | P2 | backend | `backend/testing/test_metrics_integrity_sweep.py` | 8,161 | 216 | critical (>5000 LOC) | 65.620s measured | — |
 | P2 | backend | `backend/testing/test_admin_routers__version_lifecycle.py` | 6,455 | 129 | critical (>5000 LOC) | 57.642s measured | — |
 | P2 | backend | `backend/testing/test_compute.py` | 9,739 | 199 | critical (>5000 LOC) | 57.415s measured | — |

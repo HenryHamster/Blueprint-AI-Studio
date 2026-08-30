@@ -74,6 +74,7 @@ from app.task_capabilities import (
     CODE_REVIEW_GATED_TASK_TYPES,
     agent_capability_slice,
 )
+from app.task_blocked import PARKED_AGENT_VM_CONTEXT_KEY
 from app.strategic_cold_successor_authority import (
     cold_successor_capability_slice,
     enforce_cold_successor_request_authority,
@@ -646,6 +647,8 @@ async def verify_agent_token(
                     and task.status == TaskStatus.PARKED
                     and task.vm_instance_id is None
                     and token_vm
+                    and (task.context or {}).get(PARKED_AGENT_VM_CONTEXT_KEY)
+                    == token_vm
                 )
                 if (
                     is_idempotent_path
