@@ -608,6 +608,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_rollup_open_pr_reconciliation.py` | 94 | 1 | under 1500 LOC | 0.517s measured | — |
 | G | backend | `backend/testing/test_release_promotion_github_preflight.py` | 260 | 9 | under 1500 LOC | 0.510s measured | — |
 | G | backend | `backend/testing/test_branch_resolution_alerts.py` | 100 | 2 | under 1500 LOC | 0.509s measured | — |
+| G | backend | `backend/testing/test_release_qualification_control.py` | 557 | 9 | under 1500 LOC | 0.507s measured | — |
 | G | admin-ui | `admin-ui/src/components/WarmReuseVsCostTrend.test.tsx` | 218 | 9 | under 1500 LOC | 0.492s measured | — |
 | G | admin-ui | `admin-ui/src/components/FixLoopConvergenceWidget.test.tsx` | 156 | 2 | under 1500 LOC | 0.491s measured | — |
 | G | backend | `backend/testing/test_concurrency_overlap.py` | 303 | 7 | under 1500 LOC | 0.486s measured | — |
@@ -624,7 +625,6 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_lock_ordering.py` | 152 | 2 | under 1500 LOC | 0.436s measured | — |
 | G | admin-ui | `admin-ui/src/components/HeaderBar.test.tsx` | 136 | 5 | under 1500 LOC | 0.434s measured | — |
 | G | backend | `backend/testing/test_migration_0717_strategic_memory_semantic_ledger.py` | 217 | 3 | under 1500 LOC | 0.425s measured | — |
-| G | backend | `backend/testing/test_release_qualification_control.py` | 497 | 8 | under 1500 LOC | 0.423s measured | — |
 | G | backend | `backend/testing/test_strategic_memory_corrections.py` | 532 | 14 | under 1500 LOC | 0.416s measured | — |
 | G | backend | `backend/testing/test_digest_latency.py` | 216 | 10 | under 1500 LOC | 0.415s measured | — |
 | G | admin-ui | `admin-ui/src/components/MarkdownContentInner.test.tsx` | 115 | 12 | under 1500 LOC | 0.413s measured | — |

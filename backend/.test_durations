@@ -16139,6 +16139,7 @@
   "testing/test_release_qualification_control.py::test_locked_recheck_rejects_continuation_changed_after_early_check": 0.03956644400022924,
   "testing/test_release_qualification_control.py::test_missing_or_mismatched_continuation_is_rejected_before_work[None]": 0.027476778021082282,
   "testing/test_release_qualification_control.py::test_missing_or_mismatched_continuation_is_rejected_before_work[active_attempt1]": 0.02866704808548093,
+  "testing/test_release_qualification_control.py::test_reuse_promote_rechecks_hold_after_early_observation": 0.08341476181522012,
   "testing/test_release_qualification_intents.py::test_commit_fenced_receipt_canonicalizes_locked_intent_identity": 0.030137697933241725,
   "testing/test_release_qualification_intents.py::test_committed_receipt_recovers_without_replaying_apply": 0.03108141291886568,
   "testing/test_release_qualification_intents.py::test_committed_refresh_receipt_arms_wake_atomically_once": 0.0337604321539402,

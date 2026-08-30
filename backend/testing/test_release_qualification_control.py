@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from unittest.mock import AsyncMock
 
 from httpx import AsyncClient
 import pytest
@@ -276,6 +277,65 @@ async def test_locked_fence_closes_early_read_race(db_session, monkeypatch):
     )
     assert result["status"] == "automatic_qualification_disabled"
     assert version.last_qualification is None
+
+
+@pytest.mark.asyncio
+async def test_reuse_promote_rechecks_hold_after_early_observation(
+    db_session, monkeypatch
+):
+    from conftest import TestingSessionLocal
+
+    project, version = await _project_version(db_session)
+    project_id, version_id = project.id, version.id
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "promotion_failure_count": 0,
+    }
+    await db_session.commit()
+
+    assert (
+        await release_qualifier.automatic_qualification_start_block(
+            db_session, project_id
+        )
+        is None
+    )
+    await db_session.rollback()
+    async with TestingSessionLocal() as operator:
+        await _hold(operator, project_id, key="hold-after-reuse-observation")
+
+    monkeypatch.setattr(
+        release_qualifier, "_promotion_failed_reuse_eligible", lambda *_args: True
+    )
+    promote = AsyncMock(return_value={"status": "promoted"})
+    monkeypatch.setattr(release_qualifier, "promote", promote)
+    reconcile = AsyncMock()
+    trigger = AsyncMock()
+    monkeypatch.setattr(
+        release_qualifier, "_maybe_reconcile_after_promotion_conflict", reconcile
+    )
+    monkeypatch.setattr(
+        release_qualifier, "_maybe_trigger_strategic_after_qualification", trigger
+    )
+    result = await release_qualifier._reattempt_promotion_failed_in_dedicated_session(
+        version_id,
+        "a" * 40,
+        "b" * 64,
+        session_factory=TestingSessionLocal,
+        fresh_automatic=True,
+    )
+
+    assert result == {
+        "status": "automatic_qualification_disabled",
+        "qualification_control_revision": 1,
+        "qualification_control_reason": "Bound Resident qualification canary",
+    }
+    promote.assert_not_awaited()
+    reconcile.assert_not_awaited()
+    trigger.assert_not_awaited()
+    async with TestingSessionLocal() as verify:
+        persisted = await verify.get(ReleaseVersion, version_id)
+        assert persisted.status == "open"
+        assert persisted.last_qualification["status"] == "promotion_failed"
 
 
 @pytest.mark.asyncio
