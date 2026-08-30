@@ -1445,6 +1445,7 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     - 0765 persists force-promote provenance on qualification verdicts
     - 0766 fences guard-suppression escalation versions on their chain row
     - 0767 adds bounded Workday recovery lookup indexes
+    - 0768 persists exact Resident qualification delivery authority
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1587,6 +1588,9 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     workday_recovery_indexes = (
         versions_dir / "0767_workday_recovery_indexes.py"
     ).read_text()
+    qualification_intent = (
+        versions_dir / "0768_release_qualification_intent.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1712,10 +1716,15 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     assert "CREATE INDEX CONCURRENTLY" in workday_recovery_indexes
     assert "context @>" in workday_recovery_indexes
     assert "context ?" in workday_recovery_indexes
+    assert parse_revision_identifiers(qualification_intent) == ("0768", "0767")
+    assert '"releasequalificationintent"' in qualification_intent
+    assert '"authority_key"' in qualification_intent
+    assert '"length(specification_hash) = 64"' in qualification_intent
+    assert qualification_intent.count("sa.DateTime(timezone=True)") == 6
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0767", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0767', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0768", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0768', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

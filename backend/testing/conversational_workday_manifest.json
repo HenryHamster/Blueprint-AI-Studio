@@ -65,13 +65,38 @@
         "test_workday_operation_replay_survives_projection_window_and_is_packet_scoped",
         "test_authoritative_receipt_ledgers_reject_duplicate_operation_ids",
         "test_completion_debt_replay_projects_the_exact_debt_id",
+        "test_qualification_intent_replay_projects_exact_intent_id",
         "test_retry_with_new_claim_incarnation_and_operation_id_replays_exact_semantics",
         "test_version_and_acceptance_criterion_receipts_are_bounded_and_projectable",
         "test_private_strategic_operation_inventory_fails_closed_without_receipts",
+        "test_direct_bound_qualification_records_main_operation_and_replays",
+        "test_direct_bound_qualification_without_target_fails_without_receipt",
+        "test_bound_problem_model_qualification_rider_records_child_receipt",
         "test_direct_acceptance_criteria_is_composite_receipted_and_replay_safe",
         "test_composite_receipt_capacity_failure_rolls_back_every_write"
       ],
-      "test_count": 8
+      "test_count": 12
+    },
+    {
+      "path": "backend/testing/test_release_qualification_intents.py",
+      "reason": "Protects the durable, exact Resident qualification authority boundary: packet-scoped idempotency, immutable version and phase targeting, receipt-before-replay recovery, lease and claim fencing, bounded crash retries, atomic strategic-refresh delivery, and rollback of ambiguous or timed-out mutations.",
+      "test_ids": [
+        "test_prepare_qualification_intent_is_atomic_and_idempotent",
+        "test_workday_operation_authority_allows_new_ask_but_rejects_conflict",
+        "test_workday_operation_cannot_rebind_after_version_cut",
+        "test_paused_intent_stays_due_then_applies_once",
+        "test_phase_epoch_drift_supersedes_without_execution",
+        "test_committed_receipt_recovers_without_replaying_apply",
+        "test_lost_claim_fences_dirty_release_mutation",
+        "test_unknown_committed_status_fails_closed_without_replay",
+        "test_expired_claim_at_retry_cap_terminalizes_without_replay",
+        "test_committed_refresh_receipt_arms_wake_atomically_once",
+        "test_null_phase_epoch_remains_exact_authority",
+        "test_exact_null_epoch_fences_no_credentials_write_after_drift",
+        "test_exact_null_epoch_fences_sha_error_write_after_drift",
+        "test_execution_timeout_rolls_back_and_releases_claim"
+      ],
+      "test_count": 14
     },
     {
       "path": "backend/testing/test_strategic_consultation_detail.py",
@@ -210,7 +235,7 @@
         "TestNotificationConfigSettings::test_strategic_session_settings",
         "TestEvergreenFillSettingsPersist::test_strategic_session_settings_persist_across_sync"
       ],
-      "test_count": 468
+      "test_count": 470
     },
     {
       "path": "backend/testing/test_agent_strategic_fetch.py",

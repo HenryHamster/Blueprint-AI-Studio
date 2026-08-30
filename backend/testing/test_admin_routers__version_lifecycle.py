@@ -11,6 +11,7 @@ criteria router, cut-version, clear-deploy-failed, agent-serving-SHAs, and all
 version-lifecycle field tests."""
 
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -29,6 +30,7 @@ from app.models import (
     PoolVmState,
     Project,
     ProjectMember,
+    ReleaseQualificationIntent,
     ReleaseVersion,
     Task,
     TaskStatus,
@@ -72,6 +74,60 @@ async def _make_open_version(session, project_id, phase="build"):
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_release_version.py — Version Lifecycle
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_qualification_intent_receipt_readback_is_exact_and_uncached(
+    client: AsyncClient,
+    db_session,
+):
+    project = await _make_project(db_session)
+    version = await _make_open_version(
+        db_session, project.id, phase="stabilize"
+    )
+    intent = ReleaseQualificationIntent(
+        project_id=project.id,
+        release_version_id=version.id,
+        source_task_id=uuid.uuid4(),
+        authority_kind="managed_workday_operation",
+        authority_key="workday:readback-test",
+        idempotency_key="strategic-qualification:" + "a" * 64,
+        specification_hash="b" * 64,
+        reason="prove exact delivery",
+        requested_probes=[],
+        expected_phase_changed_at=version.phase_changed_at,
+        status="applied",
+        attempt_count=1,
+        result={
+            "delivery_state": "committed",
+            "status": "spawned",
+            "candidate_sha": "c" * 40,
+        },
+        completed_at=_utcnow(),
+    )
+    db_session.add(intent)
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/qualification-intents",
+        params={"intent_id": str(intent.id)},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 1
+    receipt = body["qualification_intents"][0]
+    assert receipt["id"] == str(intent.id)
+    assert receipt["release_version_id"] == str(version.id)
+    assert receipt["authority_key"] == "workday:readback-test"
+    assert receipt["specification_hash"] == "b" * 64
+    assert receipt["status"] == "applied"
+    assert receipt["attempt_count"] == 1
+    assert receipt["result"] == {
+        "delivery_state": "committed",
+        "status": "spawned",
+        "candidate_sha": "c" * 40,
+    }
+
 
 class TestSetVersionPhase:
     @pytest.mark.asyncio

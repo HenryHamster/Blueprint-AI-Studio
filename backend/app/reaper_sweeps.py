@@ -1791,6 +1791,18 @@ async def sweep_stuck_qualifications(session, *, session_factory) -> int:
     from app.release_prepromotion_rehearsal import (
         dispatch_pending_rehearsal_intents,
     )
+    from app.release_qualification_intents import (
+        launch_due_qualification_intents,
+    )
+
+    qualification_intents = await launch_due_qualification_intents(
+        session_factory=session_factory
+    )
+    if qualification_intents:
+        logger.info(
+            "[REAPER] Launched %d qualification intent delivery task(s)",
+            qualification_intents,
+        )
 
     dispatched = await dispatch_pending_rehearsal_intents(
         session_factory=session_factory

@@ -2052,6 +2052,7 @@ async def _check_lts_sync_gate(
     integration_branch: str,
     promotion_target: str,
     requested_probes: frozenset[str] = frozenset(),
+    record_deferral: bool = True,
 ) -> dict[str, Any] | None:
     """Qualify-on-synced gate: don't score a candidate that is behind ``main``.
 
@@ -2147,7 +2148,7 @@ async def _check_lts_sync_gate(
         return None
 
     # Defer (retryable — the re-emitted qualify_request / cadence re-enters).
-    version.last_qualification = {
+    deferral_record = {
         "status": "deferred_unsynced",
         "candidate_sha": candidate_sha,
         "requested_probes": sorted(requested_probes),
@@ -2161,8 +2162,10 @@ async def _check_lts_sync_gate(
             f"the promotion merge"
         ),
     }
-    flag_modified(version, "last_qualification")
-    session.add(version)
+    if record_deferral:
+        version.last_qualification = deferral_record
+        flag_modified(version, "last_qualification")
+        session.add(version)
     logger.info(
         "[RELEASE_QUALIFIER] sync-gate: deferring qualification of v%d — "
         "candidate %s is behind %s (waited %.0f/%smin); retries when synced",
@@ -2176,7 +2179,50 @@ async def _check_lts_sync_gate(
         "status": "deferred_unsynced",
         "candidate_sha": candidate_sha,
         "requested_probes": sorted(requested_probes),
+        **(
+            {"_deferral_record": deferral_record}
+            if not record_deferral
+            else {}
+        ),
     }
+
+
+async def _lock_exact_qualification_authority(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    version_id: uuid.UUID,
+    version_number: int,
+    expected_phase_changed_at: datetime | None,
+) -> tuple[release_version.ReleaseVersion | None, dict[str, Any] | None]:
+    """Fence an exact explicit request immediately before a DB mutation."""
+
+    admission_block = await release_task_admission.start_block(
+        session, project_id, version_number
+    )
+    if admission_block is not None:
+        return None, admission_block
+    locked_version = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if locked_version is None:
+        return None, {"status": "version_not_found"}
+    if locked_version.status != "open":
+        return None, {"status": "version_not_open"}
+    if locked_version.phase != "stabilize":
+        return None, {"status": "wrong_phase"}
+    if locked_version.phase_changed_at != expected_phase_changed_at:
+        return None, {"status": "superseded_phase_epoch"}
+    return locked_version, None
 
 
 async def run_qualification(
@@ -2187,6 +2233,8 @@ async def run_qualification(
     session_factory=None,
     allow_synchronous_reuse_promote: bool = False,
     qualification_attempt_id: uuid.UUID | str | None = None,
+    expected_phase_changed_at: datetime | None = None,
+    exact_authority: bool | None = None,
     retry_episode: int = 0,
     retry_episode_cap: int | None = None,
     requested_probes: list[str] | tuple[str, ...] | set[str] | None = None,
@@ -2340,6 +2388,12 @@ async def run_qualification(
     # drop is recorded durably on the spawned record under the existing
     # ``qualify_request_blocked`` / ``qualify_request_blocked_at`` keys so the
     # strategist can see why the requested probe never ran.
+    if exact_authority is None:
+        # Preserve exact semantics for older callers that supplied a concrete
+        # epoch, while allowing a durable intent to explicitly bind the valid
+        # NULL bootstrap epoch.
+        exact_authority = expected_phase_changed_at is not None
+
     effective_requested_probes, _probe_drop = (
         await _drop_incompatible_product_probes(
             session, version, effective_requested_probes
@@ -2373,23 +2427,43 @@ async def run_qualification(
     # qualification or managed promotion owns last_qualification and must never
     # be overwritten by a concurrent configuration observation.
     if not resolve_project_promotion_enabled(project_id):
-        locked_version = (
-            (
-                await session.execute(
-                    select(release_version.ReleaseVersion)
-                    .where(release_version.ReleaseVersion.id == version.id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
+        if exact_authority:
+            locked_version, authority_block = (
+                await _lock_exact_qualification_authority(
+                    session,
+                    project_id=project_id,
+                    version_id=version.id,
+                    version_number=version.version_number,
+                    expected_phase_changed_at=expected_phase_changed_at,
                 )
             )
-            .scalars()
-            .first()
-        )
-        if locked_version is None:
-            return {"status": "version_not_found"}
+            if authority_block is not None:
+                return authority_block
+        else:
+            locked_version = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if locked_version is None:
+                return {"status": "version_not_found"}
         version = locked_version
+        if version.status != "open":
+            return {"status": "version_not_open"}
         if version.phase != "stabilize":
             return {"status": "wrong_phase"}
+        if (
+            exact_authority
+            and version.phase_changed_at != expected_phase_changed_at
+        ):
+            return {"status": "superseded_phase_epoch"}
         if await _qualification_in_flight(session, version):
             return {"status": "already_pending"}
         from app.qualification_state_resolver import resolve_newest_qualification_verdict
@@ -2473,6 +2547,16 @@ async def run_qualification(
 
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:
+        if exact_authority:
+            version, authority_block = await _lock_exact_qualification_authority(
+                session,
+                project_id=project_id,
+                version_id=version.id,
+                version_number=version.version_number,
+                expected_phase_changed_at=expected_phase_changed_at,
+            )
+            if authority_block is not None:
+                return authority_block
         version.last_qualification = {
             "status": "error",
             "error": "no_credentials",
@@ -2521,6 +2605,16 @@ async def run_qualification(
             repo,
             exc,
         )
+        if exact_authority:
+            version, authority_block = await _lock_exact_qualification_authority(
+                session,
+                project_id=project_id,
+                version_id=version.id,
+                version_number=version.version_number,
+                expected_phase_changed_at=expected_phase_changed_at,
+            )
+            if authority_block is not None:
+                return authority_block
         version.last_qualification = {
             "status": "error",
             "error": "sha_error",
@@ -2647,8 +2741,26 @@ async def run_qualification(
             integration_branch=integration_branch,
             promotion_target=promotion_target,
             requested_probes=effective_requested_probes,
+            record_deferral=not exact_authority,
         )
         if _sync_gate is not None:
+            deferral_record = _sync_gate.pop("_deferral_record", None)
+            if exact_authority:
+                version, authority_block = (
+                    await _lock_exact_qualification_authority(
+                        session,
+                        project_id=project_id,
+                        version_id=version.id,
+                        version_number=version.version_number,
+                        expected_phase_changed_at=expected_phase_changed_at,
+                    )
+                )
+                if authority_block is not None:
+                    return authority_block
+                if isinstance(deferral_record, dict):
+                    version.last_qualification = deferral_record
+                    flag_modified(version, "last_qualification")
+                    session.add(version)
             return _sync_gate
 
     # 3c. Passing-audit reuse across a promotion_failed → RE-PROMOTE without
@@ -2673,8 +2785,19 @@ async def run_qualification(
     if (_pre_lock_qual.get("status") == "promotion_failed" and
             int(_pre_lock_qual.get("promotion_failure_count") or 0) >=
             _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS):
-        from app.release_qualifier_redrive import _escalate_promotion_failure_loop_in_dedicated_session
-        await _escalate_promotion_failure_loop_in_dedicated_session(version.id, session_factory=session_factory)
+        if exact_authority:
+            version, authority_block = await _lock_exact_qualification_authority(
+                session,
+                project_id=project_id,
+                version_id=version.id,
+                version_number=version.version_number,
+                expected_phase_changed_at=expected_phase_changed_at,
+            )
+            if authority_block is not None:
+                return authority_block
+        else:
+            from app.release_qualifier_redrive import _escalate_promotion_failure_loop_in_dedicated_session
+            await _escalate_promotion_failure_loop_in_dedicated_session(version.id, session_factory=session_factory)
         return {"status": "promotion_failed_requalify_cap", "candidate_sha": candidate_sha}
 
     if (
@@ -2706,6 +2829,16 @@ async def run_qualification(
                 "this lock-holding caller could hang on staged-direction activation)",
                 version.version_number,
             )
+            if exact_authority:
+                version, authority_block = await _lock_exact_qualification_authority(
+                    session,
+                    project_id=project_id,
+                    version_id=version.id,
+                    version_number=version.version_number,
+                    expected_phase_changed_at=expected_phase_changed_at,
+                )
+                if authority_block is not None:
+                    return authority_block
             return {
                 "status": "promotion_failed_reuse_deferred",
                 "candidate_sha": candidate_sha,
@@ -2757,6 +2890,13 @@ async def run_qualification(
     # From here on, mutate the freshly-locked row (its attributes are the
     # post-lock DB truth) rather than the caller's possibly-stale instance.
     version = locked_version
+    if version.status != "open":
+        logger.info(
+            "[RELEASE_QUALIFIER] run_qualification: version v%d is no longer "
+            "open — skipping",
+            version.version_number,
+        )
+        return {"status": "version_not_open"}
     # Re-check the phase under the lock — a concurrent strategic cycle may
     # have flipped it out of stabilize between the cheap guard and the lock.
     if version.phase != "stabilize":
@@ -2767,6 +2907,16 @@ async def run_qualification(
             version.phase,
         )
         return {"status": "wrong_phase"}
+    if (
+        exact_authority
+        and version.phase_changed_at != expected_phase_changed_at
+    ):
+        logger.info(
+            "[RELEASE_QUALIFIER] run_qualification: version v%d phase epoch "
+            "changed before lock — skipping",
+            version.version_number,
+        )
+        return {"status": "superseded_phase_epoch"}
 
     # Guard 2 (under the lock): a qualification already in flight (pending +
     # a live child).  Re-emitting qualify_request every strategic cycle or

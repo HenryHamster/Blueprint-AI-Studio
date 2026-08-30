@@ -16,6 +16,7 @@ from sqlmodel import select
 
 from app.database import get_session
 from app.models import (
+    ReleaseQualificationIntent,
     ReleaseVersion,
     Project,
     StrategicCycle,
@@ -64,6 +65,36 @@ _agent_serving_shas_cache = DigestCache(default_ttl=300.0, stale_retry_ttl=60.0)
 _version_lifecycle_cache = DigestCache(default_ttl=30.0, stale_retry_ttl=15.0)
 
 _MAX_RETIREMENT_CRITIQUES = 100
+
+
+def _qualification_intent_projection(
+    row: ReleaseQualificationIntent,
+) -> dict[str, Any]:
+    """Bounded exact receipt projection for qualification delivery recovery."""
+
+    return {
+        "id": str(row.id),
+        "project_id": str(row.project_id),
+        "release_version_id": str(row.release_version_id),
+        "source_task_id": str(row.source_task_id),
+        "authority_kind": row.authority_kind,
+        "authority_key": row.authority_key,
+        "idempotency_key": row.idempotency_key,
+        "specification_hash": row.specification_hash,
+        "reason": row.reason,
+        "requested_probes": list(row.requested_probes or []),
+        "expected_phase_changed_at": utc_iso(row.expected_phase_changed_at),
+        "status": row.status,
+        "attempt_count": int(row.attempt_count or 0),
+        "claim_id": str(row.claim_id) if row.claim_id is not None else None,
+        "lease_expires_at": utc_iso(row.lease_expires_at),
+        "next_attempt_at": utc_iso(row.next_attempt_at),
+        "result": dict(row.result or {}),
+        "last_error": row.last_error,
+        "created_at": utc_iso(row.created_at),
+        "updated_at": utc_iso(row.updated_at),
+        "completed_at": utc_iso(row.completed_at),
+    }
 
 
 def _compose_serving_block(
@@ -509,6 +540,50 @@ async def get_agent_serving_shas(
         "integration_head_sha": integration_head_sha,
         "promotion_target": promotion_target,
         "promotion_head_sha": promotion_head_sha,
+    }
+
+
+@router.get("/projects/{project_id}/qualification-intents")
+async def get_release_qualification_intents(
+    project_id: uuid.UUID,
+    intent_id: uuid.UUID | None = Query(default=None),
+    release_version_id: uuid.UUID | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return uncached durable qualification delivery receipts."""
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    statement = select(ReleaseQualificationIntent).where(
+        ReleaseQualificationIntent.project_id == project_id
+    )
+    if intent_id is not None:
+        statement = statement.where(ReleaseQualificationIntent.id == intent_id)
+    if release_version_id is not None:
+        statement = statement.where(
+            ReleaseQualificationIntent.release_version_id == release_version_id
+        )
+    rows = (
+        (
+            await session.execute(
+                statement.order_by(
+                    ReleaseQualificationIntent.created_at.desc()
+                ).limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if intent_id is not None and not rows:
+        raise HTTPException(status_code=404, detail="Qualification intent not found")
+    return {
+        "qualification_intents": [
+            _qualification_intent_projection(row) for row in rows
+        ],
+        "count": len(rows),
     }
 
 

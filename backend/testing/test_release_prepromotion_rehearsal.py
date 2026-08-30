@@ -962,6 +962,10 @@ async def test_reaper_dispatches_rehearsal_intents_before_qualification_sweep(mo
         "app.release_prepromotion_rehearsal.dispatch_pending_rehearsal_intents",
         new=AsyncMock(return_value=1),
     )
+    launch = mocker.patch(
+        "app.release_qualification_intents.launch_due_qualification_intents",
+        new=AsyncMock(return_value=1),
+    )
     qualify = mocker.patch.object(
         release_qualifier,
         "sweep_stuck_qualifications",
@@ -974,14 +978,17 @@ async def test_reaper_dispatches_rehearsal_intents_before_qualification_sweep(mo
         )
         == 2
     )
+    launch.assert_awaited_once_with(session_factory=session_factory)
     dispatch.assert_awaited_once_with(session_factory=session_factory)
     qualify.assert_awaited_once_with(session, session_factory=session_factory)
 
     dispatch.reset_mock(side_effect=True)
+    launch.reset_mock()
     qualify.reset_mock()
     dispatch.side_effect = asyncio.CancelledError("shutdown")
     with pytest.raises(asyncio.CancelledError, match="shutdown"):
         await reaper_sweeps.sweep_stuck_qualifications(
             session, session_factory=session_factory
         )
+    launch.assert_awaited_once_with(session_factory=session_factory)
     qualify.assert_not_awaited()

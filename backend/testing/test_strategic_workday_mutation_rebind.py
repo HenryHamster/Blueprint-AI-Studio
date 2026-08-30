@@ -15,11 +15,13 @@ from app.models import (
     MessageSurface,
     MessageType,
     ProjectMessage,
+    ReleaseQualificationIntent,
     ReleaseVersion,
     Task,
     VersionAcceptanceCriterion,
 )
 from app.routers.admin_agent_ops import STRATEGIC_AGENT_OPS
+from app.time_utils import _utcnow
 from app.strategic_autonomous_handoff import AUTONOMOUS_HANDOFF_OPS
 import app.strategic_workday_mutation_rebind as mutation_rebind
 from app.strategic_workday_mutation_rebind import (
@@ -218,6 +220,21 @@ def test_completion_debt_replay_projects_the_exact_debt_id():
     }
 
 
+def test_qualification_intent_replay_projects_exact_intent_id():
+    receipt = {
+        "op": "request_qualification",
+        "entity_kind": "release_qualification_intent",
+        "entity_id": "00000000-0000-0000-0000-000000000456",
+        "effect": "created",
+    }
+
+    assert workday_operation_replay_response(receipt) == {
+        "status": "ok",
+        "op": "request_qualification",
+        "idempotent_replay": True,
+        "qualification_intent_id": "00000000-0000-0000-0000-000000000456",
+    }
+
 def test_retry_with_new_claim_incarnation_and_operation_id_replays_exact_semantics():
     project_id = uuid.uuid4()
     task = Task(id=uuid.uuid4(), project_id=project_id, payloads=[{}])
@@ -373,6 +390,251 @@ async def _start_receipt_bound_workday_packet(client, db_session):
     )
     assert packet is not None
     return project, task, identity, packet
+
+
+async def _claim_receipt_bound_workday_packet(
+    client,
+    *,
+    project,
+    task,
+    identity,
+):
+    claimed = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/claim-next",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={**identity, "lease_seconds": 45},
+    )
+    assert claimed.status_code == 200, claimed.text
+    return claimed.json()["packet"]["workday_claim_id"]
+
+
+@pytest.mark.asyncio
+async def test_direct_bound_qualification_records_main_operation_and_replays(
+    client: AsyncClient,
+    db_session,
+):
+    project, task, identity, packet = await _start_receipt_bound_workday_packet(
+        client, db_session
+    )
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=57,
+        status="open",
+        phase="stabilize",
+        phase_changed_at=_utcnow(),
+    )
+    task.payloads = [{"type": "strategic_review", "typed_fast_enabled": True}]
+    flag_modified(task, "payloads")
+    db_session.add_all([version, task])
+    await db_session.commit()
+    workday_claim_id = await _claim_receipt_bound_workday_packet(
+        client,
+        project=project,
+        task=task,
+        identity=identity,
+    )
+    operation_id = str(uuid.uuid4())
+    request = {
+        "task_id": str(task.id),
+        "resident_incarnation_id": identity["incarnation_id"],
+        "packet_id": str(packet.id),
+        "workday_claim_id": workday_claim_id,
+        "workday_operation_id": operation_id,
+        "op": "request_qualification",
+        "data": {"reason": "the bounded canary is ready", "probes": []},
+    }
+
+    created = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=request,
+    )
+    assert created.status_code == 200, created.text
+    intent_id = created.json()["qualification_intent_id"]
+    assert created.json()["qualification_intent_status"] == "pending"
+    intent = await db_session.get(
+        ReleaseQualificationIntent,
+        uuid.UUID(intent_id),
+    )
+    assert intent is not None
+    assert intent.authority_key == f"workday:{packet.id}:{operation_id}"
+
+    durable_packet = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == packet.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().one()
+    receipt = durable_packet.context[WORKDAY_OPERATION_LEDGER_CONTEXT_KEY][-1]
+    assert receipt["operation_id"] == operation_id
+    assert receipt["op"] == "request_qualification"
+    assert receipt["entity_kind"] == "release_qualification_intent"
+    assert receipt["entity_id"] == intent_id
+
+    replay = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=request,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == {
+        "status": "ok",
+        "op": "request_qualification",
+        "idempotent_replay": True,
+        "qualification_intent_id": intent_id,
+    }
+    rows = (
+        await db_session.execute(
+            select(ReleaseQualificationIntent).where(
+                ReleaseQualificationIntent.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert [row.id for row in rows] == [intent.id]
+
+
+@pytest.mark.asyncio
+async def test_direct_bound_qualification_without_target_fails_without_receipt(
+    client: AsyncClient,
+    db_session,
+):
+    project, task, identity, packet = await _start_receipt_bound_workday_packet(
+        client, db_session
+    )
+    task.payloads = [{"type": "strategic_review", "typed_fast_enabled": True}]
+    flag_modified(task, "payloads")
+    db_session.add(task)
+    await db_session.commit()
+    workday_claim_id = await _claim_receipt_bound_workday_packet(
+        client,
+        project=project,
+        task=task,
+        identity=identity,
+    )
+    rejected = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": identity["incarnation_id"],
+            "packet_id": str(packet.id),
+            "workday_claim_id": workday_claim_id,
+            "workday_operation_id": str(uuid.uuid4()),
+            "op": "request_qualification",
+            "data": {"reason": "no target exists", "probes": []},
+        },
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert "no durable intent was created" in rejected.text
+    intents = (
+        await db_session.execute(
+            select(ReleaseQualificationIntent).where(
+                ReleaseQualificationIntent.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert intents == []
+    durable_packet = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == packet.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().one()
+    assert not durable_packet.context.get(WORKDAY_OPERATION_LEDGER_CONTEXT_KEY)
+
+
+@pytest.mark.asyncio
+async def test_bound_problem_model_qualification_rider_records_child_receipt(
+    client: AsyncClient,
+    db_session,
+):
+    project, task, identity, packet = await _start_receipt_bound_workday_packet(
+        client, db_session
+    )
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=57,
+        status="open",
+        phase="stabilize",
+        phase_changed_at=_utcnow(),
+    )
+    task.payloads = [{"type": "strategic_review", "typed_fast_enabled": True}]
+    flag_modified(task, "payloads")
+    db_session.add_all([version, task])
+    await db_session.commit()
+    workday_claim_id = await _claim_receipt_bound_workday_packet(
+        client,
+        project=project,
+        task=task,
+        identity=identity,
+    )
+    operation_id = str(uuid.uuid4())
+    request = {
+        "task_id": str(task.id),
+        "resident_incarnation_id": identity["incarnation_id"],
+        "packet_id": str(packet.id),
+        "workday_claim_id": workday_claim_id,
+        "workday_operation_id": operation_id,
+        "op": "set_problem_model",
+        "data": {
+            "intent": {
+                "purpose": "Ship the exact bounded successor proof.",
+                "current_focus": "qualify v57 exactly once",
+            },
+            "capabilities": [],
+            "gaps": [],
+            "qualify_request": {"reason": "bounded canary complete", "probes": []},
+        },
+    }
+
+    created = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=request,
+    )
+    assert created.status_code == 200, created.text
+    intents = (
+        await db_session.execute(
+            select(ReleaseQualificationIntent).where(
+                ReleaseQualificationIntent.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert len(intents) == 1
+    intent = intents[0]
+    assert intent.authority_key == f"workday:{packet.id}:{operation_id}"
+    durable_packet = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.id == packet.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().one()
+    ledger = durable_packet.context[WORKDAY_OPERATION_LEDGER_CONTEXT_KEY]
+    child = next(row for row in ledger if row["op"] == "request_qualification")
+    parent = next(row for row in ledger if row["op"] == "set_problem_model")
+    assert child["operation_id"] != operation_id
+    assert child["entity_kind"] == "release_qualification_intent"
+    assert child["entity_id"] == str(intent.id)
+    assert parent["operation_id"] == operation_id
+
+    replay = await client.post(
+        "/api/agent/strategic",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=request,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["idempotent_replay"] is True
+    rows = (
+        await db_session.execute(
+            select(ReleaseQualificationIntent.id).where(
+                ReleaseQualificationIntent.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert rows == [intent.id]
 
 
 @pytest.mark.asyncio

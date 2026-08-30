@@ -5094,7 +5094,6 @@ async def strategic_operation(
             VERSION_PHASE_DECISION_CONTEXT_KEY,
             _apply_new_acceptance_criteria,
             _apply_new_version_goal,
-            _apply_qualify_request_post_commit,
             _apply_version_phase_decision,
             extract_new_version_goal,
             extract_qualify_request,
@@ -5288,20 +5287,32 @@ async def strategic_operation(
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
-        # Apply synchronously within this handler so the decision takes immediate
-        # effect rather than waiting for task completion. These apply helpers only call
-        # session.add(); the single commit below persists everything atomically.
-        # qualify_request is the exception: it does minutes of GitHub I/O
-        # (CI-compliance scan + run_qualification) and MUST NOT run under the
-        # Project FOR UPDATE lock held by this endpoint — doing so idled the
-        # connection until Cloud SQL closed it, poisoning the commit. It is
-        # applied post-commit on a fresh session below (see
-        # _apply_qualify_request_post_commit).
+        # Apply the local decisions within this handler so one commit persists
+        # them atomically. Qualification is represented only by a durable intent
+        # here; the reaper performs its slow GitHub/qualifier I/O later without
+        # holding this endpoint's Project lock.
         _phase_applied = await _apply_version_phase_decision(
             version_phase_decision, task, project, session, path="api_inline"
         )
-        _qr_task_id = task.id
-        _qr_project_id = project.id
+        from app.release_qualification_intents import prepare_qualification_intent
+
+        _qualification_intent = await prepare_qualification_intent(
+            session,
+            request=qualify_request,
+            task=task,
+            project=project,
+            authority_key=(
+                f"workday:{workday_operation.binding.packet_id}:"
+                f"{workday_operation.binding.operation_id}"
+                if workday_operation.binding is not None
+                else f"problem-model:{task.id}:{new_pm_raw.get('revision')}"
+            ),
+            authority_kind=(
+                "managed_workday_operation"
+                if workday_operation.binding is not None
+                else "problem_model_revision"
+            ),
+        )
         # ``_received`` says the field survived extraction; ``_applied`` says it
         # actually reached the open version. They differ when there is no open
         # ReleaseVersion, and the gap is the point: without it the agent reads
@@ -5325,7 +5336,10 @@ async def strategic_operation(
         task.context = new_ctx
         flag_modified(task, "context")
         if workday_operation.binding is not None and (
-            _phase_applied or _nvg_applied or _created_criteria
+            _phase_applied
+            or _nvg_applied
+            or _created_criteria
+            or _qualification_intent is not None
         ):
             from app.release_version import current_open_version as _current_open_version
 
@@ -5364,22 +5378,24 @@ async def strategic_operation(
                     entity_id=str(_criterion.criterion_key),
                     effect="created",
                 )
+            if _qualification_intent is not None:
+                await workday_operation.record_child_entity(
+                    op="request_qualification",
+                    key=str(_qualification_intent.id),
+                    entity_kind="release_qualification_intent",
+                    entity_id=str(_qualification_intent.id),
+                    effect="created",
+                )
         await workday_operation.record_problem_model(new_pm_raw)
         await session.commit()
         await _emit_updated(
             STRATEGIC_KIND_PROBLEM_MODEL,
             problem_model_changed=True,
         )
-        # qualify_request runs AFTER the commit that released the Project lock, on
-        # its own fresh session, so its slow GitHub I/O never idles this request's
-        # locked connection (which would poison the commit and 500 the agent). The
-        # agent still awaits it here, preserving synchronous semantics.
-        await _apply_qualify_request_post_commit(
-            qualify_request,
-            task_id=_qr_task_id,
-            project_id=_qr_project_id,
-            path="api_inline",
-        )
+        # Delivery is intentionally not awaited here. The committed intent is
+        # the correctness boundary; the bounded reaper owns slow GitHub and
+        # qualifier work so this conversational request cannot repeat the
+        # liveness failure the outbox repairs.
         logger.info(
             f"[STRATEGIC API] problem_model updated for project {project.id} "
             f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
@@ -5393,8 +5409,7 @@ async def strategic_operation(
             )
         if qualify_request is not None:
             logger.info(
-                "[STRATEGIC API] qualify_request applied synchronously for "
-                "task %s — release qualifier ran if open version is in stabilize",
+                "[STRATEGIC API] qualify_request durably queued for task %s",
                 task.id,
             )
         if new_version_goal is not None:
@@ -5417,6 +5432,16 @@ async def strategic_operation(
                 "diff": pm_diff,
                 "version_phase_decision_received": version_phase_decision is not None,
                 "qualify_request_received": qualify_request is not None,
+                "qualification_intent_id": (
+                    str(_qualification_intent.id)
+                    if _qualification_intent is not None
+                    else None
+                ),
+                "qualification_intent_status": (
+                    _qualification_intent.status
+                    if _qualification_intent is not None
+                    else None
+                ),
                 "new_version_goal_received": new_version_goal is not None,
                 "new_version_goal_applied": bool(_nvg_applied),
                 "new_acceptance_criteria_received": new_acceptance_criteria is not None,
@@ -7642,14 +7667,10 @@ async def strategic_operation(
         # Both fields are optional. Probes are explicit because they consume an
         # additional runner checkout; ordinary qualification judges evidence
         # already earned by task acceptance, review, and CI. Wrong-phase is a
-        # no-op (same behavior as qualify_request via set_problem_model). The qualification runs
-        # post-commit on its own fresh session for the same structural reason as
-        # the set_problem_model path: avoid holding any DB lock during slow GitHub
-        # I/O (CI-compliance scan + run_qualification).
-        from app.strategic_completion import (
-            _apply_qualify_request_post_commit,
-            extract_qualify_request,
-        )
+        # no-op for legacy callers (same behavior as qualify_request via
+        # set_problem_model). Managed Workday calls fail closed unless an exact
+        # intent can be created. The bounded reaper owns all slow delivery I/O.
+        from app.strategic_completion import extract_qualify_request
 
         try:
             qualify_request = extract_qualify_request(
@@ -7663,16 +7684,45 @@ async def strategic_operation(
         session.add(task)
         _rq_task_id = task.id
         _rq_project_id = project.id
-        await session.commit()
-        await _apply_qualify_request_post_commit(
-            qualify_request,
-            task_id=_rq_task_id,
-            project_id=_rq_project_id,
-            path="api_inline_request_qualification",
+        from app.release_qualification_intents import prepare_qualification_intent
+
+        _qualification_intent = await prepare_qualification_intent(
+            session,
+            request=qualify_request,
+            task=task,
+            project=project,
+            authority_key=(
+                f"workday:{workday_operation.binding.packet_id}:"
+                f"{workday_operation.binding.operation_id}"
+                if workday_operation.binding is not None
+                else None
+            ),
+            authority_kind=(
+                "managed_workday_operation"
+                if workday_operation.binding is not None
+                else "legacy_resident_operation"
+            ),
         )
+        if workday_operation.binding is not None and _qualification_intent is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Managed Workday qualification requires one open stabilize "
+                    "release version; no durable intent was created"
+                ),
+            )
+        if workday_operation.binding is not None and _qualification_intent is not None:
+            await workday_operation.record_entity(
+                entity_kind="release_qualification_intent",
+                entity_id=str(_qualification_intent.id),
+                effect="created",
+            )
+        await session.commit()
+        # The durable reaper owns delivery. Return the pending receipt without
+        # holding this conversation request open across external I/O.
         logger.info(
-            "[STRATEGIC API] request_qualification applied for task %s project %s "
-            "(reason=%r probes=%s) — release qualifier ran if open version is in stabilize",
+            "[STRATEGIC API] request_qualification durably queued for task %s "
+            "project %s (reason=%r probes=%s)",
             _rq_task_id,
             _rq_project_id,
             (qualify_request or {}).get("reason"),
@@ -7684,6 +7734,16 @@ async def strategic_operation(
                 "op": "request_qualification",
                 "reason_received": (qualify_request or {}).get("reason") or None,
                 "probes_received": (qualify_request or {}).get("probes") or [],
+                "qualification_intent_id": (
+                    str(_qualification_intent.id)
+                    if _qualification_intent is not None
+                    else None
+                ),
+                "qualification_intent_status": (
+                    _qualification_intent.status
+                    if _qualification_intent is not None
+                    else None
+                ),
             }
         )
 
