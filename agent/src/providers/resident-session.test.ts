@@ -681,16 +681,39 @@ describe('startResidentClaudeSession', () => {
   });
 
   it('flags an applied strategic op when a mutating ./strategic Bash command runs', async () => {
-    const ctl = makeControllableChild();
-    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
-    const session = startResidentClaudeSession({});
-    const turn = session.sendTurn('advance');
-    ctl.pushLine({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: STRATEGIC_CREATE } }] } });
-    ctl.pushLine({ type: 'result', result: 'done' });
-    const r = await turn;
-    expect(r.sawToolUse).toBe(true);
-    expect(r.appliedStrategicOp).toBe(true);
-    session.close();
+    const cases = [
+      { id: 'success', content: '{"status":"ok","op":"set_memory","doc_id":"d-1"}', applied: true },
+      { id: 'refused', content: '{"status":"refused","applied":false,"op":"set_memory","http_status":409,"reason":"stale head"}', applied: false },
+      { id: 'missing', content: null, applied: false },
+    ];
+    for (const testCase of cases) {
+      const ctl = makeControllableChild();
+      vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+      const session = startResidentClaudeSession({});
+      const turn = session.sendTurn('advance');
+      const toolUseId = `toolu_${testCase.id}`;
+      ctl.pushLine({
+        type: 'assistant',
+        message: { content: [{
+          type: 'tool_use', id: toolUseId, name: 'Bash',
+          input: { command: './strategic set-memory --json \'{"body":"exact"}\'' },
+        }] },
+      });
+      if (testCase.content !== null) {
+        ctl.pushLine({
+          type: 'user',
+          message: { content: [{
+            type: 'tool_result', tool_use_id: toolUseId,
+            content: testCase.content, is_error: false,
+          }] },
+        });
+      }
+      ctl.pushLine({ type: 'result', result: 'done' });
+      const r = await turn;
+      expect(r.sawToolUse).toBe(true);
+      expect(r.appliedStrategicOp).toBe(testCase.applied);
+      session.close();
+    }
   });
 
   it('does not flag an applied op for a read-only ./fetch', async () => {
