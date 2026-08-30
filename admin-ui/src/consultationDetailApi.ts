@@ -48,6 +48,34 @@ export interface ConsultationClaim {
   expired: boolean;
 }
 
+export type ConsultationTraceKind = 'text' | 'tool' | 'tool_result' | 'error' | 'result';
+
+export interface ConsultationTraceEvent {
+  elapsed_ms: number;
+  kind: ConsultationTraceKind;
+  label?: string;
+  is_error?: boolean;
+}
+
+/** One immutable terminal attempt, including bounded provider diagnostics. */
+export interface ConsultationAttempt {
+  attempt: number;
+  workday_claim_id: string;
+  outcome: ConsultationOutcome;
+  terminal_predicate: string;
+  provider_terminal_reason: string | null;
+  provider_output_tail: string | null;
+  started_at: string;
+  ended_at: string;
+  turn_ms: number;
+  ttft_ms: number | null;
+  tool_call_count: number;
+  tool_call_duration_ms: number;
+  result_chars: number;
+  trace: ConsultationTraceEvent[];
+  trace_truncated: boolean;
+}
+
 export interface ConsultationIndexRow {
   consultation_id: string;
   state: ConsultationState;
@@ -81,6 +109,7 @@ export interface ConsultationDetail {
   claim: ConsultationClaim | null;
   steps: ConsultationStep[];
   steps_truncated: boolean;
+  attempts: ConsultationAttempt[];
   last_failure: {
     gate: string | null;
     detail: string | null;

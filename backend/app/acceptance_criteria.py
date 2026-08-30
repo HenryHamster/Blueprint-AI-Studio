@@ -4260,6 +4260,8 @@ async def retract_criterion(
     retracted_by: str | None = None,
     superseded_by_key: str | None = None,
     enforce_loop_authored: bool = False,
+    commit: bool = True,
+    affected_predecessor_keys: set[str] | None = None,
 ) -> VersionAcceptanceCriterion | None:
     """Retract or supersede a criterion without deleting its audit history.
 
@@ -4314,9 +4316,14 @@ async def retract_criterion(
         for pred in predecessors_result.scalars().all():
             pred.superseded_by_key = None
             session.add(pred)
+            if affected_predecessor_keys is not None:
+                affected_predecessor_keys.add(pred.criterion_key)
 
-        await session.commit()
-        await session.refresh(row)
+        if commit:
+            await session.commit()
+            await session.refresh(row)
+        else:
+            await session.flush()
     return row
 
 

@@ -6356,6 +6356,11 @@ async def strategic_operation(
                 status_code=400,
                 detail="set_acceptance_criteria: each criterion_key may be updated at most once per request",
             )
+        if len(_retract_keys) != len(set(_retract_keys)):
+            raise HTTPException(
+                status_code=400,
+                detail="set_acceptance_criteria: each criterion_key may be retracted at most once per request",
+            )
         _overlapping_keys = set(_update_keys) & set(_retract_keys)
         if _overlapping_keys:
             raise HTTPException(
@@ -6483,6 +6488,8 @@ async def strategic_operation(
         # in the same call — this is the core safety-valve path.
         retracted: list[dict] = []
         retracted_active_count = 0
+        _retracted_effect_keys: set[str] = set()
+        _updated_criterion_keys: set[str] = set()
         for item in retract_input:
             criterion_key = item["criterion_key"].strip()
             reason = item["reason"].strip()
@@ -6503,6 +6510,8 @@ async def strategic_operation(
                     retracted_by="strategist",
                     superseded_by_key=superseded_by_key,
                     enforce_loop_authored=True,
+                    commit=False,
+                    affected_predecessor_keys=_updated_criterion_keys,
                 )
             except _OperatorAuthoredRetractionError as exc:
                 # Belt-and-suspenders: the up-front guard already rejected
@@ -6515,6 +6524,7 @@ async def strategic_operation(
                 and pre_status_by_key.get(criterion_key) == "active"
             )
             if took_effect:
+                _retracted_effect_keys.add(criterion_key)
                 # Row was active and is now retracted/superseded — headroom freed.
                 retracted_active_count += 1
                 # OPERATOR-ATTENTION SIGNAL. Best-effort: a failure to post the
@@ -6574,6 +6584,7 @@ async def strategic_operation(
         new_added_count = 0
         skipped_over_cap = 0
         processed: list[dict] = []
+        _changed_direction_keys: set[str] = set()
 
         # Batch-fetch ALL direction rows referenced across criteria_input in a
         # single query instead of per-item N+1 _get_direction_row() calls
@@ -6623,6 +6634,7 @@ async def strategic_operation(
                 if text_updated:
                     existing.text = text
                     session.add(existing)
+                    _updated_criterion_keys.add(existing.criterion_key)
             else:
                 try:
                     existing = await _get_criterion_by_text(
@@ -6653,6 +6665,7 @@ async def strategic_operation(
                             evidence_contract=item.get("evidence_contract"),
                             updated_by=f"strategist:{task.id}",
                         )
+                        _updated_criterion_keys.add(existing.criterion_key)
             else:
                 if existing_active_count + new_added_count >= _MAX_CRITERIA:
                     skipped_over_cap += 1
@@ -6702,6 +6715,9 @@ async def strategic_operation(
                 # added during this call (not yet flushed to DB).
                 _valid_keys = _db_active_crit_keys | _call_crit_keys
                 _prior_keys = set(dir_row.criterion_keys or [])
+                _prior_release_version_id = (dir_row.data or {}).get(
+                    "criterion_release_version_id"
+                )
                 merged = list(
                     (_valid_keys & _prior_keys) | {criterion_key}
                 )
@@ -6716,6 +6732,11 @@ async def strategic_operation(
                 _dir_data["criterion_release_version_id"] = str(open_version.id)
                 dir_row.data = _dir_data
                 session.add(dir_row)
+                if (
+                    set(merged) != _prior_keys
+                    or _prior_release_version_id != str(open_version.id)
+                ):
+                    _changed_direction_keys.add(dk)
                 mapped_keys.append(dk)
 
             processed.append(
@@ -6739,6 +6760,72 @@ async def strategic_operation(
         }
         flag_modified(task, "context")
         session.add(task)
+
+        # The direct acceptance-criteria operation is composite. Record every
+        # canonical criterion/direction child mutation plus one parent state
+        # receipt in this same transaction. The parent uses the caller's
+        # operation UUID and is the exact replay authority; deterministic child
+        # UUIDs make the complete provenance visible without permitting a blind
+        # partial retry. The post-commit evidence backfill below is derived,
+        # idempotent maintenance rather than canonical criteria authority.
+        for item in processed:
+            criterion_key = str(item["criterion_key"])
+            if item["is_new"]:
+                await workday_operation.record_child_entity(
+                    op="create_acceptance_criterion",
+                    key=criterion_key,
+                    entity_kind="acceptance_criterion",
+                    entity_id=criterion_key,
+                    effect="created",
+                )
+            elif criterion_key in _updated_criterion_keys:
+                await workday_operation.record_child_entity(
+                    op="update_acceptance_criterion",
+                    key=criterion_key,
+                    entity_kind="acceptance_criterion",
+                    entity_id=criterion_key,
+                    effect="updated",
+                )
+        processed_keys = {
+            str(item["criterion_key"]) for item in processed
+        }
+        for criterion_key in sorted(
+            _updated_criterion_keys - processed_keys
+        ):
+            await workday_operation.record_child_entity(
+                op="update_acceptance_criterion",
+                key=criterion_key,
+                entity_kind="acceptance_criterion",
+                entity_id=criterion_key,
+                effect="updated",
+            )
+        for criterion_key in sorted(_retracted_effect_keys):
+            await workday_operation.record_child_entity(
+                op="retract_acceptance_criterion",
+                key=criterion_key,
+                entity_kind="acceptance_criterion",
+                entity_id=criterion_key,
+                effect="updated",
+            )
+        for direction_key in sorted(_changed_direction_keys):
+            await workday_operation.record_child_entity(
+                op="update_direction",
+                key=direction_key,
+                entity_kind="direction",
+                entity_id=direction_key,
+                effect="updated",
+            )
+        await workday_operation.record_state(
+            target_kind="acceptance_criteria",
+            target_revision=open_version.version_number,
+            value={
+                "release_version_id": str(open_version.id),
+                "version_number": open_version.version_number,
+                "criteria": processed,
+                "retracted": retracted,
+                "skipped_over_cap": skipped_over_cap,
+            },
+        )
         await session.commit()
         logger.info(
             "[STRATEGIC API] set_acceptance_criteria for task %s: %d criteria, "

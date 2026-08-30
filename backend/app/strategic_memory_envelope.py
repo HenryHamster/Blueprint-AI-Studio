@@ -1326,6 +1326,7 @@ async def rebind_fenced_context_envelope_for_worker(
     project_id: uuid.UUID,
     reference: Mapping[str, Any],
     session_id: str,
+    source_session_id: str | None = None,
     claim_id: uuid.UUID,
     worker_generation: int,
     worker_incarnation: uuid.UUID,
@@ -1345,7 +1346,8 @@ async def rebind_fenced_context_envelope_for_worker(
     The original snapshot remains immutable for audit history.
     """
 
-    if not session_id or worker_generation < 0:
+    expected_source_session_id = str(source_session_id or session_id).strip()
+    if not session_id or not expected_source_session_id or worker_generation < 0:
         return None
     pinned = await pin_fenced_context_envelope_for_packet(
         session,
@@ -1367,7 +1369,7 @@ async def rebind_fenced_context_envelope_for_worker(
     ).scalars().first()
     if (
         source is None
-        or source.session_id != session_id
+        or source.session_id != expected_source_session_id
         or source.claim_id != claim_id
         or source.context_authority_generation
         != pinned.context_authority_generation
@@ -1377,7 +1379,8 @@ async def rebind_fenced_context_envelope_for_worker(
     ):
         return None
     if (
-        source.worker_generation == worker_generation
+        source.session_id == session_id
+        and source.worker_generation == worker_generation
         and source.worker_incarnation == worker_incarnation
     ):
         return pinned
@@ -1403,6 +1406,8 @@ async def rebind_fenced_context_envelope_for_worker(
         retrieval_trace={
             "workday_worker_rebind": True,
             "source_snapshot_id": str(source.snapshot_id),
+            "source_session_id": source.session_id,
+            "target_session_id": session_id,
         },
         expires_at=pinned.expires_at,
     )

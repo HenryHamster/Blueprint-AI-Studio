@@ -4326,6 +4326,17 @@ class ProjectMessage(SQLModel, table=True):
         Index("ix_projectmessage_context_event_type", "context"),
         Index("ix_projectmessage_context_dedupe_key", "context"),
         Index("ix_projectmessage_context_audience", "context"),
+        Index(
+            "ix_projectmessage_workday_recovery_candidates",
+            "project_id",
+            "sequence",
+            "id",
+        ),
+        Index(
+            "ix_projectmessage_workday_atomic_reply_id",
+            "project_id",
+            "context",
+        ),
         # Accelerates high-signal message fetches filtered by (project_id, message_type)
         # and ordered by created_at DESC (build_operator_attention, get_operator_message_counts).
         Index(

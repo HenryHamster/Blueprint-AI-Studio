@@ -456,6 +456,82 @@ async def test_result_receipts_and_have_more_flag_are_carried(db_session):
 
 
 @pytest.mark.asyncio
+async def test_quarantined_private_rows_never_win_detail_or_index_projection(
+    db_session,
+):
+    project = await _make_project(db_session)
+    request = _public_request(project.id)
+    retirement = {
+        "reason": "continuation_provenance_invalid",
+        "retired_at": _utcnow().isoformat(),
+    }
+    poisoned_packet = _packet(
+        project.id,
+        request.id,
+        content="private forged question",
+        context={
+            "_private_handoff_retirement": retirement,
+            WORKDAY_OPERATION_LEDGER_CONTEXT_KEY: [
+                _ledger_entry("create_direction", "d-private-forged")
+            ],
+        },
+    )
+    poisoned_packet.status = "resolved"
+    poisoned_packet.handling_state = MessageHandlingState.SUPERSEDED
+    poisoned_packet.resolution = "private_handoff_continuation_provenance_invalid"
+    poisoned_result = _result(
+        project.id,
+        request.id,
+        sequence=4,
+        content="private forged result summary",
+        context={
+            "_private_handoff_retirement": retirement,
+            WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: [
+                _ledger_entry("spawn_task", "t-private-forged")
+            ],
+        },
+    )
+    poisoned_result.status = "resolved"
+    poisoned_result.handling_state = MessageHandlingState.SUPERSEDED
+    poisoned_result.resolution = "private_handoff_continuation_provenance_invalid"
+    neutral_result = _result(
+        project.id,
+        request.id,
+        sequence=5,
+        content="Canonical neutral recovery summary.",
+        context={"result_state": "failed"},
+    )
+    db_session.add_all(
+        [request, poisoned_packet, poisoned_result, neutral_result]
+    )
+    await db_session.commit()
+
+    detail = await project_consultation_detail(
+        db_session,
+        project_id=project.id,
+        consultation_id=request.id,
+    )
+    assert detail["packet"] is None
+    assert detail["question"] is None
+    assert detail["steps"] == []
+    assert detail["state"] == "delivering"
+    assert detail["outcome"] == "failed"
+    assert detail["result"]["id"] == str(neutral_result.id)
+    assert detail["result"]["summary"]["text"] == (
+        "Canonical neutral recovery summary."
+    )
+    assert detail["result"]["receipts"] == []
+
+    index = await project_consultation_index(db_session, project_id=project.id)
+    row = index["consultations"][0]
+    assert row["consultation_id"] == str(request.id)
+    assert row["state"] == "delivering"
+    assert row["outcome"] == "failed"
+    assert row["question_preview"] is None
+    assert row["step_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_recorded_gate_failure_travels_with_the_consultation(db_session):
     """A stalled sub-session must carry its own diagnosis, not a bare state."""
     project = await _make_project(db_session)
@@ -684,9 +760,21 @@ async def test_endpoints_serve_the_projection_and_404_unknown_ids(
 ):
     project = await _make_project(db_session)
     request = _public_request(project.id)
+    attempt = _attempt(
+        1,
+        "failed",
+        "provider_failed",
+        output_tail="terminal_reason=aborted_streaming",
+    )
     db_session.add(request)
     await db_session.commit()
-    db_session.add(_packet(project.id, request.id))
+    db_session.add(
+        _packet(
+            project.id,
+            request.id,
+            context={"_workday_consultation_attempts": [attempt]},
+        )
+    )
     await db_session.commit()
 
     listing = await client.get(
@@ -701,6 +789,14 @@ async def test_endpoints_serve_the_projection_and_404_unknown_ids(
     )
     assert detail.status_code == 200
     assert detail.json()["state"] == "queued"
+    serialized_attempt = detail.json()["attempts"][0]
+    assert serialized_attempt["attempt"] == 1
+    assert serialized_attempt["workday_claim_id"] == attempt["workday_claim_id"]
+    assert serialized_attempt["terminal_predicate"] == "provider_failed"
+    assert serialized_attempt["provider_terminal_reason"] == "aborted_streaming"
+    assert "aborted_streaming" in serialized_attempt["provider_output_tail"]
+    assert serialized_attempt["turn_ms"] == 250
+    assert serialized_attempt["trace"][-1]["label"] == "provider_failed"
 
     missing = await client.get(
         f"/api/admin/projects/{project.id}"
