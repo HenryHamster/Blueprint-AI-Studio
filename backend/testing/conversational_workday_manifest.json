@@ -82,9 +82,10 @@
         "test_every_attempt_and_terminal_predicate_survive_failed_delivery",
         "test_operation_ledger_is_projected_without_identity_fields",
         "test_result_receipts_and_have_more_flag_are_carried",
+        "test_quarantined_private_rows_never_win_detail_or_index_projection",
         "test_recorded_gate_failure_travels_with_the_consultation"
       ],
-      "test_count": 16
+      "test_count": 17
     },
     {
       "path": "backend/testing/test_strategic_workday_handoff_recovery.py",
@@ -101,7 +102,14 @@
         "test_legacy_recovery_cursor_without_ceiling_restarts_without_skipping",
         "test_retired_handoff_recovery_failure_retries_ahead_of_high_watermark",
         "test_recovery_retry_queue_rotates_persistent_failure",
-        "test_persistent_retry_does_not_starve_broad_missing_source",
+        "test_persistent_retry_does_not_starve_broad_missing_source"
+      ],
+      "test_count": 12
+    },
+    {
+      "path": "backend/testing/test_strategic_workday_handoff_authority.py",
+      "reason": "Protects fail-closed packet/result lineage, quarantine replacement without private receipt leakage, bounded recovery query cost, exact retired-session recovery, and committed operator parking.",
+      "test_ids": [
         "test_broad_recovery_savepoint_rolls_back_complete_partial_result",
         "test_invalid_continuation_provenance_is_quarantined_without_starvation",
         "test_result_lineage_requires_exact_packet_and_ack_authority",
@@ -111,7 +119,7 @@
         "test_retired_session_missing_handoff_recovers_exactly_once",
         "test_operator_turn_park_is_committed_and_returned_by_the_claim_route"
       ],
-      "test_count": 20
+      "test_count": 8
     },
     {
       "path": "backend/testing/test_conversation_coordinator_two_speed.py",

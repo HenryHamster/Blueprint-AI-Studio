@@ -1640,6 +1640,7 @@ async def _reconciled_workday_continuation_receipts(
 
     from app.strategic_workday_mutation_rebind import (
         WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY,
+        WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY,
         WORKDAY_OPERATION_LEDGER_CONTEXT_KEY,
         authoritative_workday_operation_receipts,
         authoritative_workday_result_receipts,
@@ -1687,6 +1688,9 @@ async def _reconciled_workday_continuation_receipts(
         terminal_recovery_is_canonical = bool(
             not result_receipts
             and not workday_mutation_receipts_have_more(result_context)
+            and WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY not in result_context
+            and WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY
+            not in result_context
             and WORKDAY_OPERATION_LEDGER_CONTEXT_KEY not in source_context
             and source_packet.from_type == "strategic"
             and source_packet.surface == MessageSurface.CONVERSATION

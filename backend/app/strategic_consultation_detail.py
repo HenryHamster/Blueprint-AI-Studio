@@ -80,6 +80,7 @@ _CLAIM_EXPIRES = "_workday_consultation_claim_expires_at"
 _CLAIM_ATTEMPT = "_workday_consultation_claim_attempt"
 _LAST_FAILURE = "_workday_consultation_last_failure"
 _RESULT_STATE = "result_state"
+_PRIVATE_HANDOFF_RETIREMENT = "_private_handoff_retirement"
 _HIDDEN_PRIVACY_STATES = {"redacted", "deleted"}
 
 # The operator-facing view of one durable operation. The identity fields a
@@ -166,6 +167,15 @@ def _public_request_is_visible(row: ProjectMessage | None) -> bool:
 
 def _classify_related(row: ProjectMessage) -> str | None:
     context = _context(row)
+    # Quarantine preserves the incident row for audit, but it is no longer a
+    # readable consultation packet/result. Selecting it here would expose the
+    # exact corrupt content/receipts that delivery rejected and, because rows
+    # are ordered oldest-first, hide the later neutral replacement.
+    if isinstance(context.get(_PRIVATE_HANDOFF_RETIREMENT), Mapping) or (
+        row.handling_state == MessageHandlingState.SUPERSEDED
+        and str(row.resolution or "").startswith("private_handoff_")
+    ):
+        return None
     role = context.get("message_role")
     if (
         role == "workday_consultation"
