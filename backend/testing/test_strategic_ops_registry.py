@@ -86,6 +86,9 @@ def test_manifest_is_wellformed():
         else:
             assert entry["alias"] is None, op
             assert entry["internal_reason"], f"{op} must state why it is excluded"
+    memory = next(entry for entry in manifest if entry["op"] == "set_memory")
+    assert {"expected_head_id", "supersedes_id"} <= set(memory["input"]["fields"])
+    assert any("tagged handoff must include" in note for note in memory["input"]["notes"])
 
 
 def test_create_direction_manifest_matches_backend_contract():

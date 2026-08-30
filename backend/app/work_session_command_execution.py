@@ -559,6 +559,15 @@ async def execute_work_session_command(
             "receipt": _receipt_from_message(existing),
         }
 
+    project = await session.scalar(
+        select(Project).where(Project.id == project_id).with_for_update()
+    )
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(project.vision)
+
     if not bool(command.get("enabled", True)):
         raise HTTPException(status_code=409, detail="Command is disabled")
     if not _mutation(command):

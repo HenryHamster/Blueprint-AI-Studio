@@ -23,6 +23,7 @@ from app.hotfix_narrow_candidate import (  # noqa: F401
     check_hotfix_scope_preview as check_hotfix_scope_preview,
 )
 from app.models import Project
+from app.release_authority_lock import lock_project_then_version
 from app.time_utils import _utcnow
 _MODULE_SIZE_GOVERNANCE_CAP: int = 537
 
@@ -81,18 +82,7 @@ async def _hotfix_promote_locked(
     ALREADY passed (pre-lock, in ``hotfix_promote_current_version``); this body
     only performs the audited promote.
     """
-    version = (
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == version_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        )
-        .scalars()
-        .first()
-    )
+    version = await lock_project_then_version(session, version_id)
     if version is None:
         return {"status": "version_not_found"}
     if version.status != "open":

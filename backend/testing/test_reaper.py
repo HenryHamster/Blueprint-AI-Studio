@@ -3335,6 +3335,68 @@ async def test_step3_4_rollup_poison_rolled_back_for_later_steps(
 
 
 @pytest.mark.asyncio
+async def test_version_cut_followup_poison_is_rolled_back_before_stale_staged_sweep(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Step 13b must clean a failed write transaction before Step 14."""
+
+    from sqlalchemy import text as _text
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
+    from sqlalchemy.exc import PendingRollbackError as _PendingRollbackError
+
+    project = await _make_project(reaper_db)
+    captured: dict = {"session": None, "poisoned": False, "clean": False}
+
+    async def poison_version_cut_followups(session):
+        captured["session"] = session
+        duplicate_id = _uuid_mod.uuid4()
+        for _ in range(2):
+            session.add(
+                Task(
+                    id=duplicate_id,
+                    project_id=project.id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.QUEUED,
+                )
+            )
+        with contextlib.suppress(_IntegrityError):
+            await session.flush()
+        with pytest.raises(_PendingRollbackError):
+            await session.execute(_text("SELECT 1"))
+        captured["poisoned"] = True
+        raise RuntimeError("synthetic Step 13b notification failure")
+
+    async def probe_stale_staged(session):
+        assert session is captured["session"]
+        await session.execute(_text("SELECT 1"))
+        captured["clean"] = True
+        return 0
+
+    cut_sweep = mocker.patch(
+        "app.reaper.sweep_pending_version_cut_followups",
+        new_callable=AsyncMock,
+        side_effect=poison_version_cut_followups,
+    )
+    stale_sweep = mocker.patch(
+        "app.reaper.sweep_stale_staged_directions",
+        new_callable=AsyncMock,
+        side_effect=probe_stale_staged,
+    )
+    mocker.patch(
+        "app.reaper.sweep_activate_staged_directions",
+        new_callable=AsyncMock,
+        return_value=0,
+    )
+
+    await _run_reaper_once()
+
+    cut_sweep.assert_awaited_once()
+    stale_sweep.assert_awaited_once()
+    assert captured["poisoned"] is True
+    assert captured["clean"] is True
+
+
+@pytest.mark.asyncio
 async def test_retry_after_sweep_preserves_valid(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):

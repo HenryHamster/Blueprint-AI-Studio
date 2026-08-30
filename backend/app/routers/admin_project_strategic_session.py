@@ -3118,6 +3118,14 @@ async def create_project_strategic_session_check_in(
             status = "duplicate"
 
     if message is None:
+        locked_project = await session.scalar(
+            select(Project).where(Project.id == project_id).with_for_update()
+        )
+        if locked_project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+        reject_active_cold_successor(locked_project.vision)
         now = _utcnow()
         kind = _compact_text(data.kind, max_chars=40) or "manual"
         workbench_context_for_snapshot = data.workbench_context
@@ -3750,6 +3758,9 @@ async def start_project_strategic_call(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(project.vision)
     resident = await authoritative_resident_session_snapshot(session, project)
     if not resident or resident.get("status") != "active" or resident.get("stop_requested"):
         raise HTTPException(status_code=409, detail="An active Workday Resident is required")

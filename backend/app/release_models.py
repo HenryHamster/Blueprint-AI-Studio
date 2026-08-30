@@ -507,6 +507,122 @@ class ReleasePrepromotionDispatch(SQLModel, table=True):
     )
 
 
+class ReleaseQualificationIntent(SQLModel, table=True):
+    """Durable authority to apply one Resident-requested qualification."""
+
+    __tablename__ = "releasequalificationintent"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_releasequalificationintent_idempotency_key",
+        ),
+        CheckConstraint(
+            "status IN ('pending','attempting','applied','superseded','failed')",
+            name="ck_releasequalificationintent_status",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_releasequalificationintent_attempt_count",
+        ),
+        CheckConstraint(
+            "length(specification_hash) = 64",
+            name="ck_releasequalificationintent_specification_hash",
+        ),
+        Index(
+            "ix_releasequalificationintent_due",
+            "status",
+            "next_attempt_at",
+            "lease_expires_at",
+        ),
+        Index(
+            "ix_releasequalificationintent_project_status",
+            "project_id",
+            "status",
+        ),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    release_version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    # Deliberately not an FK: task deletion must not erase qualification
+    # provenance from the durable release authority ledger.
+    source_task_id: uuid.UUID = Field(sa_column=Column(GUID(), nullable=False))
+    authority_kind: str = Field(
+        default="resident_explicit",
+        sa_column=Column(
+            String(32),
+            nullable=False,
+            server_default="resident_explicit",
+        ),
+    )
+    authority_key: str = Field(sa_column=Column(String(200), nullable=False))
+    idempotency_key: str = Field(sa_column=Column(String(255), nullable=False))
+    specification_hash: str = Field(sa_column=Column(String(64), nullable=False))
+    reason: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    requested_probes: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    expected_phase_changed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    status: str = Field(
+        default="pending",
+        sa_column=Column(String(24), nullable=False, server_default="pending"),
+    )
+    attempt_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    claim_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True),
+    )
+    lease_expires_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    next_attempt_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    result: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    last_error: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+    completed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+
 class VersionAcceptanceCriterion(SQLModel, table=True):
     """A single verifiable acceptance criterion scoped to a release version.
 

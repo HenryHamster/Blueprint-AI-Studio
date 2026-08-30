@@ -66,14 +66,16 @@ _ENTITY_OPS = frozenset(
         "dispose_completion_debt",
         # Pipeline ACTION verbs that mutate a named entity, so a Workday
         # consultation binds a receipt to them the same way it does for
-        # cancel_task. force_promote is deliberately absent: like
-        # request_qualification it is a project-level TRIGGER, not an edit to a
-        # direction/task entity, so it has no entity id to bind a receipt to.
+        # cancel_task. request_qualification is also receipt-bound because its
+        # durable intent is the exact entity created by the trigger.
         "requeue_task",
         "reset_iteration_cap",
         "set_task_priority",
         "unhold_direction",
         "create_acceptance_criterion",
+        "update_acceptance_criterion",
+        "retract_acceptance_criterion",
+        "request_qualification",
     }
 )
 _ENTITY_KINDS = frozenset(
@@ -85,6 +87,7 @@ _ENTITY_KINDS = frozenset(
         "task_watch",
         "completion_debt",
         "acceptance_criterion",
+        "release_qualification_intent",
     }
 )
 _STATE_OP_TARGET_KINDS = {
@@ -92,6 +95,7 @@ _STATE_OP_TARGET_KINDS = {
     "set_running_update": "running_update",
     "set_version_goal": "version_goal",
     "set_version_phase": "version_phase",
+    "set_acceptance_criteria": "acceptance_criteria",
 }
 WORKDAY_RECEIPT_BOUND_OPS = frozenset(
     _PROBLEM_MODEL_OPS | _ENTITY_OPS | set(_STATE_OP_TARGET_KINDS)
@@ -425,6 +429,85 @@ def workday_mutation_receipts_have_more(context: object) -> bool:
     )
 
 
+def _authoritative_workday_receipt_list(
+    raw: object,
+    *,
+    packet_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    if not isinstance(raw, list) or len(raw) > WORKDAY_OPERATION_LEDGER_LIMIT:
+        raise _conflict("Workday operation history is invalid")
+    receipts: list[dict[str, Any]] = []
+    operation_ids: set[str] = set()
+    semantic_effects: dict[tuple[str, str], tuple[object, ...]] = {}
+    for value in raw:
+        receipt = _bounded_receipt(value)
+        if receipt is None or receipt["packet_id"] != str(packet_id):
+            raise _conflict("Workday operation history is invalid")
+        operation_id = receipt["operation_id"]
+        if operation_id in operation_ids:
+            raise _conflict("Workday operation history is invalid")
+        operation_ids.add(operation_id)
+        semantic_key = (receipt["op"], receipt["operation_fingerprint"])
+        effect_identity = (
+            (
+                "state",
+                receipt["target_kind"],
+                receipt["target_revision"],
+                receipt["target_sha256"],
+            )
+            if "target_kind" in receipt
+            else (
+                "entity",
+                receipt["entity_kind"],
+                receipt["entity_id"],
+                receipt["effect"],
+            )
+        )
+        prior_effect = semantic_effects.get(semantic_key)
+        if prior_effect is not None and prior_effect != effect_identity:
+            # A stable semantic operation may legitimately be observed under a
+            # later claim/operation UUID, but it cannot have two authoritative
+            # outcomes.  Never let list order choose between divergent effects.
+            raise _conflict("Workday operation history is invalid")
+        semantic_effects[semantic_key] = effect_identity
+        receipts.append(receipt)
+    return receipts
+
+
+def authoritative_workday_operation_receipts(
+    context: object,
+    *,
+    packet_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    """Validate and return the complete bounded ledger for one packet."""
+
+    raw = (
+        context.get(WORKDAY_OPERATION_LEDGER_CONTEXT_KEY)
+        if isinstance(context, Mapping)
+        else None
+    )
+    if raw is None:
+        return []
+    return _authoritative_workday_receipt_list(raw, packet_id=packet_id)
+
+
+def authoritative_workday_result_receipts(
+    context: object,
+    *,
+    packet_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    """Validate the bounded receipt projection stored on a result packet."""
+
+    raw = (
+        context.get(WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY)
+        if isinstance(context, Mapping)
+        else None
+    )
+    if raw is None:
+        return []
+    return _authoritative_workday_receipt_list(raw, packet_id=packet_id)
+
+
 def workday_operation_fingerprint(op: str, data: object) -> str:
     return hashlib.sha256(
         canonical_json_bytes({"op": op, "data": data})
@@ -451,23 +534,9 @@ def find_workday_operation_replay(
     packet_context = (
         binding.packet.context if isinstance(binding.packet.context, dict) else {}
     )
-    raw_ledger = packet_context.get(WORKDAY_OPERATION_LEDGER_CONTEXT_KEY)
-    if raw_ledger is None:
-        raw_ledger = []
-    if not isinstance(raw_ledger, list) or any(
-        _bounded_receipt(value) is None for value in raw_ledger
-    ):
-        raise _conflict("Workday operation history is invalid")
-    ledger_context = {
-        WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: raw_ledger
-    }
-    all_receipts = bounded_workday_mutation_receipts(
-        ledger_context,
+    all_receipts = authoritative_workday_operation_receipts(
+        packet_context,
         packet_id=binding.packet_id,
-        task_id=binding.task_id,
-        resident_session_id=binding.resident_session_id,
-        worker_generation=binding.worker_generation,
-        limit=WORKDAY_OPERATION_LEDGER_LIMIT,
     )
     exact_id = [
         receipt for receipt in all_receipts
@@ -495,12 +564,12 @@ def find_workday_operation_replay(
     if semantic:
         return semantic[-1]
     if not all_receipts:
-        if len(raw_ledger) >= WORKDAY_OPERATION_LEDGER_LIMIT:
+        if len(all_receipts) >= WORKDAY_OPERATION_LEDGER_LIMIT:
             raise _conflict(
                 "Workday operation capacity is exhausted for this consultation"
             )
         return None
-    if len(raw_ledger) >= WORKDAY_OPERATION_LEDGER_LIMIT:
+    if len(all_receipts) >= WORKDAY_OPERATION_LEDGER_LIMIT:
         raise _conflict(
             "Workday operation capacity is exhausted for this consultation"
         )
@@ -671,6 +740,11 @@ async def prepare_bound_workday_operation(
         workday_claim_id=workday_claim_id,
         operation_id=operation_id,
     )
+    if binding is not None and op not in WORKDAY_RECEIPT_BOUND_OPS:
+        raise _conflict(
+            "Managed Workday operation is not receipt-bound and cannot run "
+            "inside a private consultation"
+        )
     replay = (
         find_workday_operation_replay(
             binding,
@@ -707,6 +781,7 @@ def workday_operation_replay_response(receipt: Mapping[str, Any]) -> dict[str, A
         "task_watch": "watch_id",
         "completion_debt": "debt_id",
         "acceptance_criterion": "criterion_key",
+        "release_qualification_intent": "qualification_intent_id",
     }.get(str(receipt.get("entity_kind")))
     if receipt.get("op") == "cancel_task" and entity_key == "task_id":
         entity_key = "target_task_id"
@@ -845,18 +920,11 @@ async def record_workday_consultation_operation(
         snapshot_id = pinned.snapshot_id
         context["envelope"] = context_envelope_reference(pinned)
 
-    raw_ledger = context.get(WORKDAY_OPERATION_LEDGER_CONTEXT_KEY)
-    ledger = list(raw_ledger) if isinstance(raw_ledger, list) else []
-    if any(_bounded_receipt(item) is None for item in ledger):
-        raise _conflict("Workday operation history is invalid")
-    prior = bounded_workday_mutation_receipts(
-        {WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY: ledger},
+    ledger = authoritative_workday_operation_receipts(
+        context,
         packet_id=binding.packet_id,
-        task_id=binding.task_id,
-        resident_session_id=binding.resident_session_id,
-        worker_generation=binding.worker_generation,
-        limit=WORKDAY_OPERATION_LEDGER_LIMIT,
     )
+    prior = list(ledger)
     receipt: dict[str, Any] = {
         "version": 1,
         "packet_id": str(binding.packet_id),
@@ -924,6 +992,8 @@ __all__ = [
     "WORKDAY_OPERATION_LEDGER_LIMIT",
     "WORKDAY_RECEIPT_BOUND_OPS",
     "BoundWorkdayOperation",
+    "authoritative_workday_operation_receipts",
+    "authoritative_workday_result_receipts",
     "bounded_workday_mutation_receipts",
     "find_workday_operation_replay",
     "prepare_workday_consultation_operation_binding",

@@ -1449,6 +1449,83 @@ async def test_confirm_serving_confirmed_scenario(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_confirm_terminal_required_failure_reconciles_projected_scalar(
+    db_session, mocker
+):
+    """A partial prior pass must not wedge a terminal aggregate failure.
+
+    The backend row may already have projected ``serving_confirmed`` onto the
+    legacy scalar before a different required row resolves failed.  With no
+    unconfirmed rows left, the next sweep must still aggregate that failure.
+    """
+
+    async def _terminal_rows_must_not_be_rechecked(*_args, **_kwargs):
+        raise AssertionError("terminal provider row was rechecked")
+
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_required": ReleaseArtifactProvider(
+                artifact_kind="synthetic_required",
+                check=_terminal_rows_must_not_be_rechecked,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    backend_artifact = (
+        await db_session.execute(
+            _select(ReleaseDeployArtifact).where(
+                ReleaseDeployArtifact.version_id == version.id,
+                ReleaseDeployArtifact.artifact_kind
+                == BACKEND_REVISION_ARTIFACT_KIND,
+            )
+        )
+    ).scalar_one()
+    backend_artifact.serving_status = "serving_confirmed"
+    backend_artifact.served_identifier = _SHA_A
+    backend_artifact.served_at = promoted_at + timedelta(minutes=5)
+    version.serving_status = "serving_confirmed"
+    version.served_sha = _SHA_A
+    version.served_at = backend_artifact.served_at
+    db_session.add_all(
+        [
+            version,
+            backend_artifact,
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind="synthetic_required",
+                serving_status="deploy_failed",
+                reason_code="synthetic_failed",
+                confirmation_deadline=deadline,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=10),
+    )
+
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "deploy_failed"
+    assert version.deploy_failure_reason == "synthetic_failed"
+    assert version.served_sha == _SHA_A
+
+
+@pytest.mark.asyncio
 async def test_confirm_backend_revision_descendant_serving_sha_records_observed_sha(
     db_session, mocker
 ):
@@ -7495,10 +7572,10 @@ async def test_managed_check_wait_snapshot_reloads_fresh_row_after_promotion(
     )
     mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value={}))
     # The reconciler harvests _auto_remediation via read_telemetry_or_doc; the
-    # minimal _FakeSession below cannot model that select(ProjectTelemetry.value)
-    # query (it returns a ReleaseVersion for every execute()). Stub the harvest
-    # to the same empty-config value a real session yields when the project never
-    # customized auto-remediation, so the test exercises the expire/re-read path.
+    # minimal _FakeSession below cannot model the ProjectTelemetry query. Stub
+    # the harvest to the same empty-config value a real session yields when the
+    # project never customized auto-remediation, so the test exercises the
+    # canonical Project -> ReleaseVersion lock and expire/re-read path.
     mocker.patch(
         "app.project_telemetry.read_telemetry_or_doc",
         new=AsyncMock(return_value={}),
@@ -7518,6 +7595,15 @@ async def test_managed_check_wait_snapshot_reloads_fresh_row_after_promotion(
         "confidence": 0.95,
         "promoted_sha": "feedface" * 5,
     }
+    project = Project(
+        id=project_id,
+        name="Reconcile-Test",
+        user_id="reconcile-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="release",
+    )
 
     class _FakeResult:
         def __init__(self, value):
@@ -7529,6 +7615,9 @@ async def test_managed_check_wait_snapshot_reloads_fresh_row_after_promotion(
         def first(self):
             return self._value
 
+        def scalar_one_or_none(self):
+            return self._value
+
     class _FakeSession:
         def __init__(self, stale_row, fresh_row):
             self._stale_row = stale_row
@@ -7538,20 +7627,22 @@ async def test_managed_check_wait_snapshot_reloads_fresh_row_after_promotion(
         def expire_all(self):
             self.expired = True
 
-        async def execute(self, _stmt):
+        async def execute(self, stmt):
+            selected = stmt.column_descriptions[0]
+            entity = selected.get("entity")
+            expression = selected.get("expr")
+            if entity is Project:
+                return _FakeResult(project)
+            if (
+                entity is rv.ReleaseVersion
+                and getattr(expression, "key", None) == "project_id"
+            ):
+                return _FakeResult(project_id)
             return _FakeResult(self._fresh_row if self.expired else self._stale_row)
 
         async def get(self, model, pk):
             if model is Project and pk == project_id:
-                return Project(
-                    id=project_id,
-                    name="Reconcile-Test",
-                    user_id="reconcile-user",
-                    github_owner="acme",
-                    github_repo="widget",
-                    integration_branch="automain",
-                    promotion_target="release",
-                )
+                return project
             return None
 
         def add(self, _obj):
@@ -8349,7 +8440,10 @@ async def test_record_activation_receipt_resolves_unconfirmed_to_serving_confirm
     backend artifact with the reported revision and resolves the whole version
     to serving_confirmed through the shared recovery machinery: scalar flip,
     served_sha/served_at, verdict outcome, receipt provenance."""
-    from app.release_reconciliation import _record_activation_receipt
+    from app.release_reconciliation import (
+        _confirm_serving_or_fail,
+        _record_activation_receipt,
+    )
 
     now = _utcnow()
     promoted_at = now - timedelta(hours=1)
@@ -8367,9 +8461,10 @@ async def test_record_activation_receipt_resolves_unconfirmed_to_serving_confirm
         now=now,
     )
     await db_session.commit()
+    assert receipt["serving_status"] == "unconfirmed"
+    assert await _confirm_serving_or_fail(version.id) is True
     await db_session.refresh(version)
 
-    assert receipt["serving_status"] == "serving_confirmed"
     assert version.serving_status == "serving_confirmed"
     assert version.served_sha == _SHA_B
     assert version.served_at is not None
@@ -8578,7 +8673,10 @@ async def test_approved_activation_superseded_detects_newer_promotion(db_session
 async def test_record_activation_receipt_approved_mode_stamps_provenance(db_session):
     """A receipt under an in-product approval records mode=approved_activation
     and the approval binding it fulfilled, alongside the standard provenance."""
-    from app.release_reconciliation import _record_activation_receipt
+    from app.release_reconciliation import (
+        _confirm_serving_or_fail,
+        _record_activation_receipt,
+    )
 
     now = _utcnow()
     promoted_at = now - timedelta(hours=1)
@@ -8603,6 +8701,8 @@ async def test_record_activation_receipt_approved_mode_stamps_provenance(db_sess
         now=now,
     )
     await db_session.commit()
+    assert receipt["serving_status"] == "unconfirmed"
+    assert await _confirm_serving_or_fail(version.id) is True
     await db_session.refresh(version)
 
     assert receipt["mode"] == "approved_activation"
@@ -8627,7 +8727,10 @@ async def test_cli_activation_with_outstanding_approval_allows_promoted_descenda
     confirmation with the observed descendant SHA.
     """
     from app.release_activation import reject_stale_or_mismatched_approved_receipt
-    from app.release_reconciliation import _record_activation_receipt
+    from app.release_reconciliation import (
+        _confirm_serving_or_fail,
+        _record_activation_receipt,
+    )
 
     ancestry = mocker.patch(
         "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
@@ -8665,9 +8768,10 @@ async def test_cli_activation_with_outstanding_approval_allows_promoted_descenda
         now=now,
     )
     await db_session.commit()
+    assert receipt["serving_status"] == "unconfirmed"
+    assert await _confirm_serving_or_fail(version.id) is True
     await db_session.refresh(version)
 
-    assert receipt["serving_status"] == "serving_confirmed"
     assert version.serving_status == "serving_confirmed"
     assert version.served_sha == _SHA_B
     expected_ancestry_call = call(

@@ -34,7 +34,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.admin_helpers import _get_user_project_with_role
-from app.auth import get_current_user
+from app.auth import get_current_user, resolve_task_agent_authority
 from app.database import get_session, resolve_dialect_name
 from app.landed_signal import (
     has_merge_unblock_signal,
@@ -5411,10 +5411,9 @@ async def compute_project_window_spend_usd(
 # can read the latest snapshot's per-task-type format-compliance breakdown here
 # without needing access to the admin digest path.
 #
-# Auth: the same X-Agent-Token JWT used by all other agent endpoints; JWT is
-# verified via verify_agent_jwt (the low-level validator), which avoids a
-# circular import through app.routers.agent. For a read-only telemetry endpoint
-# the task-state liveness checks in verify_agent_token are unnecessary.
+# Auth: the same task-scoped X-Agent-Token JWT used by other agent endpoints.
+# Terminal tasks remain eligible because this is read-only telemetry, but the
+# persisted task/project/VM binding and cold-successor path fence are mandatory.
 
 
 @agent_router.get("/efficiency-snapshot/format-compliance")
@@ -5454,36 +5453,14 @@ async def agent_get_efficiency_snapshot_format_compliance(
     repair counts without navigating the nested blob. Returns 404 when no
     snapshot exists yet.
     """
-    from app.auth import reject_tool_asset_scope, verify_agent_jwt
-
-    payload = verify_agent_jwt(x_agent_token)
-    # A tool-asset capability token carries scope="tool-asset" and must not be
-    # usable to read the efficiency snapshot — reject it with 403 (out of scope).
-    reject_tool_asset_scope(payload)
-    task_id_str = payload.get("sub")
-    project_id_str = payload.get("project_id")
-
-    if not task_id_str and not project_id_str:
-        raise HTTPException(status_code=401, detail="token_missing_subject")
-
-    if task_id_str:
-        try:
-            task_uuid = uuid.UUID(task_id_str)
-        except ValueError:
-            raise HTTPException(
-                status_code=401, detail="token_invalid_subject"
-            ) from None
-        task = await session.get(Task, task_uuid)
-        if task is None:
-            raise HTTPException(status_code=404, detail="task_not_found")
-        project_id = task.project_id
-    else:
-        try:
-            project_id = uuid.UUID(project_id_str)
-        except (ValueError, TypeError):
-            raise HTTPException(
-                status_code=401, detail="token_invalid_project_id"
-            ) from None
+    _payload, task = await resolve_task_agent_authority(
+        x_agent_token,
+        session,
+        method="GET",
+        path="/api/agent/efficiency-snapshot/format-compliance",
+        allow_released_task=True,
+    )
+    project_id = task.project_id
 
     project = await session.get(Project, project_id)
     if project is None:

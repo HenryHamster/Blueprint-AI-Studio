@@ -35,6 +35,11 @@ from app.models import (
     _purge_derived_strategic_context_for_privacy_mutation,
 )
 from app.strategic_conversation_query import strategic_conversation_predicate
+from app.strategic_workday_rebind_provenance import (
+    WORKDAY_REBIND_DEPTH_MAX,
+    WORKDAY_REBIND_ROOT_KEYS,
+    workday_rebind_root_provenance,
+)
 from app.time_utils import _utcnow
 
 
@@ -1326,6 +1331,7 @@ async def rebind_fenced_context_envelope_for_worker(
     project_id: uuid.UUID,
     reference: Mapping[str, Any],
     session_id: str,
+    source_session_id: str | None = None,
     claim_id: uuid.UUID,
     worker_generation: int,
     worker_incarnation: uuid.UUID,
@@ -1345,7 +1351,8 @@ async def rebind_fenced_context_envelope_for_worker(
     The original snapshot remains immutable for audit history.
     """
 
-    if not session_id or worker_generation < 0:
+    expected_source_session_id = str(source_session_id or session_id).strip()
+    if not session_id or not expected_source_session_id or worker_generation < 0:
         return None
     pinned = await pin_fenced_context_envelope_for_packet(
         session,
@@ -1367,7 +1374,7 @@ async def rebind_fenced_context_envelope_for_worker(
     ).scalars().first()
     if (
         source is None
-        or source.session_id != session_id
+        or source.session_id != expected_source_session_id
         or source.claim_id != claim_id
         or source.context_authority_generation
         != pinned.context_authority_generation
@@ -1376,11 +1383,30 @@ async def rebind_fenced_context_envelope_for_worker(
         or canonical_sha256(source.canonical_envelope) != pinned.canonical_sha256
     ):
         return None
+    root_provenance = workday_rebind_root_provenance(source)
+    if root_provenance is None:
+        return None
     if (
-        source.worker_generation == worker_generation
+        source.session_id == session_id
+        and source.worker_generation == worker_generation
         and source.worker_incarnation == worker_incarnation
     ):
         return pinned
+
+    source_depth = root_provenance["workday_rebind_depth"]
+    if source_depth >= WORKDAY_REBIND_DEPTH_MAX:
+        return None
+    rebind_trace = {
+        "workday_worker_rebind": True,
+        "source_snapshot_id": str(source.snapshot_id),
+        "source_session_id": source.session_id,
+        "target_session_id": session_id,
+        **{
+            key: root_provenance[key]
+            for key in WORKDAY_REBIND_ROOT_KEYS
+        },
+        "workday_rebind_depth": source_depth + 1,
+    }
 
     rebound = await store_context_envelope_snapshot(
         session,
@@ -1400,12 +1426,30 @@ async def rebind_fenced_context_envelope_for_worker(
             canonical_envelope=source.canonical_envelope,
             canonical_sha256=source.canonical_sha256,
         ),
-        retrieval_trace={
-            "workday_worker_rebind": True,
-            "source_snapshot_id": str(source.snapshot_id),
-        },
+        retrieval_trace=rebind_trace,
         expires_at=pinned.expires_at,
     )
+    rebound_provenance = workday_rebind_root_provenance(rebound)
+    rebound_trace = (
+        rebound.retrieval_trace
+        if isinstance(rebound.retrieval_trace, dict)
+        else {}
+    )
+    if (
+        rebound_provenance is None
+        or rebound.session_id != session_id
+        or rebound.worker_generation != worker_generation
+        or rebound.worker_incarnation != worker_incarnation
+        or rebound_trace.get("source_snapshot_id") != str(source.snapshot_id)
+        or rebound_trace.get("source_session_id") != source.session_id
+        or rebound_trace.get("target_session_id") != session_id
+        or rebound_provenance["workday_rebind_depth"] != source_depth + 1
+        or any(
+            rebound_provenance[key] != root_provenance[key]
+            for key in WORKDAY_REBIND_ROOT_KEYS
+        )
+    ):
+        return None
     return await pin_fenced_context_envelope_for_packet(
         session,
         project_id=project_id,
@@ -1438,4 +1482,5 @@ __all__ = [
     "purge_expired_context_envelope_snapshots",
     "rebind_fenced_context_envelope_for_worker",
     "store_context_envelope_snapshot",
+    "workday_rebind_root_provenance",
 ]

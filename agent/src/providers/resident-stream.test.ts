@@ -294,6 +294,21 @@ describe('parseResidentLine', () => {
     });
   });
 
+  it('marks aborted_streaming as failed when the provider omits is_error', () => {
+    const events = parseResidentLine(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      terminal_reason: 'aborted_streaming',
+      result: 'partial output',
+    }));
+    expect(events[0]).toMatchObject({
+      kind: 'result',
+      isError: true,
+      isTurnResult: true,
+      terminalReason: 'aborted_streaming',
+    });
+  });
+
   it('carries token usage on a result event', () => {
     const events = parseResidentLine(JSON.stringify({
       type: 'result', result: 'done',

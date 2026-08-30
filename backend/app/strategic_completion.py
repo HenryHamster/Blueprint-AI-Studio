@@ -53,6 +53,8 @@ from app.models import (
     TaskStatus,
 )
 from app.broadcast import broadcast_to_project
+from app.agent_access_redaction import redact_agent_text
+from app.failure_reason import exception_reason
 from app.message_audience import stamp_message_audience
 from app.project_message_creation import build_project_message
 from app.project_message_projection import message_event_payload
@@ -1657,7 +1659,11 @@ async def _apply_qualify_request(
     session: AsyncSession,
     *,
     path: str,
-) -> None:
+    target_version=None,
+    expected_phase_changed_at=None,
+    exact_authority: bool | None = None,
+    result_out: dict[str, Any] | None = None,
+) -> bool:
     """Parse and apply an optional ``qualify_request`` from the strategic agent.
 
     ``request`` is the raw ``{reason: str, probes?: list[str]}`` value from either:
@@ -1687,7 +1693,66 @@ async def _apply_qualify_request(
     ``ReleaseVersion``, or that version is not in ``stabilize``. All errors are
     logged and swallowed — a bad or absent request must never block the write.
     """
+    if exact_authority is None:
+        # Compatibility for existing exact callers that predate the explicit
+        # flag. Durable intents always pass True so a legitimate NULL epoch is
+        # still an exact, target-bound authority rather than a legacy request.
+        exact_authority = expected_phase_changed_at is not None
+
+    def _record_result(status: str, **fields: Any) -> None:
+        if result_out is not None:
+            result_out.clear()
+            result_out.update(status=status, **fields)
+
+    async def _lock_block_receipt_authority():
+        """Fence Project -> exact Version before a CI-block mutation."""
+
+        from app.models import ReleaseVersion
+        from app.release_task_admission import start_block
+
+        admission_block = await start_block(
+            session, project.id, open_ver.version_number
+        )
+        if admission_block is not None:
+            _record_result(
+                str(admission_block.get("status") or "task_admission_deferred"),
+                **{
+                    key: value
+                    for key, value in admission_block.items()
+                    if key != "status"
+                },
+            )
+            return None
+        locked_version = (
+            (
+                await session.execute(
+                    select(ReleaseVersion)
+                    .where(ReleaseVersion.id == open_ver.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if locked_version is None:
+            _record_result("version_not_found")
+            return None
+        if locked_version.status != "open":
+            _record_result("version_not_open")
+            return None
+        if locked_version.phase != "stabilize":
+            _record_result("wrong_phase", phase=locked_version.phase)
+            return None
+        if exact_authority and (
+            locked_version.phase_changed_at != expected_phase_changed_at
+        ):
+            _record_result("superseded_phase_epoch")
+            return None
+        return locked_version
+
     if not request or not isinstance(request, dict):
+        _record_result("invalid_request")
         return False
     reason_raw = request.get("reason")
     reason = reason_raw.strip() or None if isinstance(reason_raw, str) else None
@@ -1700,8 +1765,10 @@ async def _apply_qualify_request(
             path,
             exc,
         )
+        _record_result("invalid_request", error=str(exc))
         return False
     if normalized_request is None:
+        _record_result("invalid_request")
         return False
     reason = normalized_request["reason"] or None
     requested_probes = normalized_request["probes"]
@@ -1712,7 +1779,12 @@ async def _apply_qualify_request(
         from app import release_qualifier as _rq
         from app import release_version as _rv
 
-        open_ver = await _rv.current_open_version(session, project.id)
+        open_ver = target_version
+        if open_ver is None:
+            open_ver = await _rv.current_open_version(session, project.id)
+        elif open_ver.project_id != project.id or open_ver.status != "open":
+            _record_result("superseded")
+            return False
         if open_ver is None:
             logger.debug(
                 "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project "
@@ -1721,6 +1793,7 @@ async def _apply_qualify_request(
                 path,
                 project.id,
             )
+            _record_result("no_open_version")
             return False
         if open_ver.phase != "stabilize":
             logger.info(
@@ -1732,6 +1805,7 @@ async def _apply_qualify_request(
                 open_ver.version_number,
                 open_ver.phase,
             )
+            _record_result("wrong_phase", phase=open_ver.phase)
             return False
         try:
             from app import ci_compliance as _ci_compliance
@@ -1746,6 +1820,9 @@ async def _apply_qualify_request(
             if status.get("status") == "success":
                 gate = ci_compliance_qualify_gate(project, status.get("head_sha"))
                 if gate.get("blocked"):
+                    open_ver = await _lock_block_receipt_authority()
+                    if open_ver is None:
+                        return False
                     logger.info(
                         "[STRATEGIC] Task %s (%s path): qualify_request for "
                         "project %s version v%d blocked by CI-compliance "
@@ -1814,6 +1891,10 @@ async def _apply_qualify_request(
                             task.id,
                             path,
                         )
+                        _record_result(
+                            "error",
+                            error="ci_compliance_block_receipt_failed",
+                        )
                         return False
                     # Notify the operator (deduped per project + HEAD) so the
                     # block is not silent. The strategist payload also surfaces
@@ -1864,6 +1945,11 @@ async def _apply_qualify_request(
                             path,
                             project.id,
                         )
+                    _record_result(
+                        "ci_compliance_blocked",
+                        blocker_class="actionable",
+                        head_sha=gate.get("head_sha"),
+                    )
                     return True
             else:
                 # CI-compliance evidence is UNAVAILABLE (GitHub credentials or
@@ -1881,6 +1967,9 @@ async def _apply_qualify_request(
                     project.id,
                     status.get("reason"),
                 )
+                open_ver = await _lock_block_receipt_authority()
+                if open_ver is None:
+                    return False
                 try:
                     open_ver.last_qualification = {
                         **(open_ver.last_qualification or {}),
@@ -1902,7 +1991,15 @@ async def _apply_qualify_request(
                         task.id,
                         path,
                     )
+                    _record_result(
+                        "error",
+                        error="ci_compliance_unavailable_receipt_failed",
+                    )
                     return False
+                _record_result(
+                    "ci_compliance_blocked",
+                    blocker_class="unavailable_evidence",
+                )
                 return True
         except Exception:
             # The gate itself raised (network error from the compliance fetch,
@@ -1918,6 +2015,9 @@ async def _apply_qualify_request(
                 path,
                 project.id,
             )
+            open_ver = await _lock_block_receipt_authority()
+            if open_ver is None:
+                return False
             try:
                 open_ver.last_qualification = {
                     **(open_ver.last_qualification or {}),
@@ -1939,15 +2039,32 @@ async def _apply_qualify_request(
                     task.id,
                     path,
                 )
+                _record_result(
+                    "error",
+                    error="ci_compliance_gate_error_receipt_failed",
+                )
                 return False
+            _record_result(
+                "ci_compliance_blocked",
+                blocker_class="unavailable_evidence",
+            )
             return True
         result = await _rq.run_qualification(
             session,
             project.id,
             open_ver,
+            expected_phase_changed_at=expected_phase_changed_at,
+            exact_authority=exact_authority,
             requested_probes=requested_probes,
             explicit_request=True,
         )
+        if isinstance(result, dict):
+            _record_result(
+                str(result.get("status") or "unknown"),
+                **{key: value for key, value in result.items() if key != "status"},
+            )
+        else:
+            _record_result("unknown")
         logger.info(
             "[STRATEGIC] Task %s (%s path): qualify_request ran qualification "
             "for project %s version v%d — status=%s (reason=%r)",
@@ -1958,7 +2075,7 @@ async def _apply_qualify_request(
             (result or {}).get("status"),
             reason,
         )
-    except Exception:
+    except Exception as exc:
         import traceback as _tb
 
         logger.exception(
@@ -1988,6 +2105,16 @@ async def _apply_qualify_request(
                     task.id,
                     path,
                 )
+        bounded_trace = redact_agent_text(_tb.format_exc(limit=5))[:2000]
+        _record_result(
+            "error",
+            error=redact_agent_text(exception_reason(exc, limit=600)),
+            exception_type=type(exc).__name__,
+            execution_trace=bounded_trace,
+            execution_trace_sha256=hashlib.sha256(
+                bounded_trace.encode("utf-8")
+            ).hexdigest(),
+        )
     return False
 
 
@@ -4568,106 +4695,6 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
     }
 
 
-async def _apply_qualify_request_post_commit(
-    request: object,
-    *,
-    task_id: "uuid.UUID",
-    project_id: "uuid.UUID",
-    path: str,
-    session_factory=None,
-) -> None:
-    """Post-commit: run the best-effort ``qualify_request`` side-effect on a fresh session.
-
-    STRUCTURAL INVARIANT (docs/concurrency.md; ``_process_post_commit`` — "release
-    the lock before slow GitHub calls"): the ``qualify_request`` handler does
-    minutes of external GitHub I/O — the CI-compliance scan in
-    ``ci_compliance.ensure_current_ci_compliance`` (which reads the capped module
-    set at the integration-branch HEAD) plus the candidate-SHA resolution in
-    ``release_qualifier.run_qualification``. That MUST NOT run while the strategic
-    completion holds the Project ``FOR UPDATE`` row lock (acquired up front by
-    ``_process_post_commit`` via ``lock_project_then_task``) and its DB connection.
-
-    Running it under the lock idled the completion's connection across the
-    multi-minute scan until Cloud SQL closed it mid-flush (``UPDATE project SET
-    ci_compliance`` → asyncpg ``InterfaceError: connection is closed``), poisoning
-    the completion session so its commit raised ``PendingRollbackError``. The
-    completion handler classified that as a transient error and requeued the WHOLE
-    agent job — re-running a 5–24 min architecture review up to ``max_retries``
-    times before giving up as FAILED, even though the agent's design-doc write had
-    already landed each time.
-
-    ``run_qualification`` is self-defending — it takes its own ``ReleaseVersion``
-    ``FOR UPDATE`` lock and resolves its GitHub I/O outside that lock — so it
-    needs no lock held by this caller. So the qualify side-effect runs here, AFTER
-    the completion has durably committed and released its Project lock, on a
-    dedicated fresh session. It is best-effort: any failure (connection death,
-    GitHub error) is logged and swallowed — the durable completion already
-    committed, so a failure here can never requeue the task or discard the
-    agent's work.
-    """  # noqa: RUF002
-    if not request or not isinstance(request, dict):
-        return
-    from app.database import AsyncSessionLocal
-
-    factory = session_factory or AsyncSessionLocal
-    refresh_required = False
-    try:
-        async with factory() as fresh:
-            project = await fresh.get(Project, project_id)
-            task = await fresh.get(Task, task_id)
-            if project is None or task is None:
-                return
-            refresh_required = await _apply_qualify_request(
-                request, task, project, fresh, path=path
-            )
-            await fresh.commit()
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[STRATEGIC_COMPLETION] _apply_qualify_request_post_commit: qualify_request "
-            "side-effect failed for task %s project %s (%s path) — non-fatal; the "
-            "strategic completion already committed durably, task NOT requeued",
-            task_id,
-            project_id,
-            path,
-            exc_info=True,
-        )
-        return
-
-    if refresh_required:
-        # Keep refresh arming isolated from blocker persistence. The trigger's
-        # bounded lock-retry path may roll its transaction back on contention or
-        # DB failure; running it in a fresh session means that can never erase
-        # the already-committed ReleaseVersion evidence above.
-        try:
-            from app.strategic_trigger import request_strategic_refresh
-
-            async with factory() as refresh_session:
-                armed = await request_strategic_refresh(
-                    refresh_session,
-                    project_id,
-                    "qualification blocked by actionable CI compliance evidence",
-                    skip_locked=False,
-                )
-                if armed:
-                    await refresh_session.commit()
-                else:
-                    await refresh_session.rollback()
-            if not armed:
-                logger.warning(
-                    "[STRATEGIC_COMPLETION] CI-compliance blocker committed but "
-                    "Strategic refresh could not be armed for project %s; the "
-                    "cadence backstop remains available",
-                    project_id,
-                )
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "[STRATEGIC_COMPLETION] CI-compliance blocker committed but "
-                "isolated Strategic refresh failed for project %s",
-                project_id,
-                exc_info=True,
-            )
-
-
 async def _maybe_retry_workday_auto_start(
     project_id: "uuid.UUID",
     *,
@@ -5283,16 +5310,22 @@ async def _handle_strategic_completion(
         # sanitized {reason} dict under ``QUALIFY_REQUEST_CONTEXT_KEY``. When the
         # open ReleaseVersion is in ``stabilize`` this kicks off the release
         # qualifier.
-        # qualify_request is a best-effort side-effect that does minutes of GitHub
-        # I/O (CI-compliance scan + run_qualification). Per the "release the lock
-        # before slow GitHub calls" invariant it must NOT run under the Project
-        # FOR UPDATE lock _process_post_commit holds — doing so idled this
-        # session's connection across the scan until Cloud SQL closed it,
-        # poisoning the commit below (PendingRollbackError) and requeuing the
-        # whole agent job. Captured here; applied post-commit on a fresh session.
+        # Qualification delivery does minutes of GitHub I/O (CI-compliance scan
+        # + run_qualification), so this lock-holding transaction persists only
+        # an exact durable intent. The bounded reaper performs delivery later on
+        # a fresh session; a provider/network stall can no longer poison this
+        # completion commit or requeue the whole agent job.
         _qr_ctx = (task.context or {}).get(QUALIFY_REQUEST_CONTEXT_KEY)
-        _qr_task_id = task.id
-        _qr_project_id = project.id
+        from app.release_qualification_intents import prepare_qualification_intent
+
+        _qualification_intent = await prepare_qualification_intent(
+            session,
+            request=_qr_ctx,
+            task=task,
+            project=project,
+            authority_key=f"task-completion:{task.id}",
+            authority_kind="resident_task_completion",
+        )
         # Apply new_version_goal if the agent supplied one via the API. Same
         # transport as qualify_request: the ``set_problem_model`` endpoint lifts
         # the field out of the problem_model JSON (ProblemModel extra="forbid")
@@ -5324,13 +5357,8 @@ async def _handle_strategic_completion(
                 exc_info=True,
             )
         await session.commit()
-        # qualify_request runs AFTER the lock-release commit, on its own fresh
-        # session, so its slow GitHub I/O never holds this completion's Project
-        # lock / connection and a failure here can never requeue the durably-
-        # completed task (see _apply_qualify_request_post_commit).
-        await _apply_qualify_request_post_commit(
-            _qr_ctx, task_id=_qr_task_id, project_id=_qr_project_id, path="api"
-        )
+        # The committed intent is delivered by the bounded reaper. Never keep
+        # the completion request alive across slow qualification I/O.
         if not preserve_terminal_cycle_disposition:
             # Post-commit: the live strategic ops already emitted per-write
             # `strategic_updated` events during execution; here we close the cycle.
@@ -7469,12 +7497,19 @@ async def _handle_strategic_completion(
     await _apply_version_phase_decision(
         _vpd_parsed, task, project, session, path="fallback"
     )
-    # See _apply_qualify_request_post_commit: the qualify_request side-effect does
-    # slow GitHub I/O and must run AFTER this path's lock-release commit, on a
-    # fresh session — never under the completion's Project lock. Captured here.
+    # Qualification is captured as an exact outbox intent in this transaction;
+    # slow delivery never runs under the completion's Project lock.
     _qr_parsed = parsed.get("qualify_request")
-    _qr_task_id_fb = task.id
-    _qr_project_id_fb = task.project_id
+    from app.release_qualification_intents import prepare_qualification_intent
+
+    _qualification_intent_fb = await prepare_qualification_intent(
+        session,
+        request=_qr_parsed,
+        task=task,
+        project=project,
+        authority_key=f"task-completion:{task.id}",
+        authority_kind="resident_task_completion",
+    )
 
     # Update cycle history with final outcome
     # Audit W2: cycle outcome lives on the StrategicCycle row.
@@ -7938,12 +7973,8 @@ async def _handle_strategic_completion(
                 message.id,
                 exc_info=True,
             )
-    # qualify_request runs post-commit on its own fresh session (see
-    # _apply_qualify_request_post_commit) so its slow GitHub I/O never holds this
-    # completion's Project lock / connection.
-    await _apply_qualify_request_post_commit(
-        _qr_parsed, task_id=_qr_task_id_fb, project_id=_qr_project_id_fb, path="fallback"
-    )
+    # Slow qualification delivery is owned by the durable outbox reaper.
+    # The bounded reaper owns the committed qualification intent.
     # Post-commit: notify the admin UI of every strategist output this
     # legacy-parse path wrote, then close the cycle. Tiny refetch signals.
     from app.strategic_events import (

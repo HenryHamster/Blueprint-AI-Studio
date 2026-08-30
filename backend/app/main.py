@@ -45,12 +45,17 @@ from app.models import (
 )
 from app.compute import provision_agent_vm  # noqa: F401  (re-exported for test patches; see main.py:108 docstring)
 from app.deployed_sha import resolve_deployed_sha
-from app.auth import get_current_user, get_current_user_optional, verify_agent_jwt
+from app.auth import (
+    get_current_user,
+    get_current_user_optional,
+    resolve_task_agent_authority,
+)
 from app.admin_helpers import _get_user_project
 from app.schemas import ArtifactDownloadResponse
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
 from app.routers.admin_project_strategic_session import router as admin_project_strategic_session_router
+from app.routers.strategic_cold_successor import router as strategic_cold_successor_router
 from app.routers.admin_project_consultations import router as admin_project_consultations_router
 from app.routers.admin_settings import router as admin_settings_router
 from app.routers.admin_migration_exemptions import (
@@ -114,6 +119,9 @@ from app.routers.admin_service_credentials import (
 )
 from app.routers.agent_access import router as agent_access_router
 from app.routers.agent_access_directions import router as agent_access_directions_router
+from app.routers.agent_access_release_spawns import (
+    router as agent_access_release_spawns_router,
+)
 from app.routers.operator_access import router as operator_access_router
 from app.shared_state import limiter
 import app.shared_state as _shared_state
@@ -133,7 +141,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0766"
+EXPECTED_SCHEMA_REVISION = "0768"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1036,6 +1044,58 @@ class RequestDurationMiddleware(BaseHTTPMiddleware):
         return response
 
 
+_VERSION_CUT_NO_STORE = "no-store, private"
+
+
+def _is_exact_version_cut_path(path: str) -> bool:
+    """Match only the two authority-bearing version-cut HTTP surfaces."""
+
+    normalized = path[:-1] if path.endswith("/") else path
+    parts = normalized.split("/")
+    return (
+        len(parts) == 6
+        and parts[:4] == ["", "api", "admin", "projects"]
+        and bool(parts[4])
+        and parts[5] in {"version-cut", "version-cut-context"}
+    )
+
+
+def _apply_version_cut_no_store(response: Response, request: Request) -> Response:
+    if _is_exact_version_cut_path(request.url.path):
+        response.headers["Cache-Control"] = _VERSION_CUT_NO_STORE
+    return response
+
+
+class VersionCutNoStoreMiddleware:
+    """Keep exact-cut identities and receipts uncached on every HTTP outcome."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or not _is_exact_version_cut_path(
+            str(scope.get("path") or "")
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_no_store(message):
+            if message.get("type") == "http.response.start":
+                message = dict(message)
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"cache-control"
+                ]
+                headers.append(
+                    (b"cache-control", _VERSION_CUT_NO_STORE.encode("ascii"))
+                )
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_no_store)
+
+
 app = FastAPI(
     title="Blueprint Orchestrator",
     description="Secure Orchestration & State Management",
@@ -1046,6 +1106,7 @@ app = FastAPI(
 app.include_router(admin_router)
 app.include_router(admin_projects_router)
 app.include_router(admin_project_strategic_session_router)
+app.include_router(strategic_cold_successor_router)
 app.include_router(admin_project_consultations_router)
 app.include_router(admin_settings_router)
 app.include_router(admin_migration_exemptions_router)
@@ -1087,6 +1148,7 @@ app.include_router(admin_operator_attention_router)
 app.include_router(admin_service_credentials_router)
 app.include_router(agent_access_router)
 app.include_router(agent_access_directions_router)
+app.include_router(agent_access_release_spawns_router)
 app.include_router(operator_access_router)
 app.include_router(admin_evergreen_router)
 app.include_router(admin_orchestrator_errors_router)
@@ -1577,19 +1639,14 @@ async def get_viewport_failure_screenshot_download_url(
     from app.viewport_evidence import viewport_object_name
 
     if x_agent_token is not None:
-        claims = verify_agent_jwt(x_agent_token)
-        task_id = claims.get("sub")
-        token_project_id = claims.get("project_id")
-        if not task_id:
-            raise HTTPException(status_code=403, detail="Agent token has no task scope")
-        if str(token_project_id) != str(project_id):
-            raise HTTPException(status_code=403, detail="Project mismatch")
-        result = await session.execute(
-            select(Task).where(Task.id == uuid.UUID(task_id))
+        _claims, task = await resolve_task_agent_authority(
+            x_agent_token,
+            session,
+            method="GET",
+            path="/api/admin/viewport-failures/download-url",
+            expected_project_id=project_id,
+            allow_released_task=True,
         )
-        task = result.scalar_one_or_none()
-        if task is None:
-            raise HTTPException(status_code=403, detail="Task not found")
         object_name = viewport_object_name(project_id, component, width)
         stamped_uri = (task.context or {}).get("viewport_failure_screenshot_uri", "")
         if not stamped_uri or not stamped_uri.endswith(object_name):
@@ -1653,15 +1710,14 @@ async def get_viewport_screenshot_download_url(
     )
 
     if x_agent_token is not None:
-        claims = verify_agent_jwt(x_agent_token)
-        token_task_id = claims.get("sub")
-        token_project_id = claims.get("project_id")
-        if not token_task_id:
-            raise HTTPException(status_code=403, detail="Agent token has no task scope")
-        # Project-scoped check only: review/fix agents need cross-task access to
-        # download screenshots from the source implementer task within the same project.
-        if str(token_project_id) != str(project_id):
-            raise HTTPException(status_code=403, detail="Project mismatch")
+        await resolve_task_agent_authority(
+            x_agent_token,
+            session,
+            method="GET",
+            path="/api/admin/viewport-shots/download-url",
+            expected_project_id=project_id,
+            allow_released_task=True,
+        )
     elif current_user is not None:
         await _get_user_project(project_id, current_user["user_id"], session)
     else:
@@ -2152,7 +2208,7 @@ def _cors_aware_rate_limit_handler(request: Request, exc: RateLimitExceeded):
         },
         headers={"Retry-After": "5"},
     )
-    return _apply_cors_headers(resp, request)
+    return _apply_version_cut_no_store(_apply_cors_headers(resp, request), request)
 
 
 app.add_exception_handler(RateLimitExceeded, _cors_aware_rate_limit_handler)
@@ -2165,7 +2221,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={"error": {"code": exc.status_code, "message": exc.detail}},
         headers=exc.headers,
     )
-    return _apply_cors_headers(resp, request)
+    return _apply_version_cut_no_store(_apply_cors_headers(resp, request), request)
 
 
 @app.exception_handler(RequestValidationError)
@@ -2184,7 +2240,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "error": {"code": 422, "message": "Validation Error", "details": errors}
         },
     )
-    return _apply_cors_headers(resp, request)
+    return _apply_version_cut_no_store(_apply_cors_headers(resp, request), request)
 
 
 @app.exception_handler(Exception)
@@ -2196,7 +2252,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"detail": "Internal Server Error"},
     )
-    return _apply_cors_headers(resp, request)
+    return _apply_version_cut_no_store(_apply_cors_headers(resp, request), request)
 
 
 # Add CORS Middleware so the frontend can call these APIs
@@ -2251,6 +2307,7 @@ app.add_middleware(
 )
 
 app.add_middleware(RequestDurationMiddleware)
+app.add_middleware(VersionCutNoStoreMiddleware)
 
 
 static_dir = os.path.join(os.path.dirname(__file__), "..", "static")

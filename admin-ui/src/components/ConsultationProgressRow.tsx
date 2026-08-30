@@ -4,6 +4,7 @@ import {
   consultationIsLive,
   consultationStateLabel,
   fetchConsultationDetail,
+  type ConsultationAttempt,
   type ConsultationDetail,
   type ConsultationIndexRow,
   type ConsultationState,
@@ -76,6 +77,73 @@ function StepList({ steps, truncated }: { steps: ConsultationStep[]; truncated: 
   );
 }
 
+function formatDuration(milliseconds: number): string {
+  if (milliseconds < 1000) return `${milliseconds} ms`;
+  if (milliseconds < 60_000) return `${(milliseconds / 1000).toFixed(1)} s`;
+  return `${(milliseconds / 60_000).toFixed(1)} min`;
+}
+
+function AttemptList({ attempts }: { attempts: ConsultationAttempt[] }) {
+  if (attempts.length === 0) return null;
+  return (
+    <div>
+      <p className="text-ui-md font-medium text-neutral-500">Attempts</p>
+      <ol className="space-y-1.5">
+        {attempts.map(attempt => (
+          <li
+            key={attempt.workday_claim_id}
+            data-testid={`consultation-attempt-${attempt.attempt}`}
+            className="min-w-0 rounded border border-neutral-800/60 px-1.5 py-1 text-ui-md text-neutral-500"
+          >
+            <p className="break-words text-neutral-400">
+              Attempt {attempt.attempt} · {attempt.outcome} · {attempt.terminal_predicate}
+            </p>
+            <p className="break-words text-neutral-600">
+              Started <time dateTime={attempt.started_at}>{timeAgo(attempt.started_at)}</time>
+              {' · '}ended <time dateTime={attempt.ended_at}>{timeAgo(attempt.ended_at)}</time>
+              {' · '}turn {formatDuration(attempt.turn_ms)}
+              {attempt.ttft_ms != null && <> · TTFT {formatDuration(attempt.ttft_ms)}</>}
+            </p>
+            <p className="break-words text-neutral-600">
+              {attempt.tool_call_count} tool call{attempt.tool_call_count === 1 ? '' : 's'}
+              {' · '}tool time {formatDuration(attempt.tool_call_duration_ms)}
+              {' · '}{attempt.result_chars} result chars
+            </p>
+            {attempt.provider_terminal_reason && (
+              <p className="break-words text-amber-400/90">
+                Provider: {attempt.provider_terminal_reason}
+              </p>
+            )}
+            {attempt.provider_output_tail && (
+              <pre className="mt-0.5 min-w-0 whitespace-pre-wrap break-words rounded bg-workbench-shell p-1 font-mono text-ui-sm text-neutral-500">
+                {attempt.provider_output_tail}
+              </pre>
+            )}
+            {attempt.trace.length > 0 && (
+              <ol className="mt-0.5 space-y-0.5 border-l border-neutral-800 pl-1.5">
+                {attempt.trace.map((event, index) => (
+                  <li
+                    key={`${event.elapsed_ms}-${event.kind}-${index}`}
+                    className={event.is_error ? 'break-words text-red-400/90' : 'break-words text-neutral-600'}
+                  >
+                    +{formatDuration(event.elapsed_ms)} · {event.kind}
+                    {event.label ? ` · ${event.label}` : ''}
+                  </li>
+                ))}
+                {attempt.trace_truncated && (
+                  <li className="break-words text-neutral-600">
+                    Some trace events are outside this bounded window.
+                  </li>
+                )}
+              </ol>
+            )}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 function DetailBody({ detail }: { detail: ConsultationDetail }) {
   const claim = detail.claim;
   return (
@@ -106,6 +174,7 @@ function DetailBody({ detail }: { detail: ConsultationDetail }) {
         <p className="text-ui-md font-medium text-neutral-500">Did</p>
         <StepList steps={detail.steps} truncated={detail.steps_truncated} />
       </div>
+      <AttemptList attempts={detail.attempts} />
       {detail.last_failure && (
         <p className="flex gap-1.5 text-ui-md text-amber-400/90">
           <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />

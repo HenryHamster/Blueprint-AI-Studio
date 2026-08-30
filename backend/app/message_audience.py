@@ -85,6 +85,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "release_build_stalled": OPERATOR_FYI,
     "release_stabilize_stalled": OPERATOR_FYI,
     "release_ci_unresolved_stall": OPERATOR_FYI,
+    "release_version_abandoned": OPERATOR_FYI,
     "direction_outcome_stalled": OPERATOR_FYI,
     "direction_staged_activated": OPERATOR_FYI,
     "promotion_readiness_reached": OPERATOR_FYI,
@@ -642,6 +643,7 @@ _WEBHOOK_EVENT_AUDIENCE: dict[str, str] = {
     # webhook, even when a legacy notification_config has enabled them. ---
     "PR_MERGED": STRATEGIST_INTERNAL,
     "DIRECTION_MILESTONE": STRATEGIST_INTERNAL,
+    "DIRECTION_STAGED_ACTIVATED": OPERATOR_FYI,
     "AUTO_FIX_SPAWNED": STRATEGIST_INTERNAL,
     "AUTO_FIX_MERGED": STRATEGIST_INTERNAL,
     "RESIDUAL_FIX_SPAWNED": STRATEGIST_INTERNAL,
@@ -672,6 +674,7 @@ _LOGICAL_EVENT_PAIRS: dict[str, str] = {
     "residual_fix_spawned": "RESIDUAL_FIX_SPAWNED",
     "residual_fix_unsuspended": "RESIDUAL_FIX_UNSUSPENDED",
     "direction_burn_pause": "DIRECTION_BURN_PAUSE",
+    "direction_staged_activated": "DIRECTION_STAGED_ACTIVATED",
     "remediation_escalated": "REMEDIATION_ESCALATED",
     "merge.unverified": "MERGE_UNVERIFIED",
     "task.failed": "TASK_FAILED",

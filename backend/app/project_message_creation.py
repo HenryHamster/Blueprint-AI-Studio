@@ -74,6 +74,7 @@ CONVERSATION_EVENT_TYPES = frozenset(
         "release_build_stalled",
         "release_stabilize_stalled",
         "release_ci_unresolved_stall",
+        "release_version_abandoned",
         "direction_outcome_stalled",
         "direction_staged_activated",
         "promotion_readiness_reached",
@@ -811,9 +812,18 @@ async def create_operator_project_message(
         .execution_options(populate_existing=True)
     )
     locked_vision = locked_project.vision if locked_project is not None else None
+    from app.strategic_cold_successor_authority import active_cold_successor_blob
+
+    active_cold_successor = active_cold_successor_blob(locked_vision)
+    if active_cold_successor is not None and conversation_turn:
+        raise HTTPException(
+            status_code=409,
+            detail="Cold successor proof has exclusive strategic authority",
+        )
     resident_snapshot = resident_session_snapshot(locked_vision)
     resident_active = bool(
-        resident_snapshot
+        active_cold_successor is None
+        and resident_snapshot
         and resident_snapshot.get("status") == "active"
         and not resident_snapshot.get("stop_requested")
         and resident_mode_selected
@@ -883,9 +893,16 @@ async def create_operator_project_message(
             .execution_options(populate_existing=True)
         )
         locked_vision = locked_project.vision if locked_project is not None else None
+        active_cold_successor = active_cold_successor_blob(locked_vision)
+        if active_cold_successor is not None and conversation_turn:
+            raise HTTPException(
+                status_code=409,
+                detail="Cold successor proof has exclusive strategic authority",
+            )
         resident_snapshot = resident_session_snapshot(locked_vision)
         resident_active = bool(
-            resident_snapshot
+            active_cold_successor is None
+            and resident_snapshot
             and resident_snapshot.get("status") == "active"
             and not resident_snapshot.get("stop_requested")
             and resident_mode_selected

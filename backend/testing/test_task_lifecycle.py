@@ -10309,6 +10309,8 @@ async def test_external_park_wake_delivery_is_exactly_once(tl_db):
     was delivered exactly once (``attempt_count == 1``).
     """
     session, _factory = tl_db
+    from app.task_blocked import PARKED_AGENT_VM_CONTEXT_KEY
+
     project = await _make_project(session)
     task = await _make_task(
         session,
@@ -10334,6 +10336,7 @@ async def test_external_park_wake_delivery_is_exactly_once(tl_db):
     task.last_heartbeat = _utcnow() - timedelta(minutes=10)
     task.started_at = _utcnow() - timedelta(minutes=11)
     task.retry_after_until = datetime(2099, 1, 1, tzinfo=timezone.utc)
+    parked_agent_vm = task.vm_instance_id
 
     # --- Park the task on the compute-job-terminal source. -------------------
     reg = await park_task(
@@ -10355,6 +10358,7 @@ async def test_external_park_wake_delivery_is_exactly_once(tl_db):
     assert task.parked_at is not None
     assert task.park_reason == "waiting on compute job job-abc"
     assert task.vm_stopped_at is not None
+    assert (task.context or {}).get(PARKED_AGENT_VM_CONTEXT_KEY) == parked_agent_vm
     assert reg.delivery_state == WakeDeliveryState.PENDING
     assert reg.wake_action == WakeAction.RESUME
 
@@ -10400,6 +10404,7 @@ async def test_external_park_wake_delivery_is_exactly_once(tl_db):
     assert "_dispatch_prep_failures" not in ctx
     assert "provision_failures" not in ctx
     assert "llm_account_id" not in ctx
+    assert PARKED_AGENT_VM_CONTEXT_KEY not in ctx
     assert task.retry_after_until is None
     assert ctx["_previous_failure_class"] == "SCOPE_OVERFLOW"
     assert ctx["_failure_class_history"] == ["SCOPE_OVERFLOW"]
@@ -10445,6 +10450,8 @@ async def test_park_task_vm_instance_id_invariant(tl_db):
       if captured before calling park_task (simulates agent_status capture pattern).
     """
     session, _factory = tl_db
+    from app.task_blocked import PARKED_AGENT_VM_CONTEXT_KEY
+
     project = await _make_project(session)
     original_vm_id = f"agent-vm-{uuid.uuid4().hex}"
     task = await _make_task(
@@ -10453,6 +10460,7 @@ async def test_park_task_vm_instance_id_invariant(tl_db):
         task_type="compute_experiment",
         status=TaskStatus.IN_PROGRESS,
         vm_instance_id=original_vm_id,
+        context={PARKED_AGENT_VM_CONTEXT_KEY: "agent-vm-untrusted-seed"},
     )
 
     # Capture before parking — mirrors the agent_status endpoint's pattern.
@@ -10483,6 +10491,7 @@ async def test_park_task_vm_instance_id_invariant(tl_db):
     )
     assert task.status == TaskStatus.PARKED
     assert task.vm_stopped_at is not None
+    assert (task.context or {}).get(PARKED_AGENT_VM_CONTEXT_KEY) == original_vm_id
 
 
 @pytest.mark.asyncio

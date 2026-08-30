@@ -55,6 +55,9 @@ from app import release_version
 from app.database import AsyncSessionLocal
 from app.models import Alert, AlertSeverity, Project
 from app.qualification_triggers import qualification_trigger_owner
+from app.release_authority_lock import (
+    lock_project_then_version as _lock_project_then_version,
+)
 from app.release_promotion import (
     _PROMOTION_CAPABILITY_FAILURES,
     _preflight_promotion_rerun_token,
@@ -71,6 +74,7 @@ from app.time_utils import _utcnow
 _MODULE_SIZE_GOVERNANCE_CAP: int = 3000
 
 logger = logging.getLogger(__name__)
+
 
 # Maximum number of sweep-driven re-entries for a ``status=error`` version.
 # A single transient GitHub outage (sha_error, no_credentials) or a walkthrough
@@ -343,7 +347,9 @@ async def _redrive_error_qualification(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as redrive_session:
-        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
+        version = await _lock_project_then_version(
+            redrive_session, version_id, skip_locked=True
+        )
         if version is None:
             return False
         qual = version.last_qualification
@@ -435,6 +441,11 @@ async def _redrive_error_qualification(
                 version.version_number,
             )
             return False
+        expected_phase_changed_at = version.phase_changed_at
+        expected_authority_fingerprint = (
+            release_qualifier.qualification_authority_fingerprint(version)
+        )
+        await redrive_session.commit()
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,
@@ -444,6 +455,9 @@ async def _redrive_error_qualification(
             retry_episode=int(qual.get("retry_episode") or 0) + 1,
             retry_episode_cap=_MAX_ERROR_REDRIVE_ATTEMPTS,
             requested_probes=qual.get("requested_probes"),
+            expected_phase_changed_at=expected_phase_changed_at,
+            expected_authority_fingerprint=expected_authority_fingerprint,
+            exact_authority=True,
             explicit_request=False,
         )
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
@@ -465,15 +479,12 @@ async def _redrive_error_qualification(
         # resets the counter (the new last_qualification won't carry
         # error_redrive_count, so the next error episode starts fresh at 0).
         if result and result.get("status") in _TRANSIENT_ERROR_CODES:
-            await redrive_session.refresh(version)
-            new_qual = version.last_qualification
-            if isinstance(new_qual, dict):
-                version.last_qualification = {
-                    **new_qual,
-                    "error_redrive_count": error_redrive_count + 1,
-                }
-                flag_modified(version, "last_qualification")
-                await redrive_session.commit()
+            await _stamp_transient_error_redrive_counter(
+                redrive_session,
+                version.id,
+                result,
+                value=error_redrive_count + 1,
+            )
         return bool(result and result.get("status") == "spawned")
 
 async def _redrive_infra_failure_qualification(
@@ -533,13 +544,9 @@ async def _redrive_infra_failure_qualification(
         # stale ``infra_failure`` marker mid-flight (2026-08-05: an explicit
         # qualification and this re-driver double-spawned duplicate
         # release_audit tasks two minutes apart).
-        version = (
-            await redrive_session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == version_id)
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
+        version = await _lock_project_then_version(
+            redrive_session, version_id, skip_locked=True
+        )
         if version is None:
             return False
         qual = version.last_qualification
@@ -768,6 +775,11 @@ async def _redrive_infra_failure_qualification(
                 version.version_number,
             )
             return False
+        expected_phase_changed_at = version.phase_changed_at
+        expected_authority_fingerprint = (
+            release_qualifier.qualification_authority_fingerprint(version)
+        )
+        await redrive_session.commit()
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,
@@ -777,6 +789,9 @@ async def _redrive_infra_failure_qualification(
             retry_episode=int(qual.get("retry_episode") or 0) + 1,
             retry_episode_cap=_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
             requested_probes=qual.get("requested_probes"),
+            expected_phase_changed_at=expected_phase_changed_at,
+            expected_authority_fingerprint=expected_authority_fingerprint,
+            exact_authority=True,
             explicit_request=False,
         )
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
@@ -845,13 +860,9 @@ async def _redrive_rubric_changed_qualification(
         # Row-lock the version (same as the infra re-driver) so this autonomous
         # re-drive serializes against a concurrently-committing explicit
         # qualification instead of reading a stale rubric marker mid-flight.
-        version = (
-            await redrive_session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == version_id)
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
+        version = await _lock_project_then_version(
+            redrive_session, version_id, skip_locked=True
+        )
         if version is None:
             return False
         qual = version.last_qualification
@@ -924,6 +935,11 @@ async def _redrive_rubric_changed_qualification(
         # qualification_attempt_id: the superseded attempt is invalid and must
         # not be continued; auto_trigger=True is the sweep's sanctioned path for
         # attempt-scoped recovery (mirrors the auto-trigger executor's fire).
+        expected_phase_changed_at = version.phase_changed_at
+        expected_authority_fingerprint = (
+            release_qualifier.qualification_authority_fingerprint(version)
+        )
+        await redrive_session.commit()
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,
@@ -931,6 +947,9 @@ async def _redrive_rubric_changed_qualification(
             retry_episode=int(qual.get("retry_episode") or 0) + 1,
             retry_episode_cap=_MAX_RUBRIC_REDRIVE_ATTEMPTS,
             requested_probes=qual.get("requested_probes"),
+            expected_phase_changed_at=expected_phase_changed_at,
+            expected_authority_fingerprint=expected_authority_fingerprint,
+            exact_authority=True,
             auto_trigger=True,
         )
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
@@ -945,15 +964,13 @@ async def _redrive_rubric_changed_qualification(
         # record), so the increment survives even if this post-commit write is
         # lost to a crash.
         if result and result.get("status") == "spawned":
-            await redrive_session.refresh(version)
-            new_qual = version.last_qualification
-            if isinstance(new_qual, dict):
-                version.last_qualification = {
-                    **new_qual,
-                    "rubric_redrive_count": rubric_redrive_count + 1,
-                }
-                flag_modified(version, "last_qualification")
-                await redrive_session.commit()
+            await _stamp_spawned_redrive_counter(
+                redrive_session,
+                version.id,
+                result,
+                key="rubric_redrive_count",
+                value=rubric_redrive_count + 1,
+            )
         return bool(result and result.get("status") == "spawned")
 
 
@@ -1025,13 +1042,9 @@ async def _redrive_walkthrough_contract_qualification(
         # autonomous re-drive serializes against a concurrently-committing
         # explicit qualification instead of reading a stale contract-failure
         # marker mid-flight.
-        version = (
-            await redrive_session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == version_id)
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
+        version = await _lock_project_then_version(
+            redrive_session, version_id, skip_locked=True
+        )
         if version is None:
             return False
         qual = version.last_qualification
@@ -1111,6 +1124,11 @@ async def _redrive_walkthrough_contract_qualification(
         # run_qualification's cached-verdict guard makes an unchanged-candidate
         # call a cheap no-op (no spawn, no cap advance), so this re-drive costs
         # real qualification work only when the inputs changed.
+        expected_phase_changed_at = version.phase_changed_at
+        expected_authority_fingerprint = (
+            release_qualifier.qualification_authority_fingerprint(version)
+        )
+        await redrive_session.commit()
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,
@@ -1118,6 +1136,9 @@ async def _redrive_walkthrough_contract_qualification(
             retry_episode=int(qual.get("retry_episode") or 0) + 1,
             retry_episode_cap=_MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS,
             requested_probes=qual.get("requested_probes"),
+            expected_phase_changed_at=expected_phase_changed_at,
+            expected_authority_fingerprint=expected_authority_fingerprint,
+            exact_authority=True,
             auto_trigger=True,
         )
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
@@ -1134,15 +1155,13 @@ async def _redrive_walkthrough_contract_qualification(
         # record), so the increment survives even if this post-commit write is
         # lost to a crash.
         if result and result.get("status") == "spawned":
-            await redrive_session.refresh(version)
-            new_qual = version.last_qualification
-            if isinstance(new_qual, dict):
-                version.last_qualification = {
-                    **new_qual,
-                    "walkthrough_contract_redrive_count": redrive_count + 1,
-                }
-                flag_modified(version, "last_qualification")
-                await redrive_session.commit()
+            await _stamp_spawned_redrive_counter(
+                redrive_session,
+                version.id,
+                result,
+                key="walkthrough_contract_redrive_count",
+                value=redrive_count + 1,
+            )
         return bool(result and result.get("status") == "spawned")
 
 
@@ -1252,6 +1271,84 @@ def _parse_iso_timestamp(raw) -> datetime | None:
     except (TypeError, ValueError):
         return None
     return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+async def _stamp_spawned_redrive_counter(
+    session,
+    version_id,
+    result: dict | None,
+    *,
+    key: str,
+    value: int,
+) -> bool:
+    """CAS one post-spawn counter onto the attempt that actually spawned."""
+
+    if not isinstance(result, dict) or result.get("status") != "spawned":
+        return False
+    result_attempt_id = result.get("qualification_attempt_id")
+    if not result_attempt_id:
+        return False
+    version = await _lock_project_then_version(session, version_id)
+    if version is None:
+        await session.rollback()
+        return False
+    qual = version.last_qualification
+    if (
+        not isinstance(qual, dict)
+        or qual.get("status") != "pending"
+        or str(qual.get("qualification_attempt_id") or "")
+        != str(result_attempt_id)
+        or str(version.active_qualification_attempt_id or "")
+        != str(result_attempt_id)
+    ):
+        await session.rollback()
+        return False
+    version.last_qualification = {**qual, key: int(value)}
+    flag_modified(version, "last_qualification")
+    session.add(version)
+    await session.commit()
+    return True
+
+
+async def _stamp_transient_error_redrive_counter(
+    session,
+    version_id,
+    result: dict | None,
+    *,
+    value: int,
+) -> bool:
+    """CAS the retry count onto the exact provider-error projection."""
+
+    if not isinstance(result, dict) or result.get("status") not in {
+        "sha_error",
+        "no_credentials",
+        "spawn_failed",
+    }:
+        return False
+    result_attempt_id = result.get("qualification_attempt_id")
+    if not result_attempt_id:
+        return False
+    version = await _lock_project_then_version(session, version_id)
+    if version is None:
+        await session.rollback()
+        return False
+    qual = version.last_qualification
+    if (
+        not isinstance(qual, dict)
+        or qual.get("status") != "error"
+        or qual.get("error") != result.get("status")
+        or str(qual.get("qualification_attempt_id") or "")
+        != str(result_attempt_id)
+        or str(version.active_qualification_attempt_id or "")
+        != str(result_attempt_id)
+    ):
+        await session.rollback()
+        return False
+    version.last_qualification = {**qual, "error_redrive_count": int(value)}
+    flag_modified(version, "last_qualification")
+    session.add(version)
+    await session.commit()
+    return True
 
 
 async def _record_redrive_decision(
@@ -1766,6 +1863,10 @@ async def _redrive_promotion_failed_qualification(
                 )
             ),
         )
+        expected_phase_changed_at = version.phase_changed_at
+        expected_authority_fingerprint = (
+            release_qualifier.qualification_authority_fingerprint(version)
+        )
         # End this session's read transaction BEFORE re-entering the qualifier:
         # the reuse-promote path opens a dedicated session that locks this row.
         await redrive_session.commit()
@@ -1776,6 +1877,9 @@ async def _redrive_promotion_failed_qualification(
             session_factory=session_factory,
             allow_synchronous_reuse_promote=True,
             requested_probes=qual.get("requested_probes"),
+            expected_phase_changed_at=expected_phase_changed_at,
+            expected_authority_fingerprint=expected_authority_fingerprint,
+            exact_authority=True,
             auto_trigger=True,
         )
         result = result or {}
@@ -1904,13 +2008,9 @@ async def _redrive_deferred_unsynced_qualification(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as redrive_session:
-        version = (
-            await redrive_session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == version_id)
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
+        version = await _lock_project_then_version(
+            redrive_session, version_id, skip_locked=True
+        )
         if version is None:
             return False
         qual = version.last_qualification
@@ -1996,12 +2096,20 @@ async def _redrive_deferred_unsynced_qualification(
             waited / 60,
             target,
         )
+        expected_phase_changed_at = version.phase_changed_at
+        expected_authority_fingerprint = (
+            release_qualifier.qualification_authority_fingerprint(version)
+        )
+        await redrive_session.commit()
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,
             version,
             session_factory=session_factory,
             requested_probes=qual.get("requested_probes"),
+            expected_phase_changed_at=expected_phase_changed_at,
+            expected_authority_fingerprint=expected_authority_fingerprint,
+            exact_authority=True,
             auto_trigger=True,
         )
         result = result or {}

@@ -667,6 +667,9 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             "activation_requested_at": "2026-08-09T00:00:00Z",
         }
         calls = []
+        state_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(state_directory.cleanup)
+        operation_id = blueprint._activation_operation_id("project-1", promoted)
 
         class FakeReleaseSocket:
             def __init__(self):
@@ -697,7 +700,9 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 pass
 
             def recv(self, _limit):
-                return b"OK\n"
+                return (
+                    f"OK {operation_id} sha256:{'0' * 64} {revision} success\n"
+                ).encode("ascii")
 
         release_socket = FakeReleaseSocket()
 
@@ -744,13 +749,24 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
         ):
             self.assertTrue(
                 deploy_blueprint._deploy_agent_once(
-                    type("Args", (), {"project_id": None})()
+                    type(
+                        "Args",
+                        (),
+                        {
+                            "project_id": None,
+                            "state_path": str(
+                                Path(state_directory.name) / "deploy-agent.state"
+                            ),
+                        },
+                    )()
                 )
             )
 
         self.assertEqual(
             release_socket.sent,
-            ("sha256:" + "0" * 64 + " " + revision + "\n").encode("ascii"),
+            (
+                "sha256:" + "0" * 64 + " " + revision + " " + operation_id + "\n"
+            ).encode("ascii"),
         )
         self.assertEqual(
             next(body for method, path, body in calls if method == "POST"),
@@ -781,6 +797,27 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 f"p=Path({str(count_path)!r}); "
                 "p.open('a', encoding='utf-8').write('release\\n'); "
                 "time.sleep(0.15)"
+            )
+            operation_id = blueprint._activation_operation_id("project-1", promoted)
+            terminal = {
+                "kind": "blueprint.local_app_release.v1",
+                "operation_id": operation_id,
+                "image_ref": release._REGISTRY
+                + "/"
+                + release._PROJECT
+                + "/"
+                + release._REPOSITORY
+                + "/"
+                + release._IMAGE
+                + "@"
+                + digest,
+                "revision": revision,
+                "outcome": "success",
+            }
+            receipt_script = (
+                "import json; print('LOCAL_APP_RELEASE_RECEIPT ' + "
+                f"json.dumps({terminal!r}, separators=(',', ':'))"
+                ")"
             )
             original_fd = os.dup(release._SOCKET_FD)
             os.dup2(release_socket.fileno(), release._SOCKET_FD)
@@ -826,7 +863,11 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     unittest.mock.patch.object(
                         release,
                         "_release_command",
-                        return_value=[sys.executable, "-c", script],
+                        side_effect=lambda *_args, **kwargs: [
+                            sys.executable,
+                            "-c",
+                            receipt_script if kwargs.get("receipt_only") else script,
+                        ],
                     ),
                     unittest.mock.patch.object(
                         release.os, "geteuid", return_value=0
@@ -841,7 +882,11 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                         [item for item in calls if item[0] == "POST"], [],
                     )
 
+                    receipt_server = threading.Thread(target=release._serve_one_request)
+                    receipt_server.start()
                     self.assertTrue(blueprint._deploy_agent_once(args))
+                    receipt_server.join(timeout=2)
+                    self.assertFalse(receipt_server.is_alive())
                     self.assertEqual(count_path.read_text(encoding="utf-8"), "release\n")
                     receipts = [item for item in calls if item[0] == "POST"]
                     self.assertEqual(len(receipts), 1)
@@ -856,8 +901,9 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 release_socket.close()
 
     def test_resume_after_started_phase_does_not_re_release(self):
-        """A restarted agent reconciles its release fence into one receipt."""
+        """A restarted agent requires the exact root receipt before API receipt."""
         revision = "f" * 40
+        digest = "sha256:" + "4" * 64
         promoted = {
             "version_number": 12,
             "status": "promoted",
@@ -865,6 +911,7 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             "serving_status": "unconfirmed",
             "activation_requested_at": "2026-08-09T00:00:00Z",
         }
+        operation_id = blueprint._activation_operation_id("project-1", promoted)
         calls = []
 
         def fake_api(method, path, body=None, timeout=30):
@@ -878,6 +925,8 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     "version_number": promoted["version_number"],
                     "promoted_sha": revision,
                     "revision": revision,
+                    "digest": digest,
+                    "operation_id": operation_id,
                     "activation_requested_at": promoted["activation_requested_at"],
                     "phase": "started",
                 }),
@@ -897,7 +946,7 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     blueprint, "_local_served_sha", return_value=revision
                 ),
                 unittest.mock.patch.object(
-                    blueprint, "_invoke_release_shim"
+                    blueprint, "_invoke_release_shim", return_value=True
                 ) as invoke_release,
                 unittest.mock.patch.object(
                     blueprint, "get_project_id", return_value="project-1"
@@ -906,7 +955,13 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             ):
                 self.assertTrue(blueprint._deploy_agent_once(args))
 
-            invoke_release.assert_not_called()
+            invoke_release.assert_called_once_with(
+                digest,
+                revision,
+                operation_id,
+                host=None,
+                receipt_only=True,
+            )
             receipts = [item for item in calls if item[0] == "POST"]
             self.assertEqual(len(receipts), 1)
             self.assertEqual(
@@ -920,7 +975,7 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             self.assertFalse(state_path.exists())
 
     def test_legacy_started_marker_without_attempt_token_does_not_re_release(self):
-        """An agent upgrade preserves a pre-token marker as the release fence."""
+        """A legacy marker never authorizes a serving-only API receipt."""
         revision = "0" * 40
         promoted = {
             "version_number": 13,
@@ -969,21 +1024,14 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 ),
                 unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
             ):
-                self.assertTrue(blueprint._deploy_agent_once(args))
+                self.assertFalse(blueprint._deploy_agent_once(args))
 
             invoke_release.assert_not_called()
-            self.assertEqual(
-                [item for item in calls if item[0] == "POST"],
-                [("POST", "/api/admin/projects/project-1/activation-receipt", {
-                    "version_number": promoted["version_number"],
-                    "revision": revision,
-                    "host": "control-plane",
-                })],
-            )
-            self.assertFalse(state_path.exists())
+            self.assertEqual([item for item in calls if item[0] == "POST"], [])
+            self.assertTrue(state_path.exists())
 
-    def test_timeout_reapproval_can_replace_legacy_marker(self):
-        """A timeout re-arm is the explicit boundary for a fresh execution."""
+    def test_timeout_reapproval_preserves_unresolved_legacy_marker(self):
+        """A re-arm cannot erase an older handoff that lacks root identity."""
         revision = "2" * 40
         promoted = {
             "version_number": 14,
@@ -1051,10 +1099,10 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 ),
                 unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
             ):
-                self.assertTrue(blueprint._deploy_agent_once(args))
+                self.assertFalse(blueprint._deploy_agent_once(args))
 
-            self.assertEqual(len(release_calls), 1)
-            self.assertFalse(state_path.exists())
+            self.assertEqual(len(release_calls), 0)
+            self.assertTrue(state_path.exists())
 
     def test_deploy_agent_poll_survives_non_api_error(self):
         """Transient poll parsing errors do not terminate the long-running unit."""
@@ -1143,8 +1191,8 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     blueprint,
                     "_invoke_release_shim",
                     side_effect=lambda *args, **kwargs: (
-                        release_calls.append(args),
-                        False,
+                        release_calls.append((args, kwargs)),
+                        kwargs.get("receipt_only", False),
                     )[1],
                 ),
             ):
@@ -1153,7 +1201,11 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 self.assertEqual(json.loads(state_path.read_text())["phase"], "accepted")
 
                 self.assertTrue(blueprint._deploy_agent_once(args))
-                self.assertEqual(len(release_calls), 1)
+                self.assertEqual(len(release_calls), 2)
+                self.assertEqual(
+                    sum(not kwargs.get("receipt_only", False) for _args, kwargs in release_calls),
+                    1,
+                )
                 self.assertEqual(
                     len([item for item in calls if item[0] == "POST"]), 1
                 )
@@ -1205,7 +1257,7 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     blueprint,
                     "_invoke_release_shim",
                     side_effect=lambda *args, **kwargs: (
-                        release_calls.append(args),
+                        release_calls.append((args, kwargs)),
                         True,
                     )[1],
                 ),
@@ -1220,7 +1272,13 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 self.assertFalse(blueprint._deploy_agent_once(args))
                 self.assertFalse(blueprint._deploy_agent_once(args))
 
-            self.assertEqual(len(release_calls), 1)
+            self.assertEqual(
+                sum(
+                    not kwargs.get("receipt_only", False)
+                    for _args, kwargs in release_calls
+                ),
+                1,
+            )
             self.assertEqual([item for item in calls if item[0] == "POST"], [])
             state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(state["phase"], "completed")
@@ -1236,6 +1294,8 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             "serving_status": "unconfirmed",
             "activation_requested_at": "2026-08-09T00:00:00Z",
         }
+        operation_id = blueprint._activation_operation_id("project-1", promoted)
+        digest = "sha256:" + "5" * 64
         calls = []
         deadline = blueprint.datetime(2026, 8, 9, tzinfo=blueprint.timezone.utc)
 
@@ -1251,6 +1311,8 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                         "version_number": 11,
                         "promoted_sha": revision,
                         "revision": revision,
+                        "digest": digest,
+                        "operation_id": operation_id,
                         "activation_requested_at": promoted["activation_requested_at"],
                         "phase": "completed",
                         "confirmation_deadline_at": deadline.isoformat(),
@@ -1265,6 +1327,9 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     blueprint, "_read_live_approved_activation", return_value=promoted
                 ),
                 unittest.mock.patch.object(
+                    blueprint, "get_project_id", return_value="project-1"
+                ),
+                unittest.mock.patch.object(
                     blueprint, "_local_served_sha", return_value="2" * 40
                 ),
                 unittest.mock.patch.object(
@@ -1276,13 +1341,13 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 ),
                 unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
                 unittest.mock.patch.object(
-                    blueprint, "_invoke_release_shim"
+                    blueprint, "_invoke_release_shim", return_value=True
                 ) as invoke_release,
             ):
                 self.assertFalse(blueprint._deploy_agent_once(args))
                 self.assertFalse(blueprint._deploy_agent_once(args))
 
-            self.assertEqual(invoke_release.call_count, 0)
+            self.assertEqual(invoke_release.call_count, 1)
             self.assertEqual([item for item in calls if item[0] == "POST"], [])
             state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(state["phase"], "failed")
@@ -1383,7 +1448,8 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     server.start()
                     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                         client.connect(socket_path)
-                        client.sendall(payload)
+                        client.sendall(payload[:17])
+                        client.sendall(payload[17:])
                         self.assertEqual(client.recv(256), b"OK\n")
                     server.join(timeout=2)
                     self.assertFalse(server.is_alive())
@@ -1441,10 +1507,63 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
     def test_release_validator_rejects_malformed_payloads_before_release(self):
         digest = "sha256:" + "0" * 64
         revision = "a" * 40
+        operation_id = "b" * 64
+        self.assertEqual(
+            release._validated_args([digest, revision, operation_id]),
+            (digest, revision, operation_id),
+        )
+        with unittest.mock.patch.object(
+            release,
+            "_newest_release_tool",
+            return_value=Path("/trusted/local_app_release.py"),
+        ):
+            command = release._release_command(digest, revision, operation_id)
+        self.assertIn("--pipe", command)
+        self.assertEqual(command[-2:], ["--operation-id", operation_id])
+        image_ref = (
+            f"{release._REGISTRY}/{release._PROJECT}/{release._REPOSITORY}/"
+            f"{release._IMAGE}@{digest}"
+        )
+        receipt = {
+            "operation_id": operation_id,
+            "image_ref": image_ref,
+            "revision": revision,
+            "outcome": "success",
+        }
+        self.assertEqual(
+            release._operation_response(
+                {"returncode": 0, "receipt": receipt},
+                digest,
+                revision,
+                operation_id,
+            ),
+            f"OK {operation_id} {digest} {revision} success\n".encode("ascii"),
+        )
+        for status in ("pending", "not_accepted"):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    release._operation_response(
+                        {
+                            "returncode": 1,
+                            "status": {
+                                "operation_id": operation_id,
+                                "image_ref": image_ref,
+                                "revision": revision,
+                                "status": status,
+                            },
+                        },
+                        digest,
+                        revision,
+                        operation_id,
+                    ).split(maxsplit=1)[0],
+                    status.upper().encode("ascii"),
+                )
         malformed = (
             (),
             (digest,),
             (digest, revision, "extra"),
+            (digest, revision, operation_id.upper()),
+            (digest, revision, operation_id, "extra"),
             (digest + "x", revision),
             (digest, revision + "a"),
             ("é", revision),
@@ -1472,12 +1591,20 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             release_service = directory / "blueprint-release.service"
             release_socket = directory / "blueprint-release.socket"
             legacy_sudoers = directory / "blueprint-release sudoers"
+            unit.write_bytes(b"old agent unit\n")
+            release_service.write_bytes(b"old release unit\n")
             legacy_sudoers.write_bytes(b"henry_hamster ALL=(root) NOPASSWD: old\n")
             commands = []
 
             def run(argv):
                 commands.append(argv)
-                return bootstrap.subprocess.CompletedProcess(argv, 0, "", "")
+                stdout = (
+                    "inactive\n"
+                    if argv[:3]
+                    == ["/usr/bin/systemctl", "show", "blueprint-release.service"]
+                    else ""
+                )
+                return bootstrap.subprocess.CompletedProcess(argv, 0, stdout, "")
 
             with (
                 unittest.mock.patch.object(bootstrap, "_DEPLOY_AGENT_UNIT", unit),
@@ -1492,8 +1619,8 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     bootstrap,
                     "_snapshot_optional",
                     side_effect=lambda path: (
-                        (legacy_sudoers.read_bytes(), 0o440)
-                        if path == legacy_sudoers
+                        (path.read_bytes(), 0o440 if path == legacy_sudoers else 0o644)
+                        if path in {unit, release_service, legacy_sudoers}
                         else None
                     ),
                 ),
@@ -1513,7 +1640,17 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     release_shim=b"new shim\n",
                 )
 
-            self.assertEqual(commands[:2], [
+            self.assertEqual(
+                commands[:2],
+                [
+                    ["/usr/bin/systemctl", "stop", "blueprint-deploy-agent.service"],
+                    [
+                        "/usr/bin/systemctl", "show", "blueprint-release.service",
+                        "--property=ActiveState", "--value",
+                    ],
+                ],
+            )
+            self.assertEqual(commands[2:4], [
                 ["/usr/bin/systemctl", "daemon-reload"],
                 ["/usr/bin/systemd-analyze", "verify", str(unit), str(release_service), str(release_socket)],
             ])
@@ -1526,6 +1663,54 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 commands,
             )
             self.assertFalse(legacy_sudoers.exists())
+
+    def test_deploy_agent_install_refuses_busy_root_release_before_writes(self):
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            unit = directory / "blueprint-deploy-agent.service"
+            release_service = directory / "blueprint-release.service"
+            release_socket = directory / "blueprint-release.socket"
+            shim = directory / "blueprint-release"
+            unit.write_bytes(b"old agent unit\n")
+            release_service.write_bytes(b"old release unit\n")
+
+            for state in ("active", "activating", "deactivating", "failed"):
+                with self.subTest(state=state):
+                    commands, writes = [], []
+
+                    def run(argv):
+                        commands.append(argv)
+                        stdout = f"{state}\n" if argv[1] == "show" else ""
+                        return bootstrap.subprocess.CompletedProcess(argv, 0, stdout, "")
+
+                    with (
+                        unittest.mock.patch.object(bootstrap, "_DEPLOY_AGENT_UNIT", unit),
+                        unittest.mock.patch.object(bootstrap, "_RELEASE_SERVICE", release_service),
+                        unittest.mock.patch.object(bootstrap, "_RELEASE_SOCKET_UNIT", release_socket),
+                        unittest.mock.patch.object(bootstrap, "_RELEASE_SHIM", shim),
+                        unittest.mock.patch.object(
+                            bootstrap, "_LEGACY_RELEASE_SUDOERS", directory / "sudoers"
+                        ),
+                        unittest.mock.patch.object(
+                            bootstrap, "_snapshot_optional",
+                            side_effect=lambda path: (path.read_bytes(), 0o644)
+                            if path.exists() else None,
+                        ),
+                        unittest.mock.patch.object(
+                            bootstrap, "_atomic_write",
+                            side_effect=lambda *args: writes.append(args),
+                        ),
+                        unittest.mock.patch.object(bootstrap, "_run", side_effect=run),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "not inactive"):
+                            bootstrap._install_deploy_agent(
+                                bundle=PurePosixPath("/trusted/new-bundle"),
+                                install_user="henry_hamster",
+                                release_shim=b"new shim\n",
+                            )
+
+                    self.assertEqual(writes, [])
+                    self.assertEqual([command[1] for command in commands], ["stop", "show"])
 
 
 if __name__ == "__main__":

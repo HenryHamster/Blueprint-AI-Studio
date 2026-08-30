@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import update
 from sqlmodel import select
 
 from app.conversation_coordinator import (
@@ -22,6 +23,8 @@ from app.conversation_coordinator import (
     complete_workday_consultation_continuation,
     create_or_get_workday_consultation_packet,
     native_resident_reply_may_complete_claim,
+    read_workday_consultation_attempt_diagnostic,
+    record_workday_consultation_attempt_diagnostic,
     record_workday_consultation_gate_failure,
     renew_workday_consultation_packet,
     reset_conversation_claim_for_session_handoff,
@@ -34,6 +37,7 @@ from app.models import (
     MessageSurface,
     Project,
     ProjectMessage,
+    StrategicMemoryProjectState,
     Task,
 )
 
@@ -42,8 +46,9 @@ async def _project_with_input(db_session, *, sequence: int = 1):
     project = Project(name="two speed conversation", user_id="two-speed-user")
     db_session.add(project)
     await db_session.commit()
+    project_id = project.id
     message = ProjectMessage(
-        project_id=project.id,
+        project_id=project_id,
         sequence=sequence,
         surface=MessageSurface.CONVERSATION,
         from_type="user",
@@ -52,7 +57,7 @@ async def _project_with_input(db_session, *, sequence: int = 1):
         handling_state=MessageHandlingState.PENDING,
     )
     task = Task(
-        project_id=project.id,
+        project_id=project_id,
         title="two speed conversation worker",
         payloads=[],
     )
@@ -66,10 +71,11 @@ async def _envelope(db_session, project: Project, claim):
         build_and_store_context_envelope_snapshot,
     )
     row = claim.rows[0]
+    project_id = project.id
     sequence = max(int(candidate.sequence or 0) for candidate in claim.rows)
     return await build_and_store_context_envelope_snapshot(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         session_id="session",
         claim_id=claim.claim_id,
         worker_generation=int(row.conversation_claim_generation or 1),
@@ -113,10 +119,11 @@ def _attempt_diagnostic(
 @pytest.mark.asyncio
 async def test_fast_claim_fences_other_public_owner(db_session):
     project, message, task = await _project_with_input(db_session)
+    project_id = project.id
     fast_task_id = task.id
     claim = await claim_operator_messages(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         session_id="session",
         task_id=fast_task_id,
         worker_generation=1,
@@ -130,7 +137,7 @@ async def test_fast_claim_fences_other_public_owner(db_session):
 
     competing = await claim_operator_messages(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         session_id="session",
         task_id=uuid.uuid4(),
         worker_generation=1,
@@ -395,7 +402,10 @@ async def test_workday_packet_and_continuation_are_idempotent_and_leave_typed_in
     )
     assert claim is not None
     envelope = await _envelope(db_session, project, claim)
-    source_reply_id = uuid.uuid4()
+    # This coordinator-only fixture does not exercise handoff-source
+    # validation, but the packet's relational lineage must still reference a
+    # durable same-project message instead of a nonexistent UUID.
+    source_reply_id = message.id
     first = await create_or_get_workday_consultation_packet(
         db_session,
         project_id=project.id,
@@ -475,11 +485,12 @@ async def test_workday_packet_and_continuation_are_idempotent_and_leave_typed_in
 @pytest.mark.asyncio
 async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_session):
     project, message, task = await _project_with_input(db_session)
+    project_id = project.id
     task_id = task.id
     incarnation_id = uuid.uuid4()
     claim = await claim_operator_messages(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         session_id="session",
         task_id=task_id,
         worker_generation=1,
@@ -490,10 +501,10 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     )
     assert claim is not None
     envelope = await _envelope(db_session, project, claim)
-    atomic_reply_id = uuid.uuid4()
+    atomic_reply_id = message.id
     packet = await create_or_get_workday_consultation_packet(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         claim=claim,
         envelope=envelope,
         delivery_key="needs-evidence",
@@ -505,7 +516,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
 
     delivery = await claim_next_workday_consultation_packet(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         task_id=task_id,
         worker_generation=1,
         worker_incarnation=incarnation_id,
@@ -518,7 +529,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
 
     duplicate_delivery = await claim_next_workday_consultation_packet(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         task_id=task_id,
         worker_generation=1,
         worker_incarnation=incarnation_id,
@@ -529,7 +540,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     completed_diagnostic = _attempt_diagnostic(delivery, "completed")
     duplicate_ack = await acknowledge_workday_consultation_packet(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         packet_id=packet.message.id,
         task_id=task_id,
         worker_generation=1,
@@ -543,9 +554,32 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     assert not duplicate_ack
     await db_session.commit()
 
+    result_key = (
+        f"workday-consultation-result:{packet.message.id}:"
+        f"{delivery.workday_claim_id}"
+    )
+    persisted_result = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.idempotency_key == result_key,
+            )
+        )
+    ).scalar_one()
+    assert persisted_result.reply_to_message_id == packet.message.id
+    # Simulate a terminal result committed by the pre-relational deployment.
+    # Only the exact ack replay may repair the missing packet link.
+    await db_session.execute(
+        update(ProjectMessage)
+        .where(ProjectMessage.id == persisted_result.id)
+        .values(reply_to_message_id=None)
+    )
+    await db_session.commit()
+    await db_session.refresh(persisted_result)
+
     retry_ack = await acknowledge_workday_consultation_packet(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         packet_id=packet.message.id,
         task_id=task_id,
         worker_generation=1,
@@ -557,9 +591,41 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
         attempt_diagnostic=completed_diagnostic,
     )
     assert retry_ack
+    repaired_result = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.idempotency_key == result_key,
+            )
+        )
+    ).scalar_one()
+    assert repaired_result.reply_to_message_id == packet.message.id
+    await db_session.commit()
+    repaired_result.reply_to_message_id = message.id
+    db_session.add(repaired_result)
+    await db_session.flush()
+    with pytest.raises(
+        ValueError, match="consultation result relational lineage conflicts"
+    ):
+        await acknowledge_workday_consultation_packet(
+            db_session,
+            project_id=project_id,
+            packet_id=packet.message.id,
+            task_id=task_id,
+            worker_generation=1,
+            worker_incarnation=incarnation_id,
+            resident_session_id="session",
+            workday_claim_id=delivery.workday_claim_id,
+            outcome="completed",
+            result_summary=(
+                "The exact evidence supports the proposed derivation."
+            ),
+            attempt_diagnostic=completed_diagnostic,
+        )
+    await db_session.rollback()
     assert await claim_next_workday_consultation_packet(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         task_id=task_id,
         worker_generation=1,
         worker_incarnation=incarnation_id,
@@ -568,7 +634,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
 
     continuation = await claim_next_workday_consultation_continuation(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         task_id=task_id,
         worker_generation=1,
         worker_incarnation=incarnation_id,
@@ -581,7 +647,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     )
     renewed = await renew_workday_consultation_continuation(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         result_packet_id=continuation.message.id,
         continuation_claim_id=continuation.continuation_claim_id,
         task_id=task_id,
@@ -594,7 +660,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     assert renewed.lease_expires_at > continuation.lease_expires_at
     assert await release_workday_consultation_continuation(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         result_packet_id=continuation.message.id,
         continuation_claim_id=continuation.continuation_claim_id,
         task_id=task_id,
@@ -604,7 +670,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     ) == "released"
     assert await release_workday_consultation_continuation(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         result_packet_id=continuation.message.id,
         continuation_claim_id=continuation.continuation_claim_id,
         task_id=task_id,
@@ -614,7 +680,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     ) == "already_released"
     continuation = await claim_next_workday_consultation_continuation(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         task_id=task_id,
         worker_generation=1,
         worker_incarnation=incarnation_id,
@@ -624,7 +690,7 @@ async def test_workday_packet_is_claimed_once_and_acked_without_public_reply(db_
     assert continuation.attempt == 2
     reply = await complete_workday_consultation_continuation(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         result_packet_id=continuation.message.id,
         continuation_claim_id=continuation.continuation_claim_id,
         task_id=task_id,
@@ -667,7 +733,7 @@ async def test_workday_empty_result_retries_once_then_creates_terminal_failure(d
         delivery_key="empty-result",
         question="Find exact evidence.",
         resident_session_id="session",
-        atomic_public_reply_id=uuid.uuid4(),
+        atomic_public_reply_id=message.id,
     )
     first = await claim_next_workday_consultation_packet(
         db_session,
@@ -824,6 +890,53 @@ async def test_claiming_next_fast_turn_preserves_prior_workday_packet(db_session
     persisted_packet = await db_session.get(ProjectMessage, packet_id)
     assert persisted_packet is not None
     assert persisted_packet.context["audience"] == "strategist-internal"
+    assert persisted_packet.reply_to_message_id == first_completion.message.id
+    memory_state = await db_session.get(StrategicMemoryProjectState, project.id)
+    assert memory_state is not None
+    privacy_generation_before_repair = memory_state.privacy_generation
+    # Simulate a packet committed before the relational lineage column was
+    # populated.  The exact public-reply replay has independent server-key and
+    # content receipts, so it may fill only this NULL link.
+    await db_session.execute(
+        update(ProjectMessage)
+        .where(ProjectMessage.id == packet_id)
+        .values(reply_to_message_id=None)
+    )
+    await db_session.commit()
+    await db_session.refresh(persisted_packet)
+    replay_completion = await complete_claimed_public_turn(
+        db_session,
+        project_id=project.id,
+        claim_id=first_claim.claim_id,
+        task_id=task.id,
+        worker_generation=1,
+        incarnation_id=first_incarnation_id,
+        owner=ConversationPublicReplyOwner.FAST,
+        content="I can answer now while Workday verifies the implementation.",
+        idempotency_key="fast-reply-with-workday-turn-1",
+        resident_session_id="session",
+        workday_request={
+            "delivery_key": "turn-1-verification",
+            "question": "Verify the exact implementation evidence.",
+        },
+        envelope=envelope,
+    )
+    assert replay_completion.duplicate
+    assert replay_completion.consultation_packet is not None
+    assert (
+        replay_completion.consultation_packet.reply_to_message_id
+        == first_completion.message.id
+    )
+    await db_session.commit()
+    repaired_memory_state = (
+        await db_session.execute(
+            select(StrategicMemoryProjectState)
+            .where(StrategicMemoryProjectState.project_id == project.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert repaired_memory_state.privacy_generation == privacy_generation_before_repair
+    assert await db_session.get(ProjectMessage, packet_id) is not None
 
     second_input = ProjectMessage(
         project_id=project.id,
@@ -894,7 +1007,7 @@ async def test_expired_workday_packet_cannot_ack_or_renew_and_is_reclaimable(db_
         delivery_key="expired-evidence",
         question="Find evidence.",
         resident_session_id="session",
-        atomic_public_reply_id=uuid.uuid4(),
+        atomic_public_reply_id=message.id,
     )
     delivery = await claim_next_workday_consultation_packet(
         db_session,
@@ -940,16 +1053,75 @@ async def test_expired_workday_packet_cannot_ack_or_renew_and_is_reclaimable(db_
             attempt_diagnostic=_attempt_diagnostic(delivery, "completed"),
         )
     await db_session.rollback()
+    successor_incarnation = uuid.uuid4()
     reclaimed = await claim_next_workday_consultation_packet(
         db_session,
         project_id=project_id,
         task_id=task_id,
         worker_generation=1,
-        worker_incarnation=uuid.uuid4(),
+        worker_incarnation=successor_incarnation,
         resident_session_id="session",
     )
     assert reclaimed is not None
     assert reclaimed.workday_claim_id != workday_claim_id
+    assert reclaimed.attempt == 2
+    placeholder = reclaimed.prior_attempts[0]
+    assert placeholder["workday_claim_id"] == str(workday_claim_id)
+    assert placeholder["terminal_predicate"] == "claim_lease_expired_without_ack"
+    assert placeholder["trace_truncated"] is True
+
+    diagnostic = _attempt_diagnostic(
+        delivery,
+        "abandoned",
+        predicate="consultation_lease_renewal_failed",
+    )
+    disposition, state, recorded = (
+        await record_workday_consultation_attempt_diagnostic(
+            db_session,
+            project_id=project_id,
+            packet_id=packet_id,
+            task_id=task_id,
+            resident_session_id="session",
+            worker_generation=1,
+            worker_incarnation=incarnation_id,
+            workday_claim_id=workday_claim_id,
+            attempt_diagnostic=diagnostic,
+        )
+    )
+    assert (disposition, state) == ("upgraded", "recorded")
+    assert recorded["terminal_predicate"] == "consultation_lease_renewal_failed"
+    duplicate, duplicate_state, _ = (
+        await record_workday_consultation_attempt_diagnostic(
+            db_session,
+            project_id=project_id,
+            packet_id=packet_id,
+            task_id=task_id,
+            resident_session_id="session",
+            worker_generation=1,
+            worker_incarnation=incarnation_id,
+            workday_claim_id=workday_claim_id,
+            attempt_diagnostic=diagnostic,
+        )
+    )
+    assert (duplicate, duplicate_state) == ("duplicate", "recorded")
+    receipt_state, receipt = await read_workday_consultation_attempt_diagnostic(
+        db_session,
+        project_id=project_id,
+        packet_id=packet_id,
+        task_id=task_id,
+        resident_session_id="session",
+        worker_generation=1,
+        worker_incarnation=incarnation_id,
+        workday_claim_id=workday_claim_id,
+    )
+    assert receipt_state == "recorded"
+    assert receipt == recorded
+    refreshed_packet = await db_session.get(ProjectMessage, packet_id)
+    assert refreshed_packet is not None
+    assert refreshed_packet.context["_workday_consultation_claim_id"] == str(
+        reclaimed.workday_claim_id
+    )
+    assert refreshed_packet.context["_workday_consultation_claim_attempt"] == 2
 
 
 @pytest.mark.asyncio
@@ -1101,7 +1273,7 @@ async def test_workday_packet_parks_after_max_unacked_reclaims(db_session):
         delivery_key="parked-after-cap",
         question="Investigate the recurring churn.",
         resident_session_id="session",
-        atomic_public_reply_id=uuid.uuid4(),
+        atomic_public_reply_id=message.id,
     )
 
     first = await claim_next_workday_consultation_packet(
@@ -1196,7 +1368,7 @@ async def test_gate_failure_detail_persists_logs_and_surfaces_in_parked_reason(
         delivery_key="gate-failure-detail",
         question="Investigate the stale-envelope 409.",
         resident_session_id="session",
-        atomic_public_reply_id=uuid.uuid4(),
+        atomic_public_reply_id=message.id,
     )
 
     # Never-claimed packet: exercises the "row exists but nothing else

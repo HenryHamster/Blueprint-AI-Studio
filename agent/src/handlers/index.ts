@@ -23,6 +23,11 @@ import { handlePlan, handleResearch } from './research-plan.js';
 import { handleDiscoveryReview } from './discovery-review.js';
 import { handleStrategic } from './strategic.js';
 import { handleStrategicResident } from './strategic-resident.js';
+import {
+  classifyColdSuccessorClaim,
+  handleStrategicColdSuccessor,
+  preflightColdSuccessorClaim,
+} from './strategic-cold-successor.js';
 import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
 import { handleReleaseAuditChallenge } from './audit-challenge.js';
 import { handleReleaseMergeGrade } from './merge-grade.js';
@@ -69,9 +74,16 @@ export function isResidentSessionTask(
     && (ctx as Record<string, unknown>)._resident_session === true;
 }
 
+export { classifyColdSuccessorClaim, preflightColdSuccessorClaim };
+
 // strategic_review dispatch preserves one-shot Strategic by default. The
 // explicitly marked Workday conversation is the sole Resident entrypoint.
 const dispatchStrategic: Handler = (taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort) => {
+  if (classifyColdSuccessorClaim(payload, task) === 'cold') {
+    return handleStrategicColdSuccessor(
+      taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
+    );
+  }
   if (isResidentSessionTask(task, payload)) {
     return handleStrategicResident(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
   }

@@ -2154,6 +2154,21 @@ def sanitize_agent_error_report(raw: object) -> dict | None:
         out["duration_ms"] = int(duration)
     out["model_output_seen"] = bool(raw.get("model_output_seen"))
     out["result_event_seen"] = bool(raw.get("result_event_seen"))
+    provider_result_is_error = raw.get("provider_result_is_error")
+    if isinstance(provider_result_is_error, bool):
+        out["provider_result_is_error"] = provider_result_is_error
+    for key, limit in (
+        ("provider_result_subtype", 100),
+        ("provider_terminal_reason", 255),
+    ):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            out[key] = value[:limit]
+    provider_api_error_status = raw.get("provider_api_error_status")
+    if isinstance(provider_api_error_status, int) and not isinstance(
+        provider_api_error_status, bool
+    ):
+        out["provider_api_error_status"] = provider_api_error_status
     stderr_tail = raw.get("stderr_tail")
     if isinstance(stderr_tail, str) and stderr_tail:
         out["stderr_tail"] = _redact_credentials(

@@ -72,7 +72,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
 from urllib.request import urlopen
 
 try:
@@ -4279,22 +4279,35 @@ def _staged_activated_by_cut(staged: list, version_number: int) -> list:
     ]
 
 
-def _cut_confirmation_prompt(pid: str) -> str:
-    """Build the version-cut confirmation prompt from lifecycle state.
+def _is_canonical_uuid(value: object) -> bool:
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value
+    except (TypeError, ValueError):
+        return False
 
-    Falls back to the generic confirmation when the lifecycle read is
-    unavailable or too incomplete to safely describe consequences.
-    """
+
+def _cut_confirmation_prompt(pid: str, context: dict, key: str) -> str:
+    """Disclose the exact cut authority plus best-effort consequences."""
+    version = context["version"]
+    integration = context["integration"]
+    version_number = version["version_number"]
+    lines = [
+        f"About to abandon v{version_number} ({version['id']}) and open the next version.",
+        "Exact authority:",
+        f"- Repository: {integration['owner']}/{integration['repo']}",
+        f"- Integration branch: {integration['branch']}",
+        f"- Integration HEAD: {integration['head_sha']}",
+        f"- Idempotency key: {key}",
+        "This cut will:",
+    ]
     lifecycle, err = _safe_read(f"/api/admin/projects/{pid}/version-lifecycle")
     if err:
-        return "About to abandon the open version and open the next. Proceed?"
+        lines.append(f"- Lifecycle consequence read unavailable ({err}).")
+        lines.append("Proceed?")
+        return "\n".join(lines)
 
     lifecycle = lifecycle or {}
     cv = lifecycle.get("current_version") or {}
-    version_number = cv.get("version_number")
-    if version_number is None:
-        return "About to abandon the open version and open the next. Proceed?"
-
     staged = lifecycle.get("staged_directions") or []
     activating = _staged_activated_by_cut(staged, version_number)
     in_flight = cv.get("in_flight_task_count")
@@ -4308,7 +4321,6 @@ def _cut_confirmation_prompt(pid: str) -> str:
         qual_state_name = qual_state_raw if isinstance(qual_state_raw, str) else None
         promotion_pr_number = None
 
-    lines = [f"About to abandon v{version_number} and open the next version.", "This cut will:"]
     if activating:
         lines.append(
             f"- Start {len(activating)} staged direction{'s' if len(activating) != 1 else ''} immediately "
@@ -4339,6 +4351,245 @@ def _cut_confirmation_prompt(pid: str) -> str:
 
     lines.append("Proceed?")
     return "\n".join(lines)
+
+
+def _exact_cut_ready_context(context: object) -> dict:
+    if not isinstance(context, dict) or context.get("status") != "ready":
+        raise APIError("version-cut preflight did not return ready authority")
+    version = context.get("version")
+    integration = context.get("integration")
+    if not isinstance(version, dict) or not isinstance(integration, dict):
+        raise APIError("version-cut preflight returned incomplete authority")
+    required_strings = (
+        version.get("id"),
+        integration.get("owner"),
+        integration.get("repo"),
+        integration.get("branch"),
+    )
+    if not all(isinstance(value, str) and value for value in required_strings):
+        raise APIError("version-cut preflight returned incomplete authority")
+    number = version.get("version_number")
+    sha = integration.get("head_sha")
+    identity = integration.get("identity_token")
+    if (
+        type(number) is not int
+        or number < 1
+        or not isinstance(version.get("id"), str)
+        or not _is_canonical_uuid(version["id"])
+        or not isinstance(sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", sha) is None
+        or not isinstance(identity, str)
+        or re.fullmatch(r"[0-9a-f]{64}", identity) is None
+    ):
+        raise APIError("version-cut preflight returned invalid exact authority")
+    return context
+
+
+def _cut_request_matches_ready(request: dict, context: dict) -> bool:
+    try:
+        ready = _exact_cut_ready_context(context)
+    except APIError:
+        return False
+    version = ready["version"]
+    integration = ready["integration"]
+    return (
+        request["expected_version_id"] == version["id"]
+        and request["expected_version_number"] == version["version_number"]
+        and request["expected_integration_sha"] == integration["head_sha"]
+        and request["expected_integration_identity"] == integration["identity_token"]
+    )
+
+
+def _cut_receipt_matches(request: dict, pid: str, context: object) -> bool:
+    if not isinstance(context, dict) or context.get("status") != "committed":
+        return False
+    receipt = context.get("receipt")
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        return False
+    return (
+        receipt.get("status") == "committed"
+        and receipt.get("project_id") == pid
+        and receipt.get("idempotency_key") == request["idempotency_key"]
+        and receipt.get("reason") == request["reason"]
+        and receipt.get("expected_version_id") == request["expected_version_id"]
+        and receipt.get("expected_version_number") == request["expected_version_number"]
+        and receipt.get("expected_integration_sha") == request["expected_integration_sha"]
+        and receipt.get("expected_integration_identity")
+        == request["expected_integration_identity"]
+    )
+
+
+def _cut_committed_context_matches(request: dict, pid: str, context: object) -> bool:
+    if not _cut_receipt_matches(request, pid, context):
+        return False
+    followups = context.get("followups") if isinstance(context, dict) else None
+    return isinstance(followups, dict) and followups.get("status") in {
+        "pending", "complete"
+    }
+
+
+def _cut_retry_argv(pid: str, request: dict) -> list[str]:
+    argv = [
+        "promote-recover", "cut", "--project-id", pid,
+        "--idempotency-key", request["idempotency_key"],
+        "--expected-version-id", request["expected_version_id"],
+        "--expected-version-number", str(request["expected_version_number"]),
+        "--expected-integration-sha", request["expected_integration_sha"],
+        "--expected-integration-identity", request["expected_integration_identity"],
+    ]
+    if request["reason"] is not None:
+        argv.extend(["--reason", request["reason"]])
+    return argv
+
+
+def _emit_cut_failure(args: argparse.Namespace, message: str, retry_argv: list[str]) -> int:
+    payload = {
+        "action": "cut",
+        "status": "not_committed_or_ambiguous",
+        "message": message,
+        "retry_argv": retry_argv,
+    }
+    if _json_mode(args):
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"ERROR: {message}", file=sys.stderr)
+        print(f"Exact recovery command: blueprint {shlex.join(retry_argv)}", file=sys.stderr)
+    return 1
+
+
+def _cmd_exact_cut(args: argparse.Namespace, pid: str) -> int:
+    reason = getattr(args, "reason", None)
+    if reason is not None and len(reason) > 500:
+        print("ERROR: version-cut reason must be at most 500 characters.", file=sys.stderr)
+        return 1
+    authority_names = (
+        "idempotency_key",
+        "expected_version_id",
+        "expected_version_number",
+        "expected_integration_sha",
+        "expected_integration_identity",
+    )
+    supplied = [getattr(args, name, None) is not None for name in authority_names]
+    if any(supplied) and not all(supplied):
+        print(
+            "ERROR: an exact cut retry requires all five authority options.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if all(supplied):
+        key = args.idempotency_key
+        if not key or key != key.strip() or len(key) > 255:
+            print(
+                "ERROR: version-cut idempotency key must be non-empty, canonical, and at most 255 characters.",
+                file=sys.stderr,
+            )
+            return 1
+        if not _is_canonical_uuid(args.expected_version_id):
+            print("ERROR: --expected-version-id must be a canonical UUID.", file=sys.stderr)
+            return 1
+        if (
+            type(args.expected_version_number) is not int
+            or args.expected_version_number < 1
+            or re.fullmatch(r"[0-9a-f]{40}", args.expected_integration_sha or "") is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                args.expected_integration_identity or "",
+            ) is None
+        ):
+            print("ERROR: exact version-cut authority values are invalid.", file=sys.stderr)
+            return 1
+        request = {
+            "reason": reason,
+            "idempotency_key": key,
+            "expected_version_id": args.expected_version_id,
+            "expected_version_number": args.expected_version_number,
+            "expected_integration_sha": args.expected_integration_sha,
+            "expected_integration_identity": args.expected_integration_identity,
+        }
+        keyed_path = (
+            f"/api/admin/projects/{pid}/version-cut-context?"
+            f"idempotency_key={quote(request['idempotency_key'], safe='')}"
+        )
+        context = api("GET", keyed_path)
+        if _cut_committed_context_matches(request, pid, context):
+            _emit(args, {"action": "cut", "result": context}, _render_promote_recover)
+            return 0
+        if isinstance(context, dict) and context.get("status") == "committed":
+            return _emit_cut_failure(
+                args,
+                "the committed receipt or follow-up state does not match the frozen request",
+                _cut_retry_argv(pid, request),
+            )
+        if not _cut_request_matches_ready(request, context):
+            return _emit_cut_failure(
+                args,
+                "the stored key is not committed and exact cut authority changed",
+                _cut_retry_argv(pid, request),
+            )
+    else:
+        context = _exact_cut_ready_context(
+            api("GET", f"/api/admin/projects/{pid}/version-cut-context")
+        )
+        request = {
+            "reason": reason,
+            "idempotency_key": str(uuid.uuid4()),
+            "expected_version_id": context["version"]["id"],
+            "expected_version_number": context["version"]["version_number"],
+            "expected_integration_sha": context["integration"]["head_sha"],
+            "expected_integration_identity": context["integration"]["identity_token"],
+        }
+        keyed_path = (
+            f"/api/admin/projects/{pid}/version-cut-context?"
+            f"idempotency_key={quote(request['idempotency_key'], safe='')}"
+        )
+
+    retry_argv = _cut_retry_argv(pid, request)
+    prompt = _cut_confirmation_prompt(pid, context, request["idempotency_key"])
+    if not _confirm(prompt, getattr(args, "yes", False)):
+        print("Aborted.")
+        return 0
+
+    raw_body = json.dumps(
+        request,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    post_error: Exception | None = None
+    try:
+        api(
+            "POST",
+            f"/api/admin/projects/{pid}/version-cut",
+            raw_body=raw_body,
+        )
+    except Exception as exc:  # noqa: BLE001 — dispatch may be ambiguous; reconcile
+        post_error = exc
+
+    try:
+        reconciled = api("GET", keyed_path)
+    except APIError as exc:
+        detail = f"keyed readback failed after the cut request: {exc}"
+        if post_error is not None:
+            detail = f"cut request and {detail}"
+        return _emit_cut_failure(args, detail, retry_argv)
+    if _cut_committed_context_matches(request, pid, reconciled):
+        _emit(
+            args,
+            {"action": "cut", "result": reconciled},
+            _render_promote_recover,
+        )
+        return 0
+    if _cut_request_matches_ready(request, reconciled):
+        return _emit_cut_failure(
+            args,
+            "no committed receipt exists; the exact frozen request may be retried explicitly",
+            retry_argv,
+        )
+    return _emit_cut_failure(
+        args,
+        "keyed readback mismatched the frozen version-cut request",
+        retry_argv,
+    )
 
 
 def _force_promote_confirmation_prompt(pid: str, candidate_sha) -> str:
@@ -4447,7 +4698,7 @@ _PROMOTE_RECOVER_ACTIONS = {
 }
 
 
-def cmd_promote_recover(args: argparse.Namespace) -> None:
+def cmd_promote_recover(args: argparse.Namespace) -> int | None:
     """Run a promotion/recovery lever with a confirmation prompt before mutating."""
     action = args.action
     spec = _PROMOTE_RECOVER_ACTIONS[action]
@@ -4464,12 +4715,25 @@ def cmd_promote_recover(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     pid = get_project_id(getattr(args, "project_id", None))
+    cut_only_names = (
+        "idempotency_key",
+        "expected_version_id",
+        "expected_version_number",
+        "expected_integration_sha",
+        "expected_integration_identity",
+    )
+    if action != "cut" and any(
+        getattr(args, name, None) is not None for name in cut_only_names
+    ):
+        print("ERROR: exact version-cut authority options require action 'cut'.", file=sys.stderr)
+        return 1
+    if action == "cut":
+        return _cmd_exact_cut(args, pid)
+
     path = path_tmpl.format(pid=pid)
     body = build_body(args)
 
-    if action == "cut":
-        prompt = _cut_confirmation_prompt(pid)
-    elif action == "force-promote":
+    if action == "force-promote":
         prompt = _force_promote_confirmation_prompt(pid, getattr(args, "candidate_sha", None))
     else:
         prompt = f"About to {summary}. Proceed?"
@@ -5503,7 +5767,7 @@ def _render_strategic_cycle(d: dict) -> None:
 # ── strategic (resident session: start / stop / chat) ─────────────────────────
 
 def cmd_strategic(args: argparse.Namespace) -> None:
-    """Dispatch resident Strategic session subcommands: start / stop / chat / send."""
+    """Dispatch resident Strategic session and cold-successor subcommands."""
     sub = getattr(args, "strategic_cmd", None)
     if sub == "start":
         _strategic_start(args)
@@ -5513,8 +5777,19 @@ def cmd_strategic(args: argparse.Namespace) -> None:
         _strategic_chat(args)
     elif sub == "send":
         _strategic_send(args)
+    elif sub == "cold-successor-start":
+        return _strategic_cold_successor_start(args)
+    elif sub == "cold-successor-preview":
+        _strategic_cold_successor_preview(args)
+    elif sub == "cold-successor-status":
+        _strategic_cold_successor_status(args)
     else:
-        print("Usage: blueprint strategic {start|stop|chat|send}", file=sys.stderr)
+        print(
+            "Usage: blueprint strategic "
+            "{start|stop|chat|send|cold-successor-preview|cold-successor-start|"
+            "cold-successor-status}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
@@ -5727,6 +6002,235 @@ def _strategic_send(args: argparse.Namespace) -> None:
         lambda row: print(f"  Strategic message sent: {row.get('id', '?')}"),
     )
     _report_arming(result, lane="strategic")
+
+
+def _is_canonical_cold_uuid(value: object) -> bool:
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value
+    except (TypeError, ValueError):
+        return False
+
+
+def _cold_successor_effect(pid: str, request: dict) -> str:
+    effect = {
+        "project_id": pid,
+        "runner_id": request["runner_id"],
+        "expected_predecessor_session_id": request[
+            "expected_predecessor_session_id"
+        ],
+        "expected_predecessor_task_id": request[
+            "expected_predecessor_task_id"
+        ],
+        "expected_predecessor_worker_generation": request[
+            "expected_predecessor_worker_generation"
+        ],
+        "expected_core_sha256": request["expected_core_sha256"],
+    }
+    return hashlib.sha256(
+        json.dumps(effect, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _cold_successor_retry_argv(pid: str, request: dict) -> list[str]:
+    argv = [
+        "strategic", "cold-successor-start", "--project-id", pid,
+        "--runner-id", request["runner_id"],
+        "--idempotency-key", request["idempotency_key"],
+        "--expected-predecessor-session-id",
+        request["expected_predecessor_session_id"],
+        "--expected-predecessor-worker-generation",
+        str(request["expected_predecessor_worker_generation"]),
+        "--expected-core-sha256", request["expected_core_sha256"],
+    ]
+    if request["expected_predecessor_task_id"] is not None:
+        argv.extend([
+            "--expected-predecessor-task-id",
+            request["expected_predecessor_task_id"],
+        ])
+    return argv
+
+
+def _cold_successor_status_matches(
+    status_row: object,
+    *,
+    fingerprint: str,
+    launch_effect_sha256: str,
+    expected_core_sha256: str,
+) -> bool:
+    return bool(
+        isinstance(status_row, dict)
+        and status_row.get("launch_mode") == "cold_successor"
+        and status_row.get("proof_state") != "absent"
+        and status_row.get("idempotency_fingerprint") == fingerprint
+        and status_row.get("launch_effect_sha256") == launch_effect_sha256
+        and status_row.get("core_sha256") == expected_core_sha256
+        and _is_canonical_cold_uuid(status_row.get("task_id"))
+        and isinstance(status_row.get("session_id"), str)
+        and bool(status_row["session_id"])
+    )
+
+
+def _emit_cold_successor_failure(
+    args: argparse.Namespace,
+    message: str,
+    retry_argv: list[str],
+) -> int:
+    payload = {
+        "status": "not_launched_or_ambiguous",
+        "message": message,
+        "retry_argv": retry_argv,
+    }
+    if _json_mode(args):
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"ERROR: {message}", file=sys.stderr)
+        print(
+            f"Exact reconciliation command: blueprint {shlex.join(retry_argv)}",
+            file=sys.stderr,
+        )
+    return 1
+
+
+def _strategic_cold_successor_start(args: argparse.Namespace) -> int:
+    """Launch once and reconcile the exact cold-successor authority receipt."""
+    _require_write_config("strategic cold-successor-start")
+    pid = get_project_id(getattr(args, "project_id", None))
+    key = str(args.idempotency_key)
+    predecessor_session = str(args.expected_predecessor_session_id)
+    predecessor_task = getattr(args, "expected_predecessor_task_id", None)
+    expected_core_sha256 = str(args.expected_core_sha256)
+    if (
+        not _is_canonical_cold_uuid(args.runner_id)
+        or (
+            predecessor_task is not None
+            and not _is_canonical_cold_uuid(predecessor_task)
+        )
+        or not key
+        or key != key.strip()
+        or len(key) > 255
+        or not predecessor_session
+        or predecessor_session != predecessor_session.strip()
+        or len(predecessor_session) > 255
+        or re.fullmatch(r"[0-9a-f]{64}", expected_core_sha256) is None
+    ):
+        print("ERROR: cold-successor exact authority values are invalid.", file=sys.stderr)
+        return 1
+    request = {
+        "runner_id": args.runner_id,
+        "idempotency_key": key,
+        "expected_predecessor_session_id": predecessor_session,
+        "expected_predecessor_task_id": predecessor_task,
+        "expected_predecessor_worker_generation": (
+            args.expected_predecessor_worker_generation
+        ),
+        "expected_core_sha256": expected_core_sha256,
+    }
+    fingerprint = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    effect_sha = _cold_successor_effect(pid, request)
+    status_path = (
+        f"/api/admin/projects/{pid}/strategic-session/cold-successor"
+        "?missing_ok=true"
+    )
+    retry_argv = _cold_successor_retry_argv(pid, request)
+    current = api("GET", status_path)
+    if _cold_successor_status_matches(
+        current,
+        fingerprint=fingerprint,
+        launch_effect_sha256=effect_sha,
+        expected_core_sha256=expected_core_sha256,
+    ):
+        _emit(args, current, _render_cold_successor_status)
+        return 0
+    if isinstance(current, dict) and current.get("proof_state") != "absent":
+        return _emit_cold_successor_failure(
+            args,
+            "a different or inconsistent cold-successor proof is already canonical",
+            retry_argv,
+        )
+    prompt = (
+        "Launch the transcript-free cold successor with exact authority?\n"
+        f"- project: {pid}\n"
+        f"- runner: {request['runner_id']}\n"
+        f"- predecessor session: {predecessor_session}\n"
+        f"- predecessor task: {predecessor_task or '-'}\n"
+        f"- predecessor generation: {request['expected_predecessor_worker_generation']}\n"
+        f"- durable source core: {expected_core_sha256}\n"
+        f"- stable idempotency key: {key}"
+    )
+    if not _confirm(prompt, getattr(args, "yes", False)):
+        print("Aborted.")
+        return 0
+    raw_body = json.dumps(request, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    post_error: Exception | None = None
+    try:
+        api(
+            "POST",
+            f"/api/admin/projects/{pid}/strategic-session/cold-successor/start",
+            raw_body=raw_body,
+        )
+    except Exception as exc:  # noqa: BLE001 - dispatch may be ambiguous
+        post_error = exc
+    try:
+        reconciled = api("GET", status_path)
+    except APIError as exc:
+        detail = f"cold-successor readback failed: {exc}"
+        if post_error is not None:
+            detail = f"launch request and {detail}"
+        return _emit_cold_successor_failure(args, detail, retry_argv)
+    if _cold_successor_status_matches(
+        reconciled,
+        fingerprint=fingerprint,
+        launch_effect_sha256=effect_sha,
+        expected_core_sha256=expected_core_sha256,
+    ):
+        _emit(args, reconciled, _render_cold_successor_status)
+        return 0
+    return _emit_cold_successor_failure(
+        args,
+        "exact cold-successor receipt was not observed; reconcile before retry",
+        retry_argv,
+    )
+
+
+def _render_cold_successor_status(row: dict) -> None:
+    print("=== COLD SUCCESSOR PROOF ===")
+    print(f"  proof_state: {row.get('proof_state', '?')}")
+    print(f"  session_id:  {row.get('session_id', '-')}")
+    print(f"  task_id:     {row.get('task_id', '-')}")
+    print(f"  generation:  {row.get('worker_generation', '-')}")
+    print(f"  runner:      {row.get('runner_id', '-')}")
+    print(f"  task_status: {row.get('task_status', '-')}")
+    print(f"  core_sha256: {row.get('core_sha256', '-')}")
+
+
+def _strategic_cold_successor_preview(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    row = api(
+        "GET",
+        f"/api/admin/projects/{pid}/strategic-session/cold-successor/preview",
+    )
+    _emit(args, row, _render_cold_successor_preview)
+
+
+def _render_cold_successor_preview(row: dict) -> None:
+    print("=== COLD SUCCESSOR SOURCE PREVIEW ===")
+    print(f"  core_sha256: {row.get('core_sha256', '-')}")
+    print(f"  problem_model_sha256: {row.get('problem_model_sha256', '-')}")
+    print(f"  running_update_sha256: {row.get('running_update_sha256', '-')}")
+    print(f"  strategic_memory_sha256: {row.get('strategic_memory_sha256', '-')}")
+    print(f"  strategic_memory_document_count: {row.get('strategic_memory_document_count', '-')}")
+    print(f"  payload_byte_count: {row.get('payload_byte_count', '-')}")
+
+
+def _strategic_cold_successor_status(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    row = api(
+        "GET",
+        f"/api/admin/projects/{pid}/strategic-session/cold-successor",
+    )
+    _emit(args, row, _render_cold_successor_status)
 
 
 # ── trim-playbook-archive ─────────────────────────────────────────────────────
@@ -9515,6 +10019,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_pr.add_argument("--candidate-sha", default=None,
                       help="force-promote only: pin the commit to promote "
                            "(default: current integration-branch HEAD).")
+    p_pr.add_argument("--idempotency-key", default=None,
+                      help="cut retry only: reuse the frozen exact request key.")
+    p_pr.add_argument("--expected-version-id", default=None,
+                      help="cut retry only: frozen release-version UUID.")
+    p_pr.add_argument("--expected-version-number", type=int, default=None,
+                      help="cut retry only: frozen release-version number.")
+    p_pr.add_argument("--expected-integration-sha", default=None,
+                      help="cut retry only: frozen full integration HEAD SHA.")
+    p_pr.add_argument("--expected-integration-identity", default=None,
+                      help="cut retry only: frozen repository/branch/head identity token.")
 
     # messages
     p_msgs = sub.add_parser(
@@ -9716,6 +10230,11 @@ def build_parser() -> argparse.ArgumentParser:
              "using SSH (control-plane host only).")
     p_deploy.add_argument("--dry-run", action="store_true",
                           help="Show what would be deployed without deploying.")
+    p_deploy.add_argument(
+        "--receipt-only",
+        action="store_true",
+        help="Query the immutable root receipt for the current exact approval; never activate.",
+    )
     p_deploy.add_argument("--yes", action="store_true",
                           help="Skip the confirmation prompt (for scripting).")
     p_deploy.add_argument(
@@ -9877,6 +10396,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_strat_send.add_argument(
         "--idempotency-key", default=None,
         help="Optional stable retry key for exactly-once message creation.")
+    p_strat_cold_start = strategic_sub.add_parser(
+        "cold-successor-start", parents=[common],
+        help="Launch and reconcile one exact transcript-free successor proof.")
+    p_strat_cold_start.add_argument("--runner-id", required=True)
+    p_strat_cold_start.add_argument("--idempotency-key", required=True)
+    p_strat_cold_start.add_argument(
+        "--expected-predecessor-session-id", required=True)
+    p_strat_cold_start.add_argument(
+        "--expected-predecessor-task-id", default=None)
+    p_strat_cold_start.add_argument(
+        "--expected-predecessor-worker-generation",
+        required=True,
+        type=int,
+        choices=range(1, 2_147_483_648),
+        metavar="N",
+    )
+    p_strat_cold_start.add_argument("--expected-core-sha256", required=True)
+    p_strat_cold_start.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt.")
+    strategic_sub.add_parser(
+        "cold-successor-preview", parents=[common],
+        help="Read the exact durable source hashes for a cold successor.")
+    strategic_sub.add_parser(
+        "cold-successor-status", parents=[common],
+        help="Read the canonical cold-successor proof receipt.")
 
     # strategic-cycle
     p_sc = sub.add_parser("strategic-cycle", parents=[common],
@@ -10185,6 +10729,19 @@ _DEPLOY_REPO = "HenryHamster/BlueprintAIStudio"
 _DEPLOY_WORKFLOW = "Deploy Blueprint"
 _DEPLOY_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DEPLOY_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_DEPLOY_OPERATION_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class _ReleaseRequestNotSent(APIError):
+    """The root socket was not reached, so no operation can have started."""
+
+
+class _ReleaseOperationNotAccepted(APIError):
+    """The exact root query proves that no immutable claim exists."""
+
+
+class _ReleaseTerminalFailure(APIError):
+    """The immutable root receipt proves a terminal non-success outcome."""
 _MIGRATION_IMAGE_PREFIX = (
     "us-central1-docker.pkg.dev/blueprint-orchestrator/"
     "blueprint-repo/blueprint-orchestrator"
@@ -10720,7 +11277,14 @@ def _fetch_deploy_manifest(wanted_sha: str | None = None) -> dict:
     return {"run": run, "digest": digest, "revision": revision}
 
 
-def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> bool:
+def _invoke_release_shim(
+    digest: str,
+    revision: str,
+    operation_id: str | None = None,
+    *,
+    host: str | None,
+    receipt_only: bool = False,
+) -> bool:
     """Use the root-owned release socket, locally or through SSH.
 
     The bootstrap removes the legacy ``/etc/sudoers.d/blueprint-release``
@@ -10730,13 +11294,27 @@ def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> boo
     execution boundary the resident deploy agent uses.
     """
     if host is None:
-        return _request_release_socket(digest, revision)
+        if operation_id is None and not receipt_only:
+            return _request_release_socket(digest, revision)
+        return _request_release_socket(
+            digest,
+            revision,
+            operation_id,
+            receipt_only=receipt_only,
+        )
     client_path = Path(__file__).resolve().with_name("release_socket_submit.py")
-    command = [
-        _resolve_windows_cli("ssh"), host, "python3", "-", digest, revision
-    ]
+    command = [_resolve_windows_cli("ssh"), host, "python3", "-"]
+    if receipt_only:
+        command.append("--receipt-only")
+    command.extend([digest, revision])
+    if operation_id is not None:
+        command.append(operation_id)
     with open(client_path, "rb") as client_source:
         proc = subprocess.run(command, check=False, stdin=client_source)
+    if proc.returncode == 4:
+        raise _ReleaseRequestNotSent("release executor socket was not reached")
+    if proc.returncode == 5:
+        raise _ReleaseOperationNotAccepted("root operation has no immutable request claim")
     if proc.returncode == 3:
         print(
             "Release executor accepted the handoff but its verdict was not "
@@ -10751,43 +11329,128 @@ def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> boo
     return True
 
 
-def _request_release_socket(digest: str, revision: str) -> bool:
+def _parse_release_socket_response(
+    response: str,
+    digest: str,
+    revision: str,
+    operation_id: str | None,
+) -> bool:
+    if operation_id is None:
+        if response == "OK":
+            return True
+        detail = response.removeprefix("ERROR ") or "empty executor response"
+        raise APIError(f"release executor failed: {detail}")
+    parts = response.split()
+    if len(parts) not in {4, 5}:
+        raise APIError("release executor returned a malformed operation receipt")
+    verdict, returned_operation, returned_digest, returned_revision = parts[:4]
+    if (
+        returned_operation != operation_id
+        or returned_digest != digest
+        or returned_revision != revision
+    ):
+        raise APIError("release executor returned a mismatched operation receipt")
+    if verdict == "OK" and len(parts) == 5 and parts[4] == "success":
+        return True
+    if verdict == "PENDING" and len(parts) == 4:
+        return False
+    if verdict == "NOT_ACCEPTED" and len(parts) == 4:
+        raise _ReleaseOperationNotAccepted(
+            "root operation has no immutable request claim"
+        )
+    if verdict == "TERMINAL" and len(parts) == 5:
+        raise _ReleaseTerminalFailure(
+            f"root operation recorded terminal outcome {parts[4]}"
+        )
+    raise APIError("release executor returned an invalid operation verdict")
+
+
+def _read_release_socket_response(connection: socket.socket) -> str:
+    chunks: list[bytes] = []
+    remaining = 256
+    while remaining:
+        chunk = connection.recv(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+        if b"\n" in chunk:
+            break
+    payload = b"".join(chunks)
+    if not payload:
+        return ""
+    if b"\n" not in payload or payload.index(b"\n") != len(payload) - 1:
+        raise APIError("release executor returned an unterminated or oversized verdict")
+    return payload.decode("ascii", errors="strict").strip()
+
+
+def _request_release_socket(
+    digest: str,
+    revision: str,
+    operation_id: str | None = None,
+    *,
+    receipt_only: bool = False,
+) -> bool:
     """Send the approval, reporting when execution outlives the socket wait."""
     if not _DEPLOY_REVISION_RE.fullmatch(revision):
         raise APIError("release revision failed validation")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise APIError("release digest failed validation")
-    request_sent = False
+    if operation_id is not None and not _DEPLOY_OPERATION_ID_RE.fullmatch(operation_id):
+        raise APIError("release operation id failed validation")
+    if receipt_only and operation_id is None:
+        raise APIError("release receipt query requires an operation id")
+    request = " ".join(
+        item
+        for item in (
+            "receipt" if receipt_only else None,
+            digest,
+            revision,
+            operation_id,
+        )
+        if item is not None
+    )
+    handoff_started = False
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(_RELEASE_SOCKET_TIMEOUT_SECONDS)
             connection.connect(_RELEASE_SOCKET_PATH)
-            connection.sendall(f"{digest} {revision}\n".encode("ascii"))
-            request_sent = True
+            handoff_started = True
+            connection.sendall(f"{request}\n".encode("ascii"))
             connection.shutdown(socket.SHUT_WR)
-            response = connection.recv(256).decode("ascii", errors="replace").strip()
+            response = _read_release_socket_response(connection)
+    except UnicodeDecodeError as exc:
+        raise APIError("release executor returned a non-ASCII verdict") from exc
     except TimeoutError as exc:
-        if request_sent:
+        if handoff_started:
             print(
                 "Release executor is still running; receipt delivery is parked "
                 "for the next poll.",
                 file=sys.stderr,
             )
             return False
-        raise APIError(f"release executor socket unavailable: {exc}") from exc
+        raise _ReleaseRequestNotSent(
+            f"release executor socket unavailable: {exc}"
+        ) from exc
     except OSError as exc:
-        if request_sent:
+        if handoff_started:
             print(
                 "Release executor handoff was accepted but its response was "
                 "lost; receipt delivery is parked for the next poll.",
                 file=sys.stderr,
             )
             return False
-        raise APIError(f"release executor socket unavailable: {exc}") from exc
-    if response != "OK":
-        detail = response.removeprefix("ERROR ") or "empty executor response"
-        raise APIError(f"release executor failed: {detail}")
-    return True
+        raise _ReleaseRequestNotSent(
+            f"release executor socket unavailable: {exc}"
+        ) from exc
+    if not response and handoff_started:
+        return False
+    return _parse_release_socket_response(
+        response,
+        digest,
+        revision,
+        operation_id,
+    )
 
 
 def _resolve_deploy_manifest(args: argparse.Namespace) -> tuple[str, str, dict]:
@@ -10802,12 +11465,16 @@ def _execute_deploy_shim(
     digest: str,
     *,
     inplace: bool = False,
+    operation_id: str | None = None,
+    receipt_only: bool = False,
 ) -> bool:
     """Run the canonical root-owned executor, locally or over legacy SSH."""
     return _invoke_release_shim(
         digest,
         revision,
+        operation_id,
         host=None if inplace else getattr(args, "host", None),
+        receipt_only=receipt_only,
     )
 
 
@@ -10820,7 +11487,18 @@ def _execute_deploy(
     inplace: bool = False,
 ) -> None:
     """Execute the shim, then post the receipt as a distinct stage."""
-    release_completed = _execute_deploy_shim(args, revision, digest, inplace=inplace)
+    operation_id = None
+    if promoted is not None and promoted.get("activation_requested_at"):
+        operation_id = _activation_operation_id(
+            get_project_id(getattr(args, "project_id", None)), promoted
+        )
+    release_completed = _execute_deploy_shim(
+        args,
+        revision,
+        digest,
+        inplace=inplace,
+        operation_id=operation_id,
+    )
     if release_completed is False:
         print(
             "Release handoff acceptance is ambiguous; do not retry activation. "
@@ -10849,6 +11527,33 @@ def _read_live_approved_activation(args: argparse.Namespace) -> dict | None:
     return promoted
 
 
+def _activation_operation_id(project_id: str, approved: dict) -> str:
+    """Bind one root release operation to the canonical approval identity."""
+    version_number = approved.get("version_number")
+    promoted_sha = (approved.get("promoted_sha") or "").lower()
+    requested_at = approved.get("activation_requested_at")
+    if (
+        not isinstance(project_id, str)
+        or not project_id
+        or not isinstance(version_number, int)
+        or not _DEPLOY_REVISION_RE.fullmatch(promoted_sha)
+        or not isinstance(requested_at, str)
+        or not requested_at
+    ):
+        raise APIError("approved activation identity is incomplete")
+    canonical = json.dumps(
+        {
+            "activation_requested_at": requested_at,
+            "project_id": project_id,
+            "promoted_sha": promoted_sha,
+            "version_number": version_number,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _deploy_agent_once(args: argparse.Namespace) -> bool:
     """Execute one current approval and post the existing activation receipt.
 
@@ -10865,7 +11570,11 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
     if approved is None:
         return False
     promoted_sha = approved["promoted_sha"].lower()
+    project_id = get_project_id(getattr(args, "project_id", None))
+    operation_id = _activation_operation_id(project_id, approved)
     state_path = getattr(args, "state_path", None)
+    if not state_path:
+        raise APIError("deploy-agent requires a durable state path")
     pending_receipt = _read_deploy_agent_state(state_path)
     if pending_receipt is not None:
         same_activation = (
@@ -10881,6 +11590,30 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
                 and approved.get("serving_status") == "unconfirmed"
             )
         )
+        if matches_approval and (
+            pending_receipt.get("operation_id") is None
+            or pending_receipt.get("digest") is None
+        ):
+            print(
+                "Legacy activation state has no immutable root operation identity; "
+                "preserving it until objective host evidence resolves the prior handoff. "
+                "Do not re-arm or infer success from serving SHA alone.",
+                file=sys.stderr,
+            )
+            return False
+        matches_approval = (
+            matches_approval
+            and pending_receipt.get("operation_id") == operation_id
+            and bool(_DEPLOY_DIGEST_RE.fullmatch(pending_receipt.get("digest") or ""))
+        )
+        known_phases = {"not_sent", "started", "accepted", "completed", "failed"}
+        if matches_approval and pending_receipt.get("phase") not in known_phases:
+            print(
+                "Parked activation state has an unknown phase; preserving it and "
+                "refusing a fresh activation.",
+                file=sys.stderr,
+            )
+            return False
         if matches_approval and pending_receipt.get("phase") == "failed":
             print(
                 f"Approved activation for v{approved.get('version_number')} failed "
@@ -10889,36 +11622,95 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
                 file=sys.stderr,
             )
             return False
-        if matches_approval and pending_receipt.get("phase") == "started":
-            # The started marker is the at-most-once fence. A restart after
-            # this point cannot distinguish an in-flight release from one
-            # that completed before the agent died, so reconcile through the
-            # same serving probe used after an accepted socket handoff.
-            confirmation = _pending_activation_confirmation(pending_receipt, promoted_sha)
+        if matches_approval and pending_receipt.get("phase") == "not_sent":
+            attempts = int(pending_receipt.get("activation_attempts") or 0) + 1
+            pending_receipt["phase"] = "started"
+            pending_receipt["activation_attempts"] = attempts
+            pending_receipt["root_release"] = {
+                "phase": "activation",
+                "attempt": attempts,
+                "status": "started",
+            }
             _write_deploy_agent_state(state_path, pending_receipt)
-            if confirmation == "failed":
+            try:
+                result = _invoke_release_shim(
+                    pending_receipt["digest"],
+                    promoted_sha,
+                    operation_id,
+                    host=None,
+                )
+            except (_ReleaseOperationNotAccepted, _ReleaseRequestNotSent) as exc:
+                pending_receipt["phase"] = "not_sent"
+                pending_receipt["failure_reason"] = str(exc)
+                pending_receipt["root_release"].update(
+                    status="not_sent", failure_reason=str(exc)
+                )
+                _write_deploy_agent_state(state_path, pending_receipt)
+                return False
+            except APIError as exc:
+                pending_receipt["phase"] = "failed"
+                pending_receipt["failure_reason"] = str(exc)
+                pending_receipt["root_release"].update(
+                    status="failed", failure_reason=str(exc)
+                )
+                _write_deploy_agent_state(state_path, pending_receipt)
+                return False
+            pending_receipt["phase"] = "completed" if result is True else "accepted"
+            pending_receipt["root_release"]["status"] = pending_receipt["phase"]
+            _write_deploy_agent_state(state_path, pending_receipt)
+        if matches_approval and pending_receipt.get("phase") in {
+            "started",
+            "accepted",
+            "completed",
+        }:
+            try:
+                root_receipt = _invoke_release_shim(
+                    pending_receipt["digest"],
+                    promoted_sha,
+                    operation_id,
+                    host=None,
+                    receipt_only=True,
+                )
+            except _ReleaseTerminalFailure as exc:
+                pending_receipt["phase"] = "failed"
+                pending_receipt["failure_reason"] = str(exc)
+                pending_receipt.setdefault("root_release", {}).update(
+                    status="failed", failure_reason=str(exc)
+                )
+                _write_deploy_agent_state(state_path, pending_receipt)
+                return False
+            except _ReleaseOperationNotAccepted as exc:
+                if pending_receipt.get("phase") == "completed":
+                    print(
+                        "Root receipt disappeared after success was observed; preserving "
+                        "the completed activation fence and refusing replay.",
+                        file=sys.stderr,
+                    )
+                    return False
+                pending_receipt["phase"] = "not_sent"
+                pending_receipt["failure_reason"] = str(exc)
+                pending_receipt.setdefault("root_release", {}).update(
+                    status="not_sent", failure_reason=str(exc)
+                )
+                _write_deploy_agent_state(state_path, pending_receipt)
+                return False
+            except _ReleaseRequestNotSent as exc:
                 print(
-                    f"Approved activation for v{approved.get('version_number')} failed: "
-                    "the promoted SHA was not observed serving before the deadline.",
+                    "Exact root receipt query could not reach the executor; "
+                    f"preserving {pending_receipt['phase']}: {exc}",
                     file=sys.stderr,
                 )
                 return False
-            if confirmation == "pending":
+            except APIError as exc:
+                print(
+                    "Exact root activation receipt is not yet available: "
+                    f"{exc}",
+                    file=sys.stderr,
+                )
+                return False
+            if root_receipt is not True:
                 return False
             pending_receipt["phase"] = "completed"
-            _write_deploy_agent_state(state_path, pending_receipt)
-            _post_activation_receipt(
-                argparse.Namespace(
-                    project_id=getattr(args, "project_id", None),
-                    host=getattr(args, "host", "control-plane"),
-                ),
-                approved,
-                promoted_sha,
-            )
-            _clear_deploy_agent_state(state_path)
-            print(f"Approved activation for v{approved.get('version_number')} completed.")
-            return True
-        if matches_approval and pending_receipt.get("phase") in {"accepted", "completed"}:
             confirmation = _pending_activation_confirmation(pending_receipt, promoted_sha)
             _write_deploy_agent_state(state_path, pending_receipt)
             if confirmation == "failed":
@@ -10932,7 +11724,7 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
                 return False
             _post_activation_receipt(
                 argparse.Namespace(
-                    project_id=getattr(args, "project_id", None),
+                    project_id=project_id,
                     host=getattr(args, "host", "control-plane"),
                 ),
                 approved,
@@ -10941,7 +11733,13 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
             _clear_deploy_agent_state(state_path)
             print(f"Approved activation for v{approved.get('version_number')} completed.")
             return True
-        _clear_deploy_agent_state(state_path)
+        if not matches_approval:
+            print(
+                "Parked activation state does not match the current approval; "
+                "preserving it for explicit root-receipt reconciliation.",
+                file=sys.stderr,
+            )
+            return False
 
     # Approved activations are bound by the receipt endpoint to this exact
     # promoted SHA. The legacy CLI still uses the descendant binding below.
@@ -10957,6 +11755,8 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
         current is None
         or current.get("version_number") != approved.get("version_number")
         or (current.get("promoted_sha") or "").lower() != promoted_sha
+        or current.get("activation_requested_at")
+        != approved.get("activation_requested_at")
         or release["revision"] != (current.get("promoted_sha") or "").lower()
     ):
         print("Approved activation changed before execution; leaving it for the next poll.")
@@ -10965,48 +11765,53 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
         "version_number": current.get("version_number"),
         "promoted_sha": promoted_sha,
         "revision": release["revision"],
+        "digest": release["digest"],
+        "operation_id": operation_id,
         "activation_requested_at": current.get("activation_requested_at"),
         "phase": "started",
-        "activation_attempts": 0,
+        "activation_attempts": 1,
+        "root_release": {
+            "phase": "activation",
+            "attempt": 1,
+            "status": "started",
+        },
     }
     # Persist the intent before crossing the privileged boundary. This is the
     # at-most-once fence when the agent dies or the socket wait expires while
     # the root service continues the release.
     _write_deploy_agent_state(state_path, activation_state)
 
-    def invoke_activation(attempt: int) -> bool:
-        # Persist the attempt counter before crossing the privileged boundary.
-        # A process restart therefore cannot silently reset a failed phase's
-        # retry budget or mistake a terminal failure for a timeout.
-        activation_state["activation_attempts"] = attempt
+    try:
+        release_completed = _invoke_release_shim(
+            release["digest"],
+            release["revision"],
+            operation_id,
+            host=None,
+        )
+    except (_ReleaseRequestNotSent, _ReleaseOperationNotAccepted) as exc:
+        activation_state["phase"] = "not_sent"
+        activation_state["failure_reason"] = str(exc)
         activation_state["root_release"] = {
             "phase": "activation",
-            "attempt": attempt,
-            "status": "started",
+            "status": "not_sent",
+            "attempts": 1,
+            "failure_reason": str(exc),
         }
         _write_deploy_agent_state(state_path, activation_state)
-        return _invoke_release_shim(release["digest"], release["revision"], host=None)
-
-    try:
-        release_completed = retry_activation_phase(
-            "activation",
-            lambda: invoke_activation(activation_state["activation_attempts"] + 1),
-            retry_if=lambda exc: isinstance(exc, APIError),
-            sleep=time.sleep,
-        )
-    except ActivationPhaseFailure as failure:
+        return False
+    except APIError as exc:
         activation_state["phase"] = "failed"
-        activation_state["failure_reason"] = str(failure)
+        activation_state["failure_reason"] = str(exc)
         activation_state["root_release"] = {
-            "phase": failure.phase,
+            "phase": "activation",
             "status": "failed",
-            "attempts": failure.attempts,
-            "failure_reason": str(failure.final_exception),
+            "attempts": 1,
+            "failure_reason": str(exc),
         }
         _write_deploy_agent_state(state_path, activation_state)
         print(
             f"Approved activation for v{current.get('version_number')} failed: "
-            f"{failure}",
+            f"{exc}",
             file=sys.stderr,
         )
         return False
@@ -11031,7 +11836,7 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
         return False
     _post_activation_receipt(
         argparse.Namespace(
-            project_id=getattr(args, "project_id", None),
+            project_id=project_id,
             host=getattr(args, "host", "control-plane"),
         ),
         current,
@@ -11104,14 +11909,17 @@ def _pending_activation_confirmation(state: dict, expected_sha: str) -> str:
 def _read_deploy_agent_state(path: str | None) -> dict | None:
     """Read the agent's host-local receipt retry marker, if it is valid."""
     if not path:
-        return None
+        raise APIError("deploy-agent state path is required")
+    expanded = os.path.expanduser(path)
     try:
-        with open(os.path.expanduser(path), encoding="utf-8") as handle:
+        with open(expanded, encoding="utf-8") as handle:
             state = json.load(handle)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return None
+    except (OSError, ValueError) as exc:
+        raise APIError("deploy-agent state is unreadable or corrupt") from exc
     if not isinstance(state, dict):
-        return None
+        raise APIError("deploy-agent state is not a JSON object")
     return state
 
 
@@ -11140,6 +11948,11 @@ def _write_deploy_agent_state(path: str | None, state: dict) -> None:
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
         temporary = None
+        parent_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
     finally:
         if temporary is not None:
             try:
@@ -11152,10 +11965,17 @@ def _clear_deploy_agent_state(path: str | None) -> None:
     """Remove a delivered or superseded receipt retry marker."""
     if not path:
         return
+    expanded = os.path.expanduser(path)
     try:
-        os.unlink(os.path.expanduser(path))
+        os.unlink(expanded)
     except FileNotFoundError:
-        pass
+        return
+    directory = os.path.dirname(os.path.abspath(expanded)) or "."
+    parent_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _preflight_file(path: str, *, executable: bool = False) -> dict:
@@ -11565,6 +12385,24 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         print("  (dry run — nothing deployed)")
         return
     _require_write_config("deploy")
+    if args.receipt_only:
+        if promoted is None or not promoted.get("activation_requested_at"):
+            raise APIError("receipt-only requires an exact approved activation")
+        operation_id = _activation_operation_id(
+            get_project_id(getattr(args, "project_id", None)), promoted
+        )
+        result = _execute_deploy_shim(
+            args,
+            revision,
+            digest,
+            inplace=args.local,
+            operation_id=operation_id,
+            receipt_only=True,
+        )
+        if result is not True:
+            raise APIError("exact root activation receipt was not observed")
+        print(f"  Root receipt: success ({operation_id})")
+        return
     if not args.yes:
         answer = input("Activate this release? [y/N] ").strip().lower()
         if answer not in ("y", "yes"):

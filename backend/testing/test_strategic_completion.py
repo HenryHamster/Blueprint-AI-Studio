@@ -76,7 +76,7 @@ from app.strategic_spawning import (
 )
 from app.strategic_analysis import _build_outcome_evaluation
 from app.direction_lifecycle import _reset_outcome_detection_state
-from app.models import CriterionEvidence, Direction, Project, ProjectMember, ReleaseVersion, StrategicCycle, Task, TaskStatus, VersionAcceptanceCriterion
+from app.models import CriterionEvidence, Direction, Project, ProjectMember, ReleaseQualificationIntent, ReleaseVersion, StrategicCycle, Task, TaskStatus, VersionAcceptanceCriterion
 from app.auth import create_agent_token
 from httpx import AsyncClient
 from sqlmodel import select
@@ -9805,17 +9805,16 @@ def test_extract_qualify_request_rejects_invalid_probe_contract(probes):
 @pytest.mark.asyncio
 async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     """End-to-end: a qualify_request embedded in a set_problem_model call is
-    applied synchronously within the API handler so it takes immediate effect.
+    committed as a durable intent within the API transaction.
 
     The strategic agent embeds qualify_request as a top-level sibling of the
     problem_model; the /api/agent/strategic endpoint lifts it out (ProblemModel
-    is extra="forbid"), applies it synchronously by calling _apply_qualify_request
-    directly, and pops the context key so _handle_strategic_completion is a
-    no-op — no double-application for tasks that also complete normally.
+    is extra="forbid"), creates an exact outbox row, and pops the context key so
+    _handle_strategic_completion is a no-op — no duplicate intent for tasks
+    that also complete normally.
 
-    Regression for fr-qualify-request-application-timing: a qualify_request
-    submitted mid-session can no longer sit queued for the entire remaining duration
-    of the conversation.
+    Slow GitHub/qualifier work is deliberately not awaited by the conversation;
+    the bounded reaper drains the committed authority after the response.
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -9936,25 +9935,42 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
         "Ship the thing"
     )
 
-    # Synchronous apply: run_qualification fired during set_problem_model itself —
-    # not deferred to task completion.
-    run_qualification.assert_awaited_once()
-    call_args = run_qualification.await_args.args
-    # run_qualification(session, project_id, version) — the handler's own session
-    # is used (not db_session), so check project_id and version identity only.
-    assert call_args[1] == project.id
-    assert call_args[2].id == version.id
-    assert run_qualification.await_args.kwargs["requested_probes"] == [
-        "walkthrough_e2e"
-    ]
+    # Delivery is not performed inline. The exact request is durable before the
+    # 200 response, including its target version and phase epoch.
+    run_qualification.assert_not_awaited()
+    intents = (
+        (
+            await db_session.execute(
+                select(ReleaseQualificationIntent).where(
+                    ReleaseQualificationIntent.project_id == project.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(intents) == 1
+    intent = intents[0]
+    assert intent.status == "pending"
+    assert intent.release_version_id == version.id
+    assert intent.expected_phase_changed_at == version.phase_changed_at
+    assert intent.requested_probes == ["walkthrough_e2e"]
 
     # The context key is consumed and popped — no stale key left over.
     await db_session.refresh(task)
     assert (task.context or {}).get("_strategic_qualify_request") is None
 
-    # Completion handler does NOT trigger a second qualification (idempotency).
+    # Completion handler does NOT enqueue or trigger a second qualification.
     await _handle_strategic_completion(task, "", db_session)
-    run_qualification.assert_awaited_once()  # still exactly once
+    run_qualification.assert_not_awaited()
+    intent_ids = (
+        await db_session.execute(
+            select(ReleaseQualificationIntent.id).where(
+                ReleaseQualificationIntent.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert intent_ids == [intent.id]
 
 
 @pytest.mark.asyncio
@@ -9973,10 +9989,9 @@ async def test_qualify_request_side_effect_failure_does_not_break_durable_write(
     5-24 min review up to ``max_retries`` times before failing -- even though the
     agent's design-doc write had already landed.
 
-    The fix runs the qualify side-effect AFTER the durable commit, on an isolated
-    fresh session, fail-open. This test simulates the side-effect blowing up the
-    exact way the connection death did and asserts the durable problem_model
-    write still commits and the agent gets a 200 — never a 500 / requeue.
+    The fix persists an outbox intent in the durable write, returns immediately,
+    and drains on an isolated session. This test simulates the delivery blowing
+    up and proves the problem-model transaction remains committed.
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -9985,9 +10000,7 @@ async def test_qualify_request_side_effect_failure_does_not_break_durable_write(
     from app import strategic_cycle
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    # Stand in for the connection-death poison: the qualify side-effect raises a
-    # disconnect-class error. Patched at the module global so the post-commit
-    # wrapper's ``await _apply_qualify_request(...)`` hits it.
+    # Stand in for the connection-death poison when the outbox is drained.
     boom = mocker.patch(
         "app.strategic_completion._apply_qualify_request",
         new_callable=AsyncMock,
@@ -10049,8 +10062,23 @@ async def test_qualify_request_side_effect_failure_does_not_break_durable_write(
     assert resp.json()["qualify_request_received"] is True
     await db_session.refresh(project)
     assert (project.problem_model or {}).get("intent", {}).get("purpose") == "Ship it"
-    # The side-effect ran POST-commit (on the isolated fresh session) and its
-    # failure was swallowed rather than propagated to the durable write.
+    boom.assert_not_awaited()
+    intent = (
+        await db_session.execute(
+            select(ReleaseQualificationIntent).where(
+                ReleaseQualificationIntent.project_id == project.id
+            )
+        )
+    ).scalars().one()
+    from app.release_qualification_intents import drain_qualification_intent
+
+    assert not await drain_qualification_intent(intent.id)
+    await db_session.refresh(intent)
+    await db_session.refresh(project)
+    assert intent.status == "pending"
+    assert intent.attempt_count == 1
+    assert "RuntimeError" in (intent.last_error or "")
+    assert (project.problem_model or {}).get("intent", {}).get("purpose") == "Ship it"
     boom.assert_awaited_once()
 
 
@@ -10292,10 +10320,8 @@ async def test_qualify_request_failure_recorded_on_release_version(
         db_session,
         path="test",
     )
-    # _apply_qualify_request does not commit — its production caller
-    # (_apply_qualify_request_post_commit) commits after it returns. Mirror that
-    # here: refresh() re-reads committed DB state under real ORM expiry, so an
-    # uncommitted pending write would be (correctly) discarded.
+    # _apply_qualify_request does not commit. Mirror the outbox delivery
+    # transaction here so refresh() re-reads committed DB state.
     await db_session.commit()
 
     # The failure must be recorded on the ReleaseVersion row, not just logged.
@@ -10311,70 +10337,6 @@ async def test_qualify_request_failure_recorded_on_release_version(
     assert "qualify_request_error_at" in lq
     # The error text must identify the failure so it is diagnosable without logs.
     assert "injected failure" in lq["qualify_request_error"]
-
-
-@pytest.mark.asyncio
-async def test_ci_blocker_commits_before_isolated_strategic_refresh(mocker):
-    """The refresh transaction cannot roll back the durable blocker write."""
-    import uuid
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock
-
-    from app.strategic_completion import _apply_qualify_request_post_commit
-
-    events: list[str] = []
-    project_id = uuid.uuid4()
-    task_id = uuid.uuid4()
-    project = SimpleNamespace(id=project_id)
-    task = SimpleNamespace(id=task_id)
-
-    first = AsyncMock()
-    first.get.side_effect = [project, task]
-    first.commit.side_effect = lambda: events.append("blocker_committed")
-    second = AsyncMock()
-    second.commit.side_effect = lambda: events.append("refresh_committed")
-
-    class _SessionContext:
-        def __init__(self, session):
-            self.session = session
-
-        async def __aenter__(self):
-            return self.session
-
-        async def __aexit__(self, *_args):
-            return False
-
-    factory = mocker.Mock(
-        side_effect=[_SessionContext(first), _SessionContext(second)]
-    )
-    apply_request = mocker.patch(
-        "app.strategic_completion._apply_qualify_request",
-        new=AsyncMock(return_value=True),
-    )
-
-    async def _arm(*_args, **kwargs):
-        assert events == ["blocker_committed"]
-        assert kwargs["skip_locked"] is False
-        events.append("refresh_armed")
-        return True
-
-    arm_refresh = mocker.patch(
-        "app.strategic_trigger.request_strategic_refresh", side_effect=_arm
-    )
-
-    await _apply_qualify_request_post_commit(
-        {"reason": "ready"},
-        task_id=task_id,
-        project_id=project_id,
-        path="test",
-        session_factory=factory,
-    )
-
-    apply_request.assert_awaited_once()
-    arm_refresh.assert_awaited_once()
-    first.rollback.assert_not_awaited()
-    second.commit.assert_awaited_once()
-    assert events == ["blocker_committed", "refresh_armed", "refresh_committed"]
 
 
 # ── new_acceptance_criteria transport / fallback ─────────────────────────────

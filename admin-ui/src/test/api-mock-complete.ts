@@ -58,6 +58,8 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
     fetchVersionSummary: vi.fn(),
     setVersionPhase: vi.fn(),
     setVersionGoal: vi.fn(),
+    VersionCutRequestError: class VersionCutRequestError extends Error {},
+    getVersionCutContext: vi.fn(),
     cutVersion: vi.fn(),
     approveActivation: vi.fn(),
     clearDeployFailed: vi.fn(),

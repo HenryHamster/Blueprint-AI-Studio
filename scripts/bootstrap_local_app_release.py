@@ -513,6 +513,22 @@ def _install_deploy_agent(
         _LEGACY_RELEASE_SUDOERS,
     )
     previous = {path: _snapshot_optional(path) for path in managed}
+    if previous[_DEPLOY_AGENT_UNIT] is not None:
+        _run(["/usr/bin/systemctl", "stop", _DEPLOY_AGENT_UNIT.name])
+    if previous[_RELEASE_SERVICE] is not None:
+        release_state = _run(
+            [
+                "/usr/bin/systemctl",
+                "show",
+                _RELEASE_SERVICE.name,
+                "--property=ActiveState",
+                "--value",
+            ]
+        ).stdout.strip()
+        if release_state != "inactive":
+            raise RuntimeError(
+                "root release is not inactive; refusing to replace its client/shim bundle"
+            )
     try:
         # This renderer is the sole owner of blueprint-deploy-agent.service.
         deploy_agent_unit = _deploy_agent_unit(bundle, install_user)

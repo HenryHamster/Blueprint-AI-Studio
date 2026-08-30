@@ -30,6 +30,9 @@ The initial `coding-agent:read` scope provides:
   and large raw context blobs stay excluded by the backend projection.
 - `list_directions`: bounded, paginated project directions with explicit
   truncation metadata.
+- `list_release_spawn_requests`: bounded, snapshot-consistent release-window
+  Resident spawn receipts with exact completeness and two-task spawn-chain
+  predicates. Combine them with exact `get_task` readback for canary admission.
 
 Every tool is annotated read-only and returns both structured MCP content and a
 JSON text copy. A failed required read is an error, not a successful snapshot
@@ -152,7 +155,7 @@ the [official Claude Code MCP documentation](https://code.claude.com/docs/en/mcp
 For another stdio MCP host, use the same command, argument, working-directory,
 and environment fields in that host's configuration format.
 
-After restarting or opening a new host session, confirm that the six Blueprint
+After restarting or opening a new host session, confirm that the seven Blueprint
 tools are visible. Ask for a project snapshot first; do not begin a diagnosis by
 manually joining several raw REST calls.
 
@@ -225,11 +228,13 @@ after every intended MCP host has moved to scoped credentials.
 - REST bounded task detail: `GET /api/agent-access/v1/tasks/{task_id}`
 - REST bounded message list: `GET /api/agent-access/v1/messages`
 - REST bounded direction list: `GET /api/agent-access/v1/directions`
+- REST bounded release spawn receipts: `GET /api/agent-access/v1/projects/{project_id}/release-versions/{version_id}/strategic-spawn-requests`
 - MCP protocol revision: current `2026-07-28`, with negotiation for
   `2025-11-25`, `2025-06-18`, and `2024-11-05` legacy hosts.
 - Snapshot schema: `blueprint.project-snapshot.v1`
 - Bounded task-detail schema: `blueprint.agent-task.v1`
 - Access schema: `blueprint.agent-access.v1`
+- Release spawn-request schema: `blueprint.agent-release-spawn-requests.v1`
 
 The MCP and `coding-agent:read` profile remain deliberately read-only. A
 separate `project-operator` scope now provides narrowly typed CLI actions for a

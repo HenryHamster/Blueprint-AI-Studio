@@ -249,6 +249,36 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "list_release_spawn_requests",
+            "description": (
+                "Read one snapshot-consistent, bounded release-window projection "
+                "of Resident Strategic spawn receipts. Use its complete and "
+                "two_task_spawn_chain_complete predicates with exact task readback "
+                "for a canary proof."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **selector,
+                    "version_id": {"type": "string", "format": "uuid"},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 20,
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1_000_000,
+                        "default": 0,
+                    },
+                },
+                "required": ["version_id"],
+                "additionalProperties": False,
+            },
+        },
     ]
     for tool in tools:
         tool["annotations"] = {
@@ -717,6 +747,32 @@ def _list_messages(arguments: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _list_release_spawn_requests(arguments: dict[str, Any]) -> dict[str, Any]:
+    project = _select_project(arguments)
+    version_id = _validate_uuid(arguments.get("version_id"), "version_id")
+    limit = _bounded_int(
+        arguments.get("limit"), label="limit", default=20, maximum=50
+    )
+    offset = _bounded_int(
+        arguments.get("offset"),
+        label="offset",
+        default=0,
+        maximum=1_000_000,
+        minimum=0,
+    )
+    path = (
+        f"/api/agent-access/v1/projects/{project['id']}/release-versions/"
+        f"{version_id}/strategic-spawn-requests"
+    )
+    return _as_object(
+        api(
+            "GET",
+            _with_query(path, [("limit", limit), ("offset", offset)]),
+        ),
+        "bounded release spawn request list",
+    )
+
+
 def call_tool(name: str, arguments: Any) -> tuple[dict[str, Any], bool]:
     """Execute a known Blueprint tool after the MCP envelope is validated."""
     args = _as_object(arguments)
@@ -745,6 +801,8 @@ def call_tool(name: str, arguments: Any) -> tuple[dict[str, Any], bool]:
         return _list_directions(args), False
     if name == "list_messages":
         return _list_messages(args), False
+    if name == "list_release_spawn_requests":
+        return _list_release_spawn_requests(args), False
     raise ProtocolError(-32602, f"Unknown tool: {name}")
 
 

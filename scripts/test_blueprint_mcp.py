@@ -14,6 +14,7 @@ import blueprint_mcp
 
 PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 TASK_ID = "22222222-2222-4222-8222-222222222222"
+VERSION_ID = "44444444-4444-4444-8444-444444444444"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -96,6 +97,7 @@ def test_tool_registry_is_discoverable_and_read_only():
         "get_task",
         "list_directions",
         "list_messages",
+        "list_release_spawn_requests",
     }
     assert not any(
         fragment in name
@@ -863,6 +865,63 @@ def test_task_and_message_tools_use_bounded_membership_scoped_routes(monkeypatch
         "offset": ["30"],
     }
     assert all(method == "GET" for method, _path, _body in calls)
+
+
+def test_release_spawn_tool_uses_exact_bounded_project_route(monkeypatch):
+    _configure_scoped_agent(monkeypatch)
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if path == "/api/agent-access/v1/me":
+            return _profile()
+        if "/strategic-spawn-requests?" in path:
+            return {
+                "schema_version": "blueprint.agent-release-spawn-requests.v1",
+                "project_id": PROJECT_ID,
+                "release_version": {"id": VERSION_ID, "version_number": 57},
+                "requests": [],
+                "total": 0,
+                "complete": False,
+                "two_task_spawn_chain_complete": False,
+            }
+        raise AssertionError(path)
+
+    monkeypatch.setattr(blueprint_mcp, "api", fake_api)
+    response = blueprint_mcp.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "list_release_spawn_requests",
+                "arguments": {
+                    "project_id": PROJECT_ID,
+                    "version_id": VERSION_ID,
+                    "limit": 2,
+                    "offset": 4,
+                },
+            },
+        }
+    )
+    payload, is_error = _tool_payload(response)
+    assert is_error is False
+    assert payload["schema_version"] == (
+        "blueprint.agent-release-spawn-requests.v1"
+    )
+    assert payload["complete"] is False
+    assert payload["two_task_spawn_chain_complete"] is False
+    method, path, request_body = calls[-1]
+    assert method == "GET"
+    assert request_body is None
+    assert path.startswith(
+        f"/api/agent-access/v1/projects/{PROJECT_ID}/release-versions/"
+        f"{VERSION_ID}/strategic-spawn-requests?"
+    )
+    assert parse_qs(urlsplit(path).query) == {
+        "limit": ["2"],
+        "offset": ["4"],
+    }
 
 
 def test_list_directions_uses_bounded_paginated_route_for_project_operator(

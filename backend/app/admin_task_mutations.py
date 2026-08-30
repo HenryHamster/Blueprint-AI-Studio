@@ -32,6 +32,11 @@ from app.landed_signal import (
     corroborate_and_apply_merged_landed_signal,
     mark_unblocked_non_merge,
 )
+from app.max_plan_pool import (
+    EXACT_MODEL_ROUTE_CONTEXT_KEY,
+    exact_model_route_marker_is_invalid,
+    resolve_exact_model_route,
+)
 from app.models import (
     Project,
     Task,
@@ -887,6 +892,15 @@ async def _apply_simple_mutations(
             immutable_identity_keys += ("acceptance_evidence",)
             if not isinstance(creation_authority, dict):
                 immutable_identity_keys += ("direction_id",)
+        if (
+            resolve_exact_model_route(task.context) is not None
+            or exact_model_route_marker_is_invalid(task.context)
+        ):
+            immutable_identity_keys += (
+                "model",
+                "effort",
+                "provider_preference",
+            )
         changed_identity = [
             key
             for key in immutable_identity_keys
@@ -979,6 +993,7 @@ async def _apply_simple_mutations(
             CRITERION_RELEASE_VERSION_CONTEXT_KEY,
             EXPLICIT_CRITERION_IDS_CONTEXT_KEY,
             OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY,
+            EXACT_MODEL_ROUTE_CONTEXT_KEY,
         }
         creation_authority = (task.context or {}).get(
             OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY

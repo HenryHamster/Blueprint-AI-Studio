@@ -123,6 +123,22 @@ function parseOperatorReplyInput(input: unknown): ResidentOperatorReply | null {
   return { content, type };
 }
 
+function strategicMutationAcknowledged(ev: ResidentStreamEvent): boolean {
+  if (ev.isError || typeof ev.toolResultText !== 'string') return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(ev.toolResultText.trim());
+  } catch {
+    return false;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  const receipt = parsed as Record<string, unknown>;
+  if (receipt.applied === false || receipt.status === 'refused' || receipt.http_status === 409) {
+    return false;
+  }
+  return receipt.applied === true || receipt.status === 'ok';
+}
+
 export interface ResidentTurnResult {
   /** authoritative final assistant text for this turn (from the `result` event) */
   resultText: string;
@@ -273,6 +289,8 @@ interface ActiveTurn {
   operatorReply: ResidentOperatorReply | null;
   /** Native reply inputs, keyed by their tool-use id until tool_result arrives. */
   pendingOperatorReplies: Map<string, ResidentOperatorReply>;
+  /** Mutating Bash calls awaiting an exact successful strategic acknowledgement. */
+  pendingStrategicMutations: Set<string>;
   interrupted: boolean;
   timedOut: boolean;
   hardTimedOut: boolean;
@@ -671,6 +689,26 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     // Nested (sub-agent) events are sub-progress: surface their text but never
     // let a nested result close the parent's turn.
     if (ev.nested) {
+      const t = activeTurn;
+      if (t) {
+        noteTurnActivity(t);
+        if (ev.kind === 'tool') {
+          t.sawToolUse = true;
+          t.toolCallCount += 1;
+          traceTurn(t, 'tool', ev.toolName || 'nested_tool');
+        } else if (ev.kind === 'tool_result') {
+          traceTurn(t, 'tool_result', 'nested_tool_result', ev.isError === true);
+        } else if (ev.kind === 'error') {
+          traceTurn(t, 'error', 'nested_error', true);
+        } else if (ev.kind === 'result') {
+          traceTurn(
+            t,
+            'result',
+            ev.terminalReason || 'nested_result',
+            ev.isError === true,
+          );
+        }
+      }
       if (ev.kind === 'text' && ev.text) emit({ kind: 'text', text: ev.text });
       return;
     }
@@ -734,7 +772,9 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           // When ev.toolUseId is absent (should never happen), record under a
           // sentinel key so the tool_result handler can still compute duration.
           t.toolCallStartTimes.set(ev.toolUseId ?? `__no_id_${t.toolCallCount}`, Date.now());
-          if (isStrategicMutation(ev.command)) t.appliedStrategicOp = true;
+          if (isStrategicMutation(ev.command) && ev.toolUseId) {
+            t.pendingStrategicMutations.add(ev.toolUseId);
+          }
           // Only the explicit MCP reply tool carries the delivery contract.
           // Bash `./messages send`, `./strategic create-message`, and normal
           // assistant text are not accepted as an operator reply.
@@ -757,6 +797,10 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           if (!ev.isError && reply) {
             t.sentOperatorMessage = true;
             t.operatorReply = reply;
+          }
+          if (t.pendingStrategicMutations.delete(ev.toolUseId)
+              && strategicMutationAcknowledged(ev)) {
+            t.appliedStrategicOp = true;
           }
         }
         // Per-tool-call latency: compute wall-clock duration from the tool_use
@@ -1026,6 +1070,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         resolve, resultText: '', accumulated: '', streamedText: false,
         sawToolUse: false, appliedStrategicOp: false, sentOperatorMessage: false, operatorReply: null,
         pendingOperatorReplies: new Map<string, ResidentOperatorReply>(),
+        pendingStrategicMutations: new Set<string>(),
         interrupted: false, timedOut: false, hardTimedOut: false, sawDeltaThisMessage: false,
         stallTimeoutMs, hardTimeoutMs: turnHardTimeoutMs,
         stallTimer: null, forceTimer: null, hardTimer: null, interruptTimer: null,

@@ -693,19 +693,24 @@ class TestGenericExceptionHandlerDoesNotLeakDetails:
         )
 
     def test_exc_type_name_not_in_response(self):
-        import re
+        import ast
 
         src = self._load_main_source()
         # Ensure the old leaking pattern is gone from the response body
         # (it may still appear in logger calls, which is fine)
-        # Look for the content= kwarg in generic_exception_handler
-        handler_match = re.search(
-            r"async def generic_exception_handler.*?return _apply_cors_headers",
-            src,
-            re.DOTALL,
-        )
-        assert handler_match, "Could not locate generic_exception_handler body"
-        handler_body = handler_match.group(0)
+        # Extract the handler structurally so response wrappers do not make this
+        # guard depend on a particular return-expression shape.
+        module = ast.parse(src)
+        handlers = [
+            node
+            for node in module.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "generic_exception_handler"
+        ]
+        assert len(handlers) == 1, "Could not uniquely locate generic_exception_handler"
+        handler_body = ast.get_source_segment(src, handlers[0])
+        assert handler_body is not None
+        assert "content=" in handler_body
         assert "type(exc).__name__" not in handler_body.split("content=", 1)[-1], (
             "generic_exception_handler must not include type(exc).__name__ "
             "in the HTTP response content"

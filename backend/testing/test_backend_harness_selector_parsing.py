@@ -461,3 +461,25 @@ def test_harness_change_selects_parser_regression() -> None:
         "backend/testing/test_backend_harness_selector_parsing.py"
         in result.stdout.splitlines()
     )
+
+    harness = (REPO_ROOT / "scripts" / "test-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    wait_block = harness.split('echo "=== Waiting for Postgres ==="', 1)[1].split(
+        'echo "=== Checking migration-required PostgreSQL extensions ==="', 1
+    )[0]
+    normalized_wait = " ".join(wait_block.replace("\\\n", " ").split())
+
+    assert 'docker exec "$PG_CONTAINER" pg_isready' not in wait_block
+    assert (
+        "psql -X -w -U test -d test_blueprint -v ON_ERROR_STOP=1 "
+        "-Atqc 'SELECT 1'" in normalized_wait
+    )
+    assert "cat /proc/1/comm" in wait_block
+    assert '= "postgres" ]' in wait_block
+    assert "POSTGRES_READY_STREAK=$((POSTGRES_READY_STREAK + 1))" in wait_block
+    assert '[ "$POSTGRES_READY_STREAK" -ge 2 ]' in wait_block
+    assert "POSTGRES_READY=1" in wait_block
+    assert '[ "$POSTGRES_READY" != "1" ]' in wait_block
+    assert "docker logs \"$PG_CONTAINER\"" in wait_block
+    assert "exit 1" in wait_block

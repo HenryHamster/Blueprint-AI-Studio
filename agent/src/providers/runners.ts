@@ -15,7 +15,9 @@ import {
 } from '../constants.js';
 import {
   WORKSPACE, ClaudeTimeoutError, getAgentToken, log, recordLlmCallStart,
-  recordLlmTokens, recordProviderReportedUsage, recordNumTurns, recordToolResultBytes, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
+  normalizeClaudeConfigContent, recordLlmTokens, recordProviderReportedUsage,
+  recordNumTurns, recordToolResultBytes, recordToolUse, sanitize, sendLog,
+  strVal, estimateTokensFromChars,
 } from '../index.js';
 import {
   AGENT_HELPER_NAMES,
@@ -94,6 +96,7 @@ const CLAUDE_OPTIONAL_FLAG_VALUE_COUNTS: Readonly<Record<string, number>> = {
   '--strict-mcp-config': 0,
   '--mcp-config': 1,
   '--allowedTools': 1,
+  '--permission-mode': 1,
   '--max-turns': 1,
   '--no-session-persistence': 0,
 };
@@ -676,6 +679,11 @@ export interface ProviderRunErrorReport {
   stderr_tail: string;
   /** Last parsed stream-json event type, for forensics. */
   last_stream_event: string | null;
+  /** Exact top-level terminal-result predicate fields when the provider emitted them. */
+  provider_result_is_error?: boolean;
+  provider_result_subtype?: string;
+  provider_terminal_reason?: string;
+  provider_api_error_status?: number;
   /** Agent-side matcher verdict when one fired (rate_limit / auth_failure / …). */
   classified?: string;
 }
@@ -791,17 +799,25 @@ export class TextOnlyProviderUnavailableError extends RuntimeUnavailableError {
 
 const TEXT_ONLY_MAX_TURNS = 1;
 
-function removeClaudeFlags(args: readonly string[], flags: ReadonlySet<string>): string[] {
-  const clean: string[] = [];
+function isolatedClaudeArgs(args: readonly string[]): string[] {
+  // Rebuild from a deliberately tiny allowlist. A denylist is not sufficient
+  // here: new Claude CLI settings/plugin/permission flags would otherwise gain
+  // authority in the transcript-free proof until this agent learned about them.
+  let model: string | null = null;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (!flags.has(arg)) {
-      clean.push(arg);
-      continue;
+    if (arg === '--model') {
+      const value = args[index + 1];
+      if (typeof value === 'string' && !value.startsWith('-')) {
+        model = value;
+        index += 1;
+      }
     }
-    index += CLAUDE_OPTIONAL_FLAG_VALUE_COUNTS[arg] ?? 0;
   }
-  return clean;
+  return [
+    '-p', '--output-format', 'stream-json', '--verbose',
+    ...(model ? ['--model', model] : []),
+  ];
 }
 
 function isolatedAnthropicEnv(baseEnv: Record<string, string>, cwd: string): Record<string, string> {
@@ -817,6 +833,12 @@ function isolatedAnthropicEnv(baseEnv: Record<string, string>, cwd: string): Rec
   };
   for (const key of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'] as const) {
     if (baseEnv[key]) env[key] = baseEnv[key];
+  }
+  if (
+    baseEnv.CLAUDE_CODE_EFFORT_LEVEL
+    && ['low', 'medium', 'high', 'max'].includes(baseEnv.CLAUDE_CODE_EFFORT_LEVEL)
+  ) {
+    env.CLAUDE_CODE_EFFORT_LEVEL = baseEnv.CLAUDE_CODE_EFFORT_LEVEL;
   }
   return env;
 }
@@ -841,15 +863,12 @@ export function buildIsolatedTextOnlyMemoryCommand(
   // explicit empty built-in list plus a fresh empty strict-MCP config. Note
   // that --allowedTools controls approval, not availability: --tools '' is
   // the actual built-in-tool boundary.
-  command.args = removeClaudeFlags(command.args, new Set([
-    '--dangerously-skip-permissions',
-    CLAUDE_PARTIAL_MESSAGES_FLAG,
-    '--tools',
-    '--allowedTools',
-    '--mcp-config',
-    '--strict-mcp-config',
-    '--max-turns',
-  ]));
+  command.args = isolatedClaudeArgs(command.args);
+  const claudeConfigPath = path.join(options.cwd, '.claude.json');
+  writePrivateFileSync(
+    claudeConfigPath,
+    normalizeClaudeConfigContent(claudeConfigPath, '{}', options.cwd),
+  );
   const mcpConfigPath = path.join(options.cwd, '.memory-empty-mcp.json');
   writePrivateFileSync(mcpConfigPath, '{"mcpServers":{}}\n');
   command.args.push(
@@ -1155,11 +1174,24 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
   };
 }
 
+export interface ProviderRunResult {
+  exitCode: number;
+  allOutput: string;
+  lastResultText: string;
+  codexTurnCompleted?: boolean;
+  stderrTail?: string;
+  providerResultEventSeen?: boolean;
+  providerResultIsError?: boolean;
+  providerResultSubtype?: string;
+  providerTerminalReason?: string;
+  providerApiErrorStatus?: number;
+}
+
 type RunClaudeCodeOverride = (
   prompt: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean,
   observer?: ProviderRunObserver,
-) => Promise<{ exitCode: number; allOutput: string; lastResultText: string }>;
+) => Promise<ProviderRunResult>;
 
 let _runClaudeCodeOverride: RunClaudeCodeOverride | null = null;
 export function __setRunClaudeCodeOverrideForSmoke(fn: RunClaudeCodeOverride | null): void {
@@ -1325,11 +1357,7 @@ export function syncAgentHelpersToPath(
   return helperBin;
 }
 
-export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean, observer?: ProviderRunObserver): Promise<{
-  exitCode: number; allOutput: string; lastResultText: string;
-  codexTurnCompleted?: boolean;
-  stderrTail?: string;
-}> {
+export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean, observer?: ProviderRunObserver): Promise<ProviderRunResult> {
   if (_runClaudeCodeOverride) {
     return _runClaudeCodeOverride(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog, observer);
   }
@@ -1359,15 +1387,11 @@ export async function runIsolatedTextOnlyMemory(
   model: string | undefined,
   effort: string | undefined,
   options: IsolatedTextOnlyRunOptions,
-): Promise<{ exitCode: number; allOutput: string; lastResultText: string; codexTurnCompleted?: boolean; stderrTail?: string }> {
+): Promise<ProviderRunResult> {
   return runProviderAgent(prompt, ws, statusRef, model, effort, undefined, false, options);
 }
 
-export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean, isolatedTextOnly?: IsolatedTextOnlyRunOptions, observer?: ProviderRunObserver): Promise<{
-  exitCode: number; allOutput: string; lastResultText: string;
-  codexTurnCompleted?: boolean;
-  stderrTail?: string;
-}> {
+export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean, isolatedTextOnly?: IsolatedTextOnlyRunOptions, observer?: ProviderRunObserver): Promise<ProviderRunResult> {
   const runner = getProviderRunner();
   const runCommand = isolatedTextOnly
     ? buildIsolatedTextOnlyMemoryCommand(runner, prompt, model, effort, isolatedTextOnly)
@@ -1385,6 +1409,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   const runStartedAt = Date.now();
   let modelOutputSeen = false;
   let resultEventSeen = false;
+  let providerResultIsError: boolean | undefined;
+  let providerResultSubtype: string | undefined;
+  let providerTerminalReason: string | undefined;
+  let providerApiErrorStatus: number | undefined;
   let lastStreamEventType: string | null = null;
   let closeSignalSeen: string | null = null;
   const providerErrors: ProviderErrorEntry[] = [];
@@ -1417,6 +1445,18 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       provider_errors: providerErrors,
       stderr_tail: stderrBuffer.slice(-RUN_REPORT_STDERR_TAIL_CHARS),
       last_stream_event: lastStreamEventType,
+      ...(providerResultIsError !== undefined
+        ? { provider_result_is_error: providerResultIsError }
+        : {}),
+      ...(providerResultSubtype !== undefined
+        ? { provider_result_subtype: providerResultSubtype }
+        : {}),
+      ...(providerTerminalReason !== undefined
+        ? { provider_terminal_reason: providerTerminalReason }
+        : {}),
+      ...(providerApiErrorStatus !== undefined
+        ? { provider_api_error_status: providerApiErrorStatus }
+        : {}),
       ...(classified ? { classified } : {}),
     };
   };
@@ -1950,9 +1990,36 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                 lastStreamEventAt = Date.now();  // terminal model event — reset no-progress watchdog
                 modelOutputSeen = true;
                 resultEventSeen = true;  // run report: the run completed its model turn
+                const rawIsError = (obj as { is_error?: unknown }).is_error;
+                providerResultIsError = typeof rawIsError === 'boolean' ? rawIsError : undefined;
+                const subtype = (obj as { subtype?: unknown }).subtype;
+                providerResultSubtype = typeof subtype === 'string' ? subtype : undefined;
+                const terminalReason = (obj as { terminal_reason?: unknown }).terminal_reason;
+                const directApiStatus = (obj as { api_error_status?: unknown }).api_error_status;
+                const apiError = (obj as { api_error?: unknown }).api_error;
+                const nestedApiStatus = apiError && typeof apiError === 'object'
+                  ? (apiError as { status?: unknown }).status
+                  : undefined;
+                const parseApiStatus = (raw: unknown): number | undefined => {
+                  const parsed = typeof raw === 'number'
+                    ? raw
+                    : typeof raw === 'string' && raw.trim()
+                      ? Number(raw)
+                      : Number.NaN;
+                  return Number.isFinite(parsed) ? Math.trunc(parsed) : undefined;
+                };
+                providerApiErrorStatus = parseApiStatus(directApiStatus)
+                  ?? parseApiStatus(nestedApiStatus);
+                providerTerminalReason = typeof terminalReason === 'string'
+                  ? terminalReason
+                  : providerResultIsError === false
+                    && providerResultSubtype === 'success'
+                    && providerApiErrorStatus === undefined
+                    ? 'completed'
+                    : undefined;
+                lastResultText = (obj as { result?: string }).result ?? '';
+                sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
               }
-              lastResultText = (obj as { result?: string }).result ?? '';
-              sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
               const usage = (obj as { result?: string; usage?: Record<string, unknown> }).usage;
               if (!isNested && usage && typeof usage === 'object') {
                 // Provider-reported path (Component B): capture raw provider usage
@@ -2444,7 +2511,8 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   // Computed up here (before the no-progress branch) so the no-progress watchdog
   // can consult it: only a CONFIRMED rate-limit message blocks the account.
   const combined = stderrBuffer + allOutput.slice(-LOG_TAIL_BYTES);
-  const sawConfirmedRateLimit = matchesRateLimit(combined, runner.provider, runner.authMode);
+  const sawConfirmedRateLimit = providerApiErrorStatus === 429
+    || matchesRateLimit(combined, runner.provider, runner.authMode);
 
   // Checked before providerKilledByOOM: the watchdog's own SIGTERM→SIGKILL can
   // trip the SIGKILL-without-timeout OOM heuristic above, so this branch must win.
@@ -2507,5 +2575,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     lastResultText: lastResultText || allOutput.trim(),
     codexTurnCompleted,
     stderrTail,
+    providerResultEventSeen: resultEventSeen,
+    providerResultIsError,
+    providerResultSubtype,
+    providerTerminalReason,
+    providerApiErrorStatus,
   };
 }

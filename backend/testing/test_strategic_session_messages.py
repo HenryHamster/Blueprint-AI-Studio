@@ -46,6 +46,7 @@ from app.shared_state import limiter
 from app.strategic_memory_envelope import (
     canonical_attachment_manifest,
     context_envelope_reference,
+    get_fenced_context_envelope_by_reference,
     get_or_create_project_memory_state,
     purge_expired_context_envelope_snapshots,
 )
@@ -1682,73 +1683,153 @@ async def test_fast_claim_retires_stale_private_result_and_delivers_next_continu
 
     project, task = await _make_resident_poll_worker(db_session)
     incarnation = await _activate_typed_fast_worker(db_session, project, task)
-    inbound = await _add_typed_fast_input(db_session, project)
-    claim = await client.post(
-        f"/api/agent/projects/{project.id}/conversation/turns/claim",
-        headers=_headers(task, vm="agent-vm-resident-poll"),
-        json=_typed_fast_claim_payload(
-            task, incarnation, inbound.id, client_claim_id=str(uuid.uuid4())
-        ),
-    )
-    assert claim.status_code == 200, claim.text
-    live_reference = context_envelope_reference(claim.json()["envelope"])
-    stale_reference = {**live_reference, "snapshot_id": str(uuid.uuid4())}
-    common_context = {
-        "_workday_consultation_result": True,
-        "audience": "strategist-internal",
-        "message_role": "workday_consultation_result",
-        "public_reply_owner": "fast",
+    identity = {
+        "task_id": str(task.id),
+        "session_id": "resident-session",
+        "worker_generation": 2,
+        "incarnation_id": incarnation,
     }
-    stale = await _add_message(
-        db_session,
-        project,
-        sequence=20,
-        surface=MessageSurface.CONVERSATION,
-        message_type=MessageType.NOTE,
-        from_type="system",
-        status="open",
-        handling_state=MessageHandlingState.PENDING,
-        content="stale result must never be surfaced",
-        resident_session_id="resident-session",
-        context={
-            **common_context,
-            "delivery_key": "stale",
-            "envelope": stale_reference,
-        },
+
+    async def create_canonical_result(
+        *, sequence: int, delivery_key: str, summary: str
+    ) -> ProjectMessage:
+        inbound = await _add_typed_fast_input(
+            db_session,
+            project,
+            sequence=sequence,
+        )
+        claim = await client.post(
+            f"/api/agent/projects/{project.id}/conversation/turns/claim",
+            headers=_headers(task, vm="agent-vm-resident-poll"),
+            json=_typed_fast_claim_payload(
+                task,
+                incarnation,
+                inbound.id,
+                client_claim_id=str(uuid.uuid4()),
+            ),
+        )
+        assert claim.status_code == 200, claim.text
+        completed = await client.post(
+            f"/api/agent/projects/{project.id}/conversation/turns/complete",
+            headers=_headers(task, vm="agent-vm-resident-poll"),
+            json={
+                **identity,
+                "claim_id": claim.json()["claim_id"],
+                "owner": "fast",
+                "content": f"I will investigate {delivery_key} and follow up.",
+                "idempotency_key": f"typed-workday-result-source:{delivery_key}",
+                "envelope": claim.json()["envelope"],
+                "workday_request": {
+                    "delivery_key": delivery_key,
+                    "question": f"Investigate {delivery_key} privately.",
+                },
+            },
+        )
+        assert completed.status_code == 200, completed.text
+        packet_claim = await client.post(
+            f"/api/agent/projects/{project.id}/workday-consultations/claim-next",
+            headers=_headers(task, vm="agent-vm-resident-poll"),
+            json={**identity, "lease_seconds": 45},
+        )
+        assert packet_claim.status_code == 200, packet_claim.text
+        packet = packet_claim.json()["packet"]
+        assert packet["packet_id"] == completed.json()["workday_packet"]["packet_id"]
+        acknowledged = await client.post(
+            f"/api/agent/projects/{project.id}/workday-consultations/"
+            f"{packet['packet_id']}/ack",
+            headers=_headers(task, vm="agent-vm-resident-poll"),
+            json={
+                **identity,
+                "workday_claim_id": packet["workday_claim_id"],
+                "outcome": "completed",
+                "result_summary": summary,
+            },
+        )
+        assert acknowledged.status_code == 200, acknowledged.text
+        results = (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.content == summary,
+                )
+            )
+        ).scalars().all()
+        result = next(
+            row
+            for row in results
+            if (row.context or {}).get("_workday_consultation_result") is True
+        )
+        assert result.idempotency_key == (
+            f"workday-consultation-result:{packet['packet_id']}:"
+            f"{packet['workday_claim_id']}"
+        )
+        return result
+
+    stale = await create_canonical_result(
+        sequence=1,
+        delivery_key="stale",
+        summary="stale result must never be surfaced",
     )
-    valid = await _add_message(
-        db_session,
-        project,
-        sequence=21,
-        surface=MessageSurface.CONVERSATION,
-        message_type=MessageType.NOTE,
-        from_type="system",
-        status="open",
-        handling_state=MessageHandlingState.PENDING,
-        content="valid checked result",
-        resident_session_id="resident-session",
-        context={**common_context, "delivery_key": "valid", "envelope": live_reference},
+    valid = await create_canonical_result(
+        sequence=2,
+        delivery_key="valid",
+        summary="valid checked result",
     )
+    stale_id = stale.id
+    valid_id = valid.id
+    assert await get_fenced_context_envelope_by_reference(
+        db_session,
+        project_id=project.id,
+        reference=(valid.context or {}).get("envelope"),
+    ) is not None
+    stale_context = dict(stale.context or {})
+    stale_snapshot = await db_session.get(
+        StrategicContextEnvelopeSnapshot,
+        uuid.UUID(str(stale_context["envelope"]["snapshot_id"])),
+    )
+    assert stale_snapshot is not None
+    await db_session.delete(stale_snapshot)
+    await db_session.commit()
+    assert await get_fenced_context_envelope_by_reference(
+        db_session,
+        project_id=project.id,
+        reference=(valid.context or {}).get("envelope"),
+    ) is not None
 
     response = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/"
         "continuations/claim-next",
         headers=_headers(task, vm="agent-vm-resident-poll"),
-        json={
-            "task_id": str(task.id),
-            "session_id": "resident-session",
-            "worker_generation": 2,
-            "incarnation_id": incarnation,
-            "lease_seconds": 45,
-        },
+        json={**identity, "lease_seconds": 45},
     )
 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "claimed"
-    assert response.json()["continuation"]["result_packet_id"] == str(valid.id)
-    assert response.json()["continuation"]["result_summary"] == "valid checked result"
-    await db_session.refresh(stale)
-    retired = stale
+    continuation = response.json()["continuation"]
+    assert continuation["result_summary"] == "valid checked result"
+    assert continuation["result_packet_id"] == str(valid_id)
+    recovery = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.idempotency_key
+                == "workday-consultation-terminal-recovery:"
+                f"{stale_context['_workday_consultation_atomic_reply_id']}",
+            )
+        )
+    ).scalar_one()
+    assert recovery.id not in {stale_id, valid_id}
+    assert recovery.status == "open"
+    assert recovery.handling_state == MessageHandlingState.PENDING
+    assert recovery.content.startswith(
+        "The private Workday consultation became unavailable"
+    )
+    retired = await db_session.get(
+        ProjectMessage,
+        stale_id,
+        populate_existing=True,
+    )
+    assert retired is not None
     assert retired.status == "resolved"
     assert retired.handling_state == MessageHandlingState.SUPERSEDED
     assert retired.handled_by_task_id is None

@@ -284,6 +284,7 @@ _VALID_NOTIFICATION_EVENTS = frozenset(
         "AUTO_FIX_ESCALATED",
         "REMEDIATION_ESCALATED",
         "DIRECTION_MILESTONE",
+        "DIRECTION_STAGED_ACTIVATED",
         # Residual remediation lifecycle (mirrors AUTO_FIX_*).
         # SPAWNED/MERGED are noisier — opt-in only. ESCALATED is BLOCKER
         # severity and joins the default-on list per the

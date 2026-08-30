@@ -25,7 +25,10 @@ from app.models import (
     WakeDeliveryState,
     TASK_PARKABLE_STATUSES,
 )
-from app.task_blocked import reset_task_for_fresh_attempt
+from app.task_blocked import (
+    PARKED_AGENT_VM_CONTEXT_KEY,
+    reset_task_for_fresh_attempt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +361,18 @@ async def park_task(
     # can't find the member and it stays LEASED forever, silently exhausting pool
     # capacity. Best-effort: a pool failure must never block the park itself.
     _park_pool_vm_id = task.vm_instance_id
+    park_context = dict(task.context or {})
+    if _park_pool_vm_id:
+        # This value is derived from the locked Task row, never from the
+        # agent-authored park payload/source_metadata.  It is the authority
+        # proof used for a bounded lost-response retry after the live VM field
+        # is cleared below.
+        park_context[PARKED_AGENT_VM_CONTEXT_KEY] = str(_park_pool_vm_id)
+    else:
+        # A programmatic park without a live VM must not retain a stale or
+        # client-seeded identity from an earlier attempt.
+        park_context.pop(PARKED_AGENT_VM_CONTEXT_KEY, None)
+    task.context = park_context
     if _park_pool_vm_id:
         try:
             from app.models import PoolVmState

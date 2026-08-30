@@ -151,6 +151,8 @@ export interface ResidentStreamEvent {
   toolUseId?: string;
   /** for a 'tool_result' event: the tool reported an error (non-zero exit for Bash). */
   isError?: boolean;
+  /** Bounded raw tool-result text retained only for exact acknowledgement parsing. */
+  toolResultText?: string;
   /** session id when the event carried one (system init, result) */
   sessionId?: string;
   /** true for a TOP-LEVEL result event — the completion signal for the active turn */
@@ -350,6 +352,7 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
     // failure signal in that shape; treating it as ordinary success makes the
     // Resident keep waiting/retrying the same dead account until hard timeout.
     const structuredApiError = terminalReason === 'api_error'
+      || terminalReason === 'aborted_streaming'
       || (apiErrorStatus !== undefined && apiErrorStatus >= 400);
     events.push({
       kind: 'result', text: result, isError: obj.is_error === true || structuredApiError,
@@ -382,9 +385,21 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
           const toolUseId = typeof block.tool_use_id === 'string' && block.tool_use_id
             ? block.tool_use_id : undefined;
           const activity = describeToolResult(block);
+          const rawContent = block.content;
+          const toolResultText = typeof rawContent === 'string'
+            ? rawContent.slice(0, 16_384)
+            : Array.isArray(rawContent)
+              ? rawContent.flatMap((item) => (
+                  item && typeof item === 'object'
+                    && (item as Record<string, unknown>).type === 'text'
+                    && typeof (item as Record<string, unknown>).text === 'string'
+                    ? [(item as Record<string, unknown>).text as string]
+                    : []
+                )).join('\n').slice(0, 16_384)
+              : undefined;
           events.push({
             kind: 'tool_result', toolUseId, isError: block.is_error === true, nested, sessionId,
-            activityKind: activity.kind, activityText: activity.text,
+            activityKind: activity.kind, activityText: activity.text, toolResultText,
           });
         }
       }

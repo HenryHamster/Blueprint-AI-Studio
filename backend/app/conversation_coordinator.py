@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any
 
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -84,6 +85,16 @@ class WorkdayConsultationClaim:
     workday_claim_id: uuid.UUID
     lease_expires_at: datetime
     attempt: int
+    prior_attempts: tuple[dict[str, Any], ...] = ()
+    prior_receipts: tuple[dict[str, Any], ...] = ()
+
+
+class WorkdayConsultationPacketProvenanceInvalid(ValueError):
+    """A private packet cannot be projected without trusting corrupt state."""
+
+    def __init__(self, packet_id: uuid.UUID):
+        super().__init__("Workday consultation packet provenance is invalid")
+        self.packet_id = packet_id
 
 
 @dataclass(frozen=True)
@@ -121,7 +132,14 @@ _CONSULTATION_REQUESTED_CONTEXT_KEY = "_workday_consultation_requested"
 _WORKDAY_LAST_FAILURE_CONTEXT_KEY = "_workday_consultation_last_failure"
 _WORKDAY_ATTEMPTS_CONTEXT_KEY = "_workday_consultation_attempts"
 _WORKDAY_ATTEMPT_LIMIT = 8
+_WORKDAY_CLAIM_AUTHORITIES_CONTEXT_KEY = "_workday_consultation_claim_authorities"
 _WORKDAY_CLAIM_STARTED_CONTEXT_KEY = "_workday_consultation_claim_started_at"
+_WORKDAY_SERVER_MISSING_PREDICATES = frozenset(
+    {
+        "claim_lease_expired_without_ack",
+        "resident_session_handoff_without_ack",
+    }
+)
 # A packet reclaimed this many times without a terminal ack is parked
 # (finalized as 'failed') at claim time instead of being requeued forever. A
 # live worker is expected to self-escalate to a 'failed' ack by attempt 2
@@ -871,6 +889,10 @@ async def create_or_get_workday_consultation_packet(
         if (
             existing.from_type != "system"
             or existing.surface != MessageSurface.CONVERSATION
+            or (
+                atomic_public_reply_id is not None
+                and existing.reply_to_message_id != atomic_public_reply_id
+            )
             or {key: existing_context.get(key) for key in expected_context}
             != expected_context
         ):
@@ -922,6 +944,7 @@ async def create_or_get_workday_consultation_packet(
         ),
         idempotency_key=idempotency_key,
         resident_session_id=resident_session_id,
+        reply_to_message_id=atomic_public_reply_id,
     )
     session.add(packet)
     await session.flush()
@@ -944,14 +967,17 @@ def _workday_claim_expiry(value: Any) -> datetime | None:
 def _is_workday_consultation_packet(
     row: ProjectMessage,
     *,
-    resident_session_id: str,
+    resident_session_id: str | None,
 ) -> bool:
     context = row.context if isinstance(row.context, dict) else {}
     return bool(
         row.from_type == "system"
         and row.surface == MessageSurface.CONVERSATION
         and row.status == "open"
-        and row.resident_session_id == resident_session_id
+        and (
+            resident_session_id is None
+            or row.resident_session_id == resident_session_id
+        )
         and context.get(_CONSULTATION_PACKET_CONTEXT_KEY) is True
         and context.get("audience") == STRATEGIST_INTERNAL
         and context.get("message_role") == "workday_consultation"
@@ -968,14 +994,17 @@ def _is_workday_consultation_packet(
 def _is_workday_consultation_result(
     row: ProjectMessage,
     *,
-    resident_session_id: str,
+    resident_session_id: str | None,
 ) -> bool:
     context = row.context if isinstance(row.context, dict) else {}
     return bool(
         row.from_type == "system"
         and row.surface == MessageSurface.CONVERSATION
         and row.status == "open"
-        and row.resident_session_id == resident_session_id
+        and (
+            resident_session_id is None
+            or row.resident_session_id == resident_session_id
+        )
         and context.get(_CONSULTATION_RESULT_CONTEXT_KEY) is True
         and context.get("audience") == STRATEGIST_INTERNAL
         and context.get("message_role") == "workday_consultation_result"
@@ -1131,6 +1160,249 @@ def _append_workday_attempt(
     context[_WORKDAY_ATTEMPTS_CONTEXT_KEY] = attempts[-_WORKDAY_ATTEMPT_LIMIT:]
 
 
+def _workday_claim_authorities(context: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = context.get(_WORKDAY_CLAIM_AUTHORITIES_CONTEXT_KEY)
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > _WORKDAY_ATTEMPT_LIMIT:
+        raise ValueError("consultation claim authority history is invalid")
+    authorities: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("consultation claim authority is invalid")
+        try:
+            claim_id = str(uuid.UUID(str(item.get("workday_claim_id"))))
+            task_id = str(uuid.UUID(str(item.get("task_id"))))
+            incarnation = str(uuid.UUID(str(item.get("worker_incarnation"))))
+        except (TypeError, ValueError, AttributeError):
+            raise ValueError("consultation claim authority identity is invalid") from None
+        attempt = item.get("attempt")
+        generation = item.get("worker_generation")
+        session_id = item.get("resident_session_id")
+        issued_at = _workday_claim_expiry(item.get("issued_at"))
+        diagnostic_state = item.get("diagnostic_state")
+        if (
+            claim_id in seen
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or not 1 <= attempt <= _WORKDAY_ATTEMPT_LIMIT
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 1
+            or not isinstance(session_id, str)
+            or not session_id
+            or issued_at is None
+            or diagnostic_state
+            not in {"open", "server_missing", "recorded", "acknowledged"}
+        ):
+            raise ValueError("consultation claim authority is invalid")
+        seen.add(claim_id)
+        authorities.append(
+            {
+                "workday_claim_id": claim_id,
+                "attempt": attempt,
+                "task_id": task_id,
+                "resident_session_id": session_id,
+                "worker_generation": generation,
+                "worker_incarnation": incarnation,
+                "issued_at": issued_at.replace(tzinfo=timezone.utc).isoformat(),
+                "diagnostic_state": diagnostic_state,
+            }
+        )
+    return authorities
+
+
+def _register_workday_claim_authority(
+    context: dict[str, Any],
+    *,
+    workday_claim_id: uuid.UUID,
+    attempt: int,
+    task_id: uuid.UUID,
+    resident_session_id: str,
+    worker_generation: int,
+    worker_incarnation: uuid.UUID,
+    issued_at: datetime,
+) -> dict[str, Any]:
+    authorities = _workday_claim_authorities(context)
+    candidate = {
+        "workday_claim_id": str(workday_claim_id),
+        "attempt": attempt,
+        "task_id": str(task_id),
+        "resident_session_id": resident_session_id,
+        "worker_generation": worker_generation,
+        "worker_incarnation": str(worker_incarnation),
+        "issued_at": issued_at.replace(tzinfo=timezone.utc).isoformat(),
+        "diagnostic_state": "open",
+    }
+    prior = next(
+        (
+            item
+            for item in authorities
+            if item["workday_claim_id"] == candidate["workday_claim_id"]
+        ),
+        None,
+    )
+    if prior is not None:
+        if {**prior, "diagnostic_state": "open"} != candidate:
+            raise ValueError("consultation claim authority conflicts")
+        return prior
+    authorities.append(candidate)
+    context[_WORKDAY_CLAIM_AUTHORITIES_CONTEXT_KEY] = authorities[
+        -_WORKDAY_ATTEMPT_LIMIT:
+    ]
+    return candidate
+
+
+def _set_workday_claim_diagnostic_state(
+    context: dict[str, Any], workday_claim_id: uuid.UUID, state: str
+) -> dict[str, Any]:
+    authorities = _workday_claim_authorities(context)
+    matched = next(
+        (
+            item
+            for item in authorities
+            if item["workday_claim_id"] == str(workday_claim_id)
+        ),
+        None,
+    )
+    if matched is None:
+        raise ValueError("consultation claim diagnostic authority is absent")
+    matched["diagnostic_state"] = state
+    context[_WORKDAY_CLAIM_AUTHORITIES_CONTEXT_KEY] = authorities
+    return matched
+
+
+def _is_server_missing_workday_attempt(value: object) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and value.get("terminal_predicate") in _WORKDAY_SERVER_MISSING_PREDICATES
+        and value.get("provider_terminal_reason") is None
+        and value.get("provider_output_tail") is None
+        and value.get("tool_call_count") == 0
+        and value.get("tool_call_duration_ms") == 0
+        and value.get("result_chars") == 0
+        and isinstance(value.get("trace"), list)
+        and len(value["trace"]) <= 1
+        and value.get("trace_truncated") is True
+    )
+
+
+def retain_workday_consultation_attempt_for_session_handoff(
+    context: object,
+    *,
+    task_id: uuid.UUID | None,
+    resident_session_id: str | None,
+    now: datetime,
+) -> dict[str, Any]:
+    """Freeze the displaced private attempt before session ownership clears."""
+
+    normalized = dict(context) if isinstance(context, dict) else {}
+    if normalized.get(_CONSULTATION_PACKET_CONTEXT_KEY) is not True:
+        return normalized
+    claim_id_raw = normalized.get(_WORKDAY_CLAIM_ID_CONTEXT_KEY)
+    if claim_id_raw is None:
+        return normalized
+    try:
+        claim_id = uuid.UUID(str(claim_id_raw))
+        attempt = int(normalized.get(_WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY))
+        generation = int(normalized.get(_WORKDAY_CLAIM_GENERATION_CONTEXT_KEY))
+        incarnation = uuid.UUID(
+            str(normalized.get(_WORKDAY_CLAIM_INCARNATION_CONTEXT_KEY))
+        )
+    except (TypeError, ValueError, AttributeError):
+        raise ValueError("consultation handoff claim identity is invalid") from None
+    started_at = _workday_claim_expiry(
+        normalized.get(_WORKDAY_CLAIM_STARTED_CONTEXT_KEY)
+    ) or now
+    if (
+        task_id is None
+        or not resident_session_id
+        or not 1 <= attempt <= _WORKDAY_ATTEMPT_LIMIT
+        or generation < 1
+    ):
+        raise ValueError("consultation handoff claim owner is invalid")
+    authority = _register_workday_claim_authority(
+        normalized,
+        workday_claim_id=claim_id,
+        attempt=attempt,
+        task_id=task_id,
+        resident_session_id=resident_session_id,
+        worker_generation=generation,
+        worker_incarnation=incarnation,
+        issued_at=started_at,
+    )
+    attempts = bounded_workday_consultation_attempts(normalized)
+    prior = next(
+        (
+            item
+            for item in attempts
+            if item["workday_claim_id"] == str(claim_id)
+        ),
+        None,
+    )
+    if prior is None:
+        elapsed_ms = min(
+            86_400_000,
+            max(0, int((now - started_at).total_seconds() * 1_000)),
+        )
+        _append_workday_attempt(
+            normalized,
+            _normalize_workday_attempt_diagnostic(
+                {
+                    "attempt": attempt,
+                    "workday_claim_id": str(claim_id),
+                    "outcome": "abandoned",
+                    "terminal_predicate": "resident_session_handoff_without_ack",
+                    "provider_terminal_reason": None,
+                    "provider_output_tail": None,
+                    "started_at": started_at.isoformat(),
+                    "ended_at": now.isoformat(),
+                    "turn_ms": elapsed_ms,
+                    "ttft_ms": None,
+                    "tool_call_count": 0,
+                    "tool_call_duration_ms": 0,
+                    "result_chars": 0,
+                    "trace": [
+                        {
+                            "elapsed_ms": elapsed_ms,
+                            "kind": "error",
+                            "label": "provider_diagnostic_missing",
+                            "is_error": True,
+                        }
+                    ],
+                    "trace_truncated": True,
+                }
+            ),
+        )
+        _set_workday_claim_diagnostic_state(normalized, claim_id, "server_missing")
+    elif authority["diagnostic_state"] in {"recorded", "acknowledged"}:
+        pass
+    elif (
+        authority["diagnostic_state"] == "server_missing"
+        and _is_server_missing_workday_attempt(prior)
+    ):
+        pass
+    else:
+        raise ValueError("consultation handoff attempt history conflicts")
+    # The authority row and attempt diagnostic above are the durable record of
+    # the displaced claim.  Its mutable lease fields must not survive after
+    # session_message_handoff clears the row owner: a replacement Resident
+    # would otherwise be forced to reconstruct the predecessor from owner
+    # columns that are intentionally NULL at the handoff boundary.  Historical
+    # receipts remain bound to the immutable authority row; only the next live
+    # claimant may mint new lease authority.
+    for key in (
+        _WORKDAY_CLAIM_ID_CONTEXT_KEY,
+        _WORKDAY_CLAIM_GENERATION_CONTEXT_KEY,
+        _WORKDAY_CLAIM_INCARNATION_CONTEXT_KEY,
+        _WORKDAY_CLAIM_EXPIRES_CONTEXT_KEY,
+        _WORKDAY_CLAIM_STARTED_CONTEXT_KEY,
+    ):
+        normalized.pop(key, None)
+    return normalized
+
+
 def _legacy_workday_attempt_diagnostic(
     context: dict[str, Any],
     *,
@@ -1209,6 +1481,213 @@ def bounded_workday_consultation_attempts(context: object) -> list[dict[str, Any
     ]
 
 
+async def record_workday_consultation_attempt_diagnostic(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    packet_id: uuid.UUID,
+    task_id: uuid.UUID,
+    resident_session_id: str,
+    worker_generation: int,
+    worker_incarnation: uuid.UUID,
+    workday_claim_id: uuid.UUID,
+    attempt_diagnostic: dict[str, Any],
+) -> tuple[str, str, dict[str, Any]]:
+    """Persist provider evidence without granting completion authority.
+
+    A superseded worker may use this path only when the packet's server-issued
+    claim ledger proves the exact historical owner tuple.  The write never
+    changes the packet lease, owner, status, result content, receipts, or ack;
+    it can only add an absent diagnostic or replace one exact server-authored
+    missing-evidence placeholder.
+    """
+
+    row = (
+        await session.execute(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.id == packet_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise ValueError("consultation packet does not exist")
+    context = dict(row.context or {})
+    if not (
+        row.from_type == "system"
+        and row.surface == MessageSurface.CONVERSATION
+        and context.get(_CONSULTATION_PACKET_CONTEXT_KEY) is True
+        and context.get("audience") == STRATEGIST_INTERNAL
+        and context.get("message_role") == "workday_consultation"
+        and context.get("public_reply_owner")
+        == ConversationPublicReplyOwner.FAST.value
+    ):
+        raise ValueError("consultation packet provenance is invalid")
+    diagnostic = _normalize_workday_attempt_diagnostic(attempt_diagnostic)
+    if (
+        diagnostic["workday_claim_id"] != str(workday_claim_id)
+        or diagnostic["outcome"] == "completed"
+        or diagnostic["terminal_predicate"] in _WORKDAY_SERVER_MISSING_PREDICATES
+        or diagnostic["terminal_predicate"] == "server_claim_attempt_cap"
+    ):
+        raise ValueError("consultation attempt diagnostic is not reportable")
+    authorities = _workday_claim_authorities(context)
+    authority = next(
+        (
+            item
+            for item in authorities
+            if item["workday_claim_id"] == str(workday_claim_id)
+        ),
+        None,
+    )
+    if authority is None or (
+        authority["attempt"] != diagnostic["attempt"]
+        or authority["task_id"] != str(task_id)
+        or authority["resident_session_id"] != resident_session_id
+        or authority["worker_generation"] != worker_generation
+        or authority["worker_incarnation"] != str(worker_incarnation)
+    ):
+        raise ValueError("consultation attempt diagnostic authority is absent")
+    attempts = bounded_workday_consultation_attempts(context)
+    prior_index = next(
+        (
+            index
+            for index, item in enumerate(attempts)
+            if item["workday_claim_id"] == str(workday_claim_id)
+        ),
+        None,
+    )
+    if prior_index is None:
+        if authority["diagnostic_state"] != "open":
+            raise ValueError("consultation attempt diagnostic state conflicts")
+        attempts.append(diagnostic)
+        disposition = "recorded"
+    else:
+        prior = attempts[prior_index]
+        if prior == diagnostic and authority["diagnostic_state"] in {
+            "recorded",
+            "acknowledged",
+        }:
+            disposition = "duplicate"
+        elif (
+            authority["diagnostic_state"] == "server_missing"
+            and _is_server_missing_workday_attempt(prior)
+        ):
+            attempts[prior_index] = diagnostic
+            disposition = "upgraded"
+        else:
+            raise ValueError("consultation attempt diagnostic conflicts")
+    context[_WORKDAY_ATTEMPTS_CONTEXT_KEY] = attempts[-_WORKDAY_ATTEMPT_LIMIT:]
+
+    result_rows = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.reply_to_message_id == packet_id,
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    canonical_results = [
+        result
+        for result in result_rows
+        if isinstance(result.context, dict)
+        and result.context.get(_CONSULTATION_RESULT_CONTEXT_KEY) is True
+        and result.context.get("source_packet_id") == str(packet_id)
+    ]
+    if len(canonical_results) > 1 or (row.status != "open" and not canonical_results):
+        raise ValueError("consultation result diagnostic projection is invalid")
+    if canonical_results:
+        result = canonical_results[0]
+        result_context = dict(result.context or {})
+        result_attempts = bounded_workday_consultation_attempts(result_context)
+        result_index = next(
+            (
+                index
+                for index, item in enumerate(result_attempts)
+                if item["workday_claim_id"] == str(workday_claim_id)
+            ),
+            None,
+        )
+        if result_index is None:
+            if disposition == "duplicate":
+                raise ValueError("consultation result diagnostic is missing")
+            result_attempts.append(diagnostic)
+        elif result_attempts[result_index] != diagnostic:
+            if not _is_server_missing_workday_attempt(result_attempts[result_index]):
+                raise ValueError("consultation result diagnostic conflicts")
+            result_attempts[result_index] = diagnostic
+        result_context[_WORKDAY_ATTEMPTS_CONTEXT_KEY] = result_attempts[
+            -_WORKDAY_ATTEMPT_LIMIT:
+        ]
+        result.context = result_context
+        session.add(result)
+
+    state = "acknowledged" if canonical_results else "recorded"
+    _set_workday_claim_diagnostic_state(context, workday_claim_id, state)
+    row.context = context
+    session.add(row)
+    await session.flush()
+    return disposition, state, diagnostic
+
+
+async def read_workday_consultation_attempt_diagnostic(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    packet_id: uuid.UUID,
+    task_id: uuid.UUID,
+    resident_session_id: str,
+    worker_generation: int,
+    worker_incarnation: uuid.UUID,
+    workday_claim_id: uuid.UUID,
+) -> tuple[str, dict[str, Any] | None]:
+    """Read the exact diagnostic receipt without changing packet state."""
+
+    row = (
+        await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.id == packet_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise ValueError("consultation packet does not exist")
+    context = dict(row.context or {})
+    authority = next(
+        (
+            item
+            for item in _workday_claim_authorities(context)
+            if item["workday_claim_id"] == str(workday_claim_id)
+        ),
+        None,
+    )
+    if authority is None or (
+        authority["task_id"] != str(task_id)
+        or authority["resident_session_id"] != resident_session_id
+        or authority["worker_generation"] != worker_generation
+        or authority["worker_incarnation"] != str(worker_incarnation)
+    ):
+        raise ValueError("consultation attempt diagnostic authority is absent")
+    diagnostic = next(
+        (
+            item
+            for item in bounded_workday_consultation_attempts(context)
+            if item["workday_claim_id"] == str(workday_claim_id)
+        ),
+        None,
+    )
+    return authority["diagnostic_state"], diagnostic
+
+
 async def _finalize_workday_consultation_packet(
     session: AsyncSession,
     *,
@@ -1216,9 +1695,6 @@ async def _finalize_workday_consultation_packet(
     packet_id: uuid.UUID,
     row: ProjectMessage,
     context: dict[str, Any],
-    task_id: uuid.UUID,
-    worker_generation: int,
-    worker_incarnation: uuid.UUID,
     resident_session_id: str,
     workday_claim_id: uuid.UUID,
     outcome: str,
@@ -1235,19 +1711,15 @@ async def _finalize_workday_consultation_packet(
     from app.strategic_workday_mutation_rebind import (
         WORKDAY_MUTATION_RECEIPTS_CONTEXT_KEY,
         WORKDAY_MUTATION_RECEIPTS_HAS_MORE_CONTEXT_KEY,
-        bounded_workday_mutation_receipts,
+        authoritative_workday_operation_receipts,
         workday_mutation_receipts_have_more,
     )
 
     # A retry is a continuation of the same packet, so its result must expose
     # every durable receipt, not only writes made under the final claim id.
-    mutation_receipts = bounded_workday_mutation_receipts(
+    mutation_receipts = authoritative_workday_operation_receipts(
         context,
         packet_id=packet_id,
-        task_id=task_id,
-        resident_session_id=resident_session_id,
-        worker_generation=worker_generation,
-        limit=64,
     )
     mutation_receipts_have_more = workday_mutation_receipts_have_more(context)
     result_key = f"workday-consultation-result:{packet_id}:{workday_claim_id}"
@@ -1315,6 +1787,12 @@ async def _finalize_workday_consultation_packet(
             != result_context
         ):
             raise ValueError("consultation result idempotency key conflicts")
+        if existing_result.reply_to_message_id is None:
+            existing_result.reply_to_message_id = packet_id
+            session.add(existing_result)
+            await session.flush()
+        elif existing_result.reply_to_message_id != packet_id:
+            raise ValueError("consultation result relational lineage conflicts")
     else:
         sequence = await lock_project_and_next_message_sequence(session, project_id)
         result = await build_project_message(
@@ -1329,6 +1807,7 @@ async def _finalize_workday_consultation_packet(
             context=result_context,
             idempotency_key=result_key,
             resident_session_id=resident_session_id,
+            reply_to_message_id=packet_id,
         )
         session.add(result)
     context[_WORKDAY_ACK_CLAIM_ID_CONTEXT_KEY] = str(workday_claim_id)
@@ -1431,7 +1910,9 @@ async def claim_next_workday_consultation_packet(
                     ProjectMessage.handling_state.in_(
                         (MessageHandlingState.PENDING, MessageHandlingState.CLAIMED)
                     ),
-                    ProjectMessage.resident_session_id == resident_session_id,
+                    ProjectMessage.context[_CONSULTATION_PACKET_CONTEXT_KEY]
+                    .as_boolean()
+                    .is_(True),
                 )
                 .order_by(*_message_ordering())
                 .with_for_update()
@@ -1441,11 +1922,29 @@ async def claim_next_workday_consultation_packet(
         .all()
     )
     for row in rows:
-        if not _is_workday_consultation_packet(
-            row, resident_session_id=resident_session_id
-        ):
+        if not _is_workday_consultation_packet(row, resident_session_id=None):
             continue
         context = dict(row.context or {})
+        from app.strategic_workday_mutation_rebind import (
+            authoritative_workday_operation_receipts,
+        )
+
+        try:
+            bounded_workday_consultation_attempts(context)
+            prior_receipts = authoritative_workday_operation_receipts(
+                context,
+                packet_id=row.id,
+            )
+            prior_attempt = context.get(_WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY, 0)
+            if (
+                not isinstance(prior_attempt, int)
+                or isinstance(prior_attempt, bool)
+                or prior_attempt < 0
+                or prior_attempt >= _WORKDAY_CONSULTATION_MAX_UNACKED_CLAIMS
+            ):
+                raise ValueError("consultation claim attempt is invalid")
+        except (HTTPException, ValueError) as exc:
+            raise WorkdayConsultationPacketProvenanceInvalid(row.id) from exc
         prior_claim_id_raw = context.get(_WORKDAY_CLAIM_ID_CONTEXT_KEY)
         prior_expires_at = _workday_claim_expiry(
             context.get(_WORKDAY_CLAIM_EXPIRES_CONTEXT_KEY)
@@ -1454,6 +1953,7 @@ async def claim_next_workday_consultation_packet(
         prior_incarnation = context.get(_WORKDAY_CLAIM_INCARNATION_CONTEXT_KEY)
         same_owner = (
             row.handling_state == MessageHandlingState.CLAIMED
+            and row.resident_session_id == resident_session_id
             and row.handled_by_task_id == task_id
             and prior_generation == worker_generation
             and str(prior_incarnation) == str(worker_incarnation)
@@ -1471,7 +1971,6 @@ async def claim_next_workday_consultation_packet(
         except (TypeError, ValueError, AttributeError):
             workday_claim_id = uuid.uuid4()
             same_owner = False
-        prior_attempt = int(context.get(_WORKDAY_CLAIM_ATTEMPT_CONTEXT_KEY) or 0)
         if not same_owner and prior_claim_id_raw is not None and prior_attempt >= 1:
             # A dead worker cannot send an ack. Preserve that attempt explicitly
             # at the reclaim boundary instead of letting it disappear behind the
@@ -1479,12 +1978,43 @@ async def claim_next_workday_consultation_packet(
             prior_started_at = _workday_claim_expiry(
                 context.get(_WORKDAY_CLAIM_STARTED_CONTEXT_KEY)
             ) or now
-            elapsed_ms = max(0, int((now - prior_started_at).total_seconds() * 1000))
             try:
+                prior_claim_id = uuid.UUID(str(prior_claim_id_raw))
+                if (
+                    row.handled_by_task_id is None
+                    or not isinstance(row.resident_session_id, str)
+                    or not row.resident_session_id
+                    or not isinstance(prior_generation, int)
+                    or isinstance(prior_generation, bool)
+                    or prior_generation < 1
+                ):
+                    raise ValueError("expired consultation claim owner is invalid")
+                prior_authority = _register_workday_claim_authority(
+                    context,
+                    workday_claim_id=prior_claim_id,
+                    attempt=prior_attempt,
+                    task_id=row.handled_by_task_id,
+                    resident_session_id=row.resident_session_id,
+                    worker_generation=prior_generation,
+                    worker_incarnation=uuid.UUID(str(prior_incarnation)),
+                    issued_at=prior_started_at,
+                )
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise WorkdayConsultationPacketProvenanceInvalid(row.id) from exc
+            elapsed_ms = max(0, int((now - prior_started_at).total_seconds() * 1000))
+            prior_diagnostic = next(
+                (
+                    item
+                    for item in bounded_workday_consultation_attempts(context)
+                    if item.get("workday_claim_id") == str(prior_claim_id)
+                ),
+                None,
+            )
+            if prior_diagnostic is None:
                 expired_diagnostic = _normalize_workday_attempt_diagnostic(
                     {
                         "attempt": prior_attempt,
-                        "workday_claim_id": str(uuid.UUID(str(prior_claim_id_raw))),
+                        "workday_claim_id": str(prior_claim_id),
                         "outcome": "abandoned",
                         "terminal_predicate": "claim_lease_expired_without_ack",
                         "provider_terminal_reason": None,
@@ -1496,17 +2026,30 @@ async def claim_next_workday_consultation_packet(
                         "tool_call_count": 0,
                         "tool_call_duration_ms": 0,
                         "result_chars": 0,
-                        "trace": [],
-                        "trace_truncated": False,
+                        "trace": [
+                            {
+                                "elapsed_ms": min(elapsed_ms, 86_400_000),
+                                "kind": "error",
+                                "label": "provider_diagnostic_missing",
+                                "is_error": True,
+                            }
+                        ],
+                        "trace_truncated": True,
                     }
                 )
                 _append_workday_attempt(context, expired_diagnostic)
-            except ValueError:
-                logger.exception(
-                    "failed to retain expired consultation attempt: packet=%s claim=%s",
-                    row.id,
-                    prior_claim_id_raw,
+                _set_workday_claim_diagnostic_state(
+                    context, prior_claim_id, "server_missing"
                 )
+            elif prior_authority["diagnostic_state"] in {"recorded", "acknowledged"}:
+                pass
+            elif (
+                prior_authority["diagnostic_state"] == "server_missing"
+                and _is_server_missing_workday_attempt(prior_diagnostic)
+            ):
+                pass
+            else:
+                raise WorkdayConsultationPacketProvenanceInvalid(row.id)
         attempt = prior_attempt
         if not same_owner:
             attempt += 1
@@ -1544,9 +2087,6 @@ async def claim_next_workday_consultation_packet(
                 packet_id=row.id,
                 row=row,
                 context=context,
-                task_id=task_id,
-                worker_generation=worker_generation,
-                worker_incarnation=worker_incarnation,
                 resident_session_id=resident_session_id,
                 workday_claim_id=workday_claim_id,
                 outcome="failed",
@@ -1570,6 +2110,31 @@ async def claim_next_workday_consultation_packet(
                 ),
             }
         )
+        try:
+            _register_workday_claim_authority(
+                context,
+                workday_claim_id=workday_claim_id,
+                attempt=attempt,
+                task_id=task_id,
+                resident_session_id=resident_session_id,
+                worker_generation=worker_generation,
+                worker_incarnation=worker_incarnation,
+                issued_at=_workday_claim_expiry(
+                    context[_WORKDAY_CLAIM_STARTED_CONTEXT_KEY]
+                )
+                or now,
+            )
+        except ValueError as exc:
+            raise WorkdayConsultationPacketProvenanceInvalid(row.id) from exc
+        if row.resident_session_id != resident_session_id:
+            from app.session_message_handoff import (
+                RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
+            )
+
+            prior_session_id = str(row.resident_session_id or "").strip()
+            if prior_session_id:
+                context[RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY] = prior_session_id
+            row.resident_session_id = resident_session_id
         row.context = context
         row.handling_state = MessageHandlingState.CLAIMED
         row.handled_by_task_id = task_id
@@ -1581,6 +2146,8 @@ async def claim_next_workday_consultation_packet(
             workday_claim_id=workday_claim_id,
             lease_expires_at=expires_at,
             attempt=attempt,
+            prior_attempts=tuple(bounded_workday_consultation_attempts(context)),
+            prior_receipts=tuple(prior_receipts),
         )
     return None
 
@@ -1726,6 +2293,29 @@ async def acknowledge_workday_consultation_packet(
             attempts = context.get(_WORKDAY_ATTEMPTS_CONTEXT_KEY)
             if not isinstance(attempts, list) or diagnostic not in attempts:
                 raise ValueError("completed consultation attempt diagnostic conflicts")
+            stored_result_summary = context.get(
+                _WORKDAY_RESULT_SUMMARY_CONTEXT_KEY
+            )
+            if not isinstance(stored_result_summary, str) or not stored_result_summary:
+                raise ValueError("completed consultation result receipt is invalid")
+            # A pre-relational deployment may have committed the exact result
+            # row before its packet FK existed.  An exact lost-response retry
+            # is the only safe repair boundary: the server-derived result key,
+            # immutable content/context projection, and terminal packet
+            # receipt must all match before _finalize may fill a NULL link.
+            await _finalize_workday_consultation_packet(
+                session,
+                project_id=project_id,
+                packet_id=packet_id,
+                row=row,
+                context=context,
+                resident_session_id=resident_session_id,
+                workday_claim_id=workday_claim_id,
+                outcome=outcome,
+                result_summary=stored_result_summary,
+                now=now,
+            )
+            await session.flush()
             return True
         raise ValueError("consultation packet is unavailable")
     if outcome not in {"completed", "abandoned", "failed"}:
@@ -1756,6 +2346,13 @@ async def acknowledge_workday_consultation_packet(
     ):
         raise ValueError("consultation attempt diagnostics do not match the claim")
     _append_workday_attempt(context, diagnostic)
+    if any(
+        item["workday_claim_id"] == str(workday_claim_id)
+        for item in _workday_claim_authorities(context)
+    ):
+        _set_workday_claim_diagnostic_state(
+            context, workday_claim_id, "acknowledged"
+        )
     if outcome in {"completed", "failed"}:
         await _finalize_workday_consultation_packet(
             session,
@@ -1763,9 +2360,6 @@ async def acknowledge_workday_consultation_packet(
             packet_id=packet_id,
             row=row,
             context=context,
-            task_id=task_id,
-            worker_generation=worker_generation,
-            worker_incarnation=worker_incarnation,
             resident_session_id=resident_session_id,
             workday_claim_id=workday_claim_id,
             outcome=outcome,
@@ -1821,7 +2415,9 @@ async def claim_next_workday_consultation_continuation(
                     ProjectMessage.handling_state.in_(
                         (MessageHandlingState.PENDING, MessageHandlingState.CLAIMED)
                     ),
-                    ProjectMessage.resident_session_id == resident_session_id,
+                    ProjectMessage.context[_CONSULTATION_RESULT_CONTEXT_KEY]
+                    .as_boolean()
+                    .is_(True),
                 )
                 .order_by(*_message_ordering())
                 .with_for_update()
@@ -1831,9 +2427,7 @@ async def claim_next_workday_consultation_continuation(
         .all()
     )
     for row in rows:
-        if not _is_workday_consultation_result(
-            row, resident_session_id=resident_session_id
-        ):
+        if not _is_workday_consultation_result(row, resident_session_id=None):
             continue
         context = dict(row.context or {})
         prior_claim_id = context.get(_CONTINUATION_CLAIM_ID_CONTEXT_KEY)
@@ -1842,6 +2436,7 @@ async def claim_next_workday_consultation_continuation(
         )
         same_owner = (
             row.handling_state == MessageHandlingState.CLAIMED
+            and row.resident_session_id == resident_session_id
             and row.handled_by_task_id == task_id
             and context.get(_CONTINUATION_CLAIM_GENERATION_CONTEXT_KEY)
             == worker_generation
@@ -1875,6 +2470,15 @@ async def claim_next_workday_consultation_continuation(
                 _CONTINUATION_CLAIM_ATTEMPT_CONTEXT_KEY: attempt,
             }
         )
+        if row.resident_session_id != resident_session_id:
+            from app.session_message_handoff import (
+                RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
+            )
+
+            prior_session_id = str(row.resident_session_id or "").strip()
+            if prior_session_id:
+                context[RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY] = prior_session_id
+            row.resident_session_id = resident_session_id
         row.context = context
         row.handling_state = MessageHandlingState.CLAIMED
         row.handled_by_task_id = task_id
@@ -2061,6 +2665,8 @@ async def complete_workday_consultation_continuation(
             or existing.content != normalized_content
             or context.get("_workday_continuation_claim_id")
             != str(continuation_claim_id)
+            or context.get("_workday_result_packet_id") != str(result_packet_id)
+            or existing.reply_to_message_id not in {None, result_packet_id}
         ):
             raise ValueError("idempotency_key already belongs to a different continuation")
         return PublicConversationReply(message=existing, duplicate=True)
@@ -2132,6 +2738,7 @@ async def complete_workday_consultation_continuation(
         ),
         idempotency_key=normalized_key,
         resident_session_id=resident_session_id,
+        reply_to_message_id=result_packet_id,
     )
     session.add(reply)
     context["_workday_continuation_completion_idempotency_key"] = normalized_key
@@ -2323,6 +2930,12 @@ async def complete_claimed_public_turn(
             != str(existing.id)
         ):
             raise ValueError("idempotency_key Workday request conflicts with existing reply")
+        if packet.reply_to_message_id is None:
+            packet.reply_to_message_id = existing.id
+            session.add(packet)
+            await session.flush()
+        elif packet.reply_to_message_id != existing.id:
+            raise ValueError("idempotency_key Workday relational lineage conflicts")
         return PublicConversationReply(
             message=existing,
             duplicate=True,

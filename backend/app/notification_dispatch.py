@@ -92,6 +92,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "release_build_stalled",  # post_version_build_stalled_message
         "release_stabilize_stalled",  # post_version_stabilize_stalled_message
         "release_ci_unresolved_stall",  # post_version_ci_unresolved_stall_message
+        "release_version_abandoned",  # post_release_version_abandoned_message
         "strategic_steering_deferred",  # post_strategic_steering_deferred_message
         "strategic_steering_acted",  # post_strategic_steering_acted_message
         "capability_trial_ambiguous_lift_escalation",  # raise_ambiguous_lift_escalation_notice
@@ -1244,6 +1245,8 @@ async def post_staged_directions_activated_message(
     activated: list[dict[str, Any]],
     promoted_version_number: int,
     task_id: Optional[uuid.UUID] = None,
+    *,
+    terminal_status: str = "promoted",
 ) -> Optional[ProjectMessage]:
     """Post a HIGH-SIGNAL message when staged directions auto-activate on version open.
 
@@ -1262,15 +1265,21 @@ async def post_staged_directions_activated_message(
     """
     if not activated:
         return None
+    resolved_status = str(terminal_status or "").strip().lower()
+    if resolved_status not in {"promoted", "abandoned"}:
+        raise ValueError(
+            "terminal_status must be either 'promoted' or 'abandoned'"
+        )
     texts = [str(d.get("text") or d.get("id") or "?")[:80] for d in activated]
     count = len(activated)
     joined = "; ".join(texts)
     summary = (
         f"{count} staged direction(s) auto-activated after v"
-        f"{promoted_version_number} promoted — staged work resumed: {joined}"
+        f"{promoted_version_number} {resolved_status} — staged work resumed: {joined}"
     )
     context: dict[str, Any] = {
-        "promoted_version_number": promoted_version_number,
+        "terminal_version_number": promoted_version_number,
+        "terminal_status": resolved_status,
         "count": count,
         "direction_ids": [str(d.get("id")) for d in activated if d.get("id")],
         "direction_texts": texts,
@@ -1283,19 +1292,54 @@ async def post_staged_directions_activated_message(
         context=context,
         task_id=task_id,
     )
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "DIRECTION_STAGED_ACTIVATED",
-            {
-                "promoted_version_number": promoted_version_number,
-                "count": count,
-                "direction_ids": context["direction_ids"],
-                "direction_texts": texts,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "DIRECTION_STAGED_ACTIVATED",
+        {
+            "terminal_version_number": promoted_version_number,
+            "terminal_status": resolved_status,
+            "count": count,
+            "direction_ids": context["direction_ids"],
+            "direction_texts": texts,
+        },
     )
     return msg
+
+
+async def post_release_version_abandoned_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_id: uuid.UUID,
+    version_number: int,
+    successor_version_number: int,
+    operator_display: str,
+    operator_id: str,
+    reason: str | None,
+) -> ProjectMessage:
+    """Persist the operator-visible, idempotent receipt for an exact cut."""
+
+    summary = (
+        f"v{version_number} was abandoned by operator {operator_display}"
+        + (f" ({reason})" if reason else "")
+        + f". v{successor_version_number} is now open for build."
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="release_version_abandoned",
+        summary=summary,
+        context={
+            "version_number": version_number,
+            "version_id": str(version_id),
+            "reason": reason,
+            "operator": operator_display,
+            "operator_id": operator_id,
+            "next_version_number": successor_version_number,
+        },
+        idempotency_key=f"release:{version_id}:release_version_abandoned",
+    )
 
 
 async def post_cycle_summary_message(

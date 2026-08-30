@@ -1791,6 +1791,18 @@ async def sweep_stuck_qualifications(session, *, session_factory) -> int:
     from app.release_prepromotion_rehearsal import (
         dispatch_pending_rehearsal_intents,
     )
+    from app.release_qualification_intents import (
+        launch_due_qualification_intents,
+    )
+
+    qualification_intents = await launch_due_qualification_intents(
+        session_factory=session_factory
+    )
+    if qualification_intents:
+        logger.info(
+            "[REAPER] Launched %d qualification intent delivery task(s)",
+            qualification_intents,
+        )
 
     dispatched = await dispatch_pending_rehearsal_intents(
         session_factory=session_factory
@@ -2063,7 +2075,7 @@ async def sweep_activate_staged_directions(session) -> int:
     Returns the total number of directions activated across all projects.
     """
     from app.directions_repo import activate_eligible_staged_directions
-    from app.models import Direction
+    from app.models import Direction, ReleaseVersion
     from app.release_version import current_open_version
 
     # Prefilter candidate projects via the normalised direction table (dual-
@@ -2090,14 +2102,32 @@ async def sweep_activate_staged_directions(session) -> int:
             open_version = await current_open_version(session, pid)
             if open_version is None:
                 continue
-            # The most-recently-promoted version is one below the open version.
-            # A staged_for_version equal to the open version stays staged (its
-            # target version has not promoted yet).
-            promoted_n = open_version.version_number - 1
-            if promoted_n < 1:
-                continue  # no version has promoted yet
+            # The preceding version may have promoted or been abandoned. Read
+            # its canonical terminal row instead of inferring "promoted" from
+            # the successor number; Step 13 can race the exact-cut follow-up and
+            # must never cement false promotion wording in durable notes.
+            terminal_n = open_version.version_number - 1
+            if terminal_n < 1:
+                continue  # no version has resolved yet
+            terminal_version = (
+                await session.execute(
+                    select(ReleaseVersion)
+                    .where(
+                        ReleaseVersion.project_id == pid,
+                        ReleaseVersion.version_number == terminal_n,
+                        ReleaseVersion.status.in_({"promoted", "abandoned"}),
+                    )
+                    .limit(1)
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if terminal_version is None:
+                continue
             activated = await activate_eligible_staged_directions(
-                session, pid, promoted_n
+                session,
+                pid,
+                terminal_n,
+                terminal_status=terminal_version.status,
             )
             total_activated += len(activated)
         except Exception as e:

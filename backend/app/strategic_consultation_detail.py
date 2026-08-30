@@ -80,6 +80,7 @@ _CLAIM_EXPIRES = "_workday_consultation_claim_expires_at"
 _CLAIM_ATTEMPT = "_workday_consultation_claim_attempt"
 _LAST_FAILURE = "_workday_consultation_last_failure"
 _RESULT_STATE = "result_state"
+_PRIVATE_HANDOFF_RETIREMENT = "_private_handoff_retirement"
 _HIDDEN_PRIVACY_STATES = {"redacted", "deleted"}
 
 # The operator-facing view of one durable operation. The identity fields a
@@ -166,6 +167,15 @@ def _public_request_is_visible(row: ProjectMessage | None) -> bool:
 
 def _classify_related(row: ProjectMessage) -> str | None:
     context = _context(row)
+    # Quarantine preserves the incident row for audit, but it is no longer a
+    # readable consultation packet/result. Selecting it here would expose the
+    # exact corrupt content/receipts that delivery rejected and, because rows
+    # are ordered oldest-first, hide the later neutral replacement.
+    if isinstance(context.get(_PRIVATE_HANDOFF_RETIREMENT), Mapping) or (
+        row.handling_state == MessageHandlingState.SUPERSEDED
+        and str(row.resolution or "").startswith("private_handoff_")
+    ):
+        return None
     role = context.get("message_role")
     if (
         role == "workday_consultation"
@@ -228,17 +238,20 @@ def _claim_view(
 def _last_failure(
     context: Mapping[str, Any], attempts: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
-    """Carry the recorded gate rejection forward, not a bare unexplained 409."""
+    """Project the newest gate/attempt failure without erasing either ledger."""
     raw = context.get(_LAST_FAILURE)
+    gate_failure: dict[str, Any] | None = None
+    gate_at: datetime | None = None
     if isinstance(raw, Mapping):
         gate = raw.get("gate")
         detail = raw.get("detail")
         recorded_at = raw.get("recorded_at")
-        return {
+        gate_failure = {
             "gate": gate[:64] if isinstance(gate, str) else None,
             "detail": detail[:2000] if isinstance(detail, str) else None,
             "recorded_at": recorded_at[:64] if isinstance(recorded_at, str) else None,
         }
+        gate_at = _workday_claim_expiry(recorded_at)
     latest = next(
         (
             attempt
@@ -248,7 +261,7 @@ def _last_failure(
         None,
     )
     if latest is None:
-        return None
+        return gate_failure
     predicate = str(latest.get("terminal_predicate") or "attempt_failed")
     reason = latest.get("provider_terminal_reason")
     output_tail = latest.get("provider_output_tail")
@@ -261,11 +274,19 @@ def _last_failure(
         )
         if part
     )
-    return {
+    attempt_failure = {
         "gate": f"attempt:{predicate}"[:64],
         "detail": detail[:2000],
         "recorded_at": str(latest.get("ended_at") or "")[:64] or None,
     }
+    attempt_at = _workday_claim_expiry(latest.get("ended_at"))
+    if gate_failure is None:
+        return attempt_failure
+    if gate_at is None:
+        return attempt_failure
+    if attempt_at is None or gate_at > attempt_at:
+        return gate_failure
+    return attempt_failure
 
 
 def _bounded_receipts(context: Mapping[str, Any]) -> tuple[list[dict[str, Any]], bool]:

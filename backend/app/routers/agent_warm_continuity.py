@@ -43,7 +43,7 @@ from app.capability_execution_fence import (
 from app.claim_analytics import stamp_warm_claim_timing
 from app.database import get_session, resolve_dialect_name
 from app.execution_principal import resolve_project_execution_principal
-from app.models import Task, TaskStatus, _utcnow
+from app.models import Project, Task, TaskStatus, _utcnow
 from app.research_output_contract import (
     RESEARCH_OUTPUT_CONTRACT_VERSION,
     RESEARCH_OUTPUT_CONTRACT_VERSION_HEADER,
@@ -52,6 +52,11 @@ from app.research_output_contract import (
 from app.routers.agent import _CLAIM_REPLAY_CONTEXT_KEY, verify_agent_token
 from app.shared_state import limiter
 from app.task_capabilities import get_task_capability
+from app.strategic_cold_successor_authority import (
+    cold_successor_workspace_requirement,
+    enforce_cold_successor_task_authority,
+    is_exact_cold_successor_task,
+)
 import app.shared_state as _shared_state
 
 logger = logging.getLogger(__name__)
@@ -690,6 +695,26 @@ async def _finalize_warm_claim(
             return Response(status_code=204)
         task = fenced_task
 
+    # Validate the two-sided proof marker before any warm claim/account mutation.
+    # A warm-pool claim arrives with a transferred reservation, so marker failure
+    # must abandon the pool pin and reservation together instead of leaking it.
+    try:
+        is_exact_cold_successor_task(task)
+        cold_project = await session.get(Project, task.project_id)
+        enforce_cold_successor_task_authority(
+            cold_project.vision if cold_project is not None else None,
+            task,
+        )
+    except HTTPException:
+        if transferred_account_id:
+            await abandon_pool_dispatch(
+                session,
+                task=task,
+                vm_instance_id=vm_instance_id,
+                reason="cold_successor_authority",
+            )
+        raise
+
     # Execution-authority fence (shared with cold dispatch): re-grade this locked
     # QUEUED task's capability-proof requirements against the live gate mode +
     # platform ledger BEFORE it flips to IN_PROGRESS, acquires an account, or
@@ -1026,7 +1051,9 @@ async def _finalize_warm_claim(
     # repository-backed behavior.
     task_capability = get_task_capability(task_type)
     if task_capability is not None:
-        response["workspace_requirement"] = task_capability.workspace_requirement
+        response["workspace_requirement"] = cold_successor_workspace_requirement(
+            task, task_capability.workspace_requirement
+        )
     if secret_manifest is not None:
         response["secret_manifest"] = secret_manifest
     # Lane workspace-mode: pass the checkpoint SHA + lane marker to the agent

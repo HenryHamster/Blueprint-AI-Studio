@@ -73,6 +73,7 @@ TASK_SITE_MANIFEST: dict[TaskSite, tuple[str, tuple[AuthorityProof, ...]]] = {
     ("routers.projects", "deploy_blueprint", 2): MANUAL,
     ("sr_diagnostics_endpoints", "spawn_sr_investigation", 1): MANUAL,
     ("strategic_completion", "_spawn_retirement_memos", 1): _auto(("strategic_completion", "_spawn_retirement_memos", "acquire_automatic_task_creation_authority")),
+    ("strategic_cold_successor_lifecycle", "launch_cold_successor", 1): MANUAL,
     ("strategic_memory_runtime", "_ensure_memory_job_task", 1): _auto(("strategic_memory_runtime", "_ensure_memory_job_task", "acquire_automatic_task_creation_authority")),
     ("strategic_spawn_requests", "_task_from_specification", 1): _auto(("strategic_spawn_requests", "submit_strategic_spawn", "acquire_automatic_task_creation_authority"), ("strategic_spawn_requests", "drain_deferred_spawn_requests", "acquire_automatic_task_creation_authority")),
     ("strategic_spawning", "_finalize_strategic_review_spawn", 1): _auto(("strategic_spawning", "_finalize_strategic_review_spawn", "acquire_automatic_strategic_cycle_creation_authority")),
@@ -270,7 +271,7 @@ def test_every_production_task_constructor_is_exactly_classified() -> None:
 
     assert actual == set(TASK_SITE_MANIFEST)
     classes = [classification for classification, _proofs in TASK_SITE_MANIFEST.values()]
-    assert classes.count("manual_or_terminal") == 9
+    assert classes.count("manual_or_terminal") == 10
     assert classes.count("automatic_or_mixed") == 51
 
 

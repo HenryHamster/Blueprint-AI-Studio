@@ -15,11 +15,11 @@ verbs. It exists as its own module for two reasons:
   strategic Task row ``FOR UPDATE``. Force-promote resolves a candidate SHA, a
   diff hash, and CI state against GitHub; requeueing a review/fix task fetches
   its PR. Minutes of external I/O under those locks is the exact failure that
-  ``strategic_completion._apply_qualify_request_post_commit`` documents (idled
+  the durable qualification-intent outbox was introduced to prevent (idled
   connection killed mid-flush by Cloud SQL, poisoned session, whole agent job
   requeued). So the slow half of each verb runs AFTER the caller has committed
-  and released its locks, on a dedicated fresh session -- the same shape
-  ``request_qualification`` already uses.
+  and released its locks, on a dedicated fresh session -- the same lock-safe
+  shape as qualification-intent delivery.
 * **One implementation, not a parallel one.** Each applier re-enters the SAME
   server-side function the operator lever calls, rather than reimplementing
   its semantics:

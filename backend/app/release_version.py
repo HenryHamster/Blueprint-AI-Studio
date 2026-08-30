@@ -1827,7 +1827,10 @@ async def abandon_current_version(
         _abandoned_n = locked.version_number
         async with AsyncSessionLocal() as _staged_session:
             _activated = await activate_eligible_staged_directions(
-                _staged_session, project_id, _abandoned_n
+                _staged_session,
+                project_id,
+                _abandoned_n,
+                terminal_status="abandoned",
             )
             await request_strategic_refresh(
                 _staged_session,
@@ -1853,23 +1856,17 @@ async def abandon_current_version(
 
     # Best-effort operator notification — rides the caller's commit.
     try:
-        from app.release_promotion import _notify_operator
+        from app.notification_dispatch import post_release_version_abandoned_message
 
-        await _notify_operator(
+        await post_release_version_abandoned_message(
             session,
-            locked,
-            "release_version_abandoned",
-            (
-                f"v{locked.version_number} was abandoned by operator "
-                f"{operator_id}"
-                + (f" ({truncated_reason})" if truncated_reason else "")
-                + f". v{next_version.version_number} is now open for build."
-            ),
-            extra={
-                "reason": truncated_reason,
-                "operator": operator_id,
-                "next_version_number": next_version.version_number,
-            },
+            project_id,
+            version_id=locked.id,
+            version_number=locked.version_number,
+            successor_version_number=next_version.version_number,
+            operator_display=operator_id,
+            operator_id=operator_id,
+            reason=truncated_reason,
         )
     except Exception as exc:  # noqa: BLE001 — notification must not abort the cut
         logger.warning(
@@ -1927,3 +1924,18 @@ async def abandon_current_version(
         )
 
     return locked, next_version
+
+
+# Exact version-cut authority lives in a leaf module so replay/CAS/readback
+# logic can evolve without growing this already broad release read-model file.
+# Re-export the public names for existing callers.
+from app.release_version_cut import (  # noqa: E402
+    VersionCutIdempotencyConflict,
+    VersionCutIdentityUnavailable,
+    VersionCutOutcome,
+    VersionCutPreconditionFailed,
+    abandon_current_version as cut_current_version_exact,
+    get_version_cut_context,
+    run_version_cut_followups,
+    version_cut_followup_projection,
+)

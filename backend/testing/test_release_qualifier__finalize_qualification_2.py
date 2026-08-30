@@ -1094,8 +1094,9 @@ class TestFinalizeInfraFailure:
 
     @pytest.mark.asyncio
     async def test_infra_failure_dispatches_external_webhook(self, db_session, mocker):
-        """_handle_infra_failure fires an external webhook with RELEASE_INFRA_FAILURE."""
+        """The committed infra verdict dispatches RELEASE_INFRA_FAILURE."""
         import asyncio
+        from app import release_qualifier_audit as rqa
 
         dispatch_mock = AsyncMock()
         mocker.patch(
@@ -1112,11 +1113,14 @@ class TestFinalizeInfraFailure:
             smoke_status=TaskStatus.COMPLETED,
         )
 
-        await rq._finalize_qualification(db_session, version)
+        result = await rq._finalize_qualification(db_session, version)
+        dispatch_mock.assert_not_called()
         await db_session.commit()
+        rqa.dispatch_postcommit_infra_notification(result)
         # Drain ensure_future'd coroutine.
         await asyncio.sleep(0)
 
+        assert "_postcommit_external_notification" not in result
         dispatch_mock.assert_called_once()
         call_args = dispatch_mock.call_args
         assert call_args[0][1] == "RELEASE_INFRA_FAILURE"
@@ -1129,6 +1133,7 @@ class TestFinalizeInfraFailure:
     async def test_infra_failure_streak_in_webhook_payload(self, db_session, mocker):
         """Webhook payload carries the correct consecutive_infra_errors streak count."""
         import asyncio
+        from app import release_qualifier_audit as rqa
 
         dispatch_mock = AsyncMock()
         mocker.patch(
@@ -1146,8 +1151,10 @@ class TestFinalizeInfraFailure:
             prior_infra_streak=1,
         )
 
-        await rq._finalize_qualification(db_session, version)
+        result = await rq._finalize_qualification(db_session, version)
+        dispatch_mock.assert_not_called()
         await db_session.commit()
+        rqa.dispatch_postcommit_infra_notification(result)
         await asyncio.sleep(0)
 
         dispatch_mock.assert_called_once()
@@ -1947,6 +1954,7 @@ class TestFinalizeInfraFailure:
 
         assert result["status"] == "infra_failure"
         assert result["is_permanent_gate_incapacity"] is True
+        assert result["same_error_as_prior"] is True
         assert result["same_signature_streak"] == 4  # 3 prior + current all same sig
 
 
@@ -2231,6 +2239,203 @@ class TestFinalizeInfraFailure:
         assert result["is_permanent_gate_incapacity"] is False
         # The trailing same-signature count should be 1 (just current entry)
         assert result["same_signature_streak"] == 1
+
+    @pytest.mark.asyncio
+    async def test_legacy_signature_fallback_stops_at_malformed_history_tail(
+        self, db_session, mocker
+    ):
+        """A malformed immediate predecessor cannot bridge legacy authority."""
+        from app import release_qualifier_audit as rqa
+
+        _project, version = await _make_project_and_version(db_session)
+        signature = "migration_apply:unknown:migration_apply_check_unavailable"
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 3,
+            "infra_attempt_history": [
+                {
+                    "signature": signature,
+                    "engine_sha": "current-engine-sha",
+                    "child_failures": [],
+                },
+                None,
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        mocker.patch.object(rqa, "get_serving_sha", return_value="current-engine-sha")
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(),
+        )
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "migration_apply_check_unavailable",
+        )
+        await db_session.commit()
+
+        assert result["same_error_as_prior"] is False
+        assert result["same_signature_streak"] == 1
+        assert result["is_permanent_gate_incapacity"] is False
+        preview_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_permanent_gate_incapacity_resets_on_serving_engine_change(
+        self, db_session, mocker
+    ):
+        """A deployed repair starts a new same-signature engine epoch."""
+        from app import release_qualifier_audit as rqa
+
+        _project, version = await _make_project_and_version(db_session)
+        signature = "audit:unknown:audit_task_failed_provision_failure"
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 3,
+            "previous_infra_failure_signature": signature,
+            "prior_same_signature_streak": 3,
+            "infra_attempt_history": [
+                {
+                    "finalized_at": "2026-07-10T00:01:00",
+                    "error": "audit_task_failed_provision_failure",
+                    "signature": signature,
+                    "candidate_sha": "dead" * 10,
+                    "engine_sha": "old-engine-sha",
+                    "failing_leg": "audit",
+                    "child_failures": [],
+                }
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        mocker.patch.object(rqa, "get_serving_sha", return_value="new-engine-sha")
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "audit_task_failed_provision_failure",
+        )
+        await db_session.commit()
+
+        assert result["same_signature_streak"] == 1
+        assert result["is_permanent_gate_incapacity"] is False
+
+    @pytest.mark.asyncio
+    async def test_legacy_streak_reconstruction_stops_at_engine_epoch_boundary(
+        self, db_session, mocker
+    ):
+        from app import release_qualifier_audit as rqa
+
+        _project, version = await _make_project_and_version(db_session)
+        signature = "audit:unknown:audit_task_failed_provision_failure"
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "previous_infra_failure_signature": signature,
+            "infra_attempt_history": [
+                {
+                    "signature": signature,
+                    "engine_sha": "old-engine-sha",
+                    "child_failures": [],
+                },
+                {
+                    "signature": signature,
+                    "engine_sha": "current-engine-sha",
+                    "child_failures": [],
+                },
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        mocker.patch.object(rqa, "get_serving_sha", return_value="current-engine-sha")
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "audit_task_failed_provision_failure",
+        )
+        await db_session.commit()
+
+        assert result["same_signature_streak"] == 2
+        assert result["is_permanent_gate_incapacity"] is False
+
+    @pytest.mark.asyncio
+    async def test_infra_finalization_preserves_precap_child_event_total(
+        self, db_session
+    ):
+        from app import release_qualifier_audit as rqa
+        from app.models import Task, TaskStatus
+
+        _project, version = await _make_project_and_version(db_session)
+        qual = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+        }
+        for index in range(25):
+            qual = rqa.append_infra_failure_child_event(
+                qual,
+                leg="audit",
+                failed_task=Task(
+                    id=uuid.uuid4(),
+                    project_id=version.project_id,
+                    title=f"Capped failure {index}",
+                    payloads=[{"type": "release_qualifier_audit"}],
+                    status=TaskStatus.FAILED,
+                    context={},
+                ),
+            )
+        version.last_qualification = qual
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "audit_task_failed_provision_failure",
+        )
+        await db_session.commit()
+        await db_session.refresh(version)
+        result = version.last_qualification
+
+        assert len(result["infra_failure_child_events"]) == 20
+        assert result["infra_failure_child_events_total"] == 25
+        assert result["infra_failure_child_events_truncated"] is True
+        assert result["infra_attempt_history"][-1]["child_failures_total"] == 25
+        assert result["infra_attempt_history"][-1]["child_failures_truncated"] is True
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        immutable = verdicts[-1].sub_scores["infra_failure"]
+        assert immutable["attempt_history"][-1]["child_failures_total"] == 25
 
     @pytest.mark.asyncio
     async def test_audit_leg_permanent_incapacity_after_streak(

@@ -13,7 +13,7 @@ from app.conversation_coordinator import (
     ConversationPublicReplyOwner,
     claim_next_workday_consultation_packet,
     claim_operator_messages,
-    create_or_get_workday_consultation_packet,
+    complete_claimed_public_turn,
     renew_workday_consultation_packet,
 )
 from app.models import (
@@ -1294,15 +1294,31 @@ async def test_escalation_version_preserves_claimed_workday_packet(db_session):
         decision_authority={},
         ledger_revision=0,
     )
-    packet = await create_or_get_workday_consultation_packet(
+    turn = await complete_claimed_public_turn(
         db_session,
         project_id=project.id,
-        claim=claim,
-        envelope=envelope,
-        delivery_key="guard-refresh-regression",
-        question="Perform the exact bounded operation.",
+        claim_id=claim.claim_id,
+        task_id=resident_task.id,
+        worker_generation=1,
+        incarnation_id=incarnation_id,
+        owner=ConversationPublicReplyOwner.FAST,
+        content="I'll investigate this and hand the exact operation to Workday.",
+        idempotency_key="guard-refresh-public-reply",
         resident_session_id="session",
-        atomic_public_reply_id=uuid.uuid4(),
+        workday_request={
+            "delivery_key": "guard-refresh-regression",
+            "question": "Perform the exact bounded operation.",
+            "continuation_key": "initial",
+        },
+        envelope=envelope,
+    )
+    packet = turn.consultation_packet
+    assert packet is not None
+    assert turn.message.from_type == "strategic"
+    assert (turn.message.context or {}).get("message_role") == "operator_reply"
+    assert packet.reply_to_message_id == turn.message.id
+    assert (packet.context or {}).get("_workday_consultation_atomic_reply_id") == str(
+        turn.message.id
     )
     delivery = await claim_next_workday_consultation_packet(
         db_session,
@@ -1313,8 +1329,8 @@ async def test_escalation_version_preserves_claimed_workday_packet(db_session):
         resident_session_id="session",
     )
     assert delivery is not None
-    packet_id = packet.message.id
-    snapshot_id = uuid.UUID(str(packet.message.context["envelope"]["snapshot_id"]))
+    packet_id = packet.id
+    snapshot_id = uuid.UUID(str(packet.context["envelope"]["snapshot_id"]))
     await db_session.commit()
 
     chain.occurrences += 1
