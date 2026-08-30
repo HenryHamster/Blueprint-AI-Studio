@@ -111,9 +111,10 @@
         "test_exact_null_epoch_fences_no_credentials_write_after_drift",
         "test_exact_null_epoch_fences_sha_error_write_after_drift",
         "test_execution_timeout_rolls_back_and_releases_claim",
+        "test_held_automatic_control_allows_exact_resident_intent_once",
         "test_classified_non_authorizing_result_clears_dirty_json_before_receipt"
       ],
-      "test_count": 21
+      "test_count": 22
     },
     {
       "path": "backend/testing/test_agent_access_release_spawns.py",

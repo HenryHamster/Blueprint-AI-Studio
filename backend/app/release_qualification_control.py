@@ -16,8 +16,7 @@ from app.release_authority_lock import lock_release_project
 from app import release_task_admission
 
 _MODULE_SIZE_GOVERNANCE_CAP: int = 260
-_KEY_MAX = 255
-_REASON_MAX = 500
+_KEY_MAX, _REASON_MAX = 255, 500
 
 
 class QualificationControlError(ValueError):
@@ -30,6 +29,7 @@ class QualificationControlConflict(QualificationControlError):
 
 class QualificationControlProjectNotFound(QualificationControlError):
     """The target project does not exist."""
+
 
 def _normalize_text(value: object, *, name: str, limit: int) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
