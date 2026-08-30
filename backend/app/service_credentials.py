@@ -85,6 +85,13 @@ _BOUNDED_AGENT_READ_RULES: list[tuple[str, re.Pattern]] = [
     ),
     ("GET", re.compile(r"^/api/agent-access/v1/messages$")),
     ("GET", re.compile(r"^/api/agent-access/v1/directions$")),
+    (
+        "GET",
+        re.compile(
+            rf"^/api/agent-access/v1/projects/{_UUID_PATH_SEGMENT}/"
+            rf"release-versions/{_UUID_PATH_SEGMENT}/strategic-spawn-requests$"
+        ),
+    ),
 ]
 
 # Scope registry: each scope name maps to a list of (HTTP method, compiled

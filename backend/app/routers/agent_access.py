@@ -53,6 +53,7 @@ _CAPABILITIES_BY_SCOPE = {
         "tasks.read",
         "messages.list",
         "directions.list",
+        "release.spawn_requests.list",
     ],
     "project-operator": [
         "projects.list",
@@ -71,6 +72,7 @@ _CAPABILITIES_BY_SCOPE = {
         "messages.send",
         "messages.answer",
         "directions.list",
+        "release.spawn_requests.list",
         "directions.create",
         "directions.update",
         "directions.activate",
