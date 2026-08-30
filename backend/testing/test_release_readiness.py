@@ -1019,9 +1019,11 @@ class TestFormatQualificationApiCategoryVerdicts:
         from app.release_models import QualificationVerdict
         from app.release_readiness import format_verdict_for_api
 
+        attempt_id = uuid.uuid4()
         verdict = QualificationVerdict(
             project_id=uuid.uuid4(),
             release_version_id=uuid.uuid4(),
+            qualification_attempt_id=attempt_id,
             candidate_sha="abc123",
             confidence=0.7,
             blocker=None,
@@ -1066,6 +1068,145 @@ class TestFormatQualificationApiCategoryVerdicts:
         out_legacy = format_verdict_for_api(legacy)
         assert out_legacy["category_verdicts"] is None
         assert out_legacy["residual_uncaptured_gap"] is None
+
+
+class TestFormatInfraFailureEvidence:
+    @staticmethod
+    def _event():
+        trace = [
+            {
+                "attempt_ordinal": ordinal,
+                "status": "FAILED",
+                "vm_provisioned_at": f"2026-08-30T00:0{ordinal}:00+00:00",
+                "vm_stopped_at": f"2026-08-30T00:0{ordinal}:30+00:00",
+                "failure_category": "provider_terminal_failed",
+                "child_tail": f"attempt {ordinal}",
+                "agent_error": {
+                    "schema": 1,
+                    "model_output_seen": False,
+                    "result_event_seen": False,
+                    "provider_result_is_error": True,
+                    "duration_ms": ordinal * 1000,
+                    "provider_terminal_reason": (
+                        "aborted_streaming" if ordinal == 1 else "provider_failed"
+                    ),
+                    "stderr_tail": "api_key=supersecretvalue stderr",
+                    "provider_error_tail": "token=anothersecretvalue provider",
+                    "output_tail": "token=anothersecretvalue provider",
+                    "untrusted_nested": {"leak": "must not escape"},
+                },
+                "unknown": ["must not escape"],
+            }
+            for ordinal in range(1, 7)
+        ]
+        return {
+            "diagnostic_schema_version": 1,
+            "leg": "audit",
+            "failed_task_id": "00000000-0000-0000-0000-000000000001",
+            "status": "FAILED",
+            "terminal_at": "2026-08-30T00:07:00+00:00",
+            "attempt_trace": trace,
+            "attempt_trace_total": 6,
+            "attempt_trace_truncated": True,
+            "unknown": {"leak": "must not escape"},
+        }
+
+    def test_current_and_immutable_verdict_expose_same_bounded_redacted_evidence(self):
+        import uuid
+
+        from app.release_models import QualificationVerdict
+        from app.release_readiness import (
+            format_qualification_for_api,
+            format_verdict_for_api,
+        )
+
+        event = self._event()
+        latest_event = self._event()
+        latest_event["leg"] = "challenge"
+        latest_event["failed_task_id"] = "00000000-0000-0000-0000-000000000002"
+        attempt_id = uuid.uuid4()
+        attempt_history = [
+            {"child_failures": [event]},
+            {"child_failures": [latest_event]},
+        ]
+        current = format_qualification_for_api(
+            {
+                "status": "infra_failure",
+                "qualification_attempt_id": str(attempt_id),
+                "infra_attempt_history": attempt_history,
+                "infra_attempt_history_total": 10,
+                "infra_attempt_history_truncated": True,
+                # A malformed current row must not suppress valid immutable
+                # history; the valid duplicate is merged missing-only.
+                "infra_failure_child_events": [["malformed"], latest_event],
+            }
+        )["infra_failure_evidence"]
+        verdict = QualificationVerdict(
+            project_id=uuid.uuid4(),
+            release_version_id=uuid.uuid4(),
+            qualification_attempt_id=attempt_id,
+            candidate_sha="abc123",
+            confidence=None,
+            blocker="audit_task_failed",
+            would_promote=False,
+            promotion_enabled=True,
+            terminal_status="infra_failure",
+            threshold=0.9,
+            sub_scores={
+                "infra_failure": {
+                    "attempt_history": attempt_history,
+                    "attempt_history_total": 10,
+                    "attempt_history_truncated": True,
+                }
+            },
+        )
+        verdict_out = format_verdict_for_api(verdict)
+
+        assert current == verdict_out["infra_failure_evidence"]
+        assert verdict_out["qualification_attempt_id"] == str(attempt_id)
+        assert "infra_failure" not in verdict_out["sub_scores"]
+        assert current["schema_version"] == 1
+        assert current["events_total"] == 2
+        assert current["events_truncated"] is False
+        assert current["attempts_total"] == 10
+        assert current["attempts_truncated"] is True
+        assert [row["failed_task_id"] for row in current["events"]] == [
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+        ]
+        projected_event = current["events"][0]
+        assert projected_event["attempt_trace_total"] == 6
+        assert projected_event["attempt_trace_truncated"] is True
+        assert [row["attempt_ordinal"] for row in projected_event["attempt_trace"]] == [
+            1,
+            4,
+            5,
+            6,
+        ]
+        first_error = projected_event["attempt_trace"][0]["agent_error"]
+        assert first_error["model_output_seen"] is False
+        assert first_error["result_event_seen"] is False
+        assert first_error["provider_result_is_error"] is True
+        assert first_error["provider_terminal_reason"] == "aborted_streaming"
+        assert first_error["output_tail"] == "token=*** provider"
+        assert "stderr_tail" not in first_error
+        assert "provider_error_tail" not in first_error
+        rendered = repr(current)
+        assert "supersecretvalue" not in rendered
+        assert "anothersecretvalue" not in rendered
+        assert "untrusted_nested" not in rendered
+        assert "unknown" not in rendered
+
+    def test_missing_or_malformed_infra_evidence_is_null(self):
+        from app.release_readiness import format_qualification_for_api
+
+        assert format_qualification_for_api({})["infra_failure_evidence"] is None
+        assert (
+            format_qualification_for_api(
+                {"infra_failure_child_events": ["invalid", {"unknown": True}]}
+            )["infra_failure_evidence"]
+            is None
+        )
 
 
 # ---------------------------------------------------------------------------

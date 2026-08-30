@@ -101,6 +101,12 @@ BLOCKER_RECHECK_PREDICATES: tuple[str, ...] = (BLOCKER_RECHECK_BASE_STATE,)
 BASE_STATE_RECHECK_COUNT_KEY = "_blocked_base_state_rechecks"
 PUBLICATION_GATE_RECEIPT_KEY = "publication_gate_receipt"
 PUBLICATION_GATE_RECEIPT_HISTORY_KEY = "publication_gate_receipt_history"
+# Server-observed VM identity for the current park episode. Parking clears
+# Task.vm_instance_id to release the fleet slot, but an authenticated
+# lost-response retry must still prove it came from the VM that performed the
+# park rather than treating the cleared column as a wildcard. Auth consults
+# this receipt only while status is PARKED; fresh-attempt reset strips it.
+PARKED_AGENT_VM_CONTEXT_KEY = "_parked_agent_vm_instance_id"
 _PUBLICATION_GATE_RECEIPT_HISTORY_LIMIT = 8
 PUBLICATION_GATE_ATTRIBUTION_MAX_IDENTITIES = 100
 PUBLICATION_GATE_ATTRIBUTION_IDENTITY_MAX_LENGTH = 512
@@ -622,6 +628,7 @@ FRESH_ATTEMPT_CONTEXT_STRIP_KEYS: frozenset[str] = frozenset(
         "_slot_released",
         "_api_failure_retries",
         "_dispatch_prep_failures",
+        PARKED_AGENT_VM_CONTEXT_KEY,
         # Transient lane/warm routing is per-attempt and must be reattached by
         # an explicit spawn path if still relevant.
         "improvement_lane_id",

@@ -13,7 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import select
 
 from app.main import app
-from app.models import AllowedUser, Project, ProjectMember, _utcnow
+from app.models import AllowedUser, Project, ProjectMember, Task, _utcnow
 from app.admin_helpers import pending_project_member_user_id
 from app.auth import (
     get_current_user,
@@ -613,34 +613,44 @@ class TestGetMetricsReader:
         assert result["role"] == "admin"
 
     @pytest.mark.asyncio
-    async def test_task_scoped_agent_jwt_accepted(self):
+    async def test_task_scoped_agent_jwt_accepted(self, db_session):
         """A valid task-scoped agent JWT returns role=metrics_reader."""
         from app.auth import create_agent_token, get_metrics_reader
 
-        token = create_agent_token(
-            task_id="task-abc-123",
+        project = Project(name="Metrics task scope", user_id="metrics-owner")
+        db_session.add(project)
+        await db_session.flush()
+        task = Task(
+            project_id=project.id,
             vm_instance_id="vm-def-456",
+            payloads=[{"type": "research"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        token = create_agent_token(
+            task_id=str(task.id),
+            vm_instance_id=task.vm_instance_id,
             task_type="research",
-            project_id="proj-000",
+            project_id=str(project.id),
         )
         creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
-        result = await get_metrics_reader(credentials=creds)
+        result = await get_metrics_reader(credentials=creds, session=db_session)
         assert result["role"] == "metrics_reader"
-        assert result["sub"] == "task-abc-123"
+        assert result["sub"] == str(task.id)
         assert result["vm_instance_id"] == "vm-def-456"
 
     @pytest.mark.asyncio
-    async def test_vm_scoped_agent_jwt_accepted(self):
-        """A valid VM-scoped (taskless) agent JWT returns role=metrics_reader."""
+    async def test_vm_scoped_agent_jwt_rejected(self, db_session):
+        """A VM-scoped JWT has no persisted task authority for metrics."""
         from app.auth import create_vm_scoped_token, get_metrics_reader
 
         token = create_vm_scoped_token(
             vm_instance_id="pool-vm-001", project_id="proj-111"
         )
         creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
-        result = await get_metrics_reader(credentials=creds)
-        assert result["role"] == "metrics_reader"
-        assert result["vm_instance_id"] == "pool-vm-001"
+        with pytest.raises(HTTPException) as rejected:
+            await get_metrics_reader(credentials=creds, session=db_session)
+        assert rejected.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_tool_asset_scoped_jwt_rejected(self):
@@ -703,23 +713,33 @@ class TestGetMetricsReader:
         assert exc_info.value.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_metrics_reader_accepts_agent_jwt(self):
+    async def test_metrics_reader_accepts_agent_jwt(self, db_session):
         """Acceptance test: freshly minted agent JWT is accepted by get_metrics_reader.
 
         This is the named acceptance gate for the METRICS_READER_ENDPOINTS feature.
         """
         from app.auth import create_agent_token, get_metrics_reader
 
+        project = Project(name="Metrics acceptance", user_id="metrics-owner")
+        db_session.add(project)
+        await db_session.flush()
+        task = Task(
+            project_id=project.id,
+            vm_instance_id="acceptance-vm-001",
+            payloads=[{"type": "research"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
         token = create_agent_token(
-            task_id="acceptance-task-001",
+            task_id=str(task.id),
             vm_instance_id="acceptance-vm-001",
             task_type="research",
-            project_id="00000000-0000-0000-0000-000000000001",
+            project_id=str(project.id),
         )
         creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
-        result = await get_metrics_reader(credentials=creds)
+        result = await get_metrics_reader(credentials=creds, session=db_session)
         assert result["role"] == "metrics_reader"
-        assert result["sub"] == "acceptance-task-001"
+        assert result["sub"] == str(task.id)
         assert result["vm_instance_id"] == "acceptance-vm-001"
 
 

@@ -666,6 +666,91 @@ async def test_direction_owned_research_rejects_cross_project_cycle_source(
     ] == []
 
 
+class TestStrategistSpawnExactRoute:
+    async def _make_strategic_task(self, db_session, project):
+        task = Task(
+            project_id=project.id,
+            title="Strategic exact-route author",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-exact-route",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        return task, create_agent_token(
+            str(task.id),
+            "agent-vm-exact-route",
+            task_type="strategic_review",
+        )
+
+    @pytest.mark.asyncio
+    async def test_exact_model_effort_pair_persists_complete_route_authority(
+        self, client: AsyncClient, db_session
+    ):
+        import uuid
+
+        from app.max_plan_pool import EXACT_MODEL_ROUTE_CONTEXT_KEY
+
+        project = await _make_project(db_session, name="Exact route spawn")
+        strategic, token = await self._make_strategic_task(db_session, project)
+        response = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "create",
+                    "title": "Pinned frontier implementation",
+                    "prompt": "Execute only with the requested runtime.",
+                    "model": "gpt-5.6-sol",
+                    "effort": "high",
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        child = await db_session.get(Task, uuid.UUID(body["task_id"]))
+        assert child is not None
+        assert child.first_payload["model"] == "gpt-5.6-sol"
+        assert child.first_payload["effort"] == "high"
+        assert child.first_payload["provider_preference"] == ["openai"]
+        assert child.context[EXACT_MODEL_ROUTE_CONTEXT_KEY] == {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "effort": "high",
+        }
+        assert body["requested_model"] == "gpt-5.6-sol"
+        assert body["requested_effort"] == "high"
+        assert body["requested_provider"] == "openai"
+
+    @pytest.mark.parametrize("effort", [[], {}])
+    @pytest.mark.asyncio
+    async def test_malformed_effort_returns_400_not_type_error(
+        self, client: AsyncClient, db_session, effort
+    ):
+        project = await _make_project(db_session, name="Malformed effort spawn")
+        strategic, token = await self._make_strategic_task(db_session, project)
+        response = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "create",
+                    "title": "Reject malformed effort",
+                    "prompt": "Fail closed.",
+                    "model": "gpt-5.6-sol",
+                    "effort": effort,
+                },
+            },
+        )
+        assert response.status_code == 400, response.text
+        assert "effort must be one of" in response.text
+
+
 class TestStrategistSpawnDependsOnBaseBranch:
     """spawn_task depends_on edges must reject cross-base-branch dependencies."""
 

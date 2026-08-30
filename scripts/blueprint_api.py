@@ -14,6 +14,7 @@ Usage as CLI:
 """
 
 import json
+import http.client
 import os
 import re
 import shutil
@@ -33,6 +34,23 @@ _config_cache: dict | None = None
 
 class APIError(RuntimeError):
     """Raised by api() on HTTP or network errors; caught by main() to exit cleanly."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+        payload: Any | None = None,
+        response_received: bool = False,
+        request_may_have_been_sent: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+        self.payload = payload
+        self.response_received = response_received
+        self.request_may_have_been_sent = request_may_have_been_sent
 
 
 def _config_search_paths() -> list[Path]:
@@ -179,14 +197,52 @@ def load_config() -> dict:
     raise APIError("no Blueprint API config found")
 
 
-def api(method: str, path: str, body: dict | None = None, timeout: int = 30) -> Any:
+def _structured_api_error(raw: bytes) -> tuple[Any | None, str | None, str]:
+    text = raw.decode(errors="replace")
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return None, None, text[:500]
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if not isinstance(detail, dict) and isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            nested = error.get("message")
+            detail = nested if isinstance(nested, dict) else error
+    if not isinstance(detail, dict):
+        return payload, None, text[:500]
+    code = detail.get("code") if isinstance(detail.get("code"), str) else None
+    message = detail.get("message")
+    return payload, code, message if isinstance(message, str) else text[:500]
+
+
+def api(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    timeout: int = 30,
+    *,
+    raw_body: bytes | None = None,
+) -> Any:
     """Make an authenticated request to the orchestrator API. Returns parsed JSON."""
+    if body is not None and raw_body is not None:
+        raise APIError("body and raw_body are mutually exclusive")
+    if raw_body is not None and not isinstance(raw_body, bytes):
+        raise APIError("raw_body must be bytes")
     cfg = load_config()
     url = cfg["api_url"].rstrip("/") + path
+    method_upper = method.upper()
+    mutation = method_upper not in {"GET", "HEAD", "OPTIONS"}
+    request_data = raw_body
+    if request_data is None and body is not None:
+        try:
+            request_data = json.dumps(body).encode()
+        except (TypeError, ValueError) as exc:
+            raise APIError(f"request body is not JSON serializable: {exc}") from exc
     req = urllib.request.Request(
         url,
-        data=json.dumps(body).encode() if body else None,
-        method=method,
+        data=request_data,
+        method=method_upper,
         headers={
             "Authorization": f"Bearer {cfg['api_key']}",
             "Content-Type": "application/json",
@@ -194,9 +250,35 @@ def api(method: str, path: str, body: dict | None = None, timeout: int = 30) -> 
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
+            raw_response = resp.read()
+            try:
+                return json.loads(raw_response)
+            except (TypeError, ValueError) as exc:
+                raise APIError(
+                    "API returned an unreadable JSON response",
+                    payload=raw_response.decode(errors="replace")[:500],
+                    response_received=True,
+                    request_may_have_been_sent=mutation,
+                ) from exc
     except urllib.error.HTTPError as e:
-        body = e.read().decode()[:500]
+        try:
+            raw_error = e.read(65_536)
+        except (http.client.HTTPException, OSError) as read_error:
+            partial = getattr(read_error, "partial", b"")
+            if not isinstance(partial, bytes):
+                partial = b""
+            partial = partial[:65_536]
+            payload, error_code, error_message = _structured_api_error(partial)
+            raise APIError(
+                f"HTTP {e.code}: incomplete error response: {error_message}",
+                status_code=e.code,
+                error_code=error_code,
+                payload=payload if payload is not None else partial.decode(errors="replace")[:500],
+                response_received=True,
+                request_may_have_been_sent=mutation,
+            ) from read_error
+        payload, error_code, error_message = _structured_api_error(raw_error)
+        error_text = raw_error.decode(errors="replace")[:500]
         if e.code == 401:
             print(
                 "HTTP 401 Unauthorized — your credential is invalid or expired.\n"
@@ -221,11 +303,31 @@ def api(method: str, path: str, body: dict | None = None, timeout: int = 30) -> 
                     "a separate operator BLUEPRINT_CONFIG for authorized mutations.",
                     file=sys.stderr,
                 )
-        print(f"API error {e.code}: {body}", file=sys.stderr)
-        raise APIError(f"HTTP {e.code}: {body}")
-    except urllib.error.URLError as e:
-        print(f"Error: cannot reach API at {url}: {e.reason}", file=sys.stderr)
-        raise APIError(f"cannot reach API at {url}: {e.reason}")
+        print(f"API error {e.code}: {error_text}", file=sys.stderr)
+        raise APIError(
+            f"HTTP {e.code}: {error_message}",
+            status_code=e.code,
+            error_code=error_code,
+            payload=payload if payload is not None else error_text,
+            response_received=True,
+            request_may_have_been_sent=mutation,
+        )
+    except APIError:
+        raise
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        ConnectionError,
+        OSError,
+    ) as e:
+        reason = getattr(e, "reason", e)
+        print(f"Error: cannot reach API at {url}: {reason}", file=sys.stderr)
+        raise APIError(
+            f"cannot reach API at {url}: {reason}",
+            response_received=False,
+            request_may_have_been_sent=mutation,
+        ) from e
 
 
 # ── Convenience helpers ─────────────────────────────────────────────────────

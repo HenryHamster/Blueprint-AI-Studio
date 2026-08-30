@@ -95,6 +95,7 @@ from app.strategic_workday_handoff_recovery import (
     recover_retired_private_handoff as _recover_retired_private_handoff,
     retire_unavailable_private_handoff as _retire_unavailable_private_handoff,
     terminal_recovery_source_candidate_from_server_key as _terminal_recovery_source_candidate_from_server_key,
+    workday_packet_immutable_source_id as _workday_packet_immutable_source_id,
     workday_packet_source_id_from_server_lineage as _workday_packet_source_id_from_server_lineage,
     workday_result_server_lineage as _workday_result_server_lineage,
 )
@@ -349,6 +350,17 @@ class RenewWorkdayConsultation(BaseModel):
     incarnation_id: uuid.UUID
     workday_claim_id: uuid.UUID
     lease_seconds: int = Field(default=45, ge=15, le=300)
+
+
+class RecordWorkdayConsultationAttemptDiagnostic(BaseModel):
+    """Diagnostic-only evidence for one exact server-issued historical claim."""
+
+    task_id: uuid.UUID
+    session_id: str = Field(..., min_length=1, max_length=255)
+    worker_generation: int = Field(..., ge=1)
+    incarnation_id: uuid.UUID
+    workday_claim_id: uuid.UUID
+    attempt_diagnostic: WorkdayConsultationAttemptDiagnostic
 
 
 class ClaimWorkdayContinuation(BaseModel):
@@ -1874,7 +1886,7 @@ async def claim_next_workday_consultation(
             ).scalar_one_or_none()
             if poisoned_packet is None:
                 continue
-            source_id = await _workday_packet_source_id_from_server_lineage(
+            source_id = await _workday_packet_immutable_source_id(
                 session,
                 row=poisoned_packet,
             )
@@ -1906,6 +1918,10 @@ async def claim_next_workday_consultation(
             continue
         if packet_claim is None:
             break
+        immutable_packet_source_id = await _workday_packet_immutable_source_id(
+            session,
+            row=packet_claim.message,
+        )
         packet_source_id = await _workday_packet_source_id_from_server_lineage(
             session,
             row=packet_claim.message,
@@ -1925,6 +1941,7 @@ async def claim_next_workday_consultation(
                 worker_incarnation=accepted_incarnation,
                 resident_session_id=payload.session_id,
                 trust_row_context=False,
+                server_source_id=immutable_packet_source_id,
             )
             logger.warning(
                 "[STRATEGIC] Retired private Workday packet %s because its "
@@ -1965,6 +1982,8 @@ async def claim_next_workday_consultation(
                 worker_generation=payload.worker_generation,
                 worker_incarnation=accepted_incarnation,
                 resident_session_id=payload.session_id,
+                trust_row_context=False,
+                server_source_id=packet_source_id,
             )
             logger.warning(
                 "[STRATEGIC] Retired private Workday packet %s because its "
@@ -2106,6 +2125,129 @@ async def acknowledge_workday_consultation(
         activity=activity_transition,
     )
     return {"status": "duplicate" if duplicate else "acknowledged"}
+
+
+@router.post(
+    "/projects/{project_id}/workday-consultations/{packet_id}/attempt-diagnostic"
+)
+@limiter.limit("120/minute")
+async def record_workday_consultation_attempt_diagnostic_receipt(
+    request: Request,
+    project_id: uuid.UUID,
+    packet_id: uuid.UUID,
+    payload: RecordWorkdayConsultationAttemptDiagnostic,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Record bounded provider evidence without granting ack/mutation authority."""
+
+    if str(token.get("sub")) != str(payload.task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    if payload.attempt_diagnostic.workday_claim_id != payload.workday_claim_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Consultation attempt diagnostic claim does not match",
+        )
+    await _resolve_agent_project(project_id, token, session)
+    await session.rollback()
+    project = await _lock_resident_claim_project(session, project_id)
+    task = (
+        await session.execute(
+            select(Task).where(Task.id == payload.task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        project is None
+        or task is None
+        or not isinstance(task.context, dict)
+        or task.context.get("_resident_session") is not True
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Workday diagnostic task authority is unavailable",
+        )
+    from app.conversation_coordinator import (
+        record_workday_consultation_attempt_diagnostic,
+    )
+
+    try:
+        disposition, state, diagnostic = (
+            await record_workday_consultation_attempt_diagnostic(
+                session,
+                project_id=project_id,
+                packet_id=packet_id,
+                task_id=task.id,
+                resident_session_id=payload.session_id,
+                worker_generation=payload.worker_generation,
+                worker_incarnation=payload.incarnation_id,
+                workday_claim_id=payload.workday_claim_id,
+                attempt_diagnostic=payload.attempt_diagnostic.model_dump(mode="json"),
+            )
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return {
+        "status": disposition,
+        "diagnostic_state": state,
+        "attempt_diagnostic": diagnostic,
+    }
+
+
+@router.get(
+    "/projects/{project_id}/workday-consultations/{packet_id}/"
+    "attempt-diagnostic/{workday_claim_id}"
+)
+@limiter.limit("120/minute")
+async def read_workday_consultation_attempt_diagnostic_receipt(
+    request: Request,
+    project_id: uuid.UUID,
+    packet_id: uuid.UUID,
+    workday_claim_id: uuid.UUID,
+    task_id: uuid.UUID = Query(...),
+    session_id: str = Query(..., min_length=1, max_length=255),
+    worker_generation: int = Query(..., ge=1),
+    incarnation_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Read the exact durable diagnostic receipt before any ambiguous retry."""
+
+    if str(token.get("sub")) != str(task_id):
+        raise HTTPException(status_code=403, detail="Token task mismatch")
+    await _resolve_agent_project(project_id, token, session)
+    task = await session.get(Task, task_id)
+    if (
+        task is None
+        or not isinstance(task.context, dict)
+        or task.context.get("_resident_session") is not True
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Workday diagnostic task authority is unavailable",
+        )
+    from app.conversation_coordinator import (
+        read_workday_consultation_attempt_diagnostic,
+    )
+
+    try:
+        state, diagnostic = await read_workday_consultation_attempt_diagnostic(
+            session,
+            project_id=project_id,
+            packet_id=packet_id,
+            task_id=task.id,
+            resident_session_id=session_id,
+            worker_generation=worker_generation,
+            worker_incarnation=incarnation_id,
+            workday_claim_id=workday_claim_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return {
+        "status": "missing" if state == "open" else state,
+        "attempt_diagnostic": diagnostic,
+    }
 
 
 @router.post("/projects/{project_id}/workday-consultations/{packet_id}/renew")
@@ -2318,6 +2460,7 @@ async def claim_next_workday_continuation(
         try:
             if (
                 server_lineage is None
+                or not server_lineage.projections_valid
                 or result_context.get("_workday_consultation_atomic_reply_id")
                 != str(server_lineage.public_source_id)
             ):
@@ -2426,6 +2569,8 @@ async def claim_next_workday_continuation(
                 worker_generation=payload.worker_generation,
                 worker_incarnation=accepted_incarnation,
                 resident_session_id=payload.session_id,
+                trust_row_context=False,
+                server_source_id=server_lineage.public_source_id,
             )
             logger.warning(
                 "[STRATEGIC] Retired private Workday continuation %s because "
@@ -3370,6 +3515,9 @@ async def claim_resident_messages(
     project = await _lock_resident_claim_project(session, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(project.vision)
     task = (
         await session.execute(
             select(Task)
@@ -3547,6 +3695,9 @@ async def agent_poll_messages(
         project = await _lock_resident_poll_project(session, project_id)
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
+        from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+        reject_active_cold_successor(project.vision)
         authenticated_task = await session.get(
             Task, authenticated_task_id, populate_existing=True
         )

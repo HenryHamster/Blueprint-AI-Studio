@@ -799,9 +799,24 @@ async def test_walkthrough_contract_failed_is_redriven_within_cap(
 
     # Below the cap: the re-driver re-enters the qualifier and a fresh
     # qualification spawns.
+    spawned_attempt_id = uuid.uuid4()
+
+    async def _spawn_projection(_session, _project_id, spawned_version, **_kwargs):
+        spawned_version.last_qualification = {
+            "status": "pending",
+            "qualification_attempt_id": str(spawned_attempt_id),
+        }
+        spawned_version.active_qualification_attempt_id = spawned_attempt_id
+        db_session.add(spawned_version)
+        await db_session.flush()
+        return {
+            "status": "spawned",
+            "qualification_attempt_id": str(spawned_attempt_id),
+        }
+
     mock_run_qual = mocker.patch(
         "app.release_qualifier.run_qualification",
-        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+        new=mocker.AsyncMock(side_effect=_spawn_projection),
     )
     redriven = await _redrive_walkthrough_contract_qualification(
         version.id, session_factory=_shared_session_factory(db_session)
@@ -824,11 +839,16 @@ async def test_walkthrough_contract_failed_is_redriven_within_cap(
     )
 
     # At the cap: the re-driver halts (no spawn) and raises exactly one
-    # operator Alert, deduped across subsequent sweep cycles.
+    # operator Alert, deduped across subsequent sweep cycles. Model the fresh
+    # contract-failure verdict that follows the pending attempt; a pending
+    # qualification is not itself eligible for contract-failure redrive.
     version.last_qualification = {
         **version.last_qualification,
+        "status": "not_promoted",
+        "blocker": "walkthrough_e2e_contract_failed",
         "walkthrough_contract_redrive_count": _MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS,
     }
+    version.active_qualification_attempt_id = None
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)

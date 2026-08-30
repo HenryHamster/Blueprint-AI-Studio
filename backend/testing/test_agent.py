@@ -419,6 +419,84 @@ async def test_agent_status_update_persists_runtime_identity(
 
 
 @pytest.mark.asyncio
+async def test_exact_route_rejects_mismatched_runtime_identity(
+    client: AsyncClient, db_session
+):
+    from app.max_plan_pool import EXACT_MODEL_ROUTE_CONTEXT_KEY
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Exact Runtime Telemetry", user_id="test-user-exact-runtime")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    exact_model = "gpt-5.6-sol"
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "model": exact_model,
+                "effort": "high",
+                "provider_preference": ["openai"],
+            }
+        ],
+        vm_instance_id="agent-vm-exact-runtime",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            EXACT_MODEL_ROUTE_CONTEXT_KEY: {
+                "provider": "openai",
+                "model": exact_model,
+                "effort": "high",
+            },
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+            "llm_model": exact_model,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(str(task.id), "agent-vm-exact-runtime")
+
+    reported_mismatch = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "IN_PROGRESS",
+            "provider": "openai",
+            "model": "gpt-5.5",
+        },
+    )
+    assert reported_mismatch.status_code == 409
+    assert "exact_route_runtime_mismatch" in reported_mismatch.text
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.context["llm_model"] == exact_model
+
+    stale_context = dict(task.context or {})
+    stale_context["llm_model"] = "gpt-5.5"
+    task.context = stale_context
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+    assigned_mismatch = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "IN_PROGRESS",
+        },
+    )
+    assert assigned_mismatch.status_code == 409
+    assert "exact_route_runtime_mismatch" in assigned_mismatch.text
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.context["llm_model"] == "gpt-5.5"
+    assert task.context[EXACT_MODEL_ROUTE_CONTEXT_KEY]["model"] == exact_model
+
+
+@pytest.mark.asyncio
 async def test_terminal_heartbeat_records_atomic_provider_model_pair(
     client: AsyncClient, db_session, mocker
 ):
@@ -4550,6 +4628,72 @@ async def test_agent_token_rejected_on_terminal_idempotent_vm_mismatch(
         path="/api/agent/vm-heartbeat",
         task_id=task_id,
         token_vm_instance_id=original_vm,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.BLOCKED,
+    ],
+    ids=["completed", "failed", "cancelled", "blocked"],
+)
+async def test_agent_status_identityless_non_parked_task_fails_closed(
+    client: AsyncClient,
+    db_session,
+    caplog,
+    terminal_status: TaskStatus,
+):
+    """Only PARKED/null-VM status retries may reach the parked no-op."""
+    from app.routers.agent import _terminated_task_ids
+
+    project = Project(name="Identityless Status Auth", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=None,
+        status=terminal_status,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    token_vm = "agent-vm-released-terminal"
+    token = create_agent_token(task_id, token_vm)
+
+    _terminated_task_ids.pop(task_id, None)
+    caplog.set_level(logging.INFO)
+
+    try:
+        response = await client.post(
+            "/api/agent/status",
+            json={"task_id": task_id, "status": "COMPLETED"},
+            headers={"x-agent-token": token},
+        )
+    finally:
+        _terminated_task_ids.pop(task_id, None)
+
+    assert response.status_code == 403
+    response_json = response.json()
+    detail = response_json.get("detail") or response_json.get("error", {}).get(
+        "message"
+    )
+    assert detail == "vm_instance_mismatch"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="terminal_vm_identity_missing_or_mismatched",
+        path="/api/agent/status",
+        task_id=task_id,
+        token_vm_instance_id=token_vm,
     )
 
 
@@ -10484,14 +10628,19 @@ async def test_agent_ws_receive_loop_rejects_terminated_task(mocker, caplog):
 
     task_id = uuid.uuid4()
     project_id = uuid.uuid4()
+    vm_id = "agent-vm-receive-deny"
 
-    token = create_agent_token(str(task_id), str(project_id))
+    token = create_agent_token(
+        str(task_id),
+        vm_id,
+        project_id=str(project_id),
+    )
 
     # Mock task returned by initial DB auth lookup
     mock_task = MagicMock()
     mock_task.id = task_id
     mock_task.project_id = project_id
-    mock_task.vm_instance_id = None
+    mock_task.vm_instance_id = vm_id
     mock_task.status = TaskStatus.IN_PROGRESS
 
     mock_execute_result = MagicMock()
@@ -10534,7 +10683,7 @@ async def test_agent_ws_receive_loop_rejects_terminated_task(mocker, caplog):
         reason="ws_deny_list_hit",
         path=f"/api/agent/ws/{task_id}",
         task_id=str(task_id),
-        token_vm_instance_id=str(project_id),
+        token_vm_instance_id=vm_id,
     )
 
     # Clean up deny-list entry
@@ -11100,13 +11249,18 @@ async def test_agent_ws_closes_on_termination_without_messages(mocker):
 
     task_id = uuid.uuid4()
     project_id = uuid.uuid4()
+    vm_id = "agent-vm-silent-deny"
 
-    token = create_agent_token(str(task_id), str(project_id))
+    token = create_agent_token(
+        str(task_id),
+        vm_id,
+        project_id=str(project_id),
+    )
 
     mock_task = MagicMock()
     mock_task.id = task_id
     mock_task.project_id = project_id
-    mock_task.vm_instance_id = None
+    mock_task.vm_instance_id = vm_id
     mock_task.status = TaskStatus.IN_PROGRESS
 
     mock_execute_result = MagicMock()
@@ -11179,24 +11333,29 @@ async def test_agent_ws_closes_on_db_fallback_when_denylist_misses(
 
     task_id = uuid.uuid4()
     project_id = uuid.uuid4()
+    vm_id = "agent-vm-db-fallback"
 
     # Ensure deny-list does NOT contain the task — this is the cache-miss case
     agent_module._terminated_task_ids.pop(str(task_id), None)
 
-    token = create_agent_token(str(task_id), str(project_id))
+    token = create_agent_token(
+        str(task_id),
+        vm_id,
+        project_id=str(project_id),
+    )
 
     # Initial auth-time task: IN_PROGRESS so the handshake succeeds
     initial_task = MagicMock()
     initial_task.id = task_id
     initial_task.project_id = project_id
-    initial_task.vm_instance_id = None
+    initial_task.vm_instance_id = vm_id
     initial_task.status = TaskStatus.IN_PROGRESS
 
     # DB-fallback task: now terminal (COMPLETED) — must trigger a close
     terminal_task = MagicMock()
     terminal_task.id = task_id
     terminal_task.project_id = project_id
-    terminal_task.vm_instance_id = None
+    terminal_task.vm_instance_id = vm_id
     terminal_task.status = terminal_status
 
     auth_execute_result = MagicMock()
@@ -12822,6 +12981,149 @@ async def test_external_api_provider_model_config_falls_back_without_backoff(
     assert ctx["model_fallback"]["requested"] == requested_model
     assert ctx["model_fallback"]["effective"] == "gemini-2.5-pro"
     assert ctx["model_fallback"]["reason"] == "provider_model_config_rejection"
+
+
+@pytest.mark.asyncio
+async def test_exact_route_provider_model_config_failure_never_downgrades(
+    client: AsyncClient, db_session, mocker
+):
+    from app.max_plan_pool import EXACT_MODEL_ROUTE_CONTEXT_KEY
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=mocker.AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    project = Project(name="Exact Gemini Route Failure", user_id="test-user-exact")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    requested_model = "gemini-3.1-pro-preview"
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do exact work",
+                "model": requested_model,
+                "effort": "high",
+                "provider_preference": ["gemini"],
+            }
+        ],
+        vm_instance_id="agent-vm-exact-gemini",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            EXACT_MODEL_ROUTE_CONTEXT_KEY: {
+                "provider": "gemini",
+                "model": requested_model,
+                "effort": "high",
+            },
+            "llm_provider": "gemini",
+            "llm_auth_mode": "api_key",
+            "llm_model": requested_model,
+            "llm_execution_mode": "default",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-exact-gemini")
+    response = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "fatal",
+            "logs": "ModelNotFoundError: gemini preview model is not found",
+        },
+    )
+    assert response.status_code == 200
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.payloads[0]["model"] == requested_model
+    assert task.payloads[0]["effort"] == "high"
+    assert task.context[EXACT_MODEL_ROUTE_CONTEXT_KEY]["model"] == requested_model
+    assert "model_fallback" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_exact_route_provider_model_config_failure_rejects_stale_identity(
+    client: AsyncClient, db_session, mocker
+):
+    from app.max_plan_pool import EXACT_MODEL_ROUTE_CONTEXT_KEY
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=mocker.AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    project = Project(name="Exact Stale Route Failure", user_id="test-user-exact-stale")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    requested_model = "gemini-3.1-pro-preview"
+    stale_model = "gemini-3-pro-preview"
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do exact work",
+                "model": stale_model,
+                "effort": "high",
+                "provider_preference": ["gemini"],
+            }
+        ],
+        vm_instance_id="agent-vm-exact-stale-gemini",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            EXACT_MODEL_ROUTE_CONTEXT_KEY: {
+                "provider": "gemini",
+                "model": requested_model,
+                "effort": "high",
+            },
+            "llm_provider": "gemini",
+            "llm_auth_mode": "api_key",
+            "llm_model": stale_model,
+            "llm_execution_mode": "default",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-exact-stale-gemini")
+    response = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "fatal",
+            "logs": "ModelNotFoundError: stale Gemini model is not found",
+        },
+    )
+    assert response.status_code == 409
+    assert "exact_route_runtime_mismatch" in response.text
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.payloads[0]["model"] == stale_model
+    assert task.payloads[0]["effort"] == "high"
+    assert task.context[EXACT_MODEL_ROUTE_CONTEXT_KEY]["model"] == requested_model
+    assert task.context["llm_model"] == stale_model
+    assert "model_fallback" not in task.context
 
 
 @pytest.mark.asyncio
@@ -25315,6 +25617,10 @@ async def test_two_failed_retries_bank_distinct_attempt_diagnostics(
                 "provider_errors": [],
                 "stderr_tail": "first structured stderr",
                 "last_stream_event": "result",
+                "provider_result_is_error": False,
+                "provider_result_subtype": "success",
+                "provider_terminal_reason": "completed",
+                "provider_api_error_status": 200,
             },
         },
         headers={"x-agent-token": create_agent_token(task_id_str, first_vm_id)},
@@ -25343,6 +25649,12 @@ async def test_two_failed_retries_bank_distinct_attempt_diagnostics(
     assert first_snapshot["agent_error_report"]["stderr_tail"] == (
         "first structured stderr"
     )
+    assert first_snapshot["agent_error_report"]["provider_result_is_error"] is False
+    assert first_snapshot["agent_error_report"]["provider_result_subtype"] == "success"
+    assert first_snapshot["agent_error_report"]["provider_terminal_reason"] == (
+        "completed"
+    )
+    assert first_snapshot["agent_error_report"]["provider_api_error_status"] == 200
 
     # Model a fresh dispatch of the queued retry.  The first report was stripped
     # by reset_task_for_fresh_attempt; the second status deliberately omits one.
@@ -26995,6 +27307,9 @@ async def test_agent_status_compute_park_callback_duplicate_parked_is_idempotent
     db_session.expire_all()
     await db_session.refresh(task)
     assert task.status == TaskStatus.PARKED
+    from app.task_blocked import PARKED_AGENT_VM_CONTEXT_KEY
+
+    assert (task.context or {}).get(PARKED_AGENT_VM_CONTEXT_KEY) == vm_id
 
     regs_after_first = (
         (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
@@ -27003,6 +27318,23 @@ async def test_agent_status_compute_park_callback_duplicate_parked_is_idempotent
     first_reg_id = regs_after_first[0].id
     first_reg_state = regs_after_first[0].delivery_state
     first_parked_at = task.parked_at
+
+    # A still-valid token for this task but a different historical VM cannot
+    # use the cleared DB VM identity as a wildcard.
+    wrong_vm_response = await client.post(
+        "/api/agent/status",
+        json=park_payload,
+        headers={
+            "x-agent-token": create_agent_token(
+                str(task.id), "agent-vm-wrong-park-retry"
+            )
+        },
+    )
+    assert wrong_vm_response.status_code == 403
+    wrong_vm_detail = wrong_vm_response.json().get("detail") or (
+        wrong_vm_response.json().get("error", {}).get("message")
+    )
+    assert wrong_vm_detail == "vm_instance_mismatch"
 
     # Second POST: duplicate retry — must be idempotent.
     resp2 = await client.post(

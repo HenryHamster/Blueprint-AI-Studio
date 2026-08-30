@@ -722,9 +722,10 @@ async def test_force_promote_does_not_run_under_the_dispatch_locks(
 
     ``strategic_operation`` holds the Project row FOR UPDATE for its whole
     body. Running force-promote there idles the connection across minutes of
-    GitHub I/O — the failure ``_apply_qualify_request_post_commit`` was written
-    to prevent. The observable proof is that the implementation is handed a
-    DIFFERENT session object than the request session that took the locks.
+    GitHub I/O — the failure that the durable qualification-intent outbox was
+    introduced to prevent. The observable proof is that the implementation is
+    handed a DIFFERENT session object than the request session that took the
+    locks.
     """
     from app import release_qualifier
     import app.routers.admin_agent_ops as agent_ops

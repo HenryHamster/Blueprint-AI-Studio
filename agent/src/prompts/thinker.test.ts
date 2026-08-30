@@ -900,6 +900,9 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('Do NOT fabricate criteria when the version goal is unset');
     expect(prompt).toContain('/tmp/proposed_criteria_criteria-task-1.json');
     expect(prompt).toContain('{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]},{"text":"The candidate contains no operator-authored commits across its complete release range.","evidence_contract":{"type":"operator_authored_commits","predicate":{"max_count":0}}}],"retract":');
+    expect(prompt).toContain('does NOT implicitly seed a candidate-authorship contract');
+    expect(prompt).toContain('explicitly author the unbound `operator_authored_commits` criterion');
+    expect(prompt).toContain('Never attach that machine gate to a direction');
     expect(prompt).toContain('5-7 criteria maximum');
     expect(prompt).toContain('outcomes ("Users can X", "System handles Y"), not implementation steps');
 

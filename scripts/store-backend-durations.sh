@@ -81,7 +81,7 @@ if [ "$#" -eq 0 ]; then
   # pytest-split writes .test_durations to the rootdir (/app inside Docker),
   # which is bind-mounted from backend/, so the file lands on the host at the
   # committed artifact path.
-  "$TEST_BACKEND_SCRIPT" testing/ --store-durations
+  bash "$TEST_BACKEND_SCRIPT" testing/ --store-durations
 else
   echo "=== Refresh mode: targeted duration inventory ($*) ==="
   # Keep targeted output separate: pytest-split's direct artifact writer would
@@ -97,7 +97,7 @@ else
   mkdir -p "$PARTIAL_DIR"
   MERGE_SRC_DIR="$PARTIAL_ROOT"
   PARTIAL_PATH="$(basename "$PARTIAL_ROOT")/target/durations.json"
-  "$TEST_BACKEND_SCRIPT" "$@" --store-durations \
+  bash "$TEST_BACKEND_SCRIPT" "$@" --store-durations \
     --durations-path "$PARTIAL_PATH"
 fi
 

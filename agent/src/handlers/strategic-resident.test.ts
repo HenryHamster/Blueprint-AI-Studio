@@ -3331,6 +3331,90 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(workday.sendTurn).not.toHaveBeenCalled();
   });
 
+  it('delivers a durable continuation before claiming newer consultation work while Fast warms', async () => {
+    vi.useFakeTimers();
+    const envelope = typedEnvelope('Deliver the settled earlier result first.', 206);
+    let workdayAlive = true;
+    let resolveReadiness!: () => void;
+    const readiness = new Promise<void>((resolve) => { resolveReadiness = resolve; });
+    typedFastMocks.ensureReady.mockImplementationOnce(() => readiness);
+    let continuationClaims = 0;
+    let consultationClaims = 0;
+    let packetCompleted = false;
+    const claimOrder: string[] = [];
+
+    mockApiGet.mockResolvedValue({ messages: [], fast_message_ids: [], claim_required: true });
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({ authority_held: true, resident_incarnation_held: true });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true,
+          lease: { lease_id: 'lease-continuation-priority', generation: 1 },
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/release')) {
+        return Promise.resolve({ released: true });
+      }
+      if (url.endsWith('/workday-consultations/continuations/claim-next')) {
+        continuationClaims += 1;
+        claimOrder.push('continuation');
+        if (packetCompleted) return Promise.resolve({ status: 'empty' });
+        return Promise.resolve({
+          status: 'claimed',
+          continuation: {
+            result_packet_id: 'packet-priority-before-newer',
+            continuation_claim_id: 'continuation-priority-claim',
+            lease_expires_at: '2035-01-01T00:00:00.000Z',
+            attempt: 1,
+            claim_id: 'original-fast-priority-claim',
+            delivery_key: 'delivery-priority',
+            continuation_key: 'continuation-priority',
+            result_summary: 'The older private result is settled and ready.',
+            envelope,
+          },
+        });
+      }
+      if (url.endsWith('/workday-consultations/claim-next')) {
+        consultationClaims += 1;
+        claimOrder.push('consultation');
+        return Promise.resolve({ status: 'claimed' });
+      }
+      if (url.endsWith('/workday-consultations/continuations/packet-priority-before-newer/complete')) {
+        packetCompleted = true;
+        workdayAlive = false;
+        return Promise.resolve({ status: 'completed' });
+      }
+      return Promise.resolve({});
+    });
+    typedFastMocks.dispatch.mockImplementation((receipt: unknown) => Promise.resolve({
+      receipt,
+      result: turnResult(),
+      completion: { receipt, content: 'The earlier Workday result is delivered.' },
+      workdayRequests: [],
+    }));
+    const workday = makeSession(() => Promise.resolve(turnResult()), () => workdayAlive);
+    mockStartSession.mockReturnValue(workday);
+
+    const done = run('typed-continuation-priority-during-warmup', {
+      ...qualifiedPayload(),
+      strategic_session_message_poll_seconds: 0.01,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(continuationClaims).toBe(0);
+    expect(consultationClaims).toBe(0);
+
+    resolveReadiness();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await done;
+
+    expect(continuationClaims).toBe(1);
+    expect(consultationClaims).toBe(0);
+    expect(claimOrder).toEqual(['continuation']);
+    expect(workday.sendTurn).not.toHaveBeenCalled();
+  });
+
   it('terminalizes a repeatedly poisoned Workday continuation with a safe fallback', async () => {
     vi.useFakeTimers();
     const continuationEnvelope = typedEnvelope('Private Workday findings are ready.', 2051);
@@ -4364,6 +4448,12 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
           stop_requested: heartbeatCount > 2,
         });
       }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true,
+          lease: { lease_id: `lease-${_label.replace(/\s+/g, '-')}`, generation: 1 },
+        });
+      }
       if (url === '/api/agent/strategic' && body?.op === 'begin_autonomous_turn') {
         return Promise.reject(leaseError);
       }
@@ -5307,6 +5397,290 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     });
   });
 
+  it.each([
+    {
+      label: 'partial provider failure',
+      flags: { providerFailed: true, providerTerminalReason: 'aborted_streaming' },
+      terminalPredicate: 'provider_failed',
+    },
+    {
+      label: 'partial provider interruption',
+      flags: { interrupted: true, providerTerminalReason: 'interrupted' },
+      terminalPredicate: 'provider_interrupted',
+    },
+    {
+      label: 'empty provider failure',
+      flags: { resultText: '', providerFailed: true, providerTerminalReason: 'aborted_streaming' },
+      terminalPredicate: 'provider_failed',
+    },
+    {
+      label: 'empty provider interruption',
+      flags: { resultText: '', interrupted: true, providerTerminalReason: 'interrupted' },
+      terminalPredicate: 'provider_interrupted',
+    },
+    {
+      label: 'empty provider process exit',
+      flags: { resultText: '', processGone: true, providerTerminalReason: 'process_exit' },
+      terminalPredicate: 'provider_process_exit',
+    },
+    {
+      label: 'empty stall timeout',
+      flags: { resultText: '', timedOut: true, providerTerminalReason: 'stall_timeout' },
+      terminalPredicate: 'session_stall_timeout',
+    },
+    {
+      label: 'empty hard timeout',
+      flags: { resultText: '', hardTimedOut: true, providerTerminalReason: 'hard_timeout' },
+      terminalPredicate: 'session_hard_timeout',
+    },
+  ])('does not complete a failed typed consultation after $label', async ({
+    flags,
+    terminalPredicate,
+  }) => {
+    vi.useFakeTimers();
+    mockApiGet.mockResolvedValue({ messages: [], fast_message_ids: [], claim_required: true });
+    const envelope = typedEnvelope('Return a bounded private result.', 901);
+    let alive = true;
+    let claims = 0;
+    const acks: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({ authority_held: true, resident_incarnation_held: true });
+      }
+      if (url.endsWith('/workday-consultations/claim-next')) {
+        claims += 1;
+        return Promise.resolve(claims === 1 ? {
+          status: 'claimed',
+          packet: {
+            packet_id: 'packet-partial-provider-result',
+            workday_claim_id: 'claim-partial-provider-result',
+            lease_expires_at: '2035-01-01T00:00:00.000Z',
+            attempt: 1,
+            claim_id: 'fast-claim-partial-provider-result',
+            delivery_key: 'delivery-partial-provider-result',
+            continuation_key: 'continuation-partial-provider-result',
+            question: 'Return a bounded private result.',
+            envelope,
+          },
+        } : { status: 'empty' });
+      }
+      if (url.endsWith('/workday-consultations/packet-partial-provider-result/renew')) {
+        return Promise.resolve({
+          workday_claim_id: 'claim-partial-provider-result',
+          lease_expires_at: '2035-01-01T00:00:00.000Z',
+        });
+      }
+      if (url.endsWith('/workday-consultations/packet-partial-provider-result/ack')) {
+        acks.push(body ?? {});
+        alive = false;
+        return Promise.resolve({ status: 'abandoned' });
+      }
+      return Promise.resolve({});
+    });
+    const workday = makeSession(() => Promise.resolve(turnResult({
+      resultText: 'partial output that must not be delivered as success',
+      sentOperatorMessage: false,
+      providerOutputTail: 'partial output tail',
+      ...flags,
+    })), () => alive);
+    bindSessionWithPrivateRuntime(workday);
+
+    const done = run(`typed-consultation-partial-${terminalPredicate}`, {
+      ...qualifiedPayload(),
+      typed_fast_enabled: false,
+      strategic_session_autonomous: true,
+      strategic_session_message_poll_seconds: 0.01,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await done;
+
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(acks).toHaveLength(1);
+    expect(acks[0]).not.toHaveProperty('result_summary');
+    expect(acks[0]).toMatchObject({
+      outcome: 'abandoned',
+      attempt_diagnostic: {
+        outcome: 'abandoned',
+        terminal_predicate: terminalPredicate,
+        provider_output_tail: 'partial output tail',
+      },
+    });
+  });
+
+  it('renews the typed consultation lease through a long failed-result delivery heartbeat stall', async () => {
+    vi.useFakeTimers();
+    mockApiGet.mockResolvedValue({ messages: [], fast_message_ids: [], claim_required: true });
+    const envelope = typedEnvelope('Diagnose the provider failure exactly.', 902);
+    let alive = true;
+    let claims = 0;
+    let deliveryOutageUntil = 0;
+    let renewCalls = 0;
+    const acks: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        if (deliveryOutageUntil > Date.now()) return Promise.resolve(null);
+        return Promise.resolve({ authority_held: true, resident_incarnation_held: true });
+      }
+      if (url.endsWith('/workday-consultations/claim-next')) {
+        claims += 1;
+        return Promise.resolve(claims === 1 ? {
+          status: 'claimed',
+          packet: {
+            packet_id: 'packet-delivery-stall',
+            workday_claim_id: 'claim-delivery-stall',
+            lease_expires_at: '2035-01-01T00:00:00.000Z',
+            attempt: 2,
+            claim_id: 'fast-claim-delivery-stall',
+            delivery_key: 'delivery-stall',
+            continuation_key: 'continuation-delivery-stall',
+            question: 'Diagnose the provider failure exactly.',
+            envelope,
+          },
+        } : { status: 'empty' });
+      }
+      if (url.endsWith('/workday-consultations/packet-delivery-stall/renew')) {
+        renewCalls += 1;
+        return Promise.resolve({
+          workday_claim_id: 'claim-delivery-stall',
+          lease_expires_at: '2035-01-01T00:00:00.000Z',
+        });
+      }
+      if (url.endsWith('/workday-consultations/packet-delivery-stall/ack')) {
+        acks.push(JSON.parse(JSON.stringify(body ?? {})) as Record<string, unknown>);
+        alive = false;
+        return Promise.resolve({ status: 'failed' });
+      }
+      return Promise.resolve({});
+    });
+    const workday = makeSession(() => {
+      deliveryOutageUntil = Date.now() + 50_000;
+      return Promise.resolve(turnResult({
+        resultText: 'partial durable work',
+        sentOperatorMessage: false,
+        providerFailed: true,
+        providerTerminalReason: 'aborted_streaming',
+        providerOutputTail: 'exact bounded provider tail',
+        trace: [{ elapsedMs: 4_000, kind: 'result', label: 'aborted_streaming' }],
+      }));
+    }, () => alive);
+    bindSessionWithPrivateRuntime(workday);
+
+    const done = run('typed-consultation-delivery-stall', {
+      ...qualifiedPayload(),
+      typed_fast_enabled: false,
+      strategic_session_autonomous: true,
+      strategic_session_message_poll_seconds: 1,
+    });
+    await vi.advanceTimersByTimeAsync(55_000);
+    await done;
+
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(renewCalls).toBeGreaterThanOrEqual(3);
+    expect(acks).toHaveLength(1);
+    expect(acks[0]).toMatchObject({
+      outcome: 'failed',
+      attempt_diagnostic: {
+        attempt: 2,
+        outcome: 'failed',
+        terminal_predicate: 'provider_failed',
+        provider_terminal_reason: 'aborted_streaming',
+        provider_output_tail: 'exact bounded provider tail',
+      },
+    });
+  });
+
+  it('retries an identical consultation ack after a post-commit transport loss without rerunning private Workday', async () => {
+    vi.useFakeTimers();
+    mockApiGet.mockResolvedValue({
+      messages: [],
+      fast_message_ids: [],
+      claim_required: true,
+    });
+
+    const envelope = typedEnvelope('Commit this private result exactly once.', 91);
+    let consultationClaims = 0;
+    let alive = true;
+    const ackBodies: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+        });
+      }
+      if (url.endsWith('/workday-consultations/claim-next')) {
+        consultationClaims += 1;
+        return Promise.resolve(consultationClaims === 1 ? {
+          status: 'claimed',
+          packet: {
+            packet_id: 'packet-ack-response-lost',
+            workday_claim_id: 'workday-claim-ack-response-lost',
+            lease_expires_at: '2035-01-01T00:00:00.000Z',
+            attempt: 1,
+            claim_id: 'fast-claim-ack-response-lost',
+            delivery_key: 'delivery-ack-response-lost',
+            continuation_key: 'continuation-ack-response-lost',
+            question: 'Commit this private result exactly once.',
+            envelope,
+          },
+        } : { status: 'empty' });
+      }
+      if (url.endsWith('/workday-consultations/packet-ack-response-lost/renew')) {
+        return Promise.resolve({
+          workday_claim_id: 'workday-claim-ack-response-lost',
+          lease_expires_at: '2035-01-01T00:00:00.000Z',
+        });
+      }
+      if (url.endsWith('/workday-consultations/packet-ack-response-lost/ack')) {
+        ackBodies.push(JSON.parse(JSON.stringify(body ?? {})) as Record<string, unknown>);
+        if (ackBodies.length === 1) {
+          return Promise.reject(
+            new Error('connection lost after durable consultation ack commit'),
+          );
+        }
+        alive = false;
+        return Promise.resolve({ status: 'duplicate' });
+      }
+      return Promise.resolve({});
+    });
+
+    const workday = makeSession(() => Promise.resolve(turnResult({
+      resultText: 'Private result committed once.',
+      sentOperatorMessage: false,
+      providerTerminalReason: 'success',
+      providerOutputTail: 'Private result committed once.',
+      trace: [{ elapsedMs: 1, kind: 'result', label: 'success' }],
+    })), () => alive);
+    bindSessionWithPrivateRuntime(workday);
+
+    const done = run('typed-fast-ack-response-lost', {
+      ...qualifiedPayload(),
+      typed_fast_enabled: false,
+      strategic_session_autonomous: true,
+      strategic_session_message_poll_seconds: 0.001,
+      strategic_session_exploration_interval_seconds: 1,
+    });
+    for (let tick = 0; tick < 20 && ackBodies.length < 2; tick += 1) {
+      await vi.advanceTimersByTimeAsync(250);
+    }
+    await vi.advanceTimersByTimeAsync(1_000);
+    await done;
+
+    expect(ackBodies).toHaveLength(2);
+    expect(ackBodies[1]).toEqual(ackBodies[0]);
+    expect(ackBodies[1]?.attempt_diagnostic).toMatchObject({
+      attempt: 1,
+      outcome: 'completed',
+      terminal_predicate: 'provider_result',
+      provider_terminal_reason: 'success',
+    });
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(workday.interrupt).not.toHaveBeenCalled();
+    expect(consultationClaims).toBe(1);
+    expect(mockSendLog.mock.calls.filter(([, text]) =>
+      String(text).includes('typed Workday consultation ack deferred'))).toHaveLength(1);
+  });
+
   it('keeps a consultation-restart checkpoint out of the private retry and delivers it to the next ordinary turn', async () => {
     vi.useFakeTimers();
     const operatorMessage = {
@@ -5320,9 +5694,10 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     let renewCalls = 0;
     let operatorDelivered = false;
     const ackBodies: Array<Record<string, unknown> | undefined> = [];
+    const diagnosticBodies: Array<Record<string, unknown> | undefined> = [];
     mockApiGet.mockImplementation((url: string) => {
       if (!url.includes('/messages?')) return Promise.resolve(null);
-      if (ackBodies.length >= 2 && !operatorDelivered) {
+      if (ackBodies.length >= 1 && !operatorDelivered) {
         operatorDelivered = true;
         return Promise.resolve({
           messages: [operatorMessage],
@@ -5381,6 +5756,13 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         return Promise.resolve({
           workday_claim_id: 'different-owner-after-renewal-loss',
           lease_expires_at: '2035-01-01T00:00:00.000Z',
+        });
+      }
+      if (url.endsWith('/workday-consultations/packet-private-restart/attempt-diagnostic')) {
+        diagnosticBodies.push(body);
+        return Promise.resolve({
+          status: 'recorded',
+          attempt_diagnostic: body?.attempt_diagnostic,
         });
       }
       if (url.endsWith('/workday-consultations/packet-private-restart/ack')) {
@@ -5499,13 +5881,16 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(secondPrompts[1]).toContain('# Session checkpoint — compaction restart');
     expect(secondPrompts[1]).not.toContain('Retry the exact bounded private operation.');
     expect(secondPrompts[1]).toContain('Continue with the ordinary Workday conversation.');
-    expect(ackBodies.map(body => body?.outcome)).toEqual(['abandoned', 'completed']);
+    expect(diagnosticBodies.map(body => body?.attempt_diagnostic)).toEqual([
+      expect.objectContaining({
+        outcome: 'abandoned',
+        terminal_predicate: 'consultation_lease_renewal_failed',
+      }),
+    ]);
+    expect(ackBodies.map(body => body?.outcome)).toEqual(['completed']);
     expect(ackBodies.map(body => (
       body?.attempt_diagnostic as { terminal_predicate?: string } | undefined
-    )?.terminal_predicate)).toEqual([
-      'consultation_lease_renewal_failed',
-      'provider_result',
-    ]);
+    )?.terminal_predicate)).toEqual(['provider_result']);
   });
 
   const runOrdinaryWorkdayOverlapCase = async (

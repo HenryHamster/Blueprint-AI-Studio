@@ -72,7 +72,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
 from urllib.request import urlopen
 
 try:
@@ -4279,22 +4279,35 @@ def _staged_activated_by_cut(staged: list, version_number: int) -> list:
     ]
 
 
-def _cut_confirmation_prompt(pid: str) -> str:
-    """Build the version-cut confirmation prompt from lifecycle state.
+def _is_canonical_uuid(value: object) -> bool:
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value
+    except (TypeError, ValueError):
+        return False
 
-    Falls back to the generic confirmation when the lifecycle read is
-    unavailable or too incomplete to safely describe consequences.
-    """
+
+def _cut_confirmation_prompt(pid: str, context: dict, key: str) -> str:
+    """Disclose the exact cut authority plus best-effort consequences."""
+    version = context["version"]
+    integration = context["integration"]
+    version_number = version["version_number"]
+    lines = [
+        f"About to abandon v{version_number} ({version['id']}) and open the next version.",
+        "Exact authority:",
+        f"- Repository: {integration['owner']}/{integration['repo']}",
+        f"- Integration branch: {integration['branch']}",
+        f"- Integration HEAD: {integration['head_sha']}",
+        f"- Idempotency key: {key}",
+        "This cut will:",
+    ]
     lifecycle, err = _safe_read(f"/api/admin/projects/{pid}/version-lifecycle")
     if err:
-        return "About to abandon the open version and open the next. Proceed?"
+        lines.append(f"- Lifecycle consequence read unavailable ({err}).")
+        lines.append("Proceed?")
+        return "\n".join(lines)
 
     lifecycle = lifecycle or {}
     cv = lifecycle.get("current_version") or {}
-    version_number = cv.get("version_number")
-    if version_number is None:
-        return "About to abandon the open version and open the next. Proceed?"
-
     staged = lifecycle.get("staged_directions") or []
     activating = _staged_activated_by_cut(staged, version_number)
     in_flight = cv.get("in_flight_task_count")
@@ -4308,7 +4321,6 @@ def _cut_confirmation_prompt(pid: str) -> str:
         qual_state_name = qual_state_raw if isinstance(qual_state_raw, str) else None
         promotion_pr_number = None
 
-    lines = [f"About to abandon v{version_number} and open the next version.", "This cut will:"]
     if activating:
         lines.append(
             f"- Start {len(activating)} staged direction{'s' if len(activating) != 1 else ''} immediately "
@@ -4339,6 +4351,245 @@ def _cut_confirmation_prompt(pid: str) -> str:
 
     lines.append("Proceed?")
     return "\n".join(lines)
+
+
+def _exact_cut_ready_context(context: object) -> dict:
+    if not isinstance(context, dict) or context.get("status") != "ready":
+        raise APIError("version-cut preflight did not return ready authority")
+    version = context.get("version")
+    integration = context.get("integration")
+    if not isinstance(version, dict) or not isinstance(integration, dict):
+        raise APIError("version-cut preflight returned incomplete authority")
+    required_strings = (
+        version.get("id"),
+        integration.get("owner"),
+        integration.get("repo"),
+        integration.get("branch"),
+    )
+    if not all(isinstance(value, str) and value for value in required_strings):
+        raise APIError("version-cut preflight returned incomplete authority")
+    number = version.get("version_number")
+    sha = integration.get("head_sha")
+    identity = integration.get("identity_token")
+    if (
+        type(number) is not int
+        or number < 1
+        or not isinstance(version.get("id"), str)
+        or not _is_canonical_uuid(version["id"])
+        or not isinstance(sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", sha) is None
+        or not isinstance(identity, str)
+        or re.fullmatch(r"[0-9a-f]{64}", identity) is None
+    ):
+        raise APIError("version-cut preflight returned invalid exact authority")
+    return context
+
+
+def _cut_request_matches_ready(request: dict, context: dict) -> bool:
+    try:
+        ready = _exact_cut_ready_context(context)
+    except APIError:
+        return False
+    version = ready["version"]
+    integration = ready["integration"]
+    return (
+        request["expected_version_id"] == version["id"]
+        and request["expected_version_number"] == version["version_number"]
+        and request["expected_integration_sha"] == integration["head_sha"]
+        and request["expected_integration_identity"] == integration["identity_token"]
+    )
+
+
+def _cut_receipt_matches(request: dict, pid: str, context: object) -> bool:
+    if not isinstance(context, dict) or context.get("status") != "committed":
+        return False
+    receipt = context.get("receipt")
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        return False
+    return (
+        receipt.get("status") == "committed"
+        and receipt.get("project_id") == pid
+        and receipt.get("idempotency_key") == request["idempotency_key"]
+        and receipt.get("reason") == request["reason"]
+        and receipt.get("expected_version_id") == request["expected_version_id"]
+        and receipt.get("expected_version_number") == request["expected_version_number"]
+        and receipt.get("expected_integration_sha") == request["expected_integration_sha"]
+        and receipt.get("expected_integration_identity")
+        == request["expected_integration_identity"]
+    )
+
+
+def _cut_committed_context_matches(request: dict, pid: str, context: object) -> bool:
+    if not _cut_receipt_matches(request, pid, context):
+        return False
+    followups = context.get("followups") if isinstance(context, dict) else None
+    return isinstance(followups, dict) and followups.get("status") in {
+        "pending", "complete"
+    }
+
+
+def _cut_retry_argv(pid: str, request: dict) -> list[str]:
+    argv = [
+        "promote-recover", "cut", "--project-id", pid,
+        "--idempotency-key", request["idempotency_key"],
+        "--expected-version-id", request["expected_version_id"],
+        "--expected-version-number", str(request["expected_version_number"]),
+        "--expected-integration-sha", request["expected_integration_sha"],
+        "--expected-integration-identity", request["expected_integration_identity"],
+    ]
+    if request["reason"] is not None:
+        argv.extend(["--reason", request["reason"]])
+    return argv
+
+
+def _emit_cut_failure(args: argparse.Namespace, message: str, retry_argv: list[str]) -> int:
+    payload = {
+        "action": "cut",
+        "status": "not_committed_or_ambiguous",
+        "message": message,
+        "retry_argv": retry_argv,
+    }
+    if _json_mode(args):
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"ERROR: {message}", file=sys.stderr)
+        print(f"Exact recovery command: blueprint {shlex.join(retry_argv)}", file=sys.stderr)
+    return 1
+
+
+def _cmd_exact_cut(args: argparse.Namespace, pid: str) -> int:
+    reason = getattr(args, "reason", None)
+    if reason is not None and len(reason) > 500:
+        print("ERROR: version-cut reason must be at most 500 characters.", file=sys.stderr)
+        return 1
+    authority_names = (
+        "idempotency_key",
+        "expected_version_id",
+        "expected_version_number",
+        "expected_integration_sha",
+        "expected_integration_identity",
+    )
+    supplied = [getattr(args, name, None) is not None for name in authority_names]
+    if any(supplied) and not all(supplied):
+        print(
+            "ERROR: an exact cut retry requires all five authority options.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if all(supplied):
+        key = args.idempotency_key
+        if not key or key != key.strip() or len(key) > 255:
+            print(
+                "ERROR: version-cut idempotency key must be non-empty, canonical, and at most 255 characters.",
+                file=sys.stderr,
+            )
+            return 1
+        if not _is_canonical_uuid(args.expected_version_id):
+            print("ERROR: --expected-version-id must be a canonical UUID.", file=sys.stderr)
+            return 1
+        if (
+            type(args.expected_version_number) is not int
+            or args.expected_version_number < 1
+            or re.fullmatch(r"[0-9a-f]{40}", args.expected_integration_sha or "") is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                args.expected_integration_identity or "",
+            ) is None
+        ):
+            print("ERROR: exact version-cut authority values are invalid.", file=sys.stderr)
+            return 1
+        request = {
+            "reason": reason,
+            "idempotency_key": key,
+            "expected_version_id": args.expected_version_id,
+            "expected_version_number": args.expected_version_number,
+            "expected_integration_sha": args.expected_integration_sha,
+            "expected_integration_identity": args.expected_integration_identity,
+        }
+        keyed_path = (
+            f"/api/admin/projects/{pid}/version-cut-context?"
+            f"idempotency_key={quote(request['idempotency_key'], safe='')}"
+        )
+        context = api("GET", keyed_path)
+        if _cut_committed_context_matches(request, pid, context):
+            _emit(args, {"action": "cut", "result": context}, _render_promote_recover)
+            return 0
+        if isinstance(context, dict) and context.get("status") == "committed":
+            return _emit_cut_failure(
+                args,
+                "the committed receipt or follow-up state does not match the frozen request",
+                _cut_retry_argv(pid, request),
+            )
+        if not _cut_request_matches_ready(request, context):
+            return _emit_cut_failure(
+                args,
+                "the stored key is not committed and exact cut authority changed",
+                _cut_retry_argv(pid, request),
+            )
+    else:
+        context = _exact_cut_ready_context(
+            api("GET", f"/api/admin/projects/{pid}/version-cut-context")
+        )
+        request = {
+            "reason": reason,
+            "idempotency_key": str(uuid.uuid4()),
+            "expected_version_id": context["version"]["id"],
+            "expected_version_number": context["version"]["version_number"],
+            "expected_integration_sha": context["integration"]["head_sha"],
+            "expected_integration_identity": context["integration"]["identity_token"],
+        }
+        keyed_path = (
+            f"/api/admin/projects/{pid}/version-cut-context?"
+            f"idempotency_key={quote(request['idempotency_key'], safe='')}"
+        )
+
+    retry_argv = _cut_retry_argv(pid, request)
+    prompt = _cut_confirmation_prompt(pid, context, request["idempotency_key"])
+    if not _confirm(prompt, getattr(args, "yes", False)):
+        print("Aborted.")
+        return 0
+
+    raw_body = json.dumps(
+        request,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    post_error: Exception | None = None
+    try:
+        api(
+            "POST",
+            f"/api/admin/projects/{pid}/version-cut",
+            raw_body=raw_body,
+        )
+    except Exception as exc:  # noqa: BLE001 — dispatch may be ambiguous; reconcile
+        post_error = exc
+
+    try:
+        reconciled = api("GET", keyed_path)
+    except APIError as exc:
+        detail = f"keyed readback failed after the cut request: {exc}"
+        if post_error is not None:
+            detail = f"cut request and {detail}"
+        return _emit_cut_failure(args, detail, retry_argv)
+    if _cut_committed_context_matches(request, pid, reconciled):
+        _emit(
+            args,
+            {"action": "cut", "result": reconciled},
+            _render_promote_recover,
+        )
+        return 0
+    if _cut_request_matches_ready(request, reconciled):
+        return _emit_cut_failure(
+            args,
+            "no committed receipt exists; the exact frozen request may be retried explicitly",
+            retry_argv,
+        )
+    return _emit_cut_failure(
+        args,
+        "keyed readback mismatched the frozen version-cut request",
+        retry_argv,
+    )
 
 
 def _force_promote_confirmation_prompt(pid: str, candidate_sha) -> str:
@@ -4447,7 +4698,7 @@ _PROMOTE_RECOVER_ACTIONS = {
 }
 
 
-def cmd_promote_recover(args: argparse.Namespace) -> None:
+def cmd_promote_recover(args: argparse.Namespace) -> int | None:
     """Run a promotion/recovery lever with a confirmation prompt before mutating."""
     action = args.action
     spec = _PROMOTE_RECOVER_ACTIONS[action]
@@ -4464,12 +4715,25 @@ def cmd_promote_recover(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     pid = get_project_id(getattr(args, "project_id", None))
+    cut_only_names = (
+        "idempotency_key",
+        "expected_version_id",
+        "expected_version_number",
+        "expected_integration_sha",
+        "expected_integration_identity",
+    )
+    if action != "cut" and any(
+        getattr(args, name, None) is not None for name in cut_only_names
+    ):
+        print("ERROR: exact version-cut authority options require action 'cut'.", file=sys.stderr)
+        return 1
+    if action == "cut":
+        return _cmd_exact_cut(args, pid)
+
     path = path_tmpl.format(pid=pid)
     body = build_body(args)
 
-    if action == "cut":
-        prompt = _cut_confirmation_prompt(pid)
-    elif action == "force-promote":
+    if action == "force-promote":
         prompt = _force_promote_confirmation_prompt(pid, getattr(args, "candidate_sha", None))
     else:
         prompt = f"About to {summary}. Proceed?"
@@ -5503,7 +5767,7 @@ def _render_strategic_cycle(d: dict) -> None:
 # ── strategic (resident session: start / stop / chat) ─────────────────────────
 
 def cmd_strategic(args: argparse.Namespace) -> None:
-    """Dispatch resident Strategic session subcommands: start / stop / chat / send."""
+    """Dispatch resident Strategic session and cold-successor subcommands."""
     sub = getattr(args, "strategic_cmd", None)
     if sub == "start":
         _strategic_start(args)
@@ -5513,8 +5777,16 @@ def cmd_strategic(args: argparse.Namespace) -> None:
         _strategic_chat(args)
     elif sub == "send":
         _strategic_send(args)
+    elif sub == "cold-successor-start":
+        return _strategic_cold_successor_start(args)
+    elif sub == "cold-successor-status":
+        _strategic_cold_successor_status(args)
     else:
-        print("Usage: blueprint strategic {start|stop|chat|send}", file=sys.stderr)
+        print(
+            "Usage: blueprint strategic "
+            "{start|stop|chat|send|cold-successor-start|cold-successor-status}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
@@ -5727,6 +5999,206 @@ def _strategic_send(args: argparse.Namespace) -> None:
         lambda row: print(f"  Strategic message sent: {row.get('id', '?')}"),
     )
     _report_arming(result, lane="strategic")
+
+
+def _is_canonical_cold_uuid(value: object) -> bool:
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value
+    except (TypeError, ValueError):
+        return False
+
+
+def _cold_successor_effect(pid: str, request: dict) -> str:
+    effect = {
+        "project_id": pid,
+        "runner_id": request["runner_id"],
+        "expected_predecessor_session_id": request[
+            "expected_predecessor_session_id"
+        ],
+        "expected_predecessor_task_id": request[
+            "expected_predecessor_task_id"
+        ],
+        "expected_predecessor_worker_generation": request[
+            "expected_predecessor_worker_generation"
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(effect, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _cold_successor_retry_argv(pid: str, request: dict) -> list[str]:
+    argv = [
+        "strategic", "cold-successor-start", "--project-id", pid,
+        "--runner-id", request["runner_id"],
+        "--idempotency-key", request["idempotency_key"],
+        "--expected-predecessor-session-id",
+        request["expected_predecessor_session_id"],
+        "--expected-predecessor-worker-generation",
+        str(request["expected_predecessor_worker_generation"]),
+    ]
+    if request["expected_predecessor_task_id"] is not None:
+        argv.extend([
+            "--expected-predecessor-task-id",
+            request["expected_predecessor_task_id"],
+        ])
+    return argv
+
+
+def _cold_successor_status_matches(
+    status_row: object,
+    *,
+    fingerprint: str,
+    launch_effect_sha256: str,
+) -> bool:
+    return bool(
+        isinstance(status_row, dict)
+        and status_row.get("launch_mode") == "cold_successor"
+        and status_row.get("proof_state") != "absent"
+        and status_row.get("idempotency_fingerprint") == fingerprint
+        and status_row.get("launch_effect_sha256") == launch_effect_sha256
+        and _is_canonical_cold_uuid(status_row.get("task_id"))
+        and isinstance(status_row.get("session_id"), str)
+        and bool(status_row["session_id"])
+    )
+
+
+def _emit_cold_successor_failure(
+    args: argparse.Namespace,
+    message: str,
+    retry_argv: list[str],
+) -> int:
+    payload = {
+        "status": "not_launched_or_ambiguous",
+        "message": message,
+        "retry_argv": retry_argv,
+    }
+    if _json_mode(args):
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"ERROR: {message}", file=sys.stderr)
+        print(
+            f"Exact reconciliation command: blueprint {shlex.join(retry_argv)}",
+            file=sys.stderr,
+        )
+    return 1
+
+
+def _strategic_cold_successor_start(args: argparse.Namespace) -> int:
+    """Launch once and reconcile the exact cold-successor authority receipt."""
+    _require_write_config("strategic cold-successor-start")
+    pid = get_project_id(getattr(args, "project_id", None))
+    key = str(args.idempotency_key)
+    predecessor_session = str(args.expected_predecessor_session_id)
+    predecessor_task = getattr(args, "expected_predecessor_task_id", None)
+    if (
+        not _is_canonical_cold_uuid(args.runner_id)
+        or (
+            predecessor_task is not None
+            and not _is_canonical_cold_uuid(predecessor_task)
+        )
+        or not key
+        or key != key.strip()
+        or len(key) > 255
+        or not predecessor_session
+        or predecessor_session != predecessor_session.strip()
+        or len(predecessor_session) > 255
+    ):
+        print("ERROR: cold-successor exact authority values are invalid.", file=sys.stderr)
+        return 1
+    request = {
+        "runner_id": args.runner_id,
+        "idempotency_key": key,
+        "expected_predecessor_session_id": predecessor_session,
+        "expected_predecessor_task_id": predecessor_task,
+        "expected_predecessor_worker_generation": (
+            args.expected_predecessor_worker_generation
+        ),
+    }
+    fingerprint = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    effect_sha = _cold_successor_effect(pid, request)
+    status_path = (
+        f"/api/admin/projects/{pid}/strategic-session/cold-successor"
+        "?missing_ok=true"
+    )
+    retry_argv = _cold_successor_retry_argv(pid, request)
+    current = api("GET", status_path)
+    if _cold_successor_status_matches(
+        current,
+        fingerprint=fingerprint,
+        launch_effect_sha256=effect_sha,
+    ):
+        _emit(args, current, _render_cold_successor_status)
+        return 0
+    if isinstance(current, dict) and current.get("proof_state") != "absent":
+        return _emit_cold_successor_failure(
+            args,
+            "a different or inconsistent cold-successor proof is already canonical",
+            retry_argv,
+        )
+    prompt = (
+        "Launch the transcript-free cold successor with exact authority?\n"
+        f"- project: {pid}\n"
+        f"- runner: {request['runner_id']}\n"
+        f"- predecessor session: {predecessor_session}\n"
+        f"- predecessor task: {predecessor_task or '-'}\n"
+        f"- predecessor generation: {request['expected_predecessor_worker_generation']}\n"
+        f"- stable idempotency key: {key}"
+    )
+    if not _confirm(prompt, getattr(args, "yes", False)):
+        print("Aborted.")
+        return 0
+    raw_body = json.dumps(request, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    post_error: Exception | None = None
+    try:
+        api(
+            "POST",
+            f"/api/admin/projects/{pid}/strategic-session/cold-successor/start",
+            raw_body=raw_body,
+        )
+    except Exception as exc:  # noqa: BLE001 - dispatch may be ambiguous
+        post_error = exc
+    try:
+        reconciled = api("GET", status_path)
+    except APIError as exc:
+        detail = f"cold-successor readback failed: {exc}"
+        if post_error is not None:
+            detail = f"launch request and {detail}"
+        return _emit_cold_successor_failure(args, detail, retry_argv)
+    if _cold_successor_status_matches(
+        reconciled,
+        fingerprint=fingerprint,
+        launch_effect_sha256=effect_sha,
+    ):
+        _emit(args, reconciled, _render_cold_successor_status)
+        return 0
+    return _emit_cold_successor_failure(
+        args,
+        "exact cold-successor receipt was not observed; reconcile before retry",
+        retry_argv,
+    )
+
+
+def _render_cold_successor_status(row: dict) -> None:
+    print("=== COLD SUCCESSOR PROOF ===")
+    print(f"  proof_state: {row.get('proof_state', '?')}")
+    print(f"  session_id:  {row.get('session_id', '-')}")
+    print(f"  task_id:     {row.get('task_id', '-')}")
+    print(f"  generation:  {row.get('worker_generation', '-')}")
+    print(f"  runner:      {row.get('runner_id', '-')}")
+    print(f"  task_status: {row.get('task_status', '-')}")
+    print(f"  core_sha256: {row.get('core_sha256', '-')}")
+
+
+def _strategic_cold_successor_status(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    row = api(
+        "GET",
+        f"/api/admin/projects/{pid}/strategic-session/cold-successor",
+    )
+    _emit(args, row, _render_cold_successor_status)
 
 
 # ── trim-playbook-archive ─────────────────────────────────────────────────────
@@ -9515,6 +9987,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_pr.add_argument("--candidate-sha", default=None,
                       help="force-promote only: pin the commit to promote "
                            "(default: current integration-branch HEAD).")
+    p_pr.add_argument("--idempotency-key", default=None,
+                      help="cut retry only: reuse the frozen exact request key.")
+    p_pr.add_argument("--expected-version-id", default=None,
+                      help="cut retry only: frozen release-version UUID.")
+    p_pr.add_argument("--expected-version-number", type=int, default=None,
+                      help="cut retry only: frozen release-version number.")
+    p_pr.add_argument("--expected-integration-sha", default=None,
+                      help="cut retry only: frozen full integration HEAD SHA.")
+    p_pr.add_argument("--expected-integration-identity", default=None,
+                      help="cut retry only: frozen repository/branch/head identity token.")
 
     # messages
     p_msgs = sub.add_parser(
@@ -9877,6 +10359,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_strat_send.add_argument(
         "--idempotency-key", default=None,
         help="Optional stable retry key for exactly-once message creation.")
+    p_strat_cold_start = strategic_sub.add_parser(
+        "cold-successor-start", parents=[common],
+        help="Launch and reconcile one exact transcript-free successor proof.")
+    p_strat_cold_start.add_argument("--runner-id", required=True)
+    p_strat_cold_start.add_argument("--idempotency-key", required=True)
+    p_strat_cold_start.add_argument(
+        "--expected-predecessor-session-id", required=True)
+    p_strat_cold_start.add_argument(
+        "--expected-predecessor-task-id", default=None)
+    p_strat_cold_start.add_argument(
+        "--expected-predecessor-worker-generation",
+        required=True,
+        type=int,
+        choices=range(1, 2_147_483_648),
+        metavar="N",
+    )
+    p_strat_cold_start.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt.")
+    strategic_sub.add_parser(
+        "cold-successor-status", parents=[common],
+        help="Read the canonical cold-successor proof receipt.")
 
     # strategic-cycle
     p_sc = sub.add_parser("strategic-cycle", parents=[common],

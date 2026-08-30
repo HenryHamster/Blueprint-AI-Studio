@@ -871,6 +871,9 @@ async def acquire_resident_call_lease(
     holder: dict[str, Any] = {"call": None, "expired_account_id": None, "created": False}
 
     def _apply(vision: dict[str, Any]) -> None:
+        from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+        reject_active_cold_successor(vision)
         resident = read_resident_session(vision)
         if not resident_session_is_active(resident):
             raise HTTPException(status_code=409, detail="An active Workday Resident is required")
@@ -1093,6 +1096,9 @@ async def acquire_resident_typed_fast_lease(
     holder: dict[str, Any] = {"lease": None, "expired_account_id": None, "created": False}
 
     def _apply(vision: dict[str, Any]) -> None:
+        from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+        reject_active_cold_successor(vision)
         resident = read_resident_session(vision)
         if (
             not resident_session_is_active(resident)
@@ -3777,7 +3783,7 @@ async def _rebind_predecessor_conversation_handoff(
         "_workday_consultation_claim_generation",
         "_workday_consultation_claim_incarnation",
         "_workday_consultation_claim_expires_at",
-        "_workday_consultation_claim_attempt",
+        "_workday_consultation_claim_started_at",
     )
     continuation_claim_keys = (
         "_workday_continuation_claim_id",
@@ -3877,6 +3883,9 @@ async def start_resident_session(
     production ``AsyncSessionLocal`` rebinds to a different engine under the
     Postgres test harness, so a bare fresh session would clean up the wrong DB).
     """
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(project.vision)
     now = _utcnow()
     now_iso = now.isoformat()
     # Fast-path idempotency: an already-active session whose recorded task is
@@ -4064,6 +4073,7 @@ async def start_resident_session(
                 status_code=409,
                 detail="Project unavailable to claim resident session",
             )
+        reject_active_cold_successor(locked_project.vision)
         vision = dict(locked_project.vision or {})
         fresh = read_resident_session(vision)
         if locked_project.archived:
@@ -4954,6 +4964,9 @@ async def stop_resident_session(
     "ended" session in API responses even though nothing ever started. A dark /
     never-started feature stays fully inert.
     """
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(project.vision)
     blob = read_resident_session(project.vision)
     if blob is None:
         # Nothing to stop — leave ``Project.vision`` untouched (no synthetic
@@ -5004,6 +5017,7 @@ async def stop_resident_session(
     ended_holder: dict[str, Any] = {"blob": None, "typed_fast_account_id": None}
 
     def _release_and_end(vision: dict[str, Any]) -> None:
+        reject_active_cold_successor(vision)
         # Release the continuation lease (the resident session is over) and mark
         # the session blob ended, in one locked read-modify-write.
         current = read_resident_session(vision)
@@ -5397,6 +5411,9 @@ async def _bind_pending_operator_message_to_resident(
     )
     if locked_project is None:
         return False
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(locked_project.vision)
     current = read_resident_session(locked_project.vision)
     if (
         not resident_session_is_active(current)
@@ -5772,6 +5789,16 @@ async def reconcile_terminal_resident_worker(
             task = await session.get(Task, task_uuid)
             if task is None or task.status not in _TERMINAL_TASK_STATUSES:
                 return False
+            from app.strategic_cold_successor_authority import (
+                has_exact_cold_successor_markers,
+            )
+
+            if has_exact_cold_successor_markers(task):
+                from app.strategic_cold_successor_lifecycle import (
+                    reconcile_cold_successor_terminal,
+                )
+
+                return await reconcile_cold_successor_terminal(session, task_uuid)
             project_id = task.project_id
             project = await session.get(Project, project_id)
             if project is None:
@@ -6746,6 +6773,9 @@ async def agent_fetch_checkpoint_state(
     (set-problem-model, set-memory, set-running-update).
     """
     project = await _resolve_agent_project(project_id, token, session)
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(project.vision)
     resident = read_resident_session(project.vision)
     if not resident_session_is_active(resident):
         raise HTTPException(status_code=409, detail="No active resident session for checkpoint")
@@ -6864,6 +6894,9 @@ async def acquire_agent_typed_fast_lease(
     if str(token.get("sub")) != str(payload.task_id):
         raise HTTPException(status_code=403, detail="Token task mismatch")
     project = await _resolve_agent_project(project_id, token, session)
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(project.vision)
     task = await session.get(Task, uuid.UUID(payload.task_id))
     if task is None or (task.context or {}).get("_resident_session") is not True:
         raise HTTPException(status_code=409, detail="Typed Fast requires a Resident task")
@@ -7019,6 +7052,9 @@ async def resident_session_heartbeat(
     resident session task itself.
     """
     project = await _resolve_agent_project(project_id, token, session)
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(project.vision)
     if str(token.get("sub")) != str(payload.task_id):
         # The heartbeat must come from the resident session task's own token.
         raise HTTPException(status_code=403, detail="Token task mismatch")

@@ -454,7 +454,10 @@ async def test_reaper_backstop_activates_promoted_target(db_session):
 
     # Populate the normalised direction table the sweep prefilters on.
     await sync_directions(db_session, project.id, project.directions)
-    # Version 2 is OPEN — so version 1 has already promoted.
+    terminal = await rv.open_version(db_session, project.id, version_number=1)
+    terminal.status = "promoted"
+    await db_session.commit()
+    # Version 2 is OPEN while v1 is canonically terminal.
     await rv.open_version(db_session, project.id, version_number=2)
     await db_session.commit()
 
@@ -465,6 +468,11 @@ async def test_reaper_backstop_activates_promoted_target(db_session):
     by_id = {d["id"]: d["status"] for d in project.directions}
     assert by_id["d-ready"] == "active"
     assert by_id["d-hold"] == "staged"
+    notes = next(d for d in project.directions if d["id"] == "d-ready")["notes"]
+    assert "v1 promoted" in notes[-1]["text"]
+    messages = await _activation_messages(db_session, project.id)
+    assert messages[-1].context["terminal_version_number"] == 1
+    assert messages[-1].context["terminal_status"] == "promoted"
 
     # Idempotent: a second sweep activates nothing more.
     assert await sweep_activate_staged_directions(db_session) == 0
@@ -504,6 +512,60 @@ async def test_reaper_backstop_noop_without_open_version(db_session):
         .all()
     )
     assert project.id in rows
+
+
+@pytest.mark.asyncio
+async def test_reaper_backstop_requires_canonical_preceding_terminal_row(db_session):
+    """A higher open version alone is not proof that its predecessor closed."""
+    project = Project(
+        name="Staged-Reaper-Missing-Terminal",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[_staged_direction("d-missing-terminal", staged_for_version=1)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await sync_directions(db_session, project.id, project.directions)
+    # Deliberately model a damaged/imported history: v2 is open but no
+    # canonical promoted/abandoned v1 exists. The reaper must fail closed.
+    await rv.open_version(db_session, project.id, version_number=2)
+    await db_session.commit()
+
+    assert await sweep_activate_staged_directions(db_session) == 0
+    await db_session.refresh(project)
+    assert project.directions[0]["status"] == "staged"
+    assert await _activation_messages(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_reaper_backstop_reports_abandoned_terminal_status(db_session):
+    project = Project(
+        name="Staged-Reaper-Abandoned",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[_staged_direction("d-abandoned", staged_for_version=1)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await sync_directions(db_session, project.id, project.directions)
+    terminal = await rv.open_version(db_session, project.id, version_number=1)
+    terminal.status = "abandoned"
+    await db_session.commit()
+    await rv.open_version(db_session, project.id, version_number=2)
+    await db_session.commit()
+
+    assert await sweep_activate_staged_directions(db_session) == 1
+    await db_session.refresh(project)
+    notes = project.directions[0]["notes"]
+    assert "v1 abandoned" in notes[-1]["text"]
+    messages = await _activation_messages(db_session, project.id)
+    assert "v1 abandoned" in messages[-1].content
+    assert messages[-1].context["terminal_version_number"] == 1
+    assert messages[-1].context["terminal_status"] == "abandoned"
 
 
 # ---------------------------------------------------------------------------
@@ -858,7 +920,7 @@ async def test_activation_annotates_direction_with_note(db_session):
     await db_session.refresh(project)
     notes = project.directions[0].get("notes") or []
     assert notes, "activation must append a note to the direction"
-    assert "v3" in notes[-1]["text"]
+    assert "v3 promoted" in notes[-1]["text"]
     assert "resumed" in notes[-1]["text"].lower()
     assert notes[-1]["added_at"]
 
@@ -890,7 +952,8 @@ async def test_activation_posts_operator_message(db_session):
     msg = msgs[0]
     assert "v2" in msg.content
     assert (msg.context or {}).get("count") == 2
-    assert (msg.context or {}).get("promoted_version_number") == 2
+    assert (msg.context or {}).get("terminal_version_number") == 2
+    assert (msg.context or {}).get("terminal_status") == "promoted"
     assert set((msg.context or {}).get("direction_ids") or []) == {"d-n1", "d-n2"}
 
 
@@ -957,6 +1020,46 @@ async def test_activation_survives_notification_failure(db_session, monkeypatch)
     await db_session.refresh(project)
     assert project.directions[0]["status"] == "active"
     assert project.directions[0].get("notes"), "note still written despite notify failure"
+
+
+@pytest.mark.asyncio
+async def test_activation_survives_deferred_flush_failure_after_commit(
+    db_session,
+    monkeypatch,
+):
+    """A post-commit external delivery failure cannot hide durable activation."""
+    from unittest.mock import AsyncMock
+
+    import app.notification_dispatch as nd
+    import app.strategic_events as strategic_events
+
+    def _boom(_session):
+        raise RuntimeError("external scheduler down")
+
+    emitted = AsyncMock()
+    monkeypatch.setattr(nd, "flush_deferred_external_notifications", _boom)
+    monkeypatch.setattr(strategic_events, "emit_strategic_updated", emitted)
+    project = Project(
+        name="Staged-FlushFail",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[_staged_direction("d-flush", staged_for_version=1)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    activated = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=1
+    )
+
+    assert activated == ["d-flush"]
+    await db_session.refresh(project)
+    assert project.directions[0]["status"] == "active"
+    assert project.directions[0].get("notes")
+    assert len(await _activation_messages(db_session, project.id)) == 1
+    assert "_deferred_external_notifications" not in db_session.info
+    emitted.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1045,6 +1148,9 @@ async def test_activation_resolves_stale_alert_via_reaper_backstop(
     await db_session.commit()
     await db_session.refresh(project)
     await sync_directions(db_session, project.id, project.directions)
+    terminal = await rv.open_version(db_session, project.id, version_number=1)
+    terminal.status = "promoted"
+    await db_session.commit()
     await rv.open_version(db_session, project.id, version_number=2)
     await db_session.commit()
 

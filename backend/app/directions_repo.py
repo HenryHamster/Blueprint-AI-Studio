@@ -29,6 +29,7 @@ as a follow-up — see the PR body for ``p2-direction-table``.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import uuid
 from typing import Any, Dict, List
@@ -383,16 +384,20 @@ async def activate_eligible_staged_directions(
     session: AsyncSession,
     project_id,
     promoted_version_number: int,
+    *,
+    terminal_status: str = "promoted",
 ) -> List[str]:
-    """Activate staged directions whose target version has promoted/opened.
+    """Activate staged directions whose target version has resolved.
 
     A *staged* direction (``status == "staged"``) is inert work marked to begin
-    only after the version that was OPEN when it was staged has promoted. The
+    only after the version that was OPEN when it was staged has resolved. The
     per-direction ``staged_for_version`` marker records that version number.
 
     This flips to ``active`` staged directions whose
     ``staged_for_version <= promoted_version_number``, clears the
-    ``staged_for_version`` marker, and stamps ``staged_activated_at``. It is the
+    ``staged_for_version`` marker, and stamps ``staged_activated_at``. The
+    explicit terminal status preserves whether the version promoted or was
+    abandoned in every durable note and operator message. It is the
     single shared activation entry point used by BOTH the version-open promotion
     hook and the reaper durability backstop, so the two paths can never diverge.
 
@@ -451,6 +456,12 @@ async def activate_eligible_staged_directions(
     # sorts as medium; a missing staged_at sorts earliest (treated as oldest).
     _PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
 
+    resolved_status = str(terminal_status or "").strip().lower()
+    if resolved_status not in {"promoted", "abandoned"}:
+        raise ValueError(
+            "terminal_status must be either 'promoted' or 'abandoned'"
+        )
+
     activated: List[str] = []
     activated_meta: List[Dict[str, Any]] = []
     activated_with_gaps: List[tuple] = []  # (direction_id, gap_id) for PM re-staffing
@@ -503,7 +514,8 @@ async def activate_eligible_staged_directions(
             notes.append(
                 {
                     "text": (
-                        f"Auto-activated: v{promoted_version_number} promoted "
+                        f"Auto-activated: v{promoted_version_number} "
+                        f"{resolved_status} "
                         "— staged work resumed"
                     ),
                     "added_at": now_iso,
@@ -570,11 +582,19 @@ async def activate_eligible_staged_directions(
     # documented cycle avoidance.
     try:
         from app.notification_dispatch import (
+            begin_deferred_external_notifications,
+            discard_deferred_external_notifications,
+            flush_deferred_external_notifications,
             post_staged_directions_activated_message,
         )
 
+        begin_deferred_external_notifications(session)
         await post_staged_directions_activated_message(
-            session, project_id, activated_meta, promoted_version_number
+            session,
+            project_id,
+            activated_meta,
+            promoted_version_number,
+            terminal_status=resolved_status,
         )
     except Exception as exc:  # noqa: BLE001 — notification is strictly best-effort
         logger.warning(
@@ -583,7 +603,26 @@ async def activate_eligible_staged_directions(
             project_id,
             exc,
         )
-    await session.commit()
+    try:
+        await session.commit()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        if "_deferred_external_notifications" in session.info:
+            discard_deferred_external_notifications(session)
+        raise
+    if "_deferred_external_notifications" in session.info:
+        try:
+            flush_deferred_external_notifications(session)
+        except Exception as exc:  # noqa: BLE001 - activation is already committed
+            if "_deferred_external_notifications" in session.info:
+                discard_deferred_external_notifications(session)
+            logger.warning(
+                "[directions_repo] staged-activation external notification flush "
+                "failed for project %s (activation committed): %s",
+                project_id,
+                exc,
+            )
     try:
         await emit_strategic_updated(project_id, STRATEGIC_KIND_DIRECTIONS)
     except Exception as exc:  # noqa: BLE001 — broadcast is a best-effort UI signal

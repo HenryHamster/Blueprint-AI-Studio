@@ -460,13 +460,16 @@ import {{ buildArtifactFiles }} from {module!r};
 
 const accumulated = {{
   'src/measured.test.ts': {{ duration_ms_sum: 300, tests: 3, passed_runs: 1, total_runs: 1 }},
-  'src/fast.test.ts': {{ duration_ms_sum: 10, tests: 1, passed_runs: 1, total_runs: 1 }},
+  'src/fast.test.ts': {{ duration_ms_sum: 0, tests: 1, passed_runs: 1, total_runs: 1 }},
+  'src/import-failed.test.ts': {{ duration_ms_sum: 0, tests: 0, passed_runs: 0, total_runs: 1 }},
+  'src/outside-request.test.ts': {{ duration_ms_sum: 5, tests: 1, passed_runs: 1, total_runs: 1 }},
 }};
 const inventory = [
   'src/measured.test.ts',
   'src/fast.test.ts',
   'src/never-ran.test.ts',
   'src/also-never-ran.test.ts',
+  'src/import-failed.test.ts',
 ];
 const result = buildArtifactFiles(accumulated, inventory, 1);
 console.log(JSON.stringify(result));
@@ -498,8 +501,14 @@ def test_vitest_artifact_marks_unexecuted_files_unmeasured() -> None:
     by_file = {entry["file"]: entry for entry in result["files"]}
     assert by_file["src/measured.test.ts"]["measured"] is True
     assert by_file["src/measured.test.ts"]["duration_ms"] == 300
+    assert by_file["src/fast.test.ts"]["measured"] is True
+    assert by_file["src/fast.test.ts"]["duration_ms"] == 0
 
-    for missing in ("src/never-ran.test.ts", "src/also-never-ran.test.ts"):
+    for missing in (
+        "src/never-ran.test.ts",
+        "src/also-never-ran.test.ts",
+        "src/import-failed.test.ts",
+    ):
         assert by_file[missing]["measured"] is False, (
             f"{by_file[missing]}\n{format_offender_marker([missing])}"
         )
@@ -512,8 +521,11 @@ def test_vitest_artifact_marks_unexecuted_files_unmeasured() -> None:
 
     assert sorted(entry["file"] for entry in result["unmeasured"]) == [
         "src/also-never-ran.test.ts",
+        "src/import-failed.test.ts",
         "src/never-ran.test.ts",
     ]
+    assert result["unexpected"] == ["src/outside-request.test.ts"]
+    assert "src/outside-request.test.ts" not in by_file
 
 
 def test_vitest_artifact_sorts_measured_first_then_unmeasured() -> None:
@@ -528,12 +540,173 @@ def test_vitest_artifact_sorts_measured_first_then_unmeasured() -> None:
     )
 
 
-def test_vitest_generator_exits_nonzero_on_unmeasured_files() -> None:
-    """The generator must fail loudly rather than publish a partial artifact."""
-    source = TELEMETRY_PATH.read_text(encoding="utf-8")
-    assert "incomplete += (await generateArtifact(suite, SUITES[suite])).length;" in source
-    assert "if (incomplete > 0) {" in source
-    assert "process.exit(1);" in source
+def test_vitest_generator_preserves_every_artifact_when_any_suite_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    """All candidate suites validate before the first committed file changes."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not available on this host")
+    first = tmp_path / "agent.json"
+    second = tmp_path / "admin.json"
+    first.write_text("agent-old\n", encoding="utf-8")
+    second.write_text("admin-old\n", encoding="utf-8")
+    script = (
+        f"import {{ publishArtifacts }} from {TELEMETRY_PATH.as_uri()!r};\n"
+        f"const candidates = ["
+        f"{{output:{str(first)!r},artifact:{{suite:'agent'}},unmeasured:[],unexpected:[]}},"
+        f"{{output:{str(second)!r},artifact:{{suite:'admin-ui'}},"
+        "unmeasured:[{file:'src/missing.test.ts'}],unexpected:[]}];\n"
+        "try { publishArtifacts(candidates); } "
+        "catch (error) { console.log(error.message); process.exit(0); }\n"
+        "process.exit(2);\n"
+    )
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "refusing to publish any timing artifact" in completed.stdout
+    assert first.read_text(encoding="utf-8") == "agent-old\n"
+    assert second.read_text(encoding="utf-8") == "admin-old\n"
+
+
+def test_vitest_generator_publishes_with_same_directory_atomic_rename(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not available on this host")
+    output = tmp_path / "agent.json"
+    output.write_text("old\n", encoding="utf-8")
+    script = (
+        f"import {{ publishArtifacts }} from {TELEMETRY_PATH.as_uri()!r};\n"
+        f"publishArtifacts([{{output:{str(output)!r},"
+        "artifact:{suite:'agent',files:[]},unmeasured:[],unexpected:[]}]);\n"
+    )
+    subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "suite": "agent",
+        "files": [],
+    }
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["agent.json"]
+
+
+def test_vitest_atomic_rename_failure_preserves_prior_bytes_and_cleans_temp(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not available on this host")
+    output = tmp_path / "agent.json"
+    output.write_bytes(b"prior-byte-exact\n")
+    script = (
+        f"import {{ writeArtifactAtomically }} from {TELEMETRY_PATH.as_uri()!r};\n"
+        f"try {{ writeArtifactAtomically({str(output)!r}, {{suite:'agent'}}, "
+        "() => { throw new Error('rename denied'); }); } "
+        "catch (error) { console.log(error.message); process.exit(0); }\n"
+        "process.exit(2);\n"
+    )
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "rename denied" in completed.stdout
+    assert output.read_bytes() == b"prior-byte-exact\n"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["agent.json"]
+
+
+def test_vitest_generator_rejects_nonzero_run_with_complete_reporter_output() -> None:
+    """A JSON report from an import/test failure must not become measured telemetry."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not available on this host")
+    script = (
+        f"import {{ assertVitestRunSucceeded }} from {TELEMETRY_PATH.as_uri()!r};\n"
+        "try { assertVitestRunSucceeded({status: 1, signal: null}, 'agent'); } "
+        "catch (error) { console.log(error.message); process.exit(0); }\n"
+        "process.exit(2);\n"
+    )
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "refusing to publish timing telemetry" in completed.stdout
+
+
+def test_vitest_artifact_requires_every_requested_run() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not available on this host")
+    script = (
+        f"import {{ buildArtifactFiles }} from {TELEMETRY_PATH.as_uri()!r};\n"
+        "const out = buildArtifactFiles({"
+        "'src/partial.test.ts': {duration_ms_sum: 5, tests: 1, "
+        "passed_runs: 1, total_runs: 1}}, ['src/partial.test.ts'], 2);\n"
+        "console.log(JSON.stringify(out));\n"
+    )
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    result = json.loads(completed.stdout)
+    assert result["files"][0]["measured"] is False
+    assert result["unmeasured"][0]["file"] == "src/partial.test.ts"
+
+
+def test_vitest_duplicate_reporter_rows_cannot_impersonate_two_runs() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not available on this host")
+    test_path = "/tmp/telemetry-suite/src/duplicate.test.ts"
+    report = json.dumps(
+        {
+            "testResults": [
+                {
+                    "name": test_path,
+                    "startTime": 1,
+                    "endTime": 2,
+                    "status": "passed",
+                    "assertionResults": [{"status": "passed"}],
+                },
+                {
+                    "name": test_path,
+                    "startTime": 2,
+                    "endTime": 3,
+                    "status": "passed",
+                    "assertionResults": [{"status": "passed"}],
+                },
+            ]
+        }
+    )
+    script = (
+        f"import {{ parseVitestJson, buildArtifactFiles }} from "
+        f"{TELEMETRY_PATH.as_uri()!r};\n"
+        f"const parsed = parseVitestJson({report}, '/tmp/telemetry-suite');\n"
+        "console.log(JSON.stringify({parsed, built: buildArtifactFiles("
+        "parsed, ['src/duplicate.test.ts'], 2)}));\n"
+    )
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    result = json.loads(completed.stdout)
+    assert result["parsed"]["src/duplicate.test.ts"]["total_runs"] == 1
+    assert result["built"]["files"][0]["measured"] is False
 
 
 # ── mutual exclusion around the shared duration artifact ─────────────────────

@@ -934,6 +934,10 @@ class TestSanitizeAgentErrorReport:
             "stderr_tail": "x" * 10_000,
             "last_stream_event": "system",
             "classified": "rate_limit",
+            "provider_result_is_error": False,
+            "provider_result_subtype": "s" * 500,
+            "provider_terminal_reason": "r" * 500,
+            "provider_api_error_status": 429,
             "provider_errors": [
                 {"source": "claude-stream", "code": "c" * 500, "message": "m" * 5000}
             ],
@@ -949,6 +953,10 @@ class TestSanitizeAgentErrorReport:
         assert len(out["provider_errors"]) == 1
         assert len(out["provider_errors"][0]["message"]) == 500
         assert len(out["provider_errors"][0]["code"]) == 100
+        assert out["provider_result_is_error"] is False
+        assert len(out["provider_result_subtype"]) == 100
+        assert len(out["provider_terminal_reason"]) == 255
+        assert out["provider_api_error_status"] == 429
 
     def test_provider_errors_capped_and_invalid_entries_dropped(self):
         raw = {

@@ -73,6 +73,7 @@ from app.max_plan_pool import (
     clear_regression_on_success,
     disable_account_for_auth,
     disable_account_model,
+    exact_model_route_marker_is_invalid,
     get_task_llm_account_id,
     get_task_llm_auth_mode,
     get_task_llm_execution_mode,
@@ -80,6 +81,7 @@ from app.max_plan_pool import (
     get_task_llm_provider,
     get_llm_account_identity,
     reconcile_llm_runtime_identity,
+    resolve_exact_model_route,
     resolve_task_quality_tier,
     record_completion_event,
     record_task_outcome,
@@ -89,6 +91,7 @@ from app.task_lifecycle import (
     PostCommitFinalCommitFailed,
     PostCommitLocked,
 )
+from app.strategic_cold_successor_authority import cold_successor_marker_state
 from app.rollup_management import _check_and_trigger_rollup
 from app.payload_schemas import validate_internal_payload as _validate_internal_payload
 from app.task_completion import _compute_first_attempt_succeeded
@@ -150,6 +153,8 @@ def _agent_status_needs_project_authority(
     return bool(
         task is not None
         and (
+            cold_successor_marker_state(task) != "ordinary"
+            or
             (task.context or {}).get("_resident_session") is True
             or payload.status == TaskStatus.FAILED
             or payload.artifact_type == ArtifactType.DEBUG_RESULT
@@ -1400,6 +1405,13 @@ async def update_agent_status(
             headers={"Retry-After": "5"},
         )
 
+    cold_marker_state = cold_successor_marker_state(task)
+    if cold_marker_state != "ordinary":
+        raise HTTPException(
+            status_code=409,
+            detail="Cold successor tasks require the dedicated terminal protocol",
+        )
+
     if locked_resident_project is not None:
         from app.strategic_resident_session import (
             resident_worker_matches_ended_identity,
@@ -1668,8 +1680,6 @@ async def update_agent_status(
         )
         return {"status": "parked", "task_id": str(task.id)}
 
-    # 2. Update task status
-    task.status = payload.status
     # Runtime identity is assigned at dispatch. Agent telemetry may report a
     # complete, provider-valid pair (for example, a same-provider model
     # fallback), but partial or cross-provider reports must never blend with the
@@ -1678,6 +1688,59 @@ async def update_agent_status(
     _assigned_account = await _get_authoritative_llm_account_identity(
         session, _assigned_account_id
     )
+    if exact_model_route_marker_is_invalid(task.context):
+        logger.error(
+            "[AGENT STATUS] Rejecting task %s with malformed exact route authority",
+            task.id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "invalid_exact_route_authority"},
+        )
+    _exact_route = resolve_exact_model_route(task.context)
+    if _exact_route is not None:
+        _exact_provider, _exact_model, _exact_effort = _exact_route
+        _assigned_provider = get_task_llm_provider(task)
+        _assigned_model = get_task_llm_model(task)
+        _assigned_pair_present = bool(_assigned_provider or _assigned_model)
+        _assigned_pair_matches = bool(
+            _assigned_provider == _exact_provider
+            and _assigned_model == _exact_model
+        )
+        _reported_pair_present = bool(payload.provider or payload.model)
+        _reported_pair_matches = bool(
+            payload.provider
+            and payload.model
+            and str(payload.provider).strip() == _exact_provider
+            and str(payload.model).strip() == _exact_model
+        )
+        if (
+            (_assigned_pair_present and not _assigned_pair_matches)
+            or (_reported_pair_present and not _reported_pair_matches)
+        ):
+            logger.error(
+                "[AGENT STATUS] Rejecting exact-route runtime mismatch for task %s: "
+                "exact provider=%s model=%s; assigned provider=%s model=%s; "
+                "reported provider=%s model=%s",
+                task.id,
+                _exact_provider,
+                _exact_model,
+                _assigned_provider,
+                _assigned_model,
+                payload.provider,
+                payload.model,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "exact_route_runtime_mismatch",
+                    "expected_provider": _exact_provider,
+                    "expected_model": _exact_model,
+                },
+            )
+
+    # 2. Update task status only after exact execution authority is reconciled.
+    task.status = payload.status
     _quality_tier = resolve_task_quality_tier(task, _runtime_config)
     _runtime_identity = reconcile_llm_runtime_identity(
         account=_assigned_account,
@@ -2604,7 +2667,12 @@ async def update_agent_status(
                             provider_name = get_task_llm_provider(task)
                             current_model = model or _extract_task_model(task)
                             fallback_model = None
-                            if provider_name and current_model:
+                            exact_route = resolve_exact_model_route(ctx)
+                            if (
+                                provider_name
+                                and current_model
+                                and exact_route is None
+                            ):
                                 try:
                                     from app.providers.registry import get_provider
 

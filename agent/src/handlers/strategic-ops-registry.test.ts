@@ -113,6 +113,10 @@ describe('generated ./strategic CLI derives from the registry', () => {
     expect(spawn?.fields).toContain('depends_on');
     expect(spawn?.fields).toContain('require_deps_landed_on');
     expect(spawn?.fields).toContain('release_base_branch');
+    expect(spawn?.fields).toContain('model');
+    expect(spawn?.fields).toContain('effort');
+    expect(spawn?.notes?.join('\n')).toContain('model and effort are an exact pair');
+    expect(spawn?.notes?.join('\n')).toContain('never falls through');
     expect(spawn?.notes?.join('\n')).toContain(
       'bounded implementation, research, plan, design, and compute work under an existing strategic outcome',
     );

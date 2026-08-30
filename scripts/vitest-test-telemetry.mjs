@@ -134,6 +134,16 @@ function findBin(candidates) {
   return null; // falls back to npx vitest
 }
 
+export function assertVitestRunSucceeded(result, suite) {
+  if (result.status === 0 && result.signal == null) return;
+  const terminal = result.signal != null
+    ? `signal ${String(result.signal)}`
+    : `exit ${String(result.status)}`;
+  throw new Error(
+    `vitest failed for ${suite} (${terminal}); refusing to publish timing telemetry`,
+  );
+}
+
 export function collectTestFiles(relativeBase, matcher) {
   const files = [];
 
@@ -197,12 +207,20 @@ function runVitest(suite, suiteConfig, runIndex) {
     throw new Error(`Failed to spawn vitest for ${suite}: ${result.error.message}`);
   }
 
-  // vitest exits non-zero when tests fail — that's expected, we still get timing data
+  // A non-zero run may still write a complete-looking reporter file after an
+  // import/test failure. It is not a valid timing run and must never publish.
   if (!fs.existsSync(tmpOut)) {
     const out = (result.stdout ?? '').slice(-500);
     throw new Error(
       `vitest did not write output file for ${suite} (exit ${result.status}).\n${out}`,
     );
+  }
+
+  try {
+    assertVitestRunSucceeded(result, suite);
+  } catch (error) {
+    try { fs.unlinkSync(tmpOut); } catch { /* ignore */ }
+    throw error;
   }
 
   let raw;
@@ -219,7 +237,7 @@ function runVitest(suite, suiteConfig, runIndex) {
  * Vitest 2.x emits: {testResults: [{name, startTime, endTime, status, assertionResults}]}
  * The `name` field is the absolute file path.
  */
-function parseVitestJson(raw, relativeBase) {
+export function parseVitestJson(raw, relativeBase) {
   const fileMap = {};
   const testResults = raw.testResults ?? [];
 
@@ -234,12 +252,19 @@ function parseVitestJson(raw, relativeBase) {
     const passed = (r.status ?? 'passed') !== 'failed';
 
     if (!fileMap[relPath]) {
-      fileMap[relPath] = { duration_ms_sum: 0, tests: 0, passed_runs: 0, total_runs: 0 };
+      fileMap[relPath] = {
+        duration_ms_sum: 0,
+        tests: 0,
+        passed_runs: passed ? 1 : 0,
+        total_runs: 1,
+      };
+    } else if (!passed) {
+      // Duplicate reporter rows for one file are still one run. They must
+      // never impersonate a second requested run.
+      fileMap[relPath].passed_runs = 0;
     }
     fileMap[relPath].duration_ms_sum += durationMs;
     fileMap[relPath].tests = Math.max(fileMap[relPath].tests, testCount);
-    fileMap[relPath].total_runs += 1;
-    if (passed) fileMap[relPath].passed_runs += 1;
   }
 
   return fileMap;
@@ -269,9 +294,25 @@ function mergeRuns(accumulated, runMap) {
  * measurement and would silently rank real files as free in the cost queue.
  */
 export function buildArtifactFiles(accumulated, inventoryFiles, runs) {
-  const measured = Object.entries(accumulated)
-    .filter(([file]) => file && !file.startsWith('..'))
-    .map(([file, stats]) => ({
+  const inventory = [...new Set(
+    inventoryFiles.filter(file => file && !file.startsWith('..')),
+  )].sort();
+  const inventorySet = new Set(inventory);
+  const unexpected = Object.keys(accumulated)
+    .filter(file => file && !file.startsWith('..') && !inventorySet.has(file))
+    .sort();
+  const measured = inventory
+    .filter(file => {
+      const stats = accumulated[file];
+      return stats
+        && stats.tests > 0
+        && Number.isFinite(stats.duration_ms_sum)
+        && stats.duration_ms_sum >= 0
+        && stats.total_runs === runs;
+    })
+    .map(file => {
+      const stats = accumulated[file];
+      return {
       file,
       duration_ms: Math.round(stats.duration_ms_sum / Math.max(stats.total_runs, 1)),
       tests: stats.tests,
@@ -279,13 +320,13 @@ export function buildArtifactFiles(accumulated, inventoryFiles, runs) {
       flaky: runs > 1
         ? stats.passed_runs > 0 && stats.passed_runs < stats.total_runs
         : false,
-    }))
+      };
+    })
     .sort((a, b) => b.duration_ms - a.duration_ms);
 
   const measuredFiles = new Set(measured.map(f => f.file));
-  const unmeasured = inventoryFiles
-    .filter(file => file && !file.startsWith('..') && !measuredFiles.has(file))
-    .sort()
+  const unmeasured = inventory
+    .filter(file => !measuredFiles.has(file))
     .map(file => ({
       file,
       duration_ms: null,
@@ -296,7 +337,43 @@ export function buildArtifactFiles(accumulated, inventoryFiles, runs) {
 
   // Unmeasured entries sort last: they carry no cost signal, and a null
   // duration must never masquerade as the cheapest file in the ranking.
-  return { files: [...measured, ...unmeasured], unmeasured };
+  return { files: [...measured, ...unmeasured], unmeasured, unexpected };
+}
+
+export function writeArtifactAtomically(output, artifact, rename = fs.renameSync) {
+  const directory = path.dirname(output);
+  const temporary = path.join(
+    directory,
+    `.${path.basename(output)}.${process.pid}.${Date.now()}.` +
+      `${Math.random().toString(36).slice(2)}.tmp`,
+  );
+  try {
+    fs.writeFileSync(
+      temporary,
+      JSON.stringify(artifact, null, 2) + '\n',
+      { encoding: 'utf-8', flag: 'wx' },
+    );
+    rename(temporary, output);
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch { /* ignore */ }
+    throw error;
+  }
+}
+
+export function publishArtifacts(candidates) {
+  const incomplete = candidates.reduce(
+    (total, candidate) => total + candidate.unmeasured.length + candidate.unexpected.length,
+    0,
+  );
+  if (incomplete > 0) {
+    throw new Error(
+      `${incomplete} requested/reported test file(s) lack exact timing coverage; ` +
+        'refusing to publish any timing artifact',
+    );
+  }
+  for (const candidate of candidates) {
+    writeArtifactAtomically(candidate.output, candidate.artifact);
+  }
 }
 
 async function generateArtifact(suite, suiteConfig) {
@@ -304,6 +381,13 @@ async function generateArtifact(suite, suiteConfig) {
   console.log(`  runs: ${flakeRuns}, flake_detection: ${flakeRuns > 1}`);
 
   const accumulated = {};
+  // Freeze the requested roster before run #1. A concurrent file addition or
+  // removal becomes an explicit mismatch rather than changing the claim after
+  // the measurement has already started.
+  const inventory = collectTestFiles(
+    suiteConfig.relativeBase,
+    suiteConfig.testFileMatcher,
+  );
   for (let i = 1; i <= flakeRuns; i++) {
     const raw = runVitest(suite, suiteConfig, i);
     const runMap = parseVitestJson(raw, suiteConfig.relativeBase);
@@ -313,8 +397,11 @@ async function generateArtifact(suite, suiteConfig) {
   // Keep the committed artifact's population tied to the same on-disk test
   // files that the suite config collects, so the freshness guard can detect
   // both missing and stale entries.
-  const inventory = collectTestFiles(suiteConfig.relativeBase, suiteConfig.testFileMatcher);
-  const { files, unmeasured } = buildArtifactFiles(accumulated, inventory, flakeRuns);
+  const { files, unmeasured, unexpected } = buildArtifactFiles(
+    accumulated,
+    inventory,
+    flakeRuns,
+  );
 
   const artifact = {
     _meta: {
@@ -326,10 +413,6 @@ async function generateArtifact(suite, suiteConfig) {
     files,
   };
 
-  fs.writeFileSync(suiteConfig.output, JSON.stringify(artifact, null, 2) + '\n');
-  console.log(
-    `[vitest-telemetry] Wrote ${files.length} file entries → ${suiteConfig.output}`,
-  );
   const ranked = files.filter(f => f.measured);
   if (ranked.length > 0) {
     const top5 = ranked.slice(0, 5);
@@ -356,7 +439,20 @@ async function generateArtifact(suite, suiteConfig) {
       console.error(`    ... and ${unmeasured.length - 20} more`);
     }
   }
-  return unmeasured;
+  if (unexpected.length > 0) {
+    console.error(
+      `[vitest-telemetry] INVENTORY MISMATCH for ${suite}: ${unexpected.length} ` +
+        'reporter file(s) are outside the requested on-disk inventory.',
+    );
+    unexpected.slice(0, 20).forEach(file => console.error(`    - ${file}`));
+  }
+  return {
+    suite,
+    output: suiteConfig.output,
+    artifact,
+    unmeasured,
+    unexpected,
+  };
 }
 
 async function main() {
@@ -365,21 +461,22 @@ async function main() {
       ? Object.keys(SUITES)
       : suiteArg.split(',').map(s => s.trim());
 
-  let incomplete = 0;
   for (const suite of suitesToRun) {
     if (!SUITES[suite]) {
       console.error(`Unknown suite: ${suite}. Valid: ${Object.keys(SUITES).join(', ')}`);
       process.exit(1);
     }
-    incomplete += (await generateArtifact(suite, SUITES[suite])).length;
   }
-
-  if (incomplete > 0) {
-    console.error(
-      `\n[vitest-telemetry] FAILED: ${incomplete} test file(s) were never executed. ` +
-        'Do not commit the artifacts produced by this run.',
+  const candidates = [];
+  for (const suite of suitesToRun) {
+    candidates.push(await generateArtifact(suite, SUITES[suite]));
+  }
+  publishArtifacts(candidates);
+  for (const candidate of candidates) {
+    console.log(
+      `[vitest-telemetry] Wrote ${candidate.artifact.files.length} file entries ` +
+        `atomically → ${candidate.output}`,
     );
-    process.exit(1);
   }
 
   console.log(

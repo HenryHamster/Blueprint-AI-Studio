@@ -21,7 +21,9 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app import release_version
 from app.branch_resolution import get_project_promotion_target
+from app.broadcast import _sanitize_log
 from app.database import resolve_dialect_name
+from app.failure_classification import sanitize_agent_error_report
 from app.landed_signal import landed_signal_predicate
 from app.models import (
     Alert,
@@ -35,6 +37,7 @@ from app.models import (
     Task,
     TaskHistory,
     TaskStatus,
+    get_task_lifetime_attempt_ordinal,
 )
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.qualification_dimensions import LEDGER_DIMENSION_KEYS
@@ -72,6 +75,64 @@ from app.release_scoring import (
 # Preserve the historical logger name so existing caplog filters and log
 # processing continue to see these events under release_qualifier.
 logger = logging.getLogger("backend.app.release_qualifier")
+
+
+def _build_audit_leg_proof(
+    *,
+    candidate_sha: str | None,
+    audit_task_id: str | None,
+    audit_task_candidate_sha: str | None,
+    challenge_task_id: str | None,
+    challenged_candidate_sha: str | None,
+    binding_expected_count: int,
+    binding_record_count: int,
+    reconciliation_status: str | None,
+    reconciliation_reason: str | None,
+    legacy_advisory_only: bool,
+) -> dict[str, Any]:
+    """Derive the machine-readable audit-leg proof snapshot for a verdict."""
+    required = binding_expected_count > 0 and not legacy_advisory_only
+    binding_complete = (
+        binding_expected_count > 0 and binding_record_count == binding_expected_count
+    )
+    audit_sha_pinned = bool(
+        candidate_sha
+        and audit_task_candidate_sha
+        and audit_task_candidate_sha == candidate_sha
+    )
+    challenge_sha_pinned = bool(
+        candidate_sha
+        and challenged_candidate_sha
+        and challenged_candidate_sha == candidate_sha
+    )
+    reconciliation_success = (
+        reconciliation_status == "available" and reconciliation_reason is None
+    )
+    if not required:
+        state = "not_required"
+    elif (
+        audit_sha_pinned
+        and challenge_sha_pinned
+        and binding_complete
+        and reconciliation_success
+    ):
+        state = "proven"
+    else:
+        state = "unproven"
+    return {
+        "state": state,
+        "required": required,
+        "candidate_sha": candidate_sha,
+        "audit_task_id": audit_task_id,
+        "audit_task_candidate_sha": audit_task_candidate_sha,
+        "challenge_task_id": challenge_task_id,
+        "challenged_candidate_sha": challenged_candidate_sha,
+        "binding_expected_count": binding_expected_count,
+        "binding_record_count": binding_record_count,
+        "binding_complete": binding_complete,
+        "reconciliation_status": reconciliation_status,
+        "reconciliation_reason": reconciliation_reason,
+    }
 # Governing cap: keep a small explicit margin over the actual size (2340 as
 # of rollup #17573, which grew the module past the old 2339 cap by one line).
 _MODULE_SIZE_GOVERNANCE_CAP: int = 3550
@@ -87,6 +148,20 @@ _INFRA_ATTEMPT_HISTORY_LIMIT = 5
 # asyncio only holds weak references to scheduled tasks, so without this a
 # webhook coroutine could be garbage-collected mid-flight (RUF006).
 _INFRA_WEBHOOK_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def dispatch_postcommit_infra_notification(result: dict[str, Any]) -> None:
+    """Dispatch an infra webhook only after its canonical verdict commits."""
+    intent = result.pop("_postcommit_external_notification", None)
+    if not isinstance(intent, dict):
+        return
+    task = asyncio.ensure_future(
+        _release_qualifier_module().dispatch_external_notification(
+            intent["project_id"], intent["event_type"], intent["payload"]
+        )
+    )
+    _INFRA_WEBHOOK_TASKS.add(task)
+    task.add_done_callback(_INFRA_WEBHOOK_TASKS.discard)
 
 _STRANDED_APPROVED_PR_SCAN_LIMIT = 101
 _STRANDED_APPROVED_PR_PREVIEW_LIMIT = 20
@@ -392,7 +467,9 @@ def _bounded_infra_history(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     rows = [row for row in value if isinstance(row, dict)]
-    return rows[-_INFRA_ATTEMPT_HISTORY_LIMIT:]
+    if len(rows) <= _INFRA_ATTEMPT_HISTORY_LIMIT:
+        return rows
+    return [rows[0], *rows[-(_INFRA_ATTEMPT_HISTORY_LIMIT - 1):]]
 
 
 def _task_failure_category(task: Task | None) -> str | None:
@@ -404,6 +481,137 @@ def _task_failure_category(task: Task | None) -> str | None:
 
 
 _CHILD_TAIL_MAX_CHARS = 500
+_INFRA_TASK_ATTEMPT_TRACE_LIMIT = 4
+_AGENT_ERROR_STRING_FIELDS = (
+    "provider",
+    "auth_mode",
+    "exit_signal",
+    "last_stream_event",
+    "classified",
+    "provider_result_subtype",
+    "provider_terminal_reason",
+)
+_AGENT_ERROR_SCALAR_FIELDS = (
+    "schema",
+    "exit_code",
+    "duration_ms",
+    "model_output_seen",
+    "result_event_seen",
+    "provider_result_is_error",
+    "provider_api_error_status",
+)
+
+
+def _compact_agent_error_report(raw: Any) -> dict[str, Any] | None:
+    if (
+        not isinstance(raw, dict)
+        or isinstance(raw.get("schema"), bool)
+        or raw.get("schema") != 1
+    ):
+        return None
+    report = sanitize_agent_error_report(raw)
+    if report is None:
+        return None
+    compact: dict[str, Any] = {
+        key: report[key]
+        for key in _AGENT_ERROR_SCALAR_FIELDS
+        if key in report
+    }
+    for key in _AGENT_ERROR_STRING_FIELDS:
+        value = report.get(key)
+        if isinstance(value, str) and value:
+            compact[key] = _sanitize_log(value)
+    stderr_tail = report.get("stderr_tail")
+    if isinstance(stderr_tail, str) and stderr_tail:
+        compact["stderr_tail"] = _sanitize_log(stderr_tail)[-_CHILD_TAIL_MAX_CHARS:]
+    errors = report.get("provider_errors")
+    last_error = errors[-1] if isinstance(errors, list) and errors else None
+    provider_tail = last_error.get("message") if isinstance(last_error, dict) else None
+    if isinstance(provider_tail, str) and provider_tail:
+        compact["provider_error_tail"] = _sanitize_log(provider_tail)[
+            -_CHILD_TAIL_MAX_CHARS:
+        ]
+        source = last_error.get("source")
+        code = last_error.get("code")
+        if isinstance(source, str) and source:
+            compact["provider_error_source"] = _sanitize_log(source)[:50]
+        if isinstance(code, str) and code:
+            compact["provider_error_code"] = _sanitize_log(code)[:100]
+    preferred_tail = compact.get("provider_error_tail") or compact.get("stderr_tail")
+    if isinstance(preferred_tail, str):
+        compact["output_tail"] = preferred_tail
+    return compact
+
+
+def _bounded_trace_text(value: Any, *, limit: int) -> str | None:
+    if isinstance(value, TaskStatus):
+        value = value.value
+    if not isinstance(value, str) or not value:
+        return None
+    return _sanitize_log(value)[:limit]
+
+
+def _positive_attempt_ordinal(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _compact_task_attempt_trace(task: Task) -> tuple[list[dict[str, Any]], int]:
+    trace: list[dict[str, Any]] = []
+    for raw in task.attempt_history or []:
+        if not isinstance(raw, dict):
+            continue
+        row: dict[str, Any] = {}
+        ordinal = _positive_attempt_ordinal(raw.get("attempt_ordinal"))
+        if ordinal is not None:
+            row["attempt_ordinal"] = ordinal
+        for key in ("status", "vm_provisioned_at", "vm_stopped_at"):
+            value = _bounded_trace_text(raw.get(key), limit=80)
+            if value is not None:
+                row[key] = value
+        category = raw.get("failure_class") or raw.get("agent_failure_category_raw")
+        bounded_category = _bounded_trace_text(category, limit=100)
+        if bounded_category is not None:
+            row["failure_category"] = bounded_category
+        tail = raw.get("failure_message_tail")
+        if isinstance(tail, str) and tail:
+            row["child_tail"] = _sanitize_log(tail)[-_CHILD_TAIL_MAX_CHARS:]
+        agent_error = _compact_agent_error_report(raw.get("agent_error_report"))
+        if agent_error is not None:
+            row["agent_error"] = agent_error
+        if row:
+            trace.append(row)
+    current = {
+        "attempt_ordinal": get_task_lifetime_attempt_ordinal(task),
+        "status": task.status.value
+        if isinstance(task.status, TaskStatus)
+        else str(task.status)[:80],
+    }
+    if task.vm_provisioned_at is not None:
+        current["vm_provisioned_at"] = task.vm_provisioned_at.isoformat()
+    if task.vm_stopped_at is not None:
+        current["vm_stopped_at"] = task.vm_stopped_at.isoformat()
+    if task.completed_at is not None:
+        current["terminal_at"] = task.completed_at.isoformat()
+    category = _task_failure_category(task)
+    if category:
+        current["failure_category"] = category
+    if task.latest_status_message:
+        current["child_tail"] = _sanitize_log(task.latest_status_message)[
+            -_CHILD_TAIL_MAX_CHARS:
+        ]
+    agent_error = _compact_agent_error_report(
+        (task.context or {}).get("agent_error_report")
+    )
+    if agent_error is not None:
+        current["agent_error"] = agent_error
+    if not trace or trace[-1].get("attempt_ordinal") != current["attempt_ordinal"]:
+        trace.append(current)
+    total = len(trace)
+    if total > _INFRA_TASK_ATTEMPT_TRACE_LIMIT:
+        trace = [trace[0], *trace[-(_INFRA_TASK_ATTEMPT_TRACE_LIMIT - 1):]]
+    return trace, total
 
 
 def _compact_infra_child_event(
@@ -414,7 +622,7 @@ def _compact_infra_child_event(
     label: str | None = None,
     respawn_count: int | None = None,
 ) -> dict[str, Any]:
-    event: dict[str, Any] = {"leg": leg}
+    event: dict[str, Any] = {"diagnostic_schema_version": 1, "leg": leg}
     if failed_task is not None:
         event["failed_task_id"] = str(failed_task.id)
         event["status"] = failed_task.status
@@ -423,7 +631,21 @@ def _compact_infra_child_event(
             event["failure_category"] = category
         tail = failed_task.latest_status_message
         if tail:
-            event["child_tail"] = tail[-_CHILD_TAIL_MAX_CHARS:]
+            event["child_tail"] = _sanitize_log(tail)[-_CHILD_TAIL_MAX_CHARS:]
+        event["task_attempt_ordinal"] = get_task_lifetime_attempt_ordinal(
+            failed_task
+        )
+        if failed_task.completed_at is not None:
+            event["terminal_at"] = failed_task.completed_at.isoformat()
+        agent_error = _compact_agent_error_report(
+            (failed_task.context or {}).get("agent_error_report")
+        )
+        if agent_error is not None:
+            event["agent_error"] = agent_error
+        attempt_trace, attempt_trace_total = _compact_task_attempt_trace(failed_task)
+        event["attempt_trace"] = attempt_trace
+        event["attempt_trace_total"] = attempt_trace_total
+        event["attempt_trace_truncated"] = attempt_trace_total > len(attempt_trace)
     if replacement_task_id:
         event["replacement_task_id"] = replacement_task_id
     if label:
@@ -446,6 +668,15 @@ def append_infra_failure_child_event(
     events = qual.get("infra_failure_child_events")
     if not isinstance(events, list):
         events = []
+    observed_total = sum(isinstance(row, dict) for row in events)
+    declared_total = qual.get("infra_failure_child_events_total")
+    if (
+        isinstance(declared_total, bool)
+        or not isinstance(declared_total, int)
+        or declared_total < observed_total
+    ):
+        declared_total = observed_total
+    failed_task_id = str(failed_task.id) if failed_task is not None else None
     event = _compact_infra_child_event(
         leg=leg,
         failed_task=failed_task,
@@ -453,7 +684,46 @@ def append_infra_failure_child_event(
         label=label,
         respawn_count=respawn_count,
     )
-    return {**qual, "infra_failure_child_events": [*events, event][-20:]}
+    if failed_task_id is not None:
+        for index, existing in enumerate(events):
+            if not (
+                isinstance(existing, dict)
+                and str(existing.get("failed_task_id")) == failed_task_id
+            ):
+                continue
+            merged = dict(existing)
+            for key, value in event.items():
+                if merged.get(key) is None:
+                    merged[key] = value
+                elif isinstance(merged.get(key), dict) and isinstance(value, dict):
+                    nested = dict(merged[key])
+                    for nested_key, nested_value in value.items():
+                        if nested.get(nested_key) is None:
+                            nested[nested_key] = nested_value
+                    merged[key] = nested
+            enriched = list(events)
+            enriched[index] = merged
+            if len(enriched) > 20:
+                enriched = [enriched[0], *enriched[-19:]]
+            return {
+                **qual,
+                "infra_failure_child_events": enriched,
+                "infra_failure_child_events_total": declared_total,
+                "infra_failure_child_events_truncated": bool(
+                    qual.get("infra_failure_child_events_truncated")
+                    or declared_total > len(enriched)
+                ),
+            }
+    appended = [*events, event]
+    total = declared_total + 1
+    if len(appended) > 20:
+        appended = [appended[0], *appended[-19:]]
+    return {
+        **qual,
+        "infra_failure_child_events": appended,
+        "infra_failure_child_events_total": total,
+        "infra_failure_child_events_truncated": total > len(appended),
+    }
 
 
 def _infer_infra_leg(infra_error: str) -> str:
@@ -573,17 +843,18 @@ async def _collect_terminal_infra_child_events(
             ("walkthrough_e2e", str(qual.get("walkthrough_e2e_task_id")))
         )
 
-    seen_failed_ids = {
+    complete_failed_ids = {
         str(row.get("failed_task_id"))
         for row in existing
         if row.get("failed_task_id") is not None
+        and row.get("diagnostic_schema_version") == 1
     }
 
     # Collect valid UUIDs not yet in seen_failed_ids, then batch-fetch in one
     # query instead of one session.get per leg.
     valid_uuids: list[uuid.UUID] = []
     for _leg, task_id in terminal_ids:
-        if task_id in seen_failed_ids:
+        if task_id in complete_failed_ids:
             continue
         try:
             valid_uuids.append(uuid.UUID(task_id))
@@ -597,9 +868,9 @@ async def _collect_terminal_infra_child_events(
         ).scalars().all()
         tasks_by_id = {t.id: t for t in rows}
 
-    terminal_events: list[dict[str, Any]] = []
+    enriched = {**qual, "infra_failure_child_events": existing}
     for leg, task_id in terminal_ids:
-        if task_id in seen_failed_ids:
+        if task_id in complete_failed_ids:
             continue
         try:
             task_uuid = uuid.UUID(task_id)
@@ -612,14 +883,29 @@ async def _collect_terminal_infra_child_events(
             TaskStatus.BLOCKED,
         ):
             continue
-        terminal_events.append(
-            _compact_infra_child_event(
-                leg=leg,
-                failed_task=task,
-                label=infra_error if leg == _infer_infra_leg(infra_error) else None,
-            )
+        enriched = append_infra_failure_child_event(
+            enriched,
+            leg=leg,
+            failed_task=task,
+            label=infra_error if leg == _infer_infra_leg(infra_error) else None,
         )
-    return [*existing, *terminal_events][-20:]
+    observed_total = sum(
+        isinstance(row, dict)
+        for row in enriched.get("infra_failure_child_events", [])
+    )
+    declared_total = enriched.get("infra_failure_child_events_total")
+    if (
+        isinstance(declared_total, bool)
+        or not isinstance(declared_total, int)
+        or declared_total < observed_total
+    ):
+        declared_total = observed_total
+    qual["infra_failure_child_events_total"] = declared_total
+    qual["infra_failure_child_events_truncated"] = bool(
+        enriched.get("infra_failure_child_events_truncated")
+        or declared_total > observed_total
+    )
+    return enriched.get("infra_failure_child_events", [])
 
 
 def _release_qualifier_module():
@@ -1706,6 +1992,17 @@ async def _handle_infra_failure(
     child_failures = await _collect_terminal_infra_child_events(
         session, qual, infra_error
     )
+    child_failures_total = qual.get("infra_failure_child_events_total")
+    if (
+        isinstance(child_failures_total, bool)
+        or not isinstance(child_failures_total, int)
+        or child_failures_total < len(child_failures)
+    ):
+        child_failures_total = len(child_failures)
+    child_failures_truncated = bool(
+        qual.get("infra_failure_child_events_truncated")
+        or child_failures_total > len(child_failures)
+    )
     signature = _infra_failure_signature(infra_error, child_failures)
     previous_signature = qual.get("previous_infra_failure_signature") or qual.get(
         "prior_infra_failure_signature"
@@ -1720,6 +2017,19 @@ async def _handle_infra_failure(
     )
     engine_sha = get_serving_sha()
     prior_history = _bounded_infra_history(qual.get("infra_attempt_history"))
+    previous_engine_sha = next(
+        (
+            entry.get("engine_sha")
+            for entry in reversed(prior_history)
+            if isinstance(entry, dict)
+            and isinstance(entry.get("engine_sha"), str)
+            and entry.get("engine_sha")
+        ),
+        None,
+    )
+    engine_epoch_changed = bool(
+        previous_engine_sha and engine_sha and previous_engine_sha != engine_sha
+    )
     attempt_entry = {
         "finalized_at": finalized_at,
         "error": infra_error,
@@ -1734,8 +2044,18 @@ async def _handle_infra_failure(
         "engine_sha": engine_sha,
         "failing_leg": _infer_infra_leg(infra_error),
         "child_failures": child_failures,
+        "child_failures_total": child_failures_total,
+        "child_failures_truncated": child_failures_truncated,
     }
-    attempt_history = [*prior_history, attempt_entry][-_INFRA_ATTEMPT_HISTORY_LIMIT:]
+    prior_history_total = qual.get("infra_attempt_history_total")
+    if (
+        isinstance(prior_history_total, bool)
+        or not isinstance(prior_history_total, int)
+        or prior_history_total < len(prior_history)
+    ):
+        prior_history_total = len(prior_history)
+    attempt_history_total = prior_history_total + 1
+    attempt_history = _bounded_infra_history([*prior_history, attempt_entry])
 
     # Permanent gate-incapacity detection: count trailing same-signature entries
     # in attempt_history.  When ANY qualifier gate (smoketest, audit, challenge,
@@ -1744,13 +2064,36 @@ async def _handle_infra_failure(
     # structural and will not self-resolve by retry — escalate with a different
     # operator message.
     is_permanent_gate_incapacity = False
-    same_signature_streak = 0
-    cur_sig = signature
-    for entry in reversed(attempt_history):
-        if entry.get("signature") == cur_sig:
-            same_signature_streak += 1
-        else:
-            break
+    prior_same_signature_streak = qual.get("prior_same_signature_streak")
+    if (
+        isinstance(prior_same_signature_streak, bool)
+        or not isinstance(prior_same_signature_streak, int)
+        or prior_same_signature_streak < 0
+    ):
+        prior_same_signature_streak = 0
+        fallback_engine_sha = previous_engine_sha or engine_sha
+        for entry in reversed(prior_history):
+            if entry.get("signature") != signature:
+                break
+            entry_engine_sha = entry.get("engine_sha")
+            if not isinstance(entry_engine_sha, str) or not entry_engine_sha:
+                entry_engine_sha = None
+            if (
+                fallback_engine_sha
+                and entry_engine_sha
+                and entry_engine_sha != fallback_engine_sha
+            ):
+                break
+            if fallback_engine_sha is None and entry_engine_sha:
+                fallback_engine_sha = entry_engine_sha
+            prior_same_signature_streak += 1
+    if engine_epoch_changed:
+        prior_same_signature_streak = 0
+    same_signature_streak = (
+        prior_same_signature_streak + 1
+        if same_error_as_prior and not engine_epoch_changed
+        else 1
+    )
     is_permanent_gate_incapacity = (
         same_signature_streak >= _MIN_INFRA_ERROR_STREAK
     )
@@ -1767,6 +2110,8 @@ async def _handle_infra_failure(
         "same_signature_streak": same_signature_streak,
         "attempt": attempt_entry,
         "attempt_history": attempt_history,
+        "attempt_history_total": attempt_history_total,
+        "attempt_history_truncated": attempt_history_total > len(attempt_history),
     }
 
     # Per-dimension failure isolation (Phase 1): infer WHICH dimension the infra
@@ -1799,7 +2144,12 @@ async def _handle_infra_failure(
         "same_error_different_candidate": same_error_different_candidate,
         "same_infra_failure_different_candidate": same_error_different_candidate,
         "infra_failure_child_events": child_failures,
+        "infra_failure_child_events_total": child_failures_total,
+        "infra_failure_child_events_truncated": child_failures_truncated,
         "infra_attempt_history": attempt_history,
+        "infra_attempt_history_total": attempt_history_total,
+        "infra_attempt_history_truncated": attempt_history_total
+        > len(attempt_history),
         "consecutive_infra_errors": current_streak,
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
@@ -1859,16 +2209,32 @@ async def _handle_infra_failure(
         # to preview must not turn a held release into a promotion.
         # Only migration_apply has a meaningful hotfix-scope preview; other legs
         # (smoketest, audit, challenge) have no narrowed hotfix path.
-        try:
-            hotfix_preview = await _release_qualifier_module().check_hotfix_scope_preview(
-                session, version.project_id, candidate_sha=qual.get("candidate_sha")
+        if "_hotfix_scope_preview_observation" in qual:
+            hotfix_preview = qual.get("_hotfix_scope_preview_observation")
+        elif qual.get("_finalize_observation_protocol"):
+            from app.release_qualification_observation_protocol import (
+                HOTFIX_SCOPE,
+                FinalizeObservationRequired,
             )
-        except Exception:  # remediation guidance is best-effort
-            logger.warning(
-                "[RELEASE_QUALIFIER] hotfix scope preview failed for v%d",
-                version.version_number,
-                exc_info=True,
-            )
+
+            raise FinalizeObservationRequired(HOTFIX_SCOPE)
+        else:
+            # Direct unit-test compatibility. Production finalization supplies
+            # the unlocked observation through the complete gate packet.
+            try:
+                hotfix_preview = (
+                    await _release_qualifier_module().check_hotfix_scope_preview(
+                        session,
+                        version.project_id,
+                        candidate_sha=qual.get("candidate_sha"),
+                    )
+                )
+            except Exception:  # remediation guidance is best-effort
+                logger.warning(
+                    "[RELEASE_QUALIFIER] hotfix scope preview failed for v%d",
+                    version.version_number,
+                    exc_info=True,
+                )
         # Persist the hotfix eligibility preview into the qualification record so
         # post-mortem analysis can see the eligible changes without re-computing.
         if hotfix_preview and hotfix_preview.get("eligible"):
@@ -2000,27 +2366,22 @@ async def _handle_infra_failure(
         },
     )
 
-    _webhook_task = asyncio.ensure_future(
-        _release_qualifier_module().dispatch_external_notification(
-            version.project_id,
-            "RELEASE_INFRA_FAILURE",
-            {
-                "version_number": version.version_number,
-                "version_id": str(version.id),
-                "infra_error": infra_error,
-                "infra_failure_signature": signature,
-                "previous_infra_failure_signature": previous_signature,
-                "same_error_as_prior": same_error_as_prior,
-                "same_error_different_candidate": same_error_different_candidate,
-                "consecutive_infra_errors": current_streak,
-                "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
-                "same_signature_streak": same_signature_streak,
-
-            },
-        )
-    )
-    _INFRA_WEBHOOK_TASKS.add(_webhook_task)
-    _webhook_task.add_done_callback(_INFRA_WEBHOOK_TASKS.discard)
+    webhook_intent = {
+        "project_id": version.project_id,
+        "event_type": "RELEASE_INFRA_FAILURE",
+        "payload": {
+            "version_number": version.version_number,
+            "version_id": str(version.id),
+            "infra_error": infra_error,
+            "infra_failure_signature": signature,
+            "previous_infra_failure_signature": previous_signature,
+            "same_error_as_prior": same_error_as_prior,
+            "same_error_different_candidate": same_error_different_candidate,
+            "consecutive_infra_errors": current_streak,
+            "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
+            "same_signature_streak": same_signature_streak,
+        },
+    }
 
     logger.warning(
         "[RELEASE_QUALIFIER] v%d infra failure: %s (streak=%d) — "
@@ -2054,6 +2415,7 @@ async def _handle_infra_failure(
         "consecutive_infra_errors": current_streak,
         "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
         "same_signature_streak": same_signature_streak,
+        "_postcommit_external_notification": webhook_intent,
 
         # Hotfix scope preview (present only when is_permanent_gate_incapacity
         # and the preview computation succeeded with an eligible result).

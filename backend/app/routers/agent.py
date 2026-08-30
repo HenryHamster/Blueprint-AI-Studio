@@ -74,6 +74,13 @@ from app.task_capabilities import (
     CODE_REVIEW_GATED_TASK_TYPES,
     agent_capability_slice,
 )
+from app.task_blocked import PARKED_AGENT_VM_CONTEXT_KEY
+from app.strategic_cold_successor_authority import (
+    cold_successor_capability_slice,
+    enforce_cold_successor_request_authority,
+    enforce_cold_successor_task_authority,
+    reject_cold_successor_repository_authority,
+)
 import app.shared_state as _shared_state
 from app.compute_experiment_contract import (
     resolve_compute_spend_decision,
@@ -334,6 +341,19 @@ async def _create_review_check_run_bg(
 _terminated_task_ids: dict[str, float] = {}
 _TERMINATED_TTL = 75 * 60  # 75 min — 60 min JWT lifetime + 15 min grace
 _TERMINATED_TASK_IDS_MAX = 5000  # evict expired entries when cache exceeds this size
+_COLD_SUCCESSOR_IDEMPOTENT_PATH_RE = re.compile(
+    r"^/api/agent/projects/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/"
+    r"strategic-session/cold-successor/(?:terminal|receipt)$"
+)
+_WORKDAY_ATTEMPT_DIAGNOSTIC_PATH_RE = re.compile(
+    r"^/api/agent/projects/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/"
+    r"workday-consultations/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/"
+    r"attempt-diagnostic(?:/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?$"
+)
 _on_task_terminal_callbacks.append(
     lambda tid: _terminated_task_ids.__setitem__(tid, time.time())
 )
@@ -452,6 +472,18 @@ async def verify_agent_token(
             )
             raise HTTPException(status_code=401, detail="vm_scoped_token_missing_vm")
         return payload
+    try:
+        task_uuid = uuid.UUID(str(task_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        _log_agent_auth_reject(
+            "task_id_invalid",
+            path=request.url.path,
+            task_id=task_id,
+            token_vm_instance_id=payload.get("vm_instance_id"),
+            token_project_id=payload.get("project_id"),
+            error=exc,
+        )
+        raise HTTPException(status_code=401, detail="Task is no longer active") from exc
     token_vm = payload.get("vm_instance_id")
     # /next-role and /vm-heartbeat are reached AFTER a task has terminated
     # (the agent polls for the next role using the prior task's JWT). Treat
@@ -462,6 +494,9 @@ async def verify_agent_token(
         "/api/agent/credentials/rotate",
         "/api/agent/next-role",
         "/api/agent/vm-heartbeat",
+    ) or bool(_COLD_SUCCESSOR_IDEMPOTENT_PATH_RE.fullmatch(request.url.path))
+    is_idempotent_path = is_idempotent_path or bool(
+        _WORKDAY_ATTEMPT_DIAGNOSTIC_PATH_RE.fullmatch(request.url.path)
     )
     # Issue M3 freshness check (warm-VM rev): only the warm-VM idempotent
     # paths /next-role and /vm-heartbeat carry the replay risk for terminal
@@ -546,7 +581,7 @@ async def verify_agent_token(
         app = request.app
         session_factory = app.dependency_overrides.get(get_session, get_session)
         async for session in session_factory():
-            task = await session.get(Task, uuid.UUID(task_id))
+            task = await session.get(Task, task_uuid)
             if task is None:
                 _log_agent_auth_reject(
                     "task_missing",
@@ -580,8 +615,58 @@ async def verify_agent_token(
                     token_project_id=token_project,
                 )
                 raise HTTPException(status_code=403, detail="vm_instance_mismatch")
+            try:
+                enforce_cold_successor_request_authority(
+                    task,
+                    method=request.method,
+                    path=request.url.path,
+                )
+            except HTTPException as cold_authority_error:
+                _log_agent_auth_reject(
+                    "cold_successor_path_not_allowed",
+                    path=request.url.path,
+                    task_id=task_id,
+                    token_vm_instance_id=token_vm,
+                    token_project_id=token_project,
+                )
+                raise cold_authority_error
             if task.status in _AGENT_INACTIVE_TASK_STATUSES:
                 _terminated_task_ids[task_id] = time.time()
+                # Parking deliberately releases the VM by clearing
+                # ``task.vm_instance_id``.  A lost-response retry therefore
+                # cannot satisfy the ordinary same-VM check below, even though
+                # the signed JWT still carries the VM that performed the park.
+                # Admit only the exact status path: its task+VM lookup misses
+                # and the PARKED/null-VM branch returns an immutable
+                # {"status": "parked"} response before any payload mutation.
+                # Cold-successor tasks were fenced above, and every other
+                # identityless inactive task/path remains fail-closed.
+                parked_status_noop = bool(
+                    request.method == "POST"
+                    and request.url.path == "/api/agent/status"
+                    and task.status == TaskStatus.PARKED
+                    and task.vm_instance_id is None
+                    and token_vm
+                    and (task.context or {}).get(PARKED_AGENT_VM_CONTEXT_KEY)
+                    == token_vm
+                )
+                if (
+                    is_idempotent_path
+                    and (
+                        not token_vm
+                        or not task.vm_instance_id
+                        or task.vm_instance_id != token_vm
+                    )
+                    and not parked_status_noop
+                ):
+                    _log_agent_auth_reject(
+                        "terminal_vm_identity_missing_or_mismatched",
+                        path=request.url.path,
+                        task_id=task_id,
+                        token_vm_instance_id=token_vm,
+                        token_project_id=token_project,
+                    )
+                    raise HTTPException(status_code=403, detail="vm_instance_mismatch")
                 # Same-VM idempotent retry on terminal task is OK; different
                 # VM (or any non-idempotent path) fails fast.
                 if not is_idempotent_path:
@@ -769,6 +854,7 @@ async def agent_git_read_token(
     a requeued/completed task could keep minting read tokens until JWT expiry.
     """
     task = await _load_active_agent_task(session, token)
+    reject_cold_successor_repository_authority(task)
     project = await session.get(Project, task.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project_not_found")
@@ -1042,6 +1128,15 @@ async def claim_task(
             )
         idempotent_replay = True
 
+    # Marker validation is part of admission, before the claim transition.
+    # A one-sided proof marker must never fall through to ordinary Resident.
+    cold_claim_capability = cold_successor_capability_slice(task, {})
+    claim_project = await session.get(Project, task.project_id)
+    is_cold_successor = enforce_cold_successor_task_authority(
+        claim_project.vision if claim_project is not None else None,
+        task,
+    )
+
     if not idempotent_replay:
         claim_started_at = _utcnow()
         task.status = TaskStatus.IN_PROGRESS
@@ -1079,6 +1174,53 @@ async def claim_task(
         session.add(task)
         await session.commit()
         await session.refresh(task)
+
+    if is_cold_successor:
+        # Cold-successor proof tasks execute a frozen text-only contract and
+        # have no repository, project-policy, artifact, or generic Resident
+        # authority. Return immediately after the durable claim transition so
+        # none of the ordinary claim enrichment can widen that boundary.
+        # Replays return the same projection from the persisted task payload.
+        cold_context = task.context if isinstance(task.context, dict) else {}
+        cold_response = {
+            "task_id": str(task.id),
+            "payloads": [task.first_payload],
+            "context": {
+                "_cold_successor": True,
+                "strategic_session_id": cold_context["strategic_session_id"],
+                "_resident_worker_generation": cold_context[
+                    "_resident_worker_generation"
+                ],
+            },
+            "project_metadata": {"project_id": str(task.project_id)},
+            "task_capability": cold_claim_capability,
+        }
+        # Record liveness only after the durable claim/JTI/predecessor boundary
+        # has succeeded. Rejected or superseded claims cannot keep a pin alive.
+        _shared_state.record_vm_heartbeat(vm_id)
+        claim_timing.mark("claim_transition")
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS},
+        )
+        claim_timing.mark("execution_contract")
+        _claim_metrics = claim_timing.finish(cold_response)
+        logger.info(
+            "[CLAIM_TIMING] task=%s type=%s vm=%s replay=%s total_ms=%s "
+            "response_bytes_approx=%s size_measurement_ms=%s phase_ms=%s",
+            task.id,
+            str((task.first_payload or {}).get("type") or "unknown"),
+            _truncate_vm_instance_id(vm_id),
+            idempotent_replay,
+            _claim_metrics["total_ms"],
+            _claim_metrics["response_bytes_approx"],
+            _claim_metrics["size_measurement_ms"],
+            json.dumps(
+                _claim_metrics["phase_ms"], sort_keys=True, separators=(",", ":")
+            ),
+        )
+        return cold_response
 
     # Backfill artifact prerequisites from already-completed direct dependencies.
     # A dependent queued after its producer completed never received the push-path
@@ -1306,7 +1448,9 @@ async def claim_task(
             ),
         }
 
-    task_capability = agent_capability_slice(task_type)
+    task_capability = cold_successor_capability_slice(
+        task, agent_capability_slice(task_type)
+    )
     if task_capability is not None:
         response["task_capability"] = task_capability
 

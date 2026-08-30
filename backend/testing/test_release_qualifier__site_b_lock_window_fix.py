@@ -4,6 +4,8 @@
 """Domain slice: SITE B lock-window fix: GitHub-bound gates run BEFORE FOR UPDATE
 
 Split from test_release_qualifier.py."""
+from datetime import datetime, timedelta, timezone
+
 from _release_qualifier_testhelpers import *  # noqa: F403
 
 
@@ -1460,7 +1462,7 @@ async def test_collect_terminal_infra_child_events_batch_fetches_tasks(db_sessio
 
 @pytest.mark.asyncio
 async def test_collect_terminal_infra_child_events_skips_seen_failed(db_session):
-    """Tasks already in seen_failed_ids must not appear in the output."""
+    """A legacy duplicate is enriched in place without adding a second row."""
     from app.release_qualifier_audit import _collect_terminal_infra_child_events
 
     project = Project(
@@ -1497,6 +1499,8 @@ async def test_collect_terminal_infra_child_events_skips_seen_failed(db_session)
     # The existing entry must be preserved; no duplicate must appear.
     assert len(result) == 1
     assert result[0]["failed_task_id"] == str(task.id)
+    assert result[0]["diagnostic_schema_version"] == 1
+    assert result[0]["attempt_trace_total"] == 1
 
 
 # ===========================================================================
@@ -1586,6 +1590,195 @@ async def test_collect_terminal_infra_child_events_propagates_child_tail(db_sess
     assert len(result) == 1
     assert result[0]["leg"] == "audit"
     assert result[0]["child_tail"] == "Error: claude_code_failed — the agent exited with CODE_ERROR"
+
+
+def test_compact_infra_child_event_preserves_first_and_latest_attempt_diagnostics():
+    from app.release_qualifier_audit import _compact_infra_child_event
+
+    provisioned = datetime(2026, 8, 30, 1, 0, tzinfo=timezone.utc)
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="Multi-attempt audit",
+        payloads=[{"type": "release_qualifier_audit"}],
+        status=TaskStatus.FAILED,
+        attempt_count=5,
+        vm_provisioned_at=provisioned + timedelta(minutes=5),
+        vm_stopped_at=provisioned + timedelta(minutes=6),
+        completed_at=provisioned + timedelta(minutes=7),
+        latest_status_message="token=latestsecretvalue final failure",
+        context={
+            "failure_category": "provider_terminal_failed",
+            "agent_error_report": {
+                "schema": 1,
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "provider_result_is_error": True,
+                "provider_terminal_reason": "provider_failed",
+                "stderr_tail": "api_key=currentsecretvalue stderr",
+                "provider_errors": [
+                    {
+                        "message": "token=currentprovidersecret provider",
+                        "source": "result_event",
+                        "code": "provider_failed",
+                    }
+                ],
+            },
+        },
+    )
+    task.attempt_history = [
+        {
+            "attempt_ordinal": ordinal,
+            "status": "FAILED",
+            "vm_provisioned_at": (
+                provisioned + timedelta(minutes=ordinal - 1)
+            ).isoformat(),
+            "vm_stopped_at": (provisioned + timedelta(minutes=ordinal)).isoformat(),
+            "failure_class": "provider_terminal_failed",
+            "failure_message_tail": f"attempt {ordinal}",
+            "agent_error_report": {
+                "schema": 1,
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "provider_result_is_error": True,
+                "provider_terminal_reason": (
+                    "aborted_streaming" if ordinal == 1 else "provider_failed"
+                ),
+                "stderr_tail": "api_key=bankedsecretvalue stderr",
+                "provider_errors": [
+                    {
+                        "message": "token=bankedprovidersecret provider",
+                        "source": "stream",
+                        "code": "aborted",
+                    }
+                ],
+            },
+        }
+        for ordinal in range(1, 6)
+    ]
+
+    event = _compact_infra_child_event(leg="audit", failed_task=task)
+
+    assert event["diagnostic_schema_version"] == 1
+    assert event["attempt_trace_total"] == 6
+    assert event["attempt_trace_truncated"] is True
+    assert [row["attempt_ordinal"] for row in event["attempt_trace"]] == [1, 4, 5, 6]
+    first = event["attempt_trace"][0]
+    assert first["agent_error"]["provider_terminal_reason"] == "aborted_streaming"
+    assert first["agent_error"]["model_output_seen"] is False
+    assert first["agent_error"]["stderr_tail"] == "api_key=*** stderr"
+    assert first["agent_error"]["provider_error_tail"] == "token=*** provider"
+    current = event["attempt_trace"][-1]
+    assert current["vm_stopped_at"] == task.vm_stopped_at.isoformat()
+    assert current["terminal_at"] == task.completed_at.isoformat()
+    rendered = repr(event)
+    assert "bankedsecretvalue" not in rendered
+    assert "currentsecretvalue" not in rendered
+    assert "providersecret" not in rendered
+
+
+def test_compact_task_attempt_trace_rejects_unbounded_legacy_shapes():
+    from app.release_qualifier_audit import _compact_task_attempt_trace
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="Malformed history",
+        payloads=[{"type": "release_qualifier_audit"}],
+        status=TaskStatus.FAILED,
+        context={},
+    )
+    task.attempt_history = [
+        {
+            "attempt_ordinal": {"nested": "x" * 10_000},
+            "status": ["FAILED"],
+            "vm_stopped_at": {"nested": "y" * 10_000},
+            "agent_error_report": {},
+        }
+    ]
+
+    trace, total = _compact_task_attempt_trace(task)
+
+    assert total == 1
+    assert trace[0]["attempt_ordinal"] == 2
+    assert trace[0]["status"] == "FAILED"
+    assert "agent_error" not in trace[0]
+    assert "nested" not in repr(trace)
+
+
+def test_append_infra_failure_duplicate_enriches_missing_only():
+    from app.release_qualifier_audit import append_infra_failure_child_event
+
+    task = Task(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        title="Legacy diagnostic",
+        payloads=[{"type": "release_qualifier_audit"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="new bounded tail",
+        context={"failure_category": "new_category"},
+    )
+    qual = {
+        "infra_failure_child_events": [
+            {
+                "leg": "audit",
+                "failed_task_id": str(task.id),
+                "status": "FAILED",
+                "failure_category": "old_category",
+            }
+        ]
+    }
+
+    enriched = append_infra_failure_child_event(
+        qual,
+        leg="audit",
+        failed_task=task,
+        replacement_task_id="replacement",
+    )
+
+    assert len(enriched["infra_failure_child_events"]) == 1
+    event = enriched["infra_failure_child_events"][0]
+    assert event["diagnostic_schema_version"] == 1
+    assert event["failure_category"] == "old_category"
+    assert event["replacement_task_id"] == "replacement"
+    assert event["child_tail"] == "new bounded tail"
+    assert event["attempt_trace_total"] == 1
+    assert enriched["infra_failure_child_events_total"] == 1
+    assert enriched["infra_failure_child_events_truncated"] is False
+
+
+def test_infra_failure_event_cap_preserves_exact_total_and_first_latest():
+    from app.release_qualifier_audit import append_infra_failure_child_event
+
+    qual = {}
+    task_ids = []
+    for index in range(25):
+        task_id = uuid.uuid4()
+        task_ids.append(str(task_id))
+        qual = append_infra_failure_child_event(
+            qual,
+            leg="audit",
+            failed_task=Task(
+                id=task_id,
+                project_id=uuid.uuid4(),
+                title=f"Failure {index}",
+                payloads=[{"type": "release_qualifier_audit"}],
+                status=TaskStatus.FAILED,
+                context={},
+            ),
+        )
+
+    events = qual["infra_failure_child_events"]
+    assert len(events) == 20
+    assert events[0]["failed_task_id"] == task_ids[0]
+    assert [event["failed_task_id"] for event in events[-3:]] == task_ids[-3:]
+    assert qual["infra_failure_child_events_total"] == 25
+    assert qual["infra_failure_child_events_truncated"] is True
+
+
+def test_bounded_infra_history_preserves_first_attempt_and_latest_tail():
+    from app.release_qualifier_audit import _bounded_infra_history
+
+    rows = [{"attempt": attempt} for attempt in range(1, 8)]
+    assert _bounded_infra_history(rows) == [rows[0], *rows[-4:]]
 
 
 # ===========================================================================

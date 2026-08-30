@@ -11668,6 +11668,7 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         "release_reconciliation.py:_reconcile_if_not_promoted_but_pr_merged",
         "release_reconciliation.py:_reconcile_if_managed_check_wait",
         "release_version.py:_resolve_integration_head_sha",
+        "release_version_cut.py:resolve_version_cut_integration_identity",
         "strategic_spawning.py:_spawn_strategic_review",
         "task_completion.py:_ensure_branch",
         "rollup_management.py:_check_and_trigger_rollup",

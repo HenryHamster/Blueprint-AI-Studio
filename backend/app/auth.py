@@ -27,7 +27,13 @@ import firebase_admin
 from firebase_admin import auth as firebase_auth
 
 from app.database import get_session, resolve_dialect_name
-from app.models import AllowedUser, LocalRunner, _utcnow
+from app.models import (
+    AllowedUser,
+    LocalRunner,
+    Task,
+    _utcnow,
+    task_status_releases_agent_resources,
+)
 from app.admin_helpers import (
     AllowedUserBoundToDifferentUID,
     claim_pending_project_memberships,
@@ -263,6 +269,79 @@ def verify_agent_jwt(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Agent token expired") from None
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid agent token") from None
+
+
+async def resolve_task_agent_authority(
+    raw_token: str,
+    session: AsyncSession,
+    *,
+    method: str,
+    path: str,
+    expected_task_id: uuid.UUID | str | None = None,
+    expected_project_id: uuid.UUID | str | None = None,
+    allow_released_task: bool,
+) -> tuple[dict, Task]:
+    """Resolve a low-level agent JWT to one exact persisted task authority.
+
+    A few read-only and WebSocket surfaces cannot use ``verify_agent_token``
+    because they deliberately admit terminal telemetry or own their session.
+    They still require the same task/project/VM binding and cold-successor path
+    fence. Keeping that policy here prevents a raw same-secret JWT decode from
+    becoming a second, wider agent authority system.
+    """
+
+    class _TaskAgentAuthorityError(HTTPException):
+        def __init__(self, status_code: int, detail: str):
+            self.agent_payload = payload
+            super().__init__(status_code=status_code, detail=detail)
+
+    payload = verify_agent_jwt(raw_token)
+    reject_tool_asset_scope(payload)
+    if any(
+        marker in payload
+        for marker in ("scope", "token_scope", "type", "token_type")
+    ):
+        raise _TaskAgentAuthorityError(403, "Agent token scope is invalid")
+    try:
+        task_id = uuid.UUID(str(payload.get("sub") or ""))
+        project_id = uuid.UUID(str(payload.get("project_id") or ""))
+        uuid.UUID(str(payload.get("jti") or ""))
+    except (TypeError, ValueError, AttributeError):
+        raise _TaskAgentAuthorityError(403, "Agent token scope is invalid") from None
+    token_vm = payload.get("vm_instance_id")
+    if not isinstance(token_vm, str) or not token_vm:
+        raise _TaskAgentAuthorityError(403, "Agent token scope is invalid")
+    if expected_task_id is not None and str(task_id) != str(expected_task_id):
+        raise _TaskAgentAuthorityError(403, "task_id_mismatch")
+    if expected_project_id is not None and str(project_id) != str(
+        expected_project_id
+    ):
+        raise _TaskAgentAuthorityError(403, "project_mismatch")
+
+    task = (
+        await session.execute(select(Task).where(Task.id == task_id))
+    ).scalars().first()
+    if task is None:
+        raise _TaskAgentAuthorityError(403, "Task is no longer active")
+    if str(task.project_id) != str(project_id):
+        raise _TaskAgentAuthorityError(403, "project_mismatch")
+    if not task.vm_instance_id or task.vm_instance_id != token_vm:
+        raise _TaskAgentAuthorityError(403, "vm_instance_mismatch")
+
+    from app.strategic_cold_successor_authority import (
+        enforce_cold_successor_request_authority,
+    )
+
+    try:
+        enforce_cold_successor_request_authority(task, method=method, path=path)
+    except HTTPException as cold_authority_error:
+        raise _TaskAgentAuthorityError(
+            cold_authority_error.status_code,
+            str(cold_authority_error.detail),
+        ) from cold_authority_error
+    if not allow_released_task and task_status_releases_agent_resources(task.status):
+        raise _TaskAgentAuthorityError(401, "Task is no longer active")
+    return payload, task
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +860,7 @@ async def get_metrics_reader(
     Accepts EITHER:
     - A short-lived admin JWT (from ``POST /api/admin/token``)
     - A token matching ADMIN_API_KEY (existing server-to-server admin path)
-    - A valid agent JWT signed with AGENT_JWT_SECRET (task-scoped or VM-scoped)
+    - A valid task-scoped agent JWT signed with AGENT_JWT_SECRET
     - A Firebase token for an allowed admin user (browser admin UI path)
 
     Returns a small principal dict for logging/audit. Does NOT call into Firebase
@@ -809,13 +888,20 @@ async def get_metrics_reader(
         return {"role": "admin"}
 
     try:
-        # verify_agent_jwt raises HTTPException(401) on expired or invalid tokens.
-        payload = verify_agent_jwt(token)
-        # A tool-asset capability token must not authenticate to the metrics
-        # reader — reject it with 403 (out of scope) rather than treating it as a
-        # valid agent principal. The 403 propagates through the handler below
-        # (which only swallows 401 to fall through to the Firebase path).
-        reject_tool_asset_scope(payload)
+        # Signature failures fall through to Firebase. Once a token verifies
+        # under the agent secret, every shape/binding/path failure is a hard
+        # denial and must not be reinterpreted as another principal type.
+        payload, _task = await resolve_task_agent_authority(
+            token,
+            session,
+            method=request.method if request is not None else "GET",
+            path=(
+                request.url.path
+                if request is not None
+                else "/api/admin/digest-latency-stats"
+            ),
+            allow_released_task=True,
+        )
         return {
             "role": "metrics_reader",
             "sub": payload.get("sub"),

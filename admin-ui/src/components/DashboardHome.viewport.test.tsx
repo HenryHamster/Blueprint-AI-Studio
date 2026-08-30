@@ -272,6 +272,11 @@ vi.mock('../api', () => ({
     abandoned_version: { version_number: 42, status: 'abandoned' },
     new_version: { version_number: 43, phase: 'build', goal: null, opened_at: '2026-05-20T12:00:00Z' },
   })),
+  getVersionCutContext: vi.fn(async () => ({
+    status: 'ready', replayed: false,
+    version: { id: 'version-1', version_number: 1, phase: 'build', status: 'open', base_sha: null, candidate_sha: null },
+    integration: { owner: 'example', repo: 'repo', branch: 'automain', head_sha: 'a'.repeat(40), identity_token: 'b'.repeat(64), observed_at: '2026-08-30T00:00:00+00:00' },
+  })),
   clearDeployFailed: vi.fn(async () => ({
     version_number: 42,
     serving_status: 'serving',

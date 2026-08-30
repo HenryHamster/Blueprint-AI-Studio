@@ -157,6 +157,7 @@ from app.strategic_constants import (
 from app.task_capabilities import (
     STRATEGIC_TASK_TYPES,
     STRATEGIST_SPAWNABLE_TASK_TYPES,
+    get_task_capability,
 )
 from app.strategic_spawn_requests import (
     cancel_deferred_spawn_request,
@@ -1474,6 +1475,9 @@ async def strategic_operation(
 
     # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)
     project = await _lock_project_or_429(session, task.project_id)
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(project.vision)
 
     # Message mutations follow Project -> sequence -> Task. The Project lock is
     # the strongest lock this operation needs, so no later lock upgrade can
@@ -4571,19 +4575,108 @@ async def strategic_operation(
         # direction-free proving spawns to link their merge evidence to coverage
         # criteria without requiring a direction assignment.
         raw_explicit_criterion_ids = data.get("criterion_ids")
-        explicit_criterion_ids: list[str] = []
+        explicit_criterion_ids: list[str] | None = None
         if raw_explicit_criterion_ids is not None:
             if not isinstance(raw_explicit_criterion_ids, list):
                 raise HTTPException(
                     status_code=400, detail="criterion_ids must be a list of strings"
                 )
+            if len(raw_explicit_criterion_ids) > 50:
+                raise HTTPException(
+                    status_code=400,
+                    detail="criterion_ids may contain at most 50 entries",
+                )
+            normalized_criterion_ids: list[str] = []
             for _cid in raw_explicit_criterion_ids:
-                if not isinstance(_cid, str) or not _cid.strip():
+                if (
+                    not isinstance(_cid, str)
+                    or not _cid.strip()
+                    or len(_cid.strip()) > 64
+                ):
                     raise HTTPException(
                         status_code=400,
-                        detail="criterion_ids entries must be non-empty strings",
+                        detail=(
+                            "criterion_ids entries must be non-empty strings "
+                            "of at most 64 characters"
+                        ),
                     )
-            explicit_criterion_ids = [str(k).strip() for k in raw_explicit_criterion_ids[:50]]
+                normalized_criterion_ids.append(_cid.strip())
+            if len(set(normalized_criterion_ids)) != len(normalized_criterion_ids):
+                raise HTTPException(
+                    status_code=400,
+                    detail="criterion_ids must not contain duplicates",
+                )
+            explicit_criterion_ids = normalized_criterion_ids
+
+        raw_model = data.get("model")
+        raw_effort = data.get("effort")
+        spawn_capability = get_task_capability(str(spawn_type))
+        requested_model: str | None = None
+        requested_effort: str | None = None
+        requested_provider: str | None = None
+        if (raw_model is None) != (raw_effort is None):
+            raise HTTPException(
+                status_code=400,
+                detail="spawn_task model and effort must be supplied together",
+            )
+        if raw_model is not None and raw_effort is not None:
+            if (
+                not isinstance(raw_model, str)
+                or not raw_model.strip()
+                or len(raw_model.strip()) > 255
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="spawn_task model must be a non-empty string of at most 255 characters",
+                )
+            if not isinstance(raw_effort, str) or raw_effort not in {
+                "low",
+                "medium",
+                "high",
+                "max",
+            }:
+                raise HTTPException(
+                    status_code=400,
+                    detail="spawn_task effort must be one of low, medium, high, max",
+                )
+            if (
+                spawn_capability is None
+                or not spawn_capability.provider_configurable
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"spawn_task type '{spawn_type}' does not permit explicit "
+                        "model/effort routing"
+                    ),
+                )
+            from app.providers.registry import get_all_selectable_models
+
+            requested_model = raw_model.strip().lower()
+            matching_providers = [
+                provider
+                for provider, models in get_all_selectable_models().items()
+                if requested_model in models
+            ]
+            if len(matching_providers) != 1:
+                reason = "unknown" if not matching_providers else "ambiguous"
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"spawn_task model is {reason}: {requested_model}",
+                )
+            requested_provider = matching_providers[0]
+            if (
+                spawn_capability.allowed_providers is not None
+                and requested_provider not in spawn_capability.allowed_providers
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"spawn_task type '{spawn_type}' does not allow provider "
+                        f"'{requested_provider}'"
+                    ),
+                )
+            requested_effort = raw_effort
 
         # Build payload — use the same validator the research/plan spawners use
         # so the new task is indistinguishable from normal autonomous spawns
@@ -4596,6 +4689,12 @@ async def strategic_operation(
         }
         if direction_id:
             spawn_payload["direction_id"] = direction_id
+        if requested_model is not None and requested_effort is not None:
+            spawn_payload.update(
+                model=requested_model,
+                effort=requested_effort,
+                provider_preference=[requested_provider],
+            )
         enrich_direct_research_payload(
             spawn_payload,
             project=project,
@@ -4692,7 +4791,14 @@ async def strategic_operation(
         # task_type_efforts value here could silently downgrade a new research
         # parent from max effort, while copying task_type_models bypasses the
         # provider/effort model matrix entirely.
-        if spawn_type != "research":
+        if (
+            spawn_type != "research"
+            and requested_model is None
+            and (
+                spawn_capability is None
+                or spawn_capability.provider_configurable
+            )
+        ):
             type_model = (
                 _runtime_config.get("task_type_models", {}).get(spawn_type) or None
             )
@@ -4720,6 +4826,14 @@ async def strategic_operation(
             "spawned_by": "strategic_direct",
             "parent_strategic_task_id": str(task.id),
         }
+        if requested_model is not None and requested_provider is not None:
+            from app.max_plan_pool import EXACT_MODEL_ROUTE_CONTEXT_KEY
+
+            new_task_ctx[EXACT_MODEL_ROUTE_CONTEXT_KEY] = {
+                "provider": requested_provider,
+                "model": requested_model,
+                "effort": requested_effort,
+            }
         if workday_operation.binding is not None:
             new_task_ctx["_workday_consultation_provenance"] = {
                 "packet_id": str(workday_operation.binding.packet_id),
@@ -4728,29 +4842,45 @@ async def strategic_operation(
         if direction_id:
             new_task_ctx["direction_id"] = direction_id
 
+        _task_criterion_ids: list[str] = []
         _task_criterion_release_version_id: uuid.UUID | None = None
-        if direction_id or raw_explicit_criterion_ids is not None:
+        if explicit_criterion_ids is not None:
+            # Presence is exact authority, including an explicit empty list.
+            # Reuse the canonical operator-admission validator so unknown,
+            # inactive, cross-direction, and stale-version criteria fail
+            # closed instead of being silently dropped or widened.
+            from app.admin_task_admission import prepare_task_creation_authority
+            from app.acceptance_criteria import (
+                EXPLICIT_CRITERION_IDS_CONTEXT_KEY,
+            )
+
+            criterion_authority = await prepare_task_creation_authority(
+                session,
+                project=project,
+                direction_id=str(direction_id) if direction_id else None,
+                criterion_ids=explicit_criterion_ids,
+                depends_on=[],
+                base_branch=_get_project_integration_branch(project),
+                require_deps_landed_on=declared_landing_gate,
+            )
+            _task_criterion_ids = list(criterion_authority.criterion_ids)
+            _task_criterion_release_version_id = (
+                criterion_authority.criterion_release_version_id
+            )
+            new_task_ctx[EXPLICIT_CRITERION_IDS_CONTEXT_KEY] = True
+        elif direction_id:
+            # Omission retains the legacy additive behavior: inherit all active
+            # criteria currently owned by the direction.
             from app.release_version import current_open_version as _current_open_version
+            from app.directions_repo import get_direction_row as _get_direction_row
 
             _open_version = await _current_open_version(session, project.id)
             if _open_version is not None:
                 _task_criterion_release_version_id = _open_version.id
-                new_task_ctx["criterion_release_version_id"] = str(
-                    _open_version.id
-                )
-
-        # Resolve criterion_keys from two sources: the direction row (when
-        # direction_id is set) and any explicit criterion_ids the strategist
-        # passed. Both are merged and filtered to active keys on the open
-        # version so stale/retracted criteria never propagate to new tasks.
-        _task_criterion_ids: list[str] = []
-        _keys_to_filter: list[str] = list(explicit_criterion_ids)
-        if direction_id:
-            from app.directions_repo import get_direction_row as _get_direction_row
-
             _dir_row = await _get_direction_row(session, project.id, direction_id)
             from app.acceptance_criteria import (
                 direction_criterion_release_version_id as _direction_criterion_version,
+                filter_active_criterion_keys as _filter_active_crit,
             )
 
             _direction_version_id = _direction_criterion_version(_dir_row)
@@ -4762,21 +4892,16 @@ async def strategic_operation(
                     or _direction_version_id is None
                 )
             ):
-                # Merge: explicit keys first, then direction-derived; deduplicate.
-                _keys_to_filter = list(
-                    dict.fromkeys(_keys_to_filter + list(_dir_row.criterion_keys))
-                )
-        if _keys_to_filter:
-            from app.acceptance_criteria import (
-                filter_active_criterion_keys as _filter_active_crit,
-            )
-            if _task_criterion_release_version_id is not None:
                 _task_criterion_ids = await _filter_active_crit(
                     session,
                     project.id,
-                    _keys_to_filter,
+                    list(_dir_row.criterion_keys),
                     release_version_id=_task_criterion_release_version_id,
                 )
+        if _task_criterion_release_version_id is not None:
+            new_task_ctx["criterion_release_version_id"] = str(
+                _task_criterion_release_version_id
+            )
 
         # Cross-field guard: criterion_ids (explicit or direction-derived)
         # require named_test acceptance evidence so the acceptance pipeline can
@@ -4862,6 +4987,18 @@ async def strategic_operation(
                         "op": "spawn_task",
                         "request_id": str(submission.request.id),
                         "type": spawn_type,
+                        "criterion_ids": _task_criterion_ids,
+                        "criterion_ids_explicit": (
+                            explicit_criterion_ids is not None
+                        ),
+                        "criterion_release_version_id": (
+                            str(_task_criterion_release_version_id)
+                            if _task_criterion_release_version_id is not None
+                            else None
+                        ),
+                        "requested_model": requested_model,
+                        "requested_effort": requested_effort,
+                        "requested_provider": requested_provider,
                         "reason": submission.request.admission_reason,
                         "not_before": utc_iso(submission.request.not_before),
                     }
@@ -4911,6 +5048,16 @@ async def strategic_operation(
                 "type": spawn_type,
                 "priority": spawn_priority,
                 "deduplicated": submission.replayed,
+                "criterion_ids": _task_criterion_ids,
+                "criterion_ids_explicit": explicit_criterion_ids is not None,
+                "criterion_release_version_id": (
+                    str(_task_criterion_release_version_id)
+                    if _task_criterion_release_version_id is not None
+                    else None
+                ),
+                "requested_model": requested_model,
+                "requested_effort": requested_effort,
+                "requested_provider": requested_provider,
                 **(
                     {"linked_debt_id": submission.linked_debt_id}
                     if submission.linked_debt_id
@@ -4950,7 +5097,6 @@ async def strategic_operation(
             VERSION_PHASE_DECISION_CONTEXT_KEY,
             _apply_new_acceptance_criteria,
             _apply_new_version_goal,
-            _apply_qualify_request_post_commit,
             _apply_version_phase_decision,
             extract_new_version_goal,
             extract_qualify_request,
@@ -5144,20 +5290,32 @@ async def strategic_operation(
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
-        # Apply synchronously within this handler so the decision takes immediate
-        # effect rather than waiting for task completion. These apply helpers only call
-        # session.add(); the single commit below persists everything atomically.
-        # qualify_request is the exception: it does minutes of GitHub I/O
-        # (CI-compliance scan + run_qualification) and MUST NOT run under the
-        # Project FOR UPDATE lock held by this endpoint — doing so idled the
-        # connection until Cloud SQL closed it, poisoning the commit. It is
-        # applied post-commit on a fresh session below (see
-        # _apply_qualify_request_post_commit).
+        # Apply the local decisions within this handler so one commit persists
+        # them atomically. Qualification is represented only by a durable intent
+        # here; the reaper performs its slow GitHub/qualifier I/O later without
+        # holding this endpoint's Project lock.
         _phase_applied = await _apply_version_phase_decision(
             version_phase_decision, task, project, session, path="api_inline"
         )
-        _qr_task_id = task.id
-        _qr_project_id = project.id
+        from app.release_qualification_intents import prepare_qualification_intent
+
+        _qualification_intent = await prepare_qualification_intent(
+            session,
+            request=qualify_request,
+            task=task,
+            project=project,
+            authority_key=(
+                f"workday:{workday_operation.binding.packet_id}:"
+                f"{workday_operation.binding.operation_id}"
+                if workday_operation.binding is not None
+                else f"problem-model:{task.id}:{new_pm_raw.get('revision')}"
+            ),
+            authority_kind=(
+                "managed_workday_operation"
+                if workday_operation.binding is not None
+                else "problem_model_revision"
+            ),
+        )
         # ``_received`` says the field survived extraction; ``_applied`` says it
         # actually reached the open version. They differ when there is no open
         # ReleaseVersion, and the gap is the point: without it the agent reads
@@ -5181,7 +5339,10 @@ async def strategic_operation(
         task.context = new_ctx
         flag_modified(task, "context")
         if workday_operation.binding is not None and (
-            _phase_applied or _nvg_applied or _created_criteria
+            _phase_applied
+            or _nvg_applied
+            or _created_criteria
+            or _qualification_intent is not None
         ):
             from app.release_version import current_open_version as _current_open_version
 
@@ -5220,22 +5381,24 @@ async def strategic_operation(
                     entity_id=str(_criterion.criterion_key),
                     effect="created",
                 )
+            if _qualification_intent is not None:
+                await workday_operation.record_child_entity(
+                    op="request_qualification",
+                    key=str(_qualification_intent.id),
+                    entity_kind="release_qualification_intent",
+                    entity_id=str(_qualification_intent.id),
+                    effect="created",
+                )
         await workday_operation.record_problem_model(new_pm_raw)
         await session.commit()
         await _emit_updated(
             STRATEGIC_KIND_PROBLEM_MODEL,
             problem_model_changed=True,
         )
-        # qualify_request runs AFTER the commit that released the Project lock, on
-        # its own fresh session, so its slow GitHub I/O never idles this request's
-        # locked connection (which would poison the commit and 500 the agent). The
-        # agent still awaits it here, preserving synchronous semantics.
-        await _apply_qualify_request_post_commit(
-            qualify_request,
-            task_id=_qr_task_id,
-            project_id=_qr_project_id,
-            path="api_inline",
-        )
+        # Delivery is intentionally not awaited here. The committed intent is
+        # the correctness boundary; the bounded reaper owns slow GitHub and
+        # qualifier work so this conversational request cannot repeat the
+        # liveness failure the outbox repairs.
         logger.info(
             f"[STRATEGIC API] problem_model updated for project {project.id} "
             f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
@@ -5249,8 +5412,7 @@ async def strategic_operation(
             )
         if qualify_request is not None:
             logger.info(
-                "[STRATEGIC API] qualify_request applied synchronously for "
-                "task %s — release qualifier ran if open version is in stabilize",
+                "[STRATEGIC API] qualify_request durably queued for task %s",
                 task.id,
             )
         if new_version_goal is not None:
@@ -5273,6 +5435,16 @@ async def strategic_operation(
                 "diff": pm_diff,
                 "version_phase_decision_received": version_phase_decision is not None,
                 "qualify_request_received": qualify_request is not None,
+                "qualification_intent_id": (
+                    str(_qualification_intent.id)
+                    if _qualification_intent is not None
+                    else None
+                ),
+                "qualification_intent_status": (
+                    _qualification_intent.status
+                    if _qualification_intent is not None
+                    else None
+                ),
                 "new_version_goal_received": new_version_goal is not None,
                 "new_version_goal_applied": bool(_nvg_applied),
                 "new_acceptance_criteria_received": new_acceptance_criteria is not None,
@@ -7273,7 +7445,17 @@ async def strategic_operation(
                     status_code=404,
                     detail=f"cancel_task: spawn request {spawn_request_id} not found",
                 )
-            if request.parent_task_id != task.id:
+            replay_parent_ids = {
+                str(parent_id)
+                for parent_id in list(
+                    (request.policy_snapshot or {}).get("replay_parent_task_ids")
+                    or []
+                )[:50]
+            }
+            if (
+                request.parent_task_id != task.id
+                and str(task.id) not in replay_parent_ids
+            ):
                 raise HTTPException(
                     status_code=403,
                     detail="cancel_task: spawn request was not created by this strategic session",
@@ -7488,14 +7670,10 @@ async def strategic_operation(
         # Both fields are optional. Probes are explicit because they consume an
         # additional runner checkout; ordinary qualification judges evidence
         # already earned by task acceptance, review, and CI. Wrong-phase is a
-        # no-op (same behavior as qualify_request via set_problem_model). The qualification runs
-        # post-commit on its own fresh session for the same structural reason as
-        # the set_problem_model path: avoid holding any DB lock during slow GitHub
-        # I/O (CI-compliance scan + run_qualification).
-        from app.strategic_completion import (
-            _apply_qualify_request_post_commit,
-            extract_qualify_request,
-        )
+        # no-op for legacy callers (same behavior as qualify_request via
+        # set_problem_model). Managed Workday calls fail closed unless an exact
+        # intent can be created. The bounded reaper owns all slow delivery I/O.
+        from app.strategic_completion import extract_qualify_request
 
         try:
             qualify_request = extract_qualify_request(
@@ -7509,16 +7687,45 @@ async def strategic_operation(
         session.add(task)
         _rq_task_id = task.id
         _rq_project_id = project.id
-        await session.commit()
-        await _apply_qualify_request_post_commit(
-            qualify_request,
-            task_id=_rq_task_id,
-            project_id=_rq_project_id,
-            path="api_inline_request_qualification",
+        from app.release_qualification_intents import prepare_qualification_intent
+
+        _qualification_intent = await prepare_qualification_intent(
+            session,
+            request=qualify_request,
+            task=task,
+            project=project,
+            authority_key=(
+                f"workday:{workday_operation.binding.packet_id}:"
+                f"{workday_operation.binding.operation_id}"
+                if workday_operation.binding is not None
+                else None
+            ),
+            authority_kind=(
+                "managed_workday_operation"
+                if workday_operation.binding is not None
+                else "legacy_resident_operation"
+            ),
         )
+        if workday_operation.binding is not None and _qualification_intent is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Managed Workday qualification requires one open stabilize "
+                    "release version; no durable intent was created"
+                ),
+            )
+        if workday_operation.binding is not None and _qualification_intent is not None:
+            await workday_operation.record_entity(
+                entity_kind="release_qualification_intent",
+                entity_id=str(_qualification_intent.id),
+                effect="created",
+            )
+        await session.commit()
+        # The durable reaper owns delivery. Return the pending receipt without
+        # holding this conversation request open across external I/O.
         logger.info(
-            "[STRATEGIC API] request_qualification applied for task %s project %s "
-            "(reason=%r probes=%s) — release qualifier ran if open version is in stabilize",
+            "[STRATEGIC API] request_qualification durably queued for task %s "
+            "project %s (reason=%r probes=%s)",
             _rq_task_id,
             _rq_project_id,
             (qualify_request or {}).get("reason"),
@@ -7530,6 +7737,16 @@ async def strategic_operation(
                 "op": "request_qualification",
                 "reason_received": (qualify_request or {}).get("reason") or None,
                 "probes_received": (qualify_request or {}).get("probes") or [],
+                "qualification_intent_id": (
+                    str(_qualification_intent.id)
+                    if _qualification_intent is not None
+                    else None
+                ),
+                "qualification_intent_status": (
+                    _qualification_intent.status
+                    if _qualification_intent is not None
+                    else None
+                ),
             }
         )
 

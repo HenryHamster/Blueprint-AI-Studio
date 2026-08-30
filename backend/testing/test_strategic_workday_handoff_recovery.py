@@ -54,10 +54,19 @@ from testing.test_strategic_session_messages import (
 )
 
 
+async def _add_sequenced_typed_fast_input(db_session, project):
+    sequence = await lock_project_and_next_message_sequence(db_session, project.id)
+    return await _add_typed_fast_input(
+        db_session,
+        project,
+        sequence=sequence,
+    )
+
+
 async def _start_workday_request(client: AsyncClient, db_session, *, key: str):
     project, task = await _make_resident_poll_worker(db_session)
     incarnation = await _activate_typed_fast_worker(db_session, project, task)
-    inbound = await _add_typed_fast_input(db_session, project)
+    inbound = await _add_sequenced_typed_fast_input(db_session, project)
     claimed = await client.post(
         f"/api/agent/projects/{project.id}/conversation/turns/claim",
         headers=_headers(task, vm="agent-vm-resident-poll"),
@@ -113,7 +122,7 @@ async def _add_workday_request(
     identity,
     key: str,
 ):
-    inbound = await _add_typed_fast_input(db_session, project)
+    inbound = await _add_sequenced_typed_fast_input(db_session, project)
     claimed = await client.post(
         f"/api/agent/projects/{project.id}/conversation/turns/claim",
         headers=_headers(task, vm="agent-vm-resident-poll"),

@@ -357,7 +357,14 @@ async def test_every_attempt_and_terminal_predicate_survive_failed_delivery(db_s
     packet = _packet(
         project.id,
         request.id,
-        context={"_workday_consultation_attempts": attempts},
+        context={
+            "_workday_consultation_attempts": attempts,
+            "_workday_consultation_last_failure": {
+                "gate": "renew",
+                "detail": "older generic lease rejection",
+                "recorded_at": (_utcnow() - timedelta(seconds=30)).isoformat(),
+            },
+        },
     )
     packet.handling_state = MessageHandlingState.RESPONDED
     packet.status = "handled"
@@ -383,6 +390,37 @@ async def test_every_attempt_and_terminal_predicate_survive_failed_delivery(db_s
     assert detail["attempts"][1]["trace"][-1]["label"] == "provider_failed"
     assert detail["last_failure"]["gate"] == "attempt:provider_failed"
     assert "aborted_streaming" in detail["last_failure"]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_newer_gate_failure_wins_without_erasing_attempt_history(db_session):
+    project = await _make_project(db_session)
+    request = _public_request(project.id)
+    attempts = [_attempt(1, "failed", "provider_failed")]
+    packet = _packet(
+        project.id,
+        request.id,
+        context={
+            "_workday_consultation_attempts": attempts,
+            "_workday_consultation_last_failure": {
+                "gate": "renew",
+                "detail": "newer exact lease rejection",
+                "recorded_at": _utcnow().isoformat(),
+            },
+        },
+    )
+    db_session.add_all([request, packet])
+    await db_session.commit()
+
+    detail = await project_consultation_detail(
+        db_session,
+        project_id=project.id,
+        consultation_id=request.id,
+    )
+
+    assert detail["last_failure"]["gate"] == "renew"
+    assert "newer exact lease" in detail["last_failure"]["detail"]
+    assert detail["attempts"][0]["terminal_predicate"] == "provider_failed"
 
 
 # ── what the expanded view actually shows ─────────────────────────────────────

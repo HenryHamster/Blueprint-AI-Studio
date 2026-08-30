@@ -145,6 +145,7 @@ async def _apply_handoff_mutations(
     # Local import keeps this low-level handoff module independent at import
     # time while reusing the coordinator's exact claim-identity reset contract.
     from app.conversation_coordinator import (
+        retain_workday_consultation_attempt_for_session_handoff,
         reset_conversation_claim_for_session_handoff,
     )
 
@@ -162,8 +163,14 @@ async def _apply_handoff_mutations(
             message.resolved_at = message.resolved_at or now
             answered_count += 1
         else:
+            retained_context = retain_workday_consultation_attempt_for_session_handoff(
+                message.context,
+                task_id=message.handled_by_task_id,
+                resident_session_id=message.resident_session_id,
+                now=now,
+            )
             message.context = {
-                **dict(message.context or {}),
+                **retained_context,
                 RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY: resident_session_id,
                 RESIDENT_HANDOFF_AT_CONTEXT_KEY: now.isoformat(),
             }

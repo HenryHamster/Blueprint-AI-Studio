@@ -6002,9 +6002,24 @@ async def test_rubric_changed_below_cap_relaunches_exactly_once(db_session, mock
     await db_session.commit()
     await db_session.refresh(version)
 
+    spawned_attempt_id = uuid.uuid4()
+
+    async def _spawn_projection(_session, _project_id, spawned_version, **_kwargs):
+        spawned_version.last_qualification = {
+            "status": "pending",
+            "qualification_attempt_id": str(spawned_attempt_id),
+        }
+        spawned_version.active_qualification_attempt_id = spawned_attempt_id
+        db_session.add(spawned_version)
+        await db_session.flush()
+        return {
+            "status": "spawned",
+            "qualification_attempt_id": str(spawned_attempt_id),
+        }
+
     mock_run_qual = mocker.patch(
         "app.release_qualifier.run_qualification",
-        new=AsyncMock(return_value={"status": "spawned"}),
+        new=AsyncMock(side_effect=_spawn_projection),
     )
 
     result = await _redrive_rubric_changed_qualification(

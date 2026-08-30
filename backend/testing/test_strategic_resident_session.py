@@ -2350,7 +2350,10 @@ async def test_restart_rebinds_pending_workday_packet_with_fresh_lease(db_sessio
                 "_workday_consultation_claim_expires_at": (
                     _utcnow() + timedelta(minutes=5)
                 ).isoformat(),
-                "_workday_consultation_claim_attempt": 4,
+                "_workday_consultation_claim_attempt": 1,
+                "_workday_consultation_claim_started_at": (
+                    _utcnow() - timedelta(minutes=2)
+                ).isoformat(),
             },
         )
     )
@@ -2366,9 +2369,26 @@ async def test_restart_rebinds_pending_workday_packet_with_fresh_lease(db_sessio
         "_workday_consultation_claim_generation",
         "_workday_consultation_claim_incarnation",
         "_workday_consultation_claim_expires_at",
-        "_workday_consultation_claim_attempt",
+        "_workday_consultation_claim_started_at",
     ):
         assert key not in packet.context
+    assert packet.context["_workday_consultation_claim_attempt"] == 1
+    assert len(packet.context["_workday_consultation_attempts"]) == 1
+    old_attempt = packet.context["_workday_consultation_attempts"][0]
+    assert old_attempt["workday_claim_id"] == str(old_claim_id)
+    assert old_attempt["attempt"] == 1
+    assert old_attempt["outcome"] == "abandoned"
+    assert old_attempt["terminal_predicate"] == (
+        "resident_session_handoff_without_ack"
+    )
+    assert old_attempt["provider_terminal_reason"] is None
+    assert old_attempt["provider_output_tail"] is None
+    assert old_attempt["trace"][-1]["label"] == "provider_diagnostic_missing"
+    assert old_attempt["trace_truncated"] is True
+    old_authority = packet.context["_workday_consultation_claim_authorities"][0]
+    assert old_authority["workday_claim_id"] == str(old_claim_id)
+    assert old_authority["attempt"] == 1
+    assert old_authority["diagnostic_state"] == "server_missing"
 
     new_claim = await claim_next_workday_consultation_packet(
         db_session,
@@ -2381,7 +2401,14 @@ async def test_restart_rebinds_pending_workday_packet_with_fresh_lease(db_sessio
     assert new_claim is not None
     assert new_claim.message.id == packet.id
     assert new_claim.workday_claim_id != old_claim_id
-    assert new_claim.attempt == 1
+    assert new_claim.attempt == 2
+    await db_session.refresh(packet)
+    authorities = packet.context["_workday_consultation_claim_authorities"]
+    assert [item["attempt"] for item in authorities] == [1, 2]
+    assert [item["diagnostic_state"] for item in authorities] == [
+        "server_missing",
+        "open",
+    ]
 
 
 @pytest.mark.asyncio

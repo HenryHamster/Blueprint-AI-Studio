@@ -36,6 +36,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import release_version
+from app.broadcast import _sanitize_log
 from app.models import (
     AuditFindingResolution,
     Project,
@@ -413,6 +414,248 @@ def _annotate_regime(out: dict[str, Any], promotion_enabled: bool) -> dict[str, 
     return out
 
 
+_INFRA_EVIDENCE_EVENT_LIMIT = 20
+_INFRA_EVIDENCE_TRACE_LIMIT = 4
+_INFRA_EVIDENCE_TAIL_LIMIT = 500
+
+
+def _infra_evidence_text(value: Any, *, limit: int) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return _sanitize_log(value)[:limit]
+
+
+def _infra_evidence_int(value: Any, *, positive: bool = False) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < (1 if positive else 0):
+        return None
+    return value
+
+
+def _format_infra_agent_error(raw: Any) -> dict[str, Any] | None:
+    if (
+        not isinstance(raw, dict)
+        or isinstance(raw.get("schema"), bool)
+        or raw.get("schema") != 1
+    ):
+        return None
+    out: dict[str, Any] = {"schema": 1}
+    for key in (
+        "exit_code",
+        "duration_ms",
+        "provider_api_error_status",
+    ):
+        value = _infra_evidence_int(raw.get(key))
+        if value is not None:
+            out[key] = value
+    for key in (
+        "model_output_seen",
+        "result_event_seen",
+        "provider_result_is_error",
+    ):
+        value = raw.get(key)
+        if isinstance(value, bool):
+            out[key] = value
+    for key, limit in (
+        ("provider", 50),
+        ("auth_mode", 50),
+        ("exit_signal", 20),
+        ("last_stream_event", 100),
+        ("classified", 50),
+        ("provider_result_subtype", 100),
+        ("provider_terminal_reason", 255),
+        ("provider_error_source", 50),
+        ("provider_error_code", 100),
+    ):
+        value = _infra_evidence_text(raw.get(key), limit=limit)
+        if value is not None:
+            out[key] = value
+    tail = (
+        raw.get("output_tail")
+        or raw.get("provider_error_tail")
+        or raw.get("stderr_tail")
+    )
+    bounded_tail = _infra_evidence_text(tail, limit=_INFRA_EVIDENCE_TAIL_LIMIT)
+    if bounded_tail is not None:
+        out["output_tail"] = bounded_tail
+    return out
+
+
+def _format_infra_attempt_trace(raw: Any) -> tuple[list[dict[str, Any]], int]:
+    if not isinstance(raw, list):
+        return [], 0
+    rows: list[dict[str, Any]] = []
+    for value in raw:
+        if not isinstance(value, dict):
+            continue
+        row: dict[str, Any] = {}
+        ordinal = _infra_evidence_int(value.get("attempt_ordinal"), positive=True)
+        if ordinal is not None:
+            row["attempt_ordinal"] = ordinal
+        for key, limit in (
+            ("status", 80),
+            ("vm_provisioned_at", 80),
+            ("vm_stopped_at", 80),
+            ("terminal_at", 80),
+            ("failure_category", 100),
+            ("child_tail", _INFRA_EVIDENCE_TAIL_LIMIT),
+        ):
+            text_value = _infra_evidence_text(value.get(key), limit=limit)
+            if text_value is not None:
+                row[key] = text_value
+        agent_error = _format_infra_agent_error(value.get("agent_error"))
+        if agent_error is not None:
+            row["agent_error"] = agent_error
+        if row:
+            rows.append(row)
+    total = len(rows)
+    if total > _INFRA_EVIDENCE_TRACE_LIMIT:
+        rows = [rows[0], *rows[-(_INFRA_EVIDENCE_TRACE_LIMIT - 1):]]
+    return rows, total
+
+
+def _format_infra_event(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    event: dict[str, Any] = {}
+    for key, limit in (
+        ("leg", 80),
+        ("failed_task_id", 80),
+        ("replacement_task_id", 80),
+        ("status", 80),
+        ("failure_category", 100),
+        ("terminal_at", 80),
+        ("label", 160),
+    ):
+        value = _infra_evidence_text(raw.get(key), limit=limit)
+        if value is not None:
+            event[key] = value
+    for key in ("task_attempt_ordinal", "respawn_count"):
+        value = _infra_evidence_int(raw.get(key), positive=key == "task_attempt_ordinal")
+        if value is not None:
+            event[key] = value
+    trace, observed_trace_total = _format_infra_attempt_trace(
+        raw.get("attempt_trace")
+    )
+    declared_trace_total = _infra_evidence_int(raw.get("attempt_trace_total"))
+    trace_total = max(observed_trace_total, declared_trace_total or 0)
+    event["attempt_trace"] = trace
+    event["attempt_trace_total"] = trace_total
+    event["attempt_trace_truncated"] = bool(
+        raw.get("attempt_trace_truncated") or trace_total > len(trace)
+    )
+    return event if event.get("leg") or event.get("failed_task_id") else None
+
+
+def format_infra_failure_evidence(raw: Any) -> dict[str, Any] | None:
+    """Project bounded, redacted child-attempt diagnostics from durable JSON."""
+    if not isinstance(raw, dict):
+        return None
+    raw_events: list[Any] = []
+    history_declared_total = 0
+    history_truncated = False
+    history = raw.get("infra_attempt_history")
+    if not isinstance(history, list):
+        history = raw.get("attempt_history")
+    observed_attempts = len(history) if isinstance(history, list) else 0
+    declared_attempts = _infra_evidence_int(
+        raw.get("infra_attempt_history_total")
+    )
+    if declared_attempts is None:
+        declared_attempts = _infra_evidence_int(raw.get("attempt_history_total"))
+    attempts_total = max(observed_attempts, declared_attempts or 0)
+    attempts_truncated = bool(
+        raw.get("infra_attempt_history_truncated")
+        or raw.get("attempt_history_truncated")
+        or attempts_total > observed_attempts
+    )
+    if isinstance(history, list):
+        for attempt in history:
+            children = (
+                attempt.get("child_failures")
+                if isinstance(attempt, dict)
+                else None
+            )
+            if isinstance(children, list):
+                raw_events.extend(children)
+                observed_children = sum(isinstance(row, dict) for row in children)
+                declared_children = _infra_evidence_int(
+                    attempt.get("child_failures_total")
+                )
+                history_declared_total += max(
+                    observed_children, declared_children or 0
+                )
+                history_truncated = bool(
+                    history_truncated
+                    or attempt.get("child_failures_truncated")
+                    or (declared_children or 0) > observed_children
+                )
+    current_events = raw.get("infra_failure_child_events")
+    if isinstance(current_events, list):
+        raw_events.extend(current_events)
+    deduped: list[Any] = []
+    by_identity: dict[tuple[str, str], int] = {}
+    for event in raw_events:
+        if not isinstance(event, dict):
+            deduped.append(event)
+            continue
+        failed_task_id = event.get("failed_task_id")
+        leg = event.get("leg")
+        identity = (
+            (failed_task_id, leg)
+            if isinstance(failed_task_id, str)
+            and failed_task_id
+            and isinstance(leg, str)
+            and leg
+            else None
+        )
+        if identity is None or identity not in by_identity:
+            if identity is not None:
+                by_identity[identity] = len(deduped)
+            deduped.append(event)
+            continue
+        index = by_identity[identity]
+        existing = deduped[index]
+        if not isinstance(existing, dict):
+            continue
+        merged = dict(existing)
+        for key, value in event.items():
+            if merged.get(key) is None:
+                merged[key] = value
+            elif isinstance(merged.get(key), dict) and isinstance(value, dict):
+                nested = dict(merged[key])
+                for nested_key, nested_value in value.items():
+                    if nested.get(nested_key) is None:
+                        nested[nested_key] = nested_value
+                merged[key] = nested
+        deduped[index] = merged
+    events = [
+        event
+        for event in (_format_infra_event(value) for value in deduped)
+        if event is not None
+    ]
+    if not events:
+        return None
+    observed_total = len(events)
+    if observed_total > _INFRA_EVIDENCE_EVENT_LIMIT:
+        events = [events[0], *events[-(_INFRA_EVIDENCE_EVENT_LIMIT - 1):]]
+    declared_total = _infra_evidence_int(raw.get("infra_failure_child_events_total"))
+    total = max(observed_total, declared_total or 0, history_declared_total)
+    return {
+        "schema_version": 1,
+        "events": events,
+        "events_total": total,
+        "attempts_total": attempts_total,
+        "attempts_truncated": attempts_truncated,
+        "events_truncated": bool(
+            raw.get("infra_failure_child_events_truncated")
+            or history_truncated
+            or total > len(events)
+        ),
+    }
+
+
 def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
     """Return an operator-facing summary of a ``last_qualification`` record."""
     status = qual.get("status")
@@ -428,6 +671,7 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": status,
         "outcome": _OUTCOME_LABELS.get(status, status),
+        "qualification_attempt_id": qual.get("qualification_attempt_id"),
         "confidence": qual.get("confidence"),
         "threshold": qual.get("threshold"),
         "sub_scores": qual.get("sub_scores"),
@@ -436,6 +680,7 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         # a misleading zero.
         "stranded_approved_prs": qual.get("stranded_approved_prs"),
         "blocker": qual.get("blocker"),
+        "infra_failure_evidence": format_infra_failure_evidence(qual),
         "started_at": qual.get("started_at"),
         "finalized_at": qual.get("finalized_at"),
         # Durable per-attempt evidence fields mirror the immutable verdict row
@@ -540,6 +785,7 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
                 "debt_enforce_weight_preview",
                 "requested_probes",
                 "walkthrough_e2e_result",
+                "infra_failure",
             }
         }
     else:
@@ -554,11 +800,19 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
     return {
         "id": str(verdict.id),
         "release_version_id": str(verdict.release_version_id),
+        "qualification_attempt_id": (
+            str(verdict.qualification_attempt_id)
+            if verdict.qualification_attempt_id
+            else None
+        ),
         "candidate_sha": verdict.candidate_sha,
         "confidence": verdict.confidence,
         "sub_scores": sub_scores,
         "stranded_approved_prs": _sub(verdict, "stranded_approved_prs"),
         "blocker": verdict.blocker,
+        "infra_failure_evidence": format_infra_failure_evidence(
+            _sub(verdict, "infra_failure")
+        ),
         "requested_probes": requested_probes,
         "walkthrough_e2e_result": walkthrough_e2e_result,
         "audit_missing_reason": verdict.audit_missing_reason,

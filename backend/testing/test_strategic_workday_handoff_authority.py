@@ -332,14 +332,11 @@ async def test_invalid_continuation_provenance_is_quarantined_without_starvation
             )
         ).scalars().all()
     )
-    if corruption == "server-lineage":
-        # With no independently derivable source, quarantine cannot authorize
-        # even a neutral replacement snapshot.
-        assert snapshot_ids_after_delivery == snapshot_ids_before_delivery
-    else:
-        # Exact server lineage can authorize one neutral replacement, but the
-        # corrupted content/state must never authorize a rebind or projection.
-        assert len(snapshot_ids_after_delivery - snapshot_ids_before_delivery) <= 1
+    # Direct lineage may be unusable, but the bounded missing-request scan can
+    # independently re-establish the canonical public source and its receipt.
+    # Either path may create one neutral snapshot; corrupt result projections
+    # must never authorize any additional rebind or delivery.
+    assert len(snapshot_ids_after_delivery - snapshot_ids_before_delivery) <= 1
     completed_good = await client.post(
         f"/api/agent/projects/{project.id}/workday-consultations/continuations/"
         f"{good_result.id}/complete",
@@ -376,10 +373,8 @@ async def test_invalid_continuation_provenance_is_quarantined_without_starvation
         if row.idempotency_key
         == f"workday-consultation-terminal-recovery:{source.id}"
     ]
-    if corruption == "server-lineage":
-        assert recovery_rows == []
-    else:
-        assert len(recovery_rows) == 1
+    assert len(recovery_rows) <= 1
+    if recovery_rows:
         assert recovery_rows[0].content == handoff_recovery._RECOVERY_SUMMARY
     assert not any(
         str(row.idempotency_key or "").startswith(
@@ -458,8 +453,8 @@ async def test_result_lineage_requires_exact_packet_and_ack_authority(
     assert lineage.authority_row_id == packet.id
     assert lineage.kind == "consultation_packet"
 
-    # Result-owned fields never select receipt authority. The immutable server
-    # key still resolves packet/source identity, while the continuation route
+    # Result-owned fields never select receipt authority. The relational edge
+    # still resolves packet/source identity, while the continuation route
     # separately rejects this forged projection by exact equality.
     result_context = dict(result.context or {})
     result_context["source_packet_id"] = str(uuid.uuid4())
@@ -470,7 +465,10 @@ async def test_result_lineage_requires_exact_packet_and_ack_authority(
         db_session,
         row=result,
     )
-    assert forged_lineage == lineage
+    assert forged_lineage is not None
+    assert forged_lineage.public_source_id == lineage.public_source_id
+    assert forged_lineage.authority_row_id == lineage.authority_row_id
+    assert forged_lineage.projections_valid is False
 
     canonical_result_key = result.idempotency_key
     result.idempotency_key = (
@@ -491,6 +489,172 @@ async def test_result_lineage_requires_exact_packet_and_ack_authority(
         db_session,
         row=result,
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_packet_source_context_tamper_recovers_relational_source_not_decoy(
+    client: AsyncClient, db_session
+):
+    project, task, incarnation, identity, source, packet = (
+        await _start_workday_request(client, db_session, key="packet-relational-source")
+    )
+    decoy_source, _decoy_packet = await _add_workday_request(
+        client,
+        db_session,
+        project=project,
+        task=task,
+        incarnation=incarnation,
+        identity=identity,
+        key="packet-relational-decoy",
+    )
+    assert packet.reply_to_message_id == source.id
+    packet_context = dict(packet.context or {})
+    packet_context["_workday_consultation_atomic_reply_id"] = str(decoy_source.id)
+    # Direct SQL models a corrupted durable projection without invoking the
+    # governed privacy hook, which would correctly purge all derived packets
+    # and make this authority-selection scenario disappear before recovery.
+    await db_session.execute(
+        update(ProjectMessage)
+        .where(ProjectMessage.id == packet.id)
+        .values(context=packet_context)
+    )
+    await db_session.commit()
+    await db_session.refresh(packet)
+    assert await handoff_recovery.workday_packet_immutable_source_id(
+        db_session,
+        row=packet,
+    ) == source.id
+    assert await handoff_recovery.workday_packet_source_id_from_server_lineage(
+        db_session,
+        row=packet,
+    ) is None
+
+    claimed_packet = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/claim-next",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=_claim_body(identity),
+    )
+    assert claimed_packet.status_code == 200, claimed_packet.text
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.project_id == project.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().all()
+    assert sum(
+        row.idempotency_key
+        == f"workday-consultation-terminal-recovery:{source.id}"
+        for row in rows
+    ) == 1
+    assert not any(
+        row.idempotency_key
+        == f"workday-consultation-terminal-recovery:{decoy_source.id}"
+        for row in rows
+    )
+
+    recovered_ids = set()
+    for _ in range(2):
+        recovered = await _claim_continuation(client, project, task, identity)
+        assert recovered.status_code == 200, recovered.text
+        if recovered.json()["status"] == "claimed":
+            recovered_ids.add(recovered.json()["continuation"]["consultation_id"])
+    assert str(source.id) in recovered_ids
+
+
+@pytest.mark.asyncio
+async def test_result_source_context_tamper_recovers_packet_relational_source_not_decoy(
+    client: AsyncClient, db_session
+):
+    project, task, incarnation, identity, source, packet = (
+        await _start_workday_request(client, db_session, key="result-relational-source")
+    )
+    packet_claim = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/claim-next",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=_claim_body(identity),
+    )
+    assert packet_claim.status_code == 200, packet_claim.text
+    acknowledged = await client.post(
+        f"/api/agent/projects/{project.id}/workday-consultations/{packet.id}/ack",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            **identity,
+            "workday_claim_id": packet_claim.json()["packet"]["workday_claim_id"],
+            "outcome": "completed",
+            "result_summary": "poisoned result must never be delivered",
+        },
+    )
+    assert acknowledged.status_code == 200, acknowledged.text
+    result = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.context["_workday_consultation_result"]
+                .as_boolean()
+                .is_(True),
+            )
+        )
+    ).scalars().one()
+    decoy_source, _decoy_packet = await _add_workday_request(
+        client,
+        db_session,
+        project=project,
+        task=task,
+        incarnation=incarnation,
+        identity=identity,
+        key="result-relational-decoy",
+    )
+    for row in (packet, result):
+        context = dict(row.context or {})
+        context["_workday_consultation_atomic_reply_id"] = str(decoy_source.id)
+        await db_session.execute(
+            update(ProjectMessage)
+            .where(ProjectMessage.id == row.id)
+            .values(context=context)
+        )
+    await db_session.commit()
+    await db_session.refresh(packet)
+    await db_session.refresh(result)
+    lineage = await handoff_recovery.workday_result_server_lineage(
+        db_session,
+        row=result,
+    )
+    assert lineage is not None
+    assert lineage.public_source_id == source.id
+    assert lineage.projections_valid is False
+
+    recovered = await _claim_continuation(client, project, task, identity)
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["status"] == "claimed"
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.project_id == project.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().all()
+    result_by_id = {row.id: row for row in rows}
+    assert result_by_id[result.id].handling_state == MessageHandlingState.SUPERSEDED
+    assert sum(
+        row.idempotency_key
+        == f"workday-consultation-terminal-recovery:{source.id}"
+        for row in rows
+    ) == 1
+    assert not any(
+        row.idempotency_key
+        == f"workday-consultation-terminal-recovery:{decoy_source.id}"
+        for row in rows
+    )
+    recovered_ids = {recovered.json()["continuation"]["consultation_id"]}
+    for _ in range(2):
+        next_recovery = await _claim_continuation(client, project, task, identity)
+        assert next_recovery.status_code == 200, next_recovery.text
+        if next_recovery.json()["status"] == "claimed":
+            recovered_ids.add(
+                next_recovery.json()["continuation"]["consultation_id"]
+            )
+    assert str(source.id) in recovered_ids
 
 
 @pytest.mark.asyncio
@@ -903,11 +1067,11 @@ async def test_missing_recovery_select_count_is_constant_across_candidate_cardin
     task = await db_session.get(type(task), task_id)
     assert project is not None and task is not None
 
-    statements: list[str] = []
+    statements: list[tuple[str, object]] = []
 
-    def _record_statement(_conn, _cursor, statement, _params, _context, _many):
+    def _record_statement(_conn, _cursor, statement, params, _context, _many):
         if statement.lstrip().upper().startswith("SELECT"):
-            statements.append(statement)
+            statements.append((statement, params))
 
     engine = db_session.bind
     event.listen(engine.sync_engine, "before_cursor_execute", _record_statement)
@@ -929,16 +1093,20 @@ async def test_missing_recovery_select_count_is_constant_across_candidate_cardin
 
     assert recovered is None
     assert len(statements) == 4, statements
+    linked_statement, linked_params = next(
+        (statement, params)
+        for statement, params in statements
+        if "AS settled_or_live" in statement
+    )
+    assert linked_statement.upper().count("EXISTS") == 2
+    assert "reply_to_message_id" in linked_statement
+    assert "_workday_consultation_atomic_reply_id" not in linked_statement
+    assert "_workday_consultation_atomic_reply_id" not in repr(linked_params)
     if engine.dialect.name == "postgresql":
         candidate_statement = next(
             statement
-            for statement in statements
+            for statement, _params in statements
             if "_workday_consultation_requested" in statement
-        )
-        linked_statement = next(
-            statement
-            for statement in statements
-            if "_workday_consultation_atomic_reply_id" in statement
         )
         assert (
             "projectmessage.sequence IS NOT NULL AND "
@@ -947,14 +1115,6 @@ async def test_missing_recovery_select_count_is_constant_across_candidate_cardin
             "projectmessage.context @> "
             "'{\"_workday_consultation_requested\": true}'::jsonb"
         ) in candidate_statement
-        assert (
-            "projectmessage.context ? "
-            "'_workday_consultation_atomic_reply_id'"
-        ) in linked_statement
-        assert (
-            "projectmessage.context ->> "
-            "'_workday_consultation_atomic_reply_id'"
-        ) in linked_statement
     if candidate_count == 64:
         assert task.context[
             "_workday_consultation_recovery_before_sequence"

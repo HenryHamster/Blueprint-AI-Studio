@@ -23,12 +23,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import inspect as sa_inspect, select
 from sqlalchemy.exc import IntegrityError
 
 from app import release_version as rv
 from app import strategic_spawning as ss
-from app.models import Project, QualificationVerdict, ReleaseVersion, Task, TaskStatus
+from app.models import Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _utcnow
 
 
@@ -2994,6 +2994,19 @@ async def test_abandon_activates_staged_directions(db_session):
     await db_session.refresh(project)
     by_id = {d["id"]: d for d in project.directions}
     assert by_id["d-staged"]["status"] == "active"
+    assert "v2 abandoned" in by_id["d-staged"]["notes"][-1]["text"]
+    messages = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    activated = [
+        message
+        for message in messages
+        if (message.context or {}).get("event_type") == "direction_staged_activated"
+    ]
+    assert activated[-1].context["terminal_version_number"] == 2
+    assert activated[-1].context["terminal_status"] == "abandoned"
 
 
 @pytest.mark.asyncio
@@ -3786,6 +3799,10 @@ async def test_approved_activation_receipt_recorded_on_host_pull(
             now=now,
         )
         await db_session.commit()
+        from app.release_reconciliation import _confirm_serving_or_fail
+
+        assert receipt["serving_status"] == "unconfirmed"
+        assert await _confirm_serving_or_fail(version.id) is True
         await db_session.refresh(version)
 
         assert receipt["mode"] == "approved_activation"

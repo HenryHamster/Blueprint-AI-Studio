@@ -66,9 +66,8 @@ _ENTITY_OPS = frozenset(
         "dispose_completion_debt",
         # Pipeline ACTION verbs that mutate a named entity, so a Workday
         # consultation binds a receipt to them the same way it does for
-        # cancel_task. force_promote is deliberately absent: like
-        # request_qualification it is a project-level TRIGGER, not an edit to a
-        # direction/task entity, so it has no entity id to bind a receipt to.
+        # cancel_task. request_qualification is also receipt-bound because its
+        # durable intent is the exact entity created by the trigger.
         "requeue_task",
         "reset_iteration_cap",
         "set_task_priority",
@@ -76,6 +75,7 @@ _ENTITY_OPS = frozenset(
         "create_acceptance_criterion",
         "update_acceptance_criterion",
         "retract_acceptance_criterion",
+        "request_qualification",
     }
 )
 _ENTITY_KINDS = frozenset(
@@ -87,6 +87,7 @@ _ENTITY_KINDS = frozenset(
         "task_watch",
         "completion_debt",
         "acceptance_criterion",
+        "release_qualification_intent",
     }
 )
 _STATE_OP_TARGET_KINDS = {
@@ -437,6 +438,7 @@ def _authoritative_workday_receipt_list(
         raise _conflict("Workday operation history is invalid")
     receipts: list[dict[str, Any]] = []
     operation_ids: set[str] = set()
+    semantic_effects: dict[tuple[str, str], tuple[object, ...]] = {}
     for value in raw:
         receipt = _bounded_receipt(value)
         if receipt is None or receipt["packet_id"] != str(packet_id):
@@ -445,6 +447,29 @@ def _authoritative_workday_receipt_list(
         if operation_id in operation_ids:
             raise _conflict("Workday operation history is invalid")
         operation_ids.add(operation_id)
+        semantic_key = (receipt["op"], receipt["operation_fingerprint"])
+        effect_identity = (
+            (
+                "state",
+                receipt["target_kind"],
+                receipt["target_revision"],
+                receipt["target_sha256"],
+            )
+            if "target_kind" in receipt
+            else (
+                "entity",
+                receipt["entity_kind"],
+                receipt["entity_id"],
+                receipt["effect"],
+            )
+        )
+        prior_effect = semantic_effects.get(semantic_key)
+        if prior_effect is not None and prior_effect != effect_identity:
+            # A stable semantic operation may legitimately be observed under a
+            # later claim/operation UUID, but it cannot have two authoritative
+            # outcomes.  Never let list order choose between divergent effects.
+            raise _conflict("Workday operation history is invalid")
+        semantic_effects[semantic_key] = effect_identity
         receipts.append(receipt)
     return receipts
 
@@ -756,6 +781,7 @@ def workday_operation_replay_response(receipt: Mapping[str, Any]) -> dict[str, A
         "task_watch": "watch_id",
         "completion_debt": "debt_id",
         "acceptance_criterion": "criterion_key",
+        "release_qualification_intent": "qualification_intent_id",
     }.get(str(receipt.get("entity_kind")))
     if receipt.get("op") == "cancel_task" and entity_key == "task_id":
         entity_key = "target_task_id"

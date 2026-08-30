@@ -104,13 +104,128 @@ function makeLatestAudit(overrides: Partial<api.LatestAudit> = {}): api.LatestAu
   };
 }
 
+const CUT_SHA = 'a'.repeat(40);
+const CUT_IDENTITY = 'b'.repeat(64);
+
+function readyCutContext(versionNumber = 1): api.VersionCutReadyContext {
+  return {
+    status: 'ready',
+    replayed: false,
+    version: {
+      id: `version-${versionNumber}`,
+      version_number: versionNumber,
+      phase: 'build',
+      status: 'open',
+      base_sha: null,
+      candidate_sha: null,
+    },
+    integration: {
+      owner: 'example-owner',
+      repo: 'example-repo',
+      branch: 'automain',
+      head_sha: CUT_SHA,
+      identity_token: CUT_IDENTITY,
+      observed_at: '2026-08-30T00:00:00+00:00',
+    },
+  };
+}
+
+function committedCutContext(projectId: string): api.VersionCutCommittedContext {
+  const stored = JSON.parse(
+    window.sessionStorage.getItem(`blueprint:version-cut:${projectId}`) ?? '{}',
+  ) as { request?: api.VersionCutRequest };
+  const request = stored.request;
+  if (!request) throw new Error('missing stored exact cut request');
+  const committedAt = '2026-08-30T00:01:00+00:00';
+  return {
+    status: 'committed',
+    replayed: true,
+    receipt: {
+      schema_version: 1,
+      status: 'committed',
+      idempotency_key: request.idempotency_key,
+      request_fingerprint: 'c'.repeat(64),
+      project_id: projectId,
+      operator_id: 'operator-1',
+      operator_display: 'operator@example.com',
+      reason: request.reason,
+      expected_version_id: request.expected_version_id,
+      expected_version_number: request.expected_version_number,
+      expected_integration_sha: request.expected_integration_sha,
+      expected_integration_identity: request.expected_integration_identity,
+      observed_repository_owner: 'example-owner',
+      observed_repository_name: 'example-repo',
+      observed_integration_branch: 'automain',
+      observed_integration_sha: request.expected_integration_sha,
+      observed_at: '2026-08-30T00:00:00+00:00',
+      abandoned_version_id: request.expected_version_id,
+      abandoned_version_number: request.expected_version_number,
+      abandoned_status: 'abandoned',
+      abandoned_base_sha: null,
+      abandoned_candidate_sha: null,
+      abandoned_opened_at: '2026-08-29T00:00:00+00:00',
+      successor_version_id: `version-${request.expected_version_number + 1}`,
+      successor_version_number: request.expected_version_number + 1,
+      successor_status: 'open',
+      successor_phase: 'build',
+      successor_goal: null,
+      successor_base_sha: request.expected_integration_sha,
+      successor_candidate_sha: null,
+      successor_opened_at: committedAt,
+      committed_at: committedAt,
+    },
+    followups: {
+      schema_version: 1,
+      status: 'complete',
+      attempts: 1,
+      created_at: committedAt,
+      last_attempt_at: committedAt,
+      completed_at: committedAt,
+      last_error: null,
+      lease_expires_at: null,
+    },
+  };
+}
+
+function installCutContextMock(versionNumber = 1, keyedReady = false) {
+  vi.mocked(api.getVersionCutContext).mockImplementation(async (projectId, key) => (
+    key && !keyedReady ? committedCutContext(projectId) : readyCutContext(versionNumber)
+  ));
+}
+
+function storeCutAttempt(projectId = 'proj-1', versionNumber = 1) {
+  const versionId = `${versionNumber.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`;
+  const request: api.VersionCutRequest = {
+    reason: null,
+    idempotency_key: '11111111-1111-4111-8111-111111111111',
+    expected_version_id: versionId,
+    expected_version_number: versionNumber,
+    expected_integration_sha: CUT_SHA,
+    expected_integration_identity: CUT_IDENTITY,
+  };
+  const attempt = {
+    schema_version: 1,
+    project_id: projectId,
+    request,
+    raw_body: JSON.stringify(request),
+    created_at: '2026-08-30T00:00:00.000Z',
+  };
+  window.sessionStorage.setItem(
+    `blueprint:version-cut:${projectId}`,
+    JSON.stringify(attempt),
+  );
+  return attempt;
+}
+
 describe('VersionLifecyclePanel', () => {
   const mockRefresh = vi.fn();
 
   beforeEach(() => {
     vi.clearAllMocks();
+    window.sessionStorage.clear();
     mockRefresh.mockClear();
     vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    installCutContextMock();
   });
 
   it('read-only mode retains lifecycle state while hiding every mutation control', () => {
@@ -656,11 +771,21 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
       // ConfirmDialog appears with the abandon message
-      expect(screen.getByText('Abandon v1 and open a fresh version?')).toBeInTheDocument();
+      expect(await screen.findByText(/Abandon v1 and open a fresh version/)).toBeInTheDocument();
       fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
-        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', undefined, expect.any(String));
+        expect(cutVersionMock).toHaveBeenCalledTimes(1);
+      });
+      const rawBody = cutVersionMock.mock.calls[0][1];
+      expect(typeof rawBody).toBe('string');
+      expect(JSON.parse(rawBody)).toEqual({
+        reason: null,
+        idempotency_key: expect.any(String),
+        expected_version_id: 'version-1',
+        expected_version_number: 1,
+        expected_integration_sha: CUT_SHA,
+        expected_integration_identity: CUT_IDENTITY,
       });
 
       expect(mockRefresh).toHaveBeenCalled();
@@ -689,11 +814,13 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.change(reasonInput, { target: { value: 'stalled in build' } });
 
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      await screen.findByTestId('confirm-dialog-confirm');
       fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
-        expect(cutVersionMock).toHaveBeenCalledWith('proj-1', 'stalled in build', expect.any(String));
+        expect(cutVersionMock).toHaveBeenCalledTimes(1);
       });
+      expect(JSON.parse(cutVersionMock.mock.calls[0][1]).reason).toBe('stalled in build');
     });
 
     it('cancels cut version action when cancel is clicked in the dialog', async () => {
@@ -712,7 +839,7 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
       // ConfirmDialog appears; click the dialog's Cancel button
-      expect(screen.getByTestId('confirm-dialog-confirm')).toBeInTheDocument();
+      expect(await screen.findByTestId('confirm-dialog-confirm')).toBeInTheDocument();
       fireEvent.click(screen.getByTestId('confirm-dialog-cancel'));
 
       expect(vi.mocked(api.cutVersion)).not.toHaveBeenCalled();
@@ -725,6 +852,7 @@ describe('VersionLifecyclePanel', () => {
       });
       vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      installCutContextMock(5);
 
       render(
         <VersionLifecyclePanel
@@ -737,6 +865,7 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      await screen.findByTestId('confirm-dialog-confirm');
       fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
@@ -754,6 +883,7 @@ describe('VersionLifecyclePanel', () => {
         });
       vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+      installCutContextMock(1, true);
 
       render(
         <VersionLifecyclePanel
@@ -766,22 +896,89 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      await screen.findByTestId('confirm-dialog-confirm');
       fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
       await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(1));
 
-      // Retry after the failure (the cut UI stays open on error, dialog is closed).
-      // findByRole waits for the "Cut" button to re-appear after loading clears.
-      fireEvent.click(await screen.findByRole('button', { name: /^Cut$/ }));
-      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+      const retry = await screen.findByTestId('version-cut-exact-retry');
+      expect(cutVersionMock).toHaveBeenCalledTimes(1);
+      fireEvent.click(retry);
       await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(2));
 
-      // Both calls carried the SAME generated key (a lost-response retry must
-      // not advance the version a second time on the backend).
-      const firstKey = cutVersionMock.mock.calls[0][2];
-      const secondKey = cutVersionMock.mock.calls[1][2];
-      expect(typeof firstKey).toBe('string');
-      expect(firstKey).toBeTruthy();
-      expect(secondKey).toBe(firstKey);
+      expect(cutVersionMock.mock.calls[0][1]).toBe(cutVersionMock.mock.calls[1][1]);
+    });
+
+    it('recovers a committed cut from session storage on remount', async () => {
+      storeCutAttempt();
+      vi.mocked(api.getVersionCutContext).mockImplementation(async (projectId) => (
+        committedCutContext(projectId)
+      ));
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion() })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(await screen.findByText('Recovered committed cut v1 → v2.')).toBeInTheDocument();
+      expect(mockRefresh).toHaveBeenCalledTimes(1);
+      expect(window.sessionStorage.getItem('blueprint:version-cut:proj-1')).toBeNull();
+      expect(vi.mocked(api.cutVersion)).not.toHaveBeenCalled();
+    });
+
+    it('retains a committed cut while follow-up delivery is pending', async () => {
+      const attempt = storeCutAttempt();
+      vi.mocked(api.getVersionCutContext).mockImplementation(async (projectId) => ({
+        ...committedCutContext(projectId),
+        followups: {
+          ...committedCutContext(projectId).followups,
+          status: 'pending',
+          completed_at: null,
+        },
+      }));
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion() })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(await screen.findByText(/follow-up delivery is pending/)).toBeInTheDocument();
+      expect(mockRefresh).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(window.sessionStorage.getItem('blueprint:version-cut:proj-1') ?? '{}')).toEqual(attempt);
+      expect(screen.queryByTestId('version-cut-exact-retry')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('version-cut-stale-discard')).not.toBeInTheDocument();
+    });
+
+    it('discards only a revalidated stale uncommitted request', async () => {
+      storeCutAttempt();
+      vi.mocked(api.getVersionCutContext).mockResolvedValue(readyCutContext(2));
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion() })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const discard = await screen.findByTestId('version-cut-stale-discard');
+      expect(vi.mocked(api.getVersionCutContext)).toHaveBeenCalledTimes(1);
+      fireEvent.click(discard);
+
+      await waitFor(() => {
+        expect(vi.mocked(api.getVersionCutContext)).toHaveBeenCalledTimes(2);
+        expect(window.sessionStorage.getItem('blueprint:version-cut:proj-1')).toBeNull();
+      });
+      expect(screen.getByText(/Stale uncommitted cut request discarded/)).toBeInTheDocument();
+      expect(vi.mocked(api.cutVersion)).not.toHaveBeenCalled();
     });
   });
 
@@ -1048,6 +1245,7 @@ describe('VersionLifecyclePanel', () => {
     });
 
     it('folds consequences into the confirm dialog message', async () => {
+      installCutContextMock(6);
       vi.mocked(api.cutVersion).mockResolvedValue({
         abandoned_version: { version_number: 6, status: 'abandoned' },
         new_version: { version_number: 7, phase: 'build', goal: null, opened_at: '2026-01-02T00:00:00Z' },
@@ -1079,6 +1277,7 @@ describe('VersionLifecyclePanel', () => {
     });
 
     it('surfaces exact-head promotion check-wait context before confirming a cut', async () => {
+      installCutContextMock(6, true);
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
       vi.mocked(api.cutVersion).mockRejectedValue(
         new Error('a promotion PR is in Blueprint\'s exact-head check wait — wait for it to land or cancel it before cutting (PR #7357 https://example/pr/7357)'),
@@ -1390,6 +1589,37 @@ describe('VersionLifecyclePanel', () => {
                 promotion_pr_url: 'https://example.com/pr/open',
                 promotion_conflict: true,
                 promotion_error_detail: 'merge conflict',
+                infra_failure_evidence: {
+                  schema_version: 1,
+                  events_total: 6,
+                  events_truncated: true,
+                  attempts_total: 8,
+                  attempts_truncated: true,
+                  events: [{
+                    leg: 'audit',
+                    failed_task_id: 'task-current-failure',
+                    status: 'FAILED',
+                    terminal_at: '2026-08-30T00:07:00Z',
+                    attempt_trace_total: 6,
+                    attempt_trace_truncated: true,
+                    attempt_trace: [
+                      {
+                        attempt_ordinal: 1,
+                        status: 'FAILED',
+                        vm_provisioned_at: '2026-08-30T00:01:00Z',
+                        agent_error: {
+                          schema: 1,
+                          duration_ms: 360000,
+                          result_event_seen: true,
+                          provider_result_is_error: true,
+                          provider_terminal_reason: 'aborted_streaming',
+                          output_tail: 'bounded redacted output tail',
+                        },
+                      },
+                      { attempt_ordinal: 6, status: 'FAILED' },
+                    ],
+                  }],
+                },
               }),
             }),
           })}
@@ -1407,6 +1637,13 @@ describe('VersionLifecyclePanel', () => {
       expect(within(evidence).getByText(/promotion conflict/)).toBeInTheDocument();
       expect(within(evidence).getByTitle('open version needs a schema migration')).toBeInTheDocument();
       expect(within(evidence).getByTitle('apply path still diverges')).toBeInTheDocument();
+      const infra = within(evidence).getByTestId('infra-failure-evidence');
+      expect(within(infra).getByText(/showing 1 of 6/)).toBeInTheDocument();
+      expect(within(infra).getByText(/qualification attempts: 8 total/)).toBeInTheDocument();
+      expect(within(infra).getByText(/aborted_streaming/)).toBeInTheDocument();
+      expect(within(infra).getByText(/360000ms/)).toBeInTheDocument();
+      expect(within(infra).getByText(/bounded redacted output tail/)).toBeInTheDocument();
+      expect(within(infra).getByText(/showing 2 of 6 task attempts/)).toBeInTheDocument();
     });
 
     it('renders durable qualification evidence in verdict history', async () => {
@@ -1432,6 +1669,29 @@ describe('VersionLifecyclePanel', () => {
             promotion_pr_url: 'https://example.com/pr/123',
             promotion_conflict: false,
             promotion_error_detail: null,
+            infra_failure_evidence: {
+              schema_version: 1,
+              events_total: 1,
+              events_truncated: false,
+              attempts_total: 1,
+              attempts_truncated: false,
+              events: [{
+                leg: 'challenge',
+                failed_task_id: 'task-history-failure',
+                status: 'FAILED',
+                attempt_trace_total: 1,
+                attempt_trace_truncated: false,
+                attempt_trace: [{
+                  attempt_ordinal: 1,
+                  status: 'FAILED',
+                  agent_error: {
+                    schema: 1,
+                    provider_terminal_reason: 'provider_failed',
+                    output_tail: 'historical bounded tail',
+                  },
+                }],
+              }],
+            },
             would_promote: true,
             promotion_enabled: true,
             terminal_status: 'promoted',
@@ -1463,6 +1723,11 @@ describe('VersionLifecyclePanel', () => {
       expect(within(evidence).getByText(/promotion PR/)).toBeInTheDocument();
       expect(within(evidence).getByTitle('schema migration verified')).toBeInTheDocument();
       expect(within(evidence).getByTitle('apply path verified')).toBeInTheDocument();
+      const infra = within(evidence).getByTestId('infra-failure-evidence');
+      expect(within(infra).getByText(/provider_failed/)).toBeInTheDocument();
+      expect(within(infra).getByText(/historical bounded tail/)).toBeInTheDocument();
+      expect(within(infra).queryByText(/result seen:/)).not.toBeInTheDocument();
+      expect(within(infra).queryByText(/provider error:/)).not.toBeInTheDocument();
     });
 
     it('renders challenger-refuted false positives with reason in verdict history', async () => {
@@ -2817,6 +3082,63 @@ describe('VersionLifecyclePanel', () => {
         expect(badges.length).toBeGreaterThanOrEqual(1);
         const servingBadge = badges.find(b => b.getAttribute('data-outcome') === 'serving_confirmed');
         expect(servingBadge).toBeDefined();
+      });
+    });
+
+    it('matches a same-SHA requalification by exact attempt identity', async () => {
+      const candidateSha = 'abcdef1234567890';
+      const baseVerdict = {
+        release_version_id: 'rv1',
+        candidate_sha: candidateSha,
+        confidence: 0.93,
+        sub_scores: null,
+        blocker: null,
+        audit_missing_reason: null,
+        would_promote: true,
+        promotion_enabled: true,
+        threshold: 0.9,
+        started_at: null,
+        finalized_at: '2026-01-02T00:00:00Z',
+        created_at: '2026-01-02T00:00:00Z',
+      };
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            ...baseVerdict,
+            id: 'old-verdict',
+            qualification_attempt_id: 'attempt-old',
+            terminal_status: 'promoted',
+            post_promotion_outcome: 'deploy_failed',
+          },
+          {
+            ...baseVerdict,
+            id: 'current-verdict',
+            qualification_attempt_id: 'attempt-current',
+            terminal_status: 'not_promoted',
+            post_promotion_outcome: null,
+          },
+        ],
+        total: 2,
+      });
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                candidate_sha: candidateSha,
+                qualification_attempt_id: 'attempt-current',
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await screen.findByTestId('verdict-history');
+      await waitFor(() => {
+        expect(screen.getAllByTestId('post-promotion-outcome-badge')).toHaveLength(1);
       });
     });
   });

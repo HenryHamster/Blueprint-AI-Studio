@@ -43,6 +43,11 @@ from app.task_capabilities import (
     WRITE_TASK_TYPES,
     get_task_capability,
 )
+from app.strategic_cold_successor_authority import (
+    RESIDENT_SESSION_KEY as COLD_SUCCESSOR_RESIDENT_SESSION_KEY,
+    cold_successor_blob_matches_task,
+    has_exact_cold_successor_markers,
+)
 from app.json_extract import scan_balanced_json_objects
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project, _sanitize_log
@@ -1881,6 +1886,31 @@ async def _process_post_commit(
             flag_modified(task, "context")
             session.add(task)
 
+        # Cold successor is a proof-only strategic_review. Its terminal row and
+        # attestation are reconciled by the dedicated Project->Task authority
+        # path before this function runs; none of the ordinary strategic
+        # completion, cycle, failure-counter, message, or restart machinery may
+        # interpret it as a normal strategic cycle.
+        if has_exact_cold_successor_markers(task):
+            proof_blob = (
+                (locked_project.vision or {}).get(COLD_SUCCESSOR_RESIDENT_SESSION_KEY)
+                if locked_project is not None
+                else None
+            )
+            terminal_receipt = (task.context or {}).get("_cold_successor_terminal")
+            if (
+                not cold_successor_blob_matches_task(proof_blob, task)
+                or proof_blob.get("status") != "ended"
+                or not isinstance(terminal_receipt, dict)
+                or terminal_receipt.get("status")
+                != getattr(task.status, "value", task.status)
+            ):
+                raise RuntimeError(
+                    "Cold successor ordinary post-commit bypass lacks exact terminal authority"
+                )
+            await session.commit()
+            return {"status": "accepted"}
+
         # Forward-quality grader side-car: an independent grader spawned by the
         # forward-quality escalation carries QUALITY_GRADER_SOURCE_KEY pointing
         # at the source task it grades. Its completion does NOT flow through the
@@ -1944,6 +1974,7 @@ async def _process_post_commit(
                 task.status == TaskStatus.FAILED
                 and task.first_payload.get("type")
                 in ("design_doc_update", "strategic_review")
+                and not has_exact_cold_successor_markers(task)
             ):
                 try:
                     # Round 3 C3 + C4: the canonical pair-lock acquired at the

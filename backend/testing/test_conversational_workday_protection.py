@@ -857,14 +857,14 @@ def test_protect_entries_marked_complete_have_all_tests():
 
 
 def test_completeness_markers_identify_the_existing_full_suites():
-    """Only suites with former reverse guards opt into full completeness."""
+    """The intentionally ratcheted full-suite protection count stays explicit."""
     manifest = _load_manifest()
     marked = {
         entry["path"]
         for entry in manifest["protect"]
         if entry.get("completeness") == "all"
     }
-    assert len(marked) == 11
+    assert len(marked) == 14
     assert all(
         entry.get("completeness") in {None, "all"}
         for entry in manifest["protect"]

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -21,7 +22,7 @@ from sqlmodel import select
 from app.messages_noise_prefs_store import (
     get_messages_noise_prefs_row,
 )
-from app.models import LocalRunner, MessagesNoisePrefs, _utcnow
+from app.models import LocalRunner, MessagesNoisePrefs, Project, _utcnow
 from app.runner_project_binding import runner_allowed_for_project
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
@@ -1150,6 +1151,17 @@ async def persist_strategic_workbench_update(
         project_id,
         raw_state,
     )
+    locked_project = await session.scalar(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked_project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(locked_project.vision)
     if sync_local_continuation_marker:
         def _update_local_continuation_marker(vision: dict[str, Any]) -> None:
             # An operator workbench save IS a genuine operator interaction — pass

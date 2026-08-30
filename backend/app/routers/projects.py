@@ -23,7 +23,7 @@ from sqlmodel import select
 
 from app.auth import (
     get_current_user,
-    verify_agent_jwt,
+    resolve_task_agent_authority,
     create_ws_ticket,
     verify_ws_ticket,
 )
@@ -846,7 +846,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     try:
         auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
         token = auth_message.get("token")
-        if not token:
+        if not isinstance(token, str) or not token:
             _log_agent_auth_reject(
                 "ws_initial_auth_failure_missing_token",
                 path=path,
@@ -855,17 +855,6 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             await _safe_ws_close(websocket, code=1008, reason="Missing token")
             return
 
-        payload = verify_agent_jwt(token)
-        if payload.get("sub") != str(task_id):
-            _log_agent_auth_reject(
-                "ws_initial_auth_failure_task_id_mismatch",
-                path=path,
-                task_id=task_id,
-                token_vm_instance_id=payload.get("vm_instance_id"),
-                token_project_id=payload.get("project_id"),
-            )
-            await _safe_ws_close(websocket, code=1008, reason="Task ID mismatch")
-            return
     except asyncio.TimeoutError:
         _log_agent_auth_reject(
             "ws_initial_auth_failure_timeout",
@@ -885,17 +874,40 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
 
     # Get project_id for this task
     async with AsyncSessionLocal() as session:
-        stmt = select(Task).where(Task.id == task_id)
-        task = (await session.execute(stmt)).scalars().first()
-        if not task:
+        try:
+            payload, task = await resolve_task_agent_authority(
+                token,
+                session,
+                method="WEBSOCKET",
+                path=path,
+                expected_task_id=task_id,
+                allow_released_task=True,
+            )
+        except HTTPException as authority_error:
+            rejected_payload = getattr(authority_error, "agent_payload", {})
+            if authority_error.detail == "task_id_mismatch":
+                reason = "ws_initial_auth_failure_task_id_mismatch"
+                close_reason = "Task ID mismatch"
+            elif authority_error.detail == "project_mismatch":
+                reason = "ws_project_mismatch"
+                close_reason = "Project mismatch"
+            elif authority_error.detail == "vm_instance_mismatch":
+                reason = "ws_vm_instance_mismatch"
+                close_reason = "VM instance mismatch"
+            elif authority_error.status_code == 401 and not rejected_payload:
+                reason = "ws_initial_auth_failure"
+                close_reason = "Authentication failed"
+            else:
+                reason = "ws_task_authority_rejected"
+                close_reason = "Authentication failed"
             _log_agent_auth_reject(
-                "ws_task_missing",
+                reason,
                 path=path,
                 task_id=task_id,
-                token_vm_instance_id=payload.get("vm_instance_id"),
-                token_project_id=payload.get("project_id"),
+                token_vm_instance_id=rejected_payload.get("vm_instance_id"),
+                token_project_id=rejected_payload.get("project_id"),
             )
-            await _safe_ws_close(websocket, code=1008)
+            await _safe_ws_close(websocket, code=1008, reason=close_reason)
             return
 
         from app.routers.agent import _terminated_task_ids

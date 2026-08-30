@@ -7,7 +7,7 @@ import WebSocket from 'ws';
 import { enforceNodeVersion } from './node-preflight.js';
 import { getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { fetchRemoteTrackingRef, fetchSelfRepoIntegrationRef } from './gitRefs.js';
-import { handlers, resolveHandler } from './handlers/index.js';
+import { handlers, preflightColdSuccessorClaim, resolveHandler } from './handlers/index.js';
 import {
   loadTaskCapabilityContract,
   isReadOnlyTaskType,
@@ -4267,6 +4267,10 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   const payload: Record<string, unknown> = payloads[0] ?? {};
   const taskType = strVal(payload.type, 'create');
   const claimAgentToken = strVal(task.agent_token);
+  // The ordinary claim contract reuses the task-scoped token that authorized
+  // this request.  Warm-role handoff responses may rotate it, but /claim does
+  // not promise an agent_token field.  Activate only an explicit rotation and
+  // otherwise retain the already-bound task credential.
   if (claimAgentToken) {
     activateClaimedRole(
       { taskId, agentToken: claimAgentToken },
@@ -4276,12 +4280,19 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   process.env.TASK_ID = taskId;  // Expose for crash handlers (they can't access local vars)
   setCrashReportTaskId(taskId);  // Decoupled crash identity — survives the poll-window TASK_ID clear
   _inWarmPollWindow = false;     // We're back in active role execution
+  // A pool startup heartbeat or prior warm-role heartbeat must not outlive the
+  // newly claimed identity.  Stop it before validating the frozen packet.
+  stopHeartbeat();
+  // The claim response is the unavoidable transport that delivers the frozen
+  // proof packet. Validate every marker/source hash before any subsequent
+  // heartbeat, WebSocket, capability fetch, workspace, or provider I/O.
+  const coldSuccessor = preflightColdSuccessorClaim(payload, task);
   const model = payload.model ? strVal(payload.model) : (process.env.LLM_MODEL || undefined);
   const effort = payload.effort ? strVal(payload.effort) : undefined;
   const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
   const buildConfig = (projectMetadata?.build_config ?? {}) as Record<string, unknown>;
   // Attach buildConfig to the task object so handlers can access it via task.build_config
-  task.build_config = buildConfig;
+  if (!coldSuccessor) task.build_config = buildConfig;
   log(`Claimed task ${taskId} (type: ${taskType}): "${strVal(task.title)}"`);
 
   // Capture pr_number for the warm-VM next-role poll. Different handlers
@@ -4308,17 +4319,19 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   // the idempotent claim replay. Replace that timer with the normal per-role
   // heartbeat before the handler begins so only one task heartbeat remains.
   stopHeartbeat();
-  startHeartbeat(
-    taskId,
-    () => buildHeartbeatStatus(statusRef, Date.now()),
-    () => (
-      statusRef.toolStartedAt !== undefined && statusRef.lastProgressAt !== undefined
-        ? new Date(statusRef.lastProgressAt).toISOString()
-        : undefined
-    ),
-  );
+  if (!coldSuccessor) {
+    startHeartbeat(
+      taskId,
+      () => buildHeartbeatStatus(statusRef, Date.now()),
+      () => (
+        statusRef.toolStartedAt !== undefined && statusRef.lastProgressAt !== undefined
+          ? new Date(statusRef.lastProgressAt).toISOString()
+          : undefined
+      ),
+    );
+  }
   scheduleProactiveTokenRefresh(AGENT_TOKEN);
-  const ws = await connectLogStream(taskId);
+  const ws = coldSuccessor ? null : await connectLogStream(taskId);
   if (!ws) {
     log('WARNING: WebSocket log stream unavailable — logs will be sent via status updates only');
   }
@@ -4326,8 +4339,10 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
 
   try {
     // Load the published task-capability contract before any handler runs.
-    statusRef.value = 'Loading task-capability contract...';
-    await ensureTaskCapabilityContractLoaded();
+    if (!coldSuccessor) {
+      statusRef.value = 'Loading task-capability contract...';
+      await ensureTaskCapabilityContractLoaded();
+    }
 
     let ghToken = '';
     let owner = '';
@@ -4396,6 +4411,19 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     }
     const handler = resolution.handler;
     await handler(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+    if (coldSuccessor) {
+      const coldTerminalStatus = task._cold_successor_terminal_status;
+      if (coldTerminalStatus !== 'COMPLETED' && coldTerminalStatus !== 'FAILED') {
+        throw new Error('cold successor handler returned without a terminal receipt');
+      }
+      // eslint-disable-next-line @typescript-eslint/only-throw-error -- typed terminal control signal, caught by main()'s role loop
+      throw new GracefulShutdownSignal(
+        coldTerminalStatus === 'COMPLETED'
+          ? 'cold_successor_completed'
+          : 'cold_successor_failed',
+        coldTerminalStatus === 'COMPLETED' ? 0 : 1,
+      );
+    }
     const parkedAfterSuccess = consumePendingParkDirective(taskId);
     if (parkedAfterSuccess) {
       return {
@@ -4416,6 +4444,16 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     sendLog(ws, '\nTask completed.\n');
 
   } catch (error) {
+    if (error instanceof GracefulShutdownSignal) throw error;
+    if (coldSuccessor) {
+      if (error instanceof RuntimeUnavailableError) {
+        // eslint-disable-next-line @typescript-eslint/only-throw-error -- typed graceful-shutdown control signal, caught by main()'s role loop
+        throw new GracefulShutdownSignal('runtime_unavailable', error.gracefulExitCode);
+      }
+      // The cold handler owns its proof-specific terminal effect.  Never send
+      // the same failure through generic status/OAuth/artifact machinery.
+      throw error;
+    }
     // Benign cancellation during startup: the task went terminal
     // (CANCELLED/COMPLETED/superseded) between /api/agent/claim and the
     // /api/agent/github/token fetch above, so verify_agent_token 401s with

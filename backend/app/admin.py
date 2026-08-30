@@ -2352,6 +2352,13 @@ async def get_task(
         "requires_approval": task.requires_approval,
         "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
         "depends_on": task.depends_on or [],
+        "criterion_ids": list(task.criterion_ids or []),
+        "criterion_ids_explicit": (
+            (task.context or {}).get(EXPLICIT_CRITERION_IDS_CONTEXT_KEY) is True
+        ),
+        "criterion_release_version_id": (task.context or {}).get(
+            CRITERION_RELEASE_VERSION_CONTEXT_KEY
+        ),
         # Research plan_output is resumable pre-gate state until the completion
         # handler stamps it final. Do not expose rejected raw findings through
         # the generic detail field.

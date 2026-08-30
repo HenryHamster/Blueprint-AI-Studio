@@ -76,6 +76,51 @@ _STEERING_EXCERPT_MAX_CHARS = 600
 ORIGIN_QUALIFICATION = "qualification"
 ORIGIN_OPERATOR = "operator"
 
+
+def mark_strategic_refresh_in_vision(
+    vision: dict,
+    reason: str,
+    *,
+    origin: str = ORIGIN_QUALIFICATION,
+    steering_excerpt: str | None = None,
+) -> None:
+    """Idempotently coalesce one refresh into an already-locked vision blob.
+
+    Callers that already hold the canonical Project lock use this pure helper
+    so their authoritative receipt and the wake marker can share one commit.
+    """
+
+    excerpt = (
+        steering_excerpt[:_STEERING_EXCERPT_MAX_CHARS]
+        if origin == ORIGIN_OPERATOR and steering_excerpt
+        else None
+    )
+    existing = vision.get(_REFRESH_KEY)
+    if isinstance(existing, dict):
+        existing["reason"] = reason
+        existing["count"] = int(existing.get("count") or 1) + 1
+        if origin == ORIGIN_OPERATOR:
+            existing["operator_count"] = int(existing.get("operator_count") or 0) + 1
+        if origin == ORIGIN_OPERATOR or existing.get("origin") == ORIGIN_OPERATOR:
+            existing["origin"] = ORIGIN_OPERATOR
+        else:
+            existing["origin"] = origin
+        if excerpt is not None:
+            existing["excerpt"] = excerpt
+        existing.pop("notified", None)
+        return
+    marker = {
+        "requested_at": _utcnow().isoformat(),
+        "reason": reason,
+        "count": 1,
+        "operator_count": 1 if origin == ORIGIN_OPERATOR else 0,
+        "origin": origin,
+    }
+    if excerpt is not None:
+        marker["excerpt"] = excerpt
+    vision[_REFRESH_KEY] = marker
+
+
 # Operator-message arming outcomes. These describe what the wake-gate actually
 # decided for a just-created message and are surfaced to the operator (the
 # message-create response, the composer hint/toast) so the UI reflects the real
@@ -210,48 +255,13 @@ async def request_strategic_refresh(
     volatile recent-messages snapshot. On coalesce, a newer excerpt replaces the
     older one — the most recent operator message is the active steering intent.
     """
-    _excerpt = (
-        steering_excerpt[:_STEERING_EXCERPT_MAX_CHARS]
-        if origin == ORIGIN_OPERATOR and steering_excerpt
-        else None
-    )
-
     def _mark(vision: dict) -> None:
-        existing = vision.get(_REFRESH_KEY)
-        if isinstance(existing, dict):
-            # Coalesce into the existing slot: keep the original request time so
-            # staleness is visible, refresh the reason, bump an observability count.
-            existing["reason"] = reason
-            existing["count"] = int(existing.get("count") or 1) + 1
-            # operator_count tracks only genuine operator-steering coalesces so
-            # the UI badge can show a truthful "+N steers coalesced" that excludes
-            # automated qualification/promotion refreshes.
-            if origin == ORIGIN_OPERATOR:
-                existing["operator_count"] = int(existing.get("operator_count") or 0) + 1
-            # Operator intent is sticky and never downgraded by a later
-            # automated refresh; a later operator refresh upgrades an automated
-            # slot. A fresh request re-arms the one-time deferral notice.
-            if origin == ORIGIN_OPERATOR or existing.get("origin") == ORIGIN_OPERATOR:
-                existing["origin"] = ORIGIN_OPERATOR
-            else:
-                existing["origin"] = origin
-            # Most-recent operator message wins: replace the stored excerpt when
-            # a newer one is supplied. A coalescing automated refresh (no
-            # excerpt) leaves any operator excerpt already present untouched.
-            if _excerpt is not None:
-                existing["excerpt"] = _excerpt
-            existing.pop("notified", None)
-        else:
-            marker = {
-                "requested_at": _utcnow().isoformat(),
-                "reason": reason,
-                "count": 1,
-                "operator_count": 1 if origin == ORIGIN_OPERATOR else 0,
-                "origin": origin,
-            }
-            if _excerpt is not None:
-                marker["excerpt"] = _excerpt
-            vision[_REFRESH_KEY] = marker
+        mark_strategic_refresh_in_vision(
+            vision,
+            reason,
+            origin=origin,
+            steering_excerpt=steering_excerpt,
+        )
 
     async def _store_locked_refresh() -> bool:
         for attempt in range(3):

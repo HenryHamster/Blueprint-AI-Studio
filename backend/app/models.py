@@ -64,6 +64,7 @@ from app.release_models import (  # noqa: F401
     ReleaseDeployArtifact,
     ReleaseAuthorshipReconciliationState,
     ReleasePrepromotionDispatch,
+    ReleaseQualificationIntent,
     ReleaseVersion,
     ResidualVerdict,
     ModuleFindingChain,
@@ -5904,19 +5905,30 @@ def _invalidate_strategic_envelopes_for_authority_and_privacy_changes(
                 "from_type",
                 "sequence",
                 "surface",
-                "reply_to_message_id",
             )
             context_history = inspected.attrs.context.history
             old_contexts = list(context_history.deleted)
+            current_context = instance.__dict__.get("context")
             context_privacy_changed = (
                 context_history.has_changes()
                 and _project_message_privacy_context_changed(
                     old_contexts=old_contexts,
-                    new_context=instance.__dict__.get("context"),
+                    new_context=current_context,
                 )
+            )
+            # A derived Workday packet/result is not canonical transcript
+            # evidence.  Its reply_to FK is server-owned lineage metadata and
+            # may be filled during an exact lost-response reconciliation.  Do
+            # not let that repair impersonate a source-privacy mutation and
+            # purge the very derived rows it is repairing.  Canonical messages
+            # (and rows whose derived marker is absent/unloaded) stay governed.
+            reply_to_privacy_changed = bool(
+                inspected.attrs.reply_to_message_id.history.has_changes()
+                and not _is_derived_strategic_packet_context(current_context)
             )
             if (
                 context_privacy_changed
+                or reply_to_privacy_changed
                 or any(
                     inspected.attrs[field].history.has_changes()
                     for field in privacy_fields

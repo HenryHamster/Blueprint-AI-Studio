@@ -100,12 +100,33 @@ from app.release_policy_projection import (
     qualification_attempt_policy_record_fields,
 )
 from app.release_models import CriterionEvidence
+from app.release_authority_lock import lock_project_then_version
+from app.release_qualification_authority import (
+    _apply_ci_unresolved_promotion_observation,
+    _authorship_receipt_from_measurement,
+    _candidate_already_on_main_at_finalize,
+    _count_project_actionable_open_completion_debt,
+    _deployed_env_presence_snapshot,
+    _lock_exact_qualification_authority,
+    _measure_candidate_operator_authorship,
+    _measured_authorship_receipt_for_audit_spawn,
+    _observe_ci_unresolved_promotion_pending,
+    qualification_authority_fingerprint,
+    qualification_finalize_authority_fingerprint,
+    qualification_project_observation_fingerprint,
+)
+from app.release_qualification_observation_protocol import (
+    ALREADY_ON_MAIN,
+    CI_RECOVERY,
+    FinalizeObservationRequired,
+    extend_finalize_observation_packet,
+)
 from app.release_commit_authorship import (
     authorship_category_evidence,
     authorship_receipt_for_measurement,
     candidate_authorship_range,
-    count_non_bot_authored_commits,
-    resolve_candidate_base_sha,
+    count_non_bot_authored_commits,  # noqa: F401 — authority-module patch surface
+    resolve_candidate_base_sha,  # noqa: F401 — authority-module patch surface
 )
 from app.notification_dispatch import (
     dispatch_external_notification,  # noqa: F401 — re-exported for tests / compat patch point
@@ -121,12 +142,12 @@ from app.release_promotion import (
     # do ``from app.release_qualifier import promote`` keep working). The
     # implementations live in release_promotion.py; noqa pins them so a
     # ruff --fix sweep can't drop them as "unused" and silently break callers.
-    _candidate_already_on_main,
+    _candidate_already_on_main,  # noqa: F401 — authority-module patch surface
     _idempotent_pr_url,
     _lts_branch_names,
     _merge_grade_misses_armed,
     _notify_operator,
-    _record_promotion_failure,  # noqa: F401 — tests access via rq.*
+    _record_promotion_failure,
     _record_promotion_success,
     _record_qualification_verdict,
     _recover_confidence_from_ci_unresolved,
@@ -145,7 +166,9 @@ from app.release_qualifier_audit import (
     # Re-exports — release_qualifier stays the canonical import + patch surface
     # for the qualifier's audit/spawn and infra-failure seam.
     _MIN_INFRA_ERROR_STREAK,  # noqa: F401 — re-exported for callers/tests
+    _build_audit_leg_proof,
     append_infra_failure_child_event,
+    dispatch_postcommit_infra_notification,
     _enrich_infra_error,
     _handle_independent_blocker,  # re-exported for callers/tests
     _handle_infra_failure,
@@ -2052,6 +2075,7 @@ async def _check_lts_sync_gate(
     integration_branch: str,
     promotion_target: str,
     requested_probes: frozenset[str] = frozenset(),
+    record_deferral: bool = True,
 ) -> dict[str, Any] | None:
     """Qualify-on-synced gate: don't score a candidate that is behind ``main``.
 
@@ -2128,26 +2152,31 @@ async def _check_lts_sync_gate(
             promotion_target,
             integration_branch,
         )
-        await _notify_operator(
-            session,
-            version,
-            "qualify_unsynced_fall_through",
-            (
-                f"v{version.version_number}: {integration_branch} has not absorbed "
-                f"{promotion_target} for {waited_min:.0f}min, so the qualify-sync "
-                f"gate's fall-through fired — scoring the candidate anyway. Check "
-                f"the {promotion_target} -> {integration_branch} back-merge."
-            ),
-            extra={
-                "candidate_sha": candidate_sha,
-                "waited_minutes": round(waited_min),
-                "fall_through_minutes": fall_through_min,
+        # Return a pure notification intent.  The caller publishes it only
+        # after the exact Project -> Version authority CAS and only if this
+        # request actually reaches launch, so a superseded GitHub observation
+        # cannot leak a stale durable operator message.
+        return {
+            "_proceed_after_sync_fall_through": True,
+            "_notification_intent": {
+                "event": "qualify_unsynced_fall_through",
+                "detail": (
+                    f"v{version.version_number}: {integration_branch} has not "
+                    f"absorbed {promotion_target} for {waited_min:.0f}min, so "
+                    "the qualify-sync gate's fall-through fired — scoring the "
+                    f"candidate anyway. Check the {promotion_target} -> "
+                    f"{integration_branch} back-merge."
+                ),
+                "extra": {
+                    "candidate_sha": candidate_sha,
+                    "waited_minutes": round(waited_min),
+                    "fall_through_minutes": fall_through_min,
+                },
             },
-        )
-        return None
+        }
 
     # Defer (retryable — the re-emitted qualify_request / cadence re-enters).
-    version.last_qualification = {
+    deferral_record = {
         "status": "deferred_unsynced",
         "candidate_sha": candidate_sha,
         "requested_probes": sorted(requested_probes),
@@ -2161,8 +2190,10 @@ async def _check_lts_sync_gate(
             f"the promotion merge"
         ),
     }
-    flag_modified(version, "last_qualification")
-    session.add(version)
+    if record_deferral:
+        version.last_qualification = deferral_record
+        flag_modified(version, "last_qualification")
+        session.add(version)
     logger.info(
         "[RELEASE_QUALIFIER] sync-gate: deferring qualification of v%d — "
         "candidate %s is behind %s (waited %.0f/%smin); retries when synced",
@@ -2176,6 +2207,11 @@ async def _check_lts_sync_gate(
         "status": "deferred_unsynced",
         "candidate_sha": candidate_sha,
         "requested_probes": sorted(requested_probes),
+        **(
+            {"_deferral_record": deferral_record}
+            if not record_deferral
+            else {}
+        ),
     }
 
 
@@ -2187,6 +2223,9 @@ async def run_qualification(
     session_factory=None,
     allow_synchronous_reuse_promote: bool = False,
     qualification_attempt_id: uuid.UUID | str | None = None,
+    expected_phase_changed_at: datetime | None = None,
+    expected_authority_fingerprint: str | None = None,
+    exact_authority: bool | None = None,
     retry_episode: int = 0,
     retry_episode_cap: int | None = None,
     requested_probes: list[str] | tuple[str, ...] | set[str] | None = None,
@@ -2266,6 +2305,23 @@ async def run_qualification(
     is_new_attempt = continued_attempt_id is None
     retry_episode = max(0, int(retry_episode or 0))
     prior_qual = version.last_qualification or {}
+    if exact_authority is None:
+        # Preserve exact semantics for older callers that supplied a concrete
+        # epoch, while allowing a durable intent to explicitly bind the valid
+        # NULL bootstrap epoch.
+        exact_authority = (
+            expected_phase_changed_at is not None
+            or expected_authority_fingerprint is not None
+        )
+    authority_phase_changed_at = (
+        expected_phase_changed_at
+        if exact_authority
+        else version.phase_changed_at
+    )
+    authority_fingerprint = (
+        expected_authority_fingerprint
+        or qualification_authority_fingerprint(version)
+    )
     raw_requested_probes: Any = requested_probes
     if raw_requested_probes is None and continued_attempt_id is not None:
         raw_requested_probes = prior_qual.get("requested_probes")
@@ -2284,6 +2340,7 @@ async def run_qualification(
             "status": "invalid_requested_probes",
             "detail": str(exc)[:200],
         }
+    _requested_probes_before_compatibility = effective_requested_probes
 
     # Guard 1: only qualify a stabilize-phase candidate.  Cheap, no I/O — do
     # it before resolving credentials so a wrong-phase call is a pure no-op.
@@ -2373,21 +2430,21 @@ async def run_qualification(
     # qualification or managed promotion owns last_qualification and must never
     # be overwritten by a concurrent configuration observation.
     if not resolve_project_promotion_enabled(project_id):
-        locked_version = (
-            (
-                await session.execute(
-                    select(release_version.ReleaseVersion)
-                    .where(release_version.ReleaseVersion.id == version.id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
+        locked_version, authority_block = (
+            await _lock_exact_qualification_authority(
+                session,
+                project_id=project_id,
+                version_id=version.id,
+                version_number=version.version_number,
+                expected_phase_changed_at=authority_phase_changed_at,
+                expected_authority_fingerprint=authority_fingerprint,
             )
-            .scalars()
-            .first()
         )
-        if locked_version is None:
-            return {"status": "version_not_found"}
+        if authority_block is not None:
+            return authority_block
         version = locked_version
+        if version.status != "open":
+            return {"status": "version_not_open"}
         if version.phase != "stabilize":
             return {"status": "wrong_phase"}
         if await _qualification_in_flight(session, version):
@@ -2470,9 +2527,25 @@ async def run_qualification(
             project_id,
         )
         return {"status": "project_paused"}
+    project_observation_fingerprint = (
+        qualification_project_observation_fingerprint(project)
+    )
 
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:
+        version, authority_block = await _lock_exact_qualification_authority(
+            session,
+            project_id=project_id,
+            version_id=version.id,
+            version_number=version.version_number,
+            expected_phase_changed_at=authority_phase_changed_at,
+            expected_authority_fingerprint=authority_fingerprint,
+            expected_project_observation_fingerprint=(
+                project_observation_fingerprint
+            ),
+        )
+        if authority_block is not None:
+            return authority_block
         version.last_qualification = {
             "status": "error",
             "error": "no_credentials",
@@ -2521,6 +2594,19 @@ async def run_qualification(
             repo,
             exc,
         )
+        version, authority_block = await _lock_exact_qualification_authority(
+            session,
+            project_id=project_id,
+            version_id=version.id,
+            version_number=version.version_number,
+            expected_phase_changed_at=authority_phase_changed_at,
+            expected_authority_fingerprint=authority_fingerprint,
+            expected_project_observation_fingerprint=(
+                project_observation_fingerprint
+            ),
+        )
+        if authority_block is not None:
+            return authority_block
         version.last_qualification = {
             "status": "error",
             "error": "sha_error",
@@ -2636,6 +2722,7 @@ async def run_qualification(
     #     degrade-safe, and never drops the request (see _check_lts_sync_gate).
     #     Runs pre-lock (read-only GitHub I/O) like the candidate snapshot + CI
     #     check above, so no row lock is held across the compare.
+    _sync_fall_through_notification: dict[str, Any] | None = None
     if integration_branch != promotion_target:
         _sync_gate = await _check_lts_sync_gate(
             session,
@@ -2647,8 +2734,36 @@ async def run_qualification(
             integration_branch=integration_branch,
             promotion_target=promotion_target,
             requested_probes=effective_requested_probes,
+            record_deferral=False,
         )
+        if _sync_gate is not None and _sync_gate.get(
+            "_proceed_after_sync_fall_through"
+        ):
+            _intent = _sync_gate.get("_notification_intent")
+            if isinstance(_intent, dict):
+                _sync_fall_through_notification = _intent
+            _sync_gate = None
         if _sync_gate is not None:
+            deferral_record = _sync_gate.pop("_deferral_record", None)
+            version, authority_block = (
+                await _lock_exact_qualification_authority(
+                    session,
+                    project_id=project_id,
+                    version_id=version.id,
+                    version_number=version.version_number,
+                    expected_phase_changed_at=authority_phase_changed_at,
+                    expected_authority_fingerprint=authority_fingerprint,
+                    expected_project_observation_fingerprint=(
+                        project_observation_fingerprint
+                    ),
+                )
+            )
+            if authority_block is not None:
+                return authority_block
+            if isinstance(deferral_record, dict):
+                version.last_qualification = deferral_record
+                flag_modified(version, "last_qualification")
+                session.add(version)
             return _sync_gate
 
     # 3c. Passing-audit reuse across a promotion_failed → RE-PROMOTE without
@@ -2673,8 +2788,20 @@ async def run_qualification(
     if (_pre_lock_qual.get("status") == "promotion_failed" and
             int(_pre_lock_qual.get("promotion_failure_count") or 0) >=
             _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS):
-        from app.release_qualifier_redrive import _escalate_promotion_failure_loop_in_dedicated_session
-        await _escalate_promotion_failure_loop_in_dedicated_session(version.id, session_factory=session_factory)
+        if exact_authority:
+            version, authority_block = await _lock_exact_qualification_authority(
+                session,
+                project_id=project_id,
+                version_id=version.id,
+                version_number=version.version_number,
+                expected_phase_changed_at=expected_phase_changed_at,
+                expected_authority_fingerprint=expected_authority_fingerprint,
+            )
+            if authority_block is not None:
+                return authority_block
+        else:
+            from app.release_qualifier_redrive import _escalate_promotion_failure_loop_in_dedicated_session
+            await _escalate_promotion_failure_loop_in_dedicated_session(version.id, session_factory=session_factory)
         return {"status": "promotion_failed_requalify_cap", "candidate_sha": candidate_sha}
 
     if (
@@ -2706,6 +2833,17 @@ async def run_qualification(
                 "this lock-holding caller could hang on staged-direction activation)",
                 version.version_number,
             )
+            if exact_authority:
+                version, authority_block = await _lock_exact_qualification_authority(
+                    session,
+                    project_id=project_id,
+                    version_id=version.id,
+                    version_number=version.version_number,
+                    expected_phase_changed_at=expected_phase_changed_at,
+                    expected_authority_fingerprint=expected_authority_fingerprint,
+                )
+                if authority_block is not None:
+                    return authority_block
             return {
                 "status": "promotion_failed_reuse_deferred",
                 "candidate_sha": candidate_sha,
@@ -2715,8 +2853,20 @@ async def run_qualification(
             candidate_sha,
             candidate_diff_hash,
             session_factory=session_factory,
+            expected_phase_changed_at=authority_phase_changed_at,
+            expected_authority_fingerprint=authority_fingerprint,
+            expected_project_observation_fingerprint=(
+                project_observation_fingerprint
+            ),
+            enforce_phase_epoch=True,
         )
         if _reuse_result is not None:
+            if _reuse_result.get("status") in {
+                "superseded_phase_epoch",
+                "superseded_qualification_state",
+                "superseded_project_observation_state",
+            }:
+                return _reuse_result
             logger.info(
                 "[RELEASE_QUALIFIER] run_qualification: v%d reused the PASSING "
                 "audit of a promotion_failed candidate (audited surface "
@@ -2728,45 +2878,35 @@ async def run_qualification(
             )
             return {**_reuse_result, "reused_audit": True}
 
+    # Candidate authorship can require GitHub ancestry/history requests.  Build
+    # the immutable receipt before taking Project/ReleaseVersion authority;
+    # the relock below fences both the source version and repository identity
+    # before any child or qualification projection consumes it.
+    (
+        _prelock_audit_authorship_receipt,
+        _prelock_audit_authorship_range,
+    ) = await _measured_authorship_receipt_for_audit_spawn(
+        session,
+        version,
+        candidate_sha_override=candidate_sha,
+    )
+
     # 4. Project -> ReleaseVersion serialization prevents duplicate children;
     #    populate_existing also defeats a caller's stale cached version row.
-    admission_block = await release_task_admission.start_block(
-        session, project_id, version.version_number
+    locked_version, authority_block = await _lock_exact_qualification_authority(
+        session,
+        project_id=project_id,
+        version_id=version.id,
+        version_number=version.version_number,
+        expected_phase_changed_at=authority_phase_changed_at,
+        expected_authority_fingerprint=authority_fingerprint,
+        expected_project_observation_fingerprint=project_observation_fingerprint,
     )
-    if admission_block is not None:
-        return admission_block
-    locked_version = (
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == version.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if locked_version is None:
-        logger.warning(
-            "[RELEASE_QUALIFIER] run_qualification: version row %s vanished "
-            "before lock — skipping",
-            version.id,
-        )
-        return {"status": "version_not_found"}
+    if authority_block is not None:
+        return authority_block
     # From here on, mutate the freshly-locked row (its attributes are the
     # post-lock DB truth) rather than the caller's possibly-stale instance.
     version = locked_version
-    # Re-check the phase under the lock — a concurrent strategic cycle may
-    # have flipped it out of stabilize between the cheap guard and the lock.
-    if version.phase != "stabilize":
-        logger.info(
-            "[RELEASE_QUALIFIER] run_qualification: version v%d phase changed "
-            "to %s before lock — skipping (wrong_phase)",
-            version.version_number,
-            version.phase,
-        )
-        return {"status": "wrong_phase"}
 
     # Guard 2 (under the lock): a qualification already in flight (pending +
     # a live child).  Re-emitting qualify_request every strategic cycle or
@@ -2802,6 +2942,41 @@ async def run_qualification(
             version.version_number,
         )
         return _promo
+
+    # The pre-lock probe check is only a cost-saving hint.  Criteria may change
+    # while repository/provider observations run, so recompute the decision
+    # from the rubric snapshot protected by the qualification authority lock.
+    # A continued attempt inherits its selection from the freshly locked
+    # projection; a fresh request reuses the strictly normalized input.
+    prior_qual = version.last_qualification or {}
+    _authoritative_probe_request = _requested_probes_before_compatibility
+    if requested_probes is None and continued_attempt_id is not None:
+        try:
+            _authoritative_probe_request = _normalize_qualification_probes(
+                prior_qual.get("requested_probes")
+            )
+        except ValueError as exc:
+            return {
+                "status": "invalid_requested_probes",
+                "detail": str(exc)[:200],
+            }
+    effective_requested_probes, _probe_drop = (
+        await _drop_incompatible_product_probes(
+            session,
+            version,
+            _authoritative_probe_request,
+        )
+    )
+    _probe_drop_record = None
+    _probe_drop_blocked_at = None
+    if _probe_drop is not None:
+        _probe_drop_record = {
+            "blocker": "incompatible_probe",
+            "probe": _probe_drop["probe"],
+            "canonical_evidence_keys": _probe_drop["canonical_keys"],
+            "active_rubric_keys": _probe_drop["active_keys"],
+        }
+        _probe_drop_blocked_at = _utcnow().isoformat()
 
     # Stamp the candidate this attempt actually evaluates.  ``candidate_sha``
     # is re-resolved live from integration-branch HEAD on EVERY call (see the
@@ -2937,26 +3112,6 @@ async def run_qualification(
     # same qualification attempt inherits the frozen selection; a new request
     # with no selection runs no product probe. The selection was strictly
     # normalized before any GitHub I/O above.
-    prior_qual = version.last_qualification or {}
-    if requested_probes is None and continued_attempt_id is not None:
-        try:
-            effective_requested_probes = _normalize_qualification_probes(
-                prior_qual.get("requested_probes")
-            )
-        except ValueError as exc:
-            return {
-                "status": "invalid_requested_probes",
-                "detail": str(exc)[:200],
-            }
-    if _probe_drop is not None:
-        # The under-lock re-normalization above re-derives a continued attempt's
-        # frozen probe selection from prior_qual, which would resurrect the
-        # probe this gate dropped at request time.  Re-apply the same drop — the
-        # incompatibility is a property of the open version's rubric, which
-        # cannot change mid-run.
-        effective_requested_probes = effective_requested_probes - frozenset(
-            {_probe_drop["probe"]}
-        )
     if continued_attempt_id is not None:
         projected_attempt_id = _coerce_qualification_attempt_id(
             prior_qual.get("qualification_attempt_id")
@@ -3118,6 +3273,16 @@ async def run_qualification(
         if prior_qual.get("status") == "infra_failure" and not _legacy_smoke_infra
         else []
     )
+    infra_attempt_history_total = (
+        prior_qual.get("infra_attempt_history_total")
+        if prior_qual.get("status") == "infra_failure" and not _legacy_smoke_infra
+        else 0
+    )
+    prior_same_signature_streak = (
+        prior_qual.get("same_signature_streak")
+        if prior_qual.get("status") == "infra_failure" and not _legacy_smoke_infra
+        else 0
+    )
     # Carry forward the prior-superseded flag: when the reconciler previously
     # wrote blocker='qualification_superseded' (force-promote out-of-band), the
     # new qualification's diff is stabilization-only and grading it against the
@@ -3127,6 +3292,15 @@ async def run_qualification(
         prior_qual.get("prior_superseded")
         or prior_qual.get("blocker") == "qualification_superseded"
     )
+
+    if _sync_fall_through_notification is not None:
+        await _notify_operator(
+            session,
+            version,
+            str(_sync_fall_through_notification["event"]),
+            str(_sync_fall_through_notification["detail"]),
+            extra=dict(_sync_fall_through_notification.get("extra") or {}),
+        )
 
     # 5. Spawn the heavy children.
     started_at = _utcnow().isoformat()
@@ -3496,14 +3670,6 @@ async def run_qualification(
             )
             walkthrough_e2e_task_id = str(walkthrough_e2e_task.id)
         if _audit_needed:
-            # Measure the candidate's real base-to-head authorship receipt so
-            # the audit prompt's release_evidence reflects the actual range
-            # instead of always taking the receipt-missing degrade branch.
-            # Mirrors the finalize-time pattern (_finalize_qualification).
-            (
-                _audit_authorship_receipt,
-                _audit_authorship_range,
-            ) = await _measured_authorship_receipt_for_audit_spawn(session, version)
             audit_task = await _spawn_release_audit_task(
                 session,
                 project_id,
@@ -3528,8 +3694,12 @@ async def run_qualification(
                     if c.get("criterion_key")
                 ],
                 rubric_fingerprint=rubric_fingerprint,
-                candidate_authorship_receipt=_audit_authorship_receipt,
-                candidate_authorship_measured_range=_audit_authorship_range,
+                candidate_authorship_receipt=(
+                    _prelock_audit_authorship_receipt
+                ),
+                candidate_authorship_measured_range=(
+                    _prelock_audit_authorship_range
+                ),
             )
             audit_task_id = str(audit_task.id)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not raise out
@@ -3593,7 +3763,13 @@ async def run_qualification(
         # caller can interleave a lost update.
         flag_modified(version, "last_qualification")
         session.add(version)
-        return {"status": "spawn_failed"}
+        # Redrive counter stamping is an exact-result CAS.  Return the durable
+        # attempt identity so the sweep can prove it is stamping this failure,
+        # rather than a newer qualification projection for the same version.
+        return {
+            "status": "spawn_failed",
+            "qualification_attempt_id": str(attempt_id),
+        }
 
     audit_challenge_spawn_pending = _audit_needed
 
@@ -3659,6 +3835,8 @@ async def run_qualification(
         "previous_infra_failure_signature": prior_infra_failure_signature,
         "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
         "infra_attempt_history": infra_attempt_history,
+        "infra_attempt_history_total": infra_attempt_history_total,
+        "prior_same_signature_streak": prior_same_signature_streak,
         "prior_superseded": prior_superseded,
         # Per-rubric-episode re-drive counter, carried forward from the prior
         # rubric hold (0 when the prior outcome was not a rubric hold).  The
@@ -4281,63 +4459,6 @@ def _audit_task_matches_candidate(task: Task | None, candidate_sha: str | None) 
         return context_sha == candidate_sha
     payload_sha = str((task.first_payload or {}).get("candidate_sha") or "").strip()
     return bool(payload_sha and payload_sha == candidate_sha)
-
-def _build_audit_leg_proof(
-    *,
-    candidate_sha: str | None,
-    audit_task_id: str | None,
-    audit_task_candidate_sha: str | None,
-    challenge_task_id: str | None,
-    challenged_candidate_sha: str | None,
-    binding_expected_count: int,
-    binding_record_count: int,
-    reconciliation_status: str | None,
-    reconciliation_reason: str | None,
-    legacy_advisory_only: bool,
-) -> dict[str, Any]:
-    """Derive the machine-readable audit-leg proof snapshot for a verdict."""
-    required = binding_expected_count > 0 and not legacy_advisory_only
-    binding_complete = (
-        binding_expected_count > 0 and binding_record_count == binding_expected_count
-    )
-    audit_sha_pinned = bool(
-        candidate_sha
-        and audit_task_candidate_sha
-        and audit_task_candidate_sha == candidate_sha
-    )
-    challenge_sha_pinned = bool(
-        candidate_sha
-        and challenged_candidate_sha
-        and challenged_candidate_sha == candidate_sha
-    )
-    reconciliation_success = (
-        reconciliation_status == "available" and reconciliation_reason is None
-    )
-    if not required:
-        state = "not_required"
-    elif (
-        audit_sha_pinned
-        and challenge_sha_pinned
-        and binding_complete
-        and reconciliation_success
-    ):
-        state = "proven"
-    else:
-        state = "unproven"
-    return {
-        "state": state,
-        "required": state == "proven",
-        "candidate_sha": candidate_sha,
-        "audit_task_id": audit_task_id,
-        "audit_task_candidate_sha": audit_task_candidate_sha,
-        "challenge_task_id": challenge_task_id,
-        "challenged_candidate_sha": challenged_candidate_sha,
-        "binding_expected_count": binding_expected_count,
-        "binding_record_count": binding_record_count,
-        "binding_complete": binding_complete,
-        "reconciliation_status": reconciliation_status,
-        "reconciliation_reason": reconciliation_reason,
-    }
 
 async def _resolve_migration_identity_at_finalize(
     session: AsyncSession,
@@ -5025,6 +5146,7 @@ async def _collect_verified_merge_test_evidence(
                 seam_files.add(p.strip())
     return {"test_files": sorted(test_files), "seam_files": sorted(seam_files)}
 
+
 async def _guard_ci_unresolved_promotion_pending(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -5193,69 +5315,6 @@ async def _guard_ci_unresolved_promotion_pending(
         "managed_check_wait": True,
     }
 
-
-async def _candidate_already_on_main_at_finalize(
-    session: AsyncSession,
-    version: release_version.ReleaseVersion,
-    candidate_sha: str | None,
-) -> bool:
-    """Best-effort: is ``candidate_sha`` already reachable from the promotion target?
-
-    A thin finalize-time wrapper over ``_candidate_already_on_main`` (resolves the
-    project's GitHub credentials first) used ONLY to exempt an already-landed
-    candidate from the restored hard merge-grade gate — see the exemption in
-    ``_finalize_qualification``.
-
-    Fail-CLOSED to ``False`` (keep the gate armed) on any credential / GitHub /
-    single-branch-repo condition: a transient failure must never wave a failing
-    merge-grade through, and a genuinely-landed candidate is re-detected on the
-    next finalize / sweep retry once GitHub is reachable.
-    """
-    if not candidate_sha:
-        return False
-    try:
-        project = await session.get(Project, version.project_id)
-        if project is None:
-            return False
-        integration_branch, promotion_target = _lts_branch_names(project)
-        if integration_branch == promotion_target:
-            # Single-branch repo (LTS inactive): "already on main" is not a
-            # meaningful distinction — nothing to exempt.
-            return False
-        resolved = await _resolve_github_with_session(session, project)
-        if resolved is None:
-            return False
-        token, owner, repo = resolved
-        return await _candidate_already_on_main(
-            token, owner, repo, candidate_sha, version, project=project
-        )
-    except Exception as exc:  # noqa: BLE001 — a check failure keeps the gate armed
-        logger.warning(
-            "[RELEASE_QUALIFIER] merge-grade already-on-main exemption check "
-            "failed for v%d candidate %s (%s) — keeping the gate armed",
-            version.version_number,
-            (candidate_sha or "")[:8],
-            exc,
-        )
-        return False
-
-async def _count_project_actionable_open_completion_debt(
-    session: AsyncSession, project_id: Any
-) -> int:
-    """Count open completion-debt rows owned by the qualified project only."""
-    if project_id is None:
-        return 0
-    from app.models import CompletionDebtEntry
-
-    stmt = (
-        select(sa_func.count())
-        .select_from(CompletionDebtEntry)
-        .where(
-            CompletionDebtEntry.project_id == project_id,
-            CompletionDebtEntry.status == "open",
-        )
-    )
-    return int((await session.execute(stmt)).scalar_one() or 0)
 
 async def _upsert_dimension_result(
     session: AsyncSession,
@@ -6106,35 +6165,6 @@ async def _build_env_preflight_evidence_for_candidate(
         smoketest_yaml_source=smoketest_yaml,
     )
 
-def _deployed_env_presence_snapshot(
-    env_preflight_artifact: dict[str, Any] | None,
-) -> dict[str, bool]:
-    """Presence-only ``{name: bool}`` snapshot of the DEPLOYED process's environ.
-
-    Slice 3 (design 245212a4).  This runs in ``_finalize_qualification``, which
-    executes inside the deployed prod Cloud Run orchestrator — so the deployed
-    process's OWN ``os.environ`` is a faithful presence-proxy of the deploy-target
-    env.  We snapshot only the names the candidate declared it needs (from the
-    candidate-side ``env_preflight`` content artifact) plus the Cloud Run signal
-    (``K_REVISION``) so :func:`_score_env_preflight` can derive the deploy-target
-    scope.
-
-    PRESENCE-ONLY HARD RULE: every value is ``bool(os.getenv(name))`` — the env
-    VALUE is NEVER read, compared, logged, or persisted.  A key maps to ``True``
-    iff the variable is set to a non-empty string in this process.
-    """
-    from app.required_runtime_env import CLOUD_RUN_SIGNAL_ENV
-
-    names: set[str] = {CLOUD_RUN_SIGNAL_ENV}
-    if isinstance(env_preflight_artifact, dict):
-        for entry in env_preflight_artifact.get("required_env") or []:
-            if isinstance(entry, dict):
-                name = entry.get("name")
-                if isinstance(name, str) and name:
-                    names.add(name)
-    # PRESENCE-ONLY: bool(...) — never the value itself.
-    return {name: bool(os.getenv(name)) for name in names}
-
 async def _record_rubric_provenance_outcome(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -6265,94 +6295,6 @@ async def _record_rubric_provenance_outcome(
         "rubric_provenance_error": provenance_error,
     }
 
-async def _measure_candidate_operator_authorship(
-    session: AsyncSession,
-    version: release_version.ReleaseVersion,
-) -> dict[str, Any]:
-    """Measure the candidate's immutable base-to-head authorship range.
-
-    ``base_sha`` is write-once and best-effort at version-open time: a
-    resolution failure there deliberately degrades to ``None`` rather than
-    abort the cut, and no admin path can ever backfill it afterward.  When it
-    is unset, derive the same range the release actually diffs against --
-    merge-base(promotion_target, candidate_sha) -- so the gate can still reach
-    a real verdict instead of latching permanently on a measurement that
-    executed correctly but found nothing to measure.
-    """
-    base_sha, candidate_sha = candidate_authorship_range(version)
-    project = await session.get(Project, version.project_id)
-    if base_sha is None and isinstance(candidate_sha, str) and project is not None:
-        derived_base_sha, derive_reason = await resolve_candidate_base_sha(
-            candidate_sha, session=session, project=project
-        )
-        if derived_base_sha is not None:
-            base_sha = derived_base_sha
-        else:
-            logger.warning(
-                "[RELEASE_QUALIFIER] v%d has no stored base_sha and derivation "
-                "from the promotion target failed (%s); authorship gate blocks "
-                "with a distinct reason instead of latching on 'evidence missing'",
-                version.version_number,
-                derive_reason,
-            )
-            return {
-                "state": "unresolved",
-                "count": None,
-                "offenders": [],
-                "range": {"base_sha": None, "head_sha": candidate_sha},
-                "reason": f"base_sha_unset_v{version.version_number}_{derive_reason}",
-            }
-    try:
-        return await count_non_bot_authored_commits(
-            base_sha,
-            candidate_sha,
-            session=session,
-            project=project,
-        )
-    except Exception as exc:  # noqa: BLE001 - evidence remains fail-closed
-        logger.warning(
-            "[RELEASE_QUALIFIER] candidate authorship measurement failed for v%d: %s",
-            version.version_number,
-            exc,
-        )
-        return {
-            "state": "unresolved",
-            "count": None,
-            "offenders": [],
-            "range": {"base_sha": base_sha, "head_sha": candidate_sha},
-            "reason": "candidate_authorship_measurement_unavailable",
-        }
-
-
-async def _measured_authorship_receipt_for_audit_spawn(
-    session: AsyncSession,
-    version: release_version.ReleaseVersion,
-) -> tuple[dict[str, Any], tuple[str | None, str | None]]:
-    """Measure the candidate range and wrap it as a validated receipt.
-
-    Returns the receipt alongside the EXACT (base_sha, head_sha) pair it was
-    measured against, so a caller can pass both into
-    ``_spawn_release_audit_task`` and the payload's ``release_evidence`` can
-    validate the receipt against the same range it was built from — a base_sha
-    the version has no stored column for is derived from the measurement's own
-    range (mirrors ``_finalize_qualification``'s handling), so re-deriving it a
-    second time independently cannot land on a different value and fail
-    ``validate_authorship_receipt`` closed by mismatch.
-    """
-    measurement = await _measure_candidate_operator_authorship(session, version)
-    base_sha, head_sha = candidate_authorship_range(version)
-    if base_sha is None:
-        measured_range = (
-            measurement.get("range") if isinstance(measurement, dict) else None
-        )
-        if isinstance(measured_range, dict) and isinstance(
-            measured_range.get("base_sha"), str
-        ) and measured_range.get("head_sha") == head_sha:
-            base_sha = measured_range["base_sha"]
-    receipt = authorship_receipt_for_measurement(measurement, base_sha, head_sha)
-    return receipt, (base_sha, head_sha)
-
-
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -6376,13 +6318,21 @@ async def _finalize_qualification(
         ``phase = "stabilize"``.
 
 
-    Runs on whatever ``session`` it is given and does NOT commit it (the
-    non-promote paths just mutate ``version.last_qualification``); the promote
-    path delegates to ``promote()``, which issues its own intermediate commit.
-    The caller (``_finalize_in_dedicated_session``) commits the dedicated
-    session afterwards.  Returns a result dict.
+    Runs on whatever ``session`` it is given.  Non-promote paths leave their
+    mutations for the caller to commit.  The promote path delegates to
+    ``promote()``; successful promotion commits its canonical terminal state
+    before post-commit follow-ups, while the caller's trailing commit remains a
+    harmless boundary for the other paths.  Returns a result dict.
     """
     qual = dict(version.last_qualification or {})
+    if _pre_gates is not None:
+        qual["_finalize_observation_protocol"] = bool(
+            _pre_gates.get("_observation_protocol")
+        )
+        if "hotfix_scope_preview" in _pre_gates:
+            qual["_hotfix_scope_preview_observation"] = _pre_gates[
+                "hotfix_scope_preview"
+            ]
     attempt_id = _qualification_attempt_for_record(version, qual)
     qual["qualification_attempt_id"] = str(attempt_id)
     version.active_qualification_attempt_id = attempt_id
@@ -6405,6 +6355,22 @@ async def _finalize_qualification(
         else None
     )
     candidate_sha = qual.get("candidate_sha")
+
+    async def _finalize_respawn_authorship_receipt():
+        if _pre_gates is not None:
+            return _authorship_receipt_from_measurement(
+                version,
+                _pre_gates["candidate_authorship_measurement"],
+                candidate_sha_override=candidate_sha,
+            )
+        # Direct unit-test compatibility.  Production finalization only enters
+        # with a complete unlocked gate packet.
+        return await _measured_authorship_receipt_for_audit_spawn(
+            session,
+            version,
+            candidate_sha_override=candidate_sha,
+        )
+
     audit_task_id = qual.get("audit_task_id")
     challenge_task_id = qual.get("challenge_task_id")
     audit_challenge_task_id = qual.get("audit_challenge_task_id") or challenge_task_id
@@ -6659,9 +6625,7 @@ async def _finalize_qualification(
                     (
                         _respawn_authorship_receipt,
                         _respawn_authorship_range,
-                    ) = await _measured_authorship_receipt_for_audit_spawn(
-                        session, version
-                    )
+                    ) = await _finalize_respawn_authorship_receipt()
                     new_audit_task = await _spawn_release_audit_task(
                         session,
                         version.project_id,
@@ -6729,9 +6693,7 @@ async def _finalize_qualification(
                     (
                         _respawn_authorship_receipt,
                         _respawn_authorship_range,
-                    ) = await _measured_authorship_receipt_for_audit_spawn(
-                        session, version
-                    )
+                    ) = await _finalize_respawn_authorship_receipt()
                     new_audit_task = await _spawn_release_audit_task(
                         session,
                         version.project_id,
@@ -6805,9 +6767,7 @@ async def _finalize_qualification(
                     (
                         _respawn_authorship_receipt,
                         _respawn_authorship_range,
-                    ) = await _measured_authorship_receipt_for_audit_spawn(
-                        session, version
-                    )
+                    ) = await _finalize_respawn_authorship_receipt()
                     new_audit_task = await _spawn_release_audit_task(
                         session,
                         version.project_id,
@@ -8493,9 +8453,19 @@ async def _finalize_qualification(
     # so exempt the grade.  Guarded by ``merge_grade_misses`` so the ancestry
     # GitHub read only runs in the exact wedge case (armed gate + failing grade),
     # never on the common unarmed / passing-grade paths.
-    if merge_grade_misses and await _candidate_already_on_main_at_finalize(
-        session, version, candidate_sha
+    if (
+        merge_grade_misses
+        and _pre_gates is not None
+        and _pre_gates.get("_observation_protocol")
+        and ALREADY_ON_MAIN not in _pre_gates
     ):
+        raise FinalizeObservationRequired(ALREADY_ON_MAIN)
+    candidate_already_on_main = bool(
+        _pre_gates.get(ALREADY_ON_MAIN)
+    ) if _pre_gates is not None else await _candidate_already_on_main_at_finalize(
+        session, version, candidate_sha
+    )
+    if merge_grade_misses and candidate_already_on_main:
         logger.info(
             "[RELEASE_QUALIFIER] v%d candidate %s failed the blind merge-grade "
             "but is already on the promotion target — exempting "
@@ -9384,25 +9354,50 @@ async def _finalize_qualification(
         # reconciliation. Either condition means a promotion is pending and this not_promoted
         # would be a spurious miss.
         if composite.get("blocker") == "ci_unresolved":
-            _guard_project = await session.get(Project, version.project_id)
-            if _guard_project is not None:
-                _guard_resolved = await _resolve_github_with_session(
-                    session, _guard_project
+            if _pre_gates is not None:
+                if (
+                    _pre_gates.get("_observation_protocol")
+                    and CI_RECOVERY not in _pre_gates
+                ):
+                    raise FinalizeObservationRequired(CI_RECOVERY)
+                _guard_result = await _apply_ci_unresolved_promotion_observation(
+                    session,
+                    version,
+                    candidate_sha,
+                    base_record,
+                    _pre_gates.get(
+                        "ci_recovery_observation",
+                        # Legacy/direct-test packets predate the unlocked
+                        # observation field.  Missing evidence must stay a
+                        # conservative no-op, never trigger provider I/O while
+                        # the finalize authority lock is held.
+                        {"state": "unavailable", "reason": "not_observed"},
+                    ),
                 )
-                if _guard_resolved is not None:
-                    _gtoken, _gowner, _grepo = _guard_resolved
-                    _guard_result = await _guard_ci_unresolved_promotion_pending(
-                        session,
-                        version,
-                        candidate_sha,
-                        base_record,
-                        _gtoken,
-                        _gowner,
-                        _grepo,
-                        _guard_project,
+                if _guard_result is not None:
+                    return _guard_result
+            else:
+                _guard_project = await session.get(Project, version.project_id)
+                if _guard_project is not None:
+                    _guard_resolved = await _resolve_github_with_session(
+                        session, _guard_project
                     )
-                    if _guard_result is not None:
-                        return _guard_result
+                    if _guard_resolved is not None:
+                        _gtoken, _gowner, _grepo = _guard_resolved
+                        _guard_result = (
+                            await _guard_ci_unresolved_promotion_pending(
+                                session,
+                                version,
+                                candidate_sha,
+                                base_record,
+                                _gtoken,
+                                _gowner,
+                                _grepo,
+                                _guard_project,
+                            )
+                        )
+                        if _guard_result is not None:
+                            return _guard_result
 
         # Below threshold (or a hard blocker fired): keep the version open and
         # send it back to stabilize so the next strategic cycle targets the
@@ -9997,6 +9992,11 @@ async def _reattempt_promotion_failed_locked(
     version_id: uuid.UUID,
     candidate_sha: str,
     candidate_diff_hash: str,
+    *,
+    expected_phase_changed_at: datetime | None = None,
+    expected_authority_fingerprint: str | None = None,
+    expected_project_observation_fingerprint: str | None = None,
+    enforce_phase_epoch: bool = False,
 ) -> dict[str, Any] | None:
     """Lock + re-promote a ``promotion_failed`` version on an open dedicated session.
 
@@ -10006,32 +10006,42 @@ async def _reattempt_promotion_failed_locked(
     pre-lock check in ``run_qualification`` may be stale), reconstructs the
     ``composite`` / ``base_record`` from the PASSING fields the promotion_failed
     record carries, and re-enters ``promote()`` on the CURRENT ``candidate_sha``
-    WITHOUT re-auditing.  Commits the dedicated session on the promote path
-    (``promote()`` issues its own intermediate commit but the FINAL state write
-    in ``_record_promotion_{success,failure}`` is committed by the caller —
-    mirrors ``_finalize_locked_version``).  Returns the ``promote()`` result, or
+    WITHOUT re-auditing.  Successful promotion commits its canonical terminal
+    state before post-commit follow-ups; the trailing dedicated-session commit
+    remains the boundary for failure and no-op paths.  Returns the ``promote()`` result, or
     ``None`` for every no-op guard so ``run_qualification`` falls through to the
     normal re-audit path.
     """
-    version: release_version.ReleaseVersion | None = (
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == version_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        )
-        .scalars()
-        .first()
-    )
+    version = await lock_project_then_version(session, version_id)
     if version is None:
         return None
+    locked_project = await session.get(
+        Project, version.project_id, populate_existing=True
+    )
+    if locked_project is None:
+        return None
+    if (
+        expected_project_observation_fingerprint is not None
+        and qualification_project_observation_fingerprint(locked_project)
+        != expected_project_observation_fingerprint
+    ):
+        return {"status": "superseded_project_observation_state"}
     # Only an OPEN, stabilize-phase version can be re-promoted.  A concurrent
     # finalize/promote may have flipped it to promoted/abandoned or moved it out
     # of stabilize between the pre-lock read and this lock — bail to re-audit.
     if version.status != "open" or version.phase != "stabilize":
         return None
+    if (
+        enforce_phase_epoch
+        and version.phase_changed_at != expected_phase_changed_at
+    ):
+        return {"status": "superseded_phase_epoch"}
+    if (
+        expected_authority_fingerprint is not None
+        and qualification_authority_fingerprint(version)
+        != expected_authority_fingerprint
+    ):
+        return {"status": "superseded_qualification_state"}
     qual = version.last_qualification or {}
     # Authoritative re-verify of the reuse gate under the lock: a concurrent
     # re-attempt may have already advanced the state (e.g. a new promotion_failed
@@ -10094,6 +10104,10 @@ async def _reattempt_promotion_failed_in_dedicated_session(
     candidate_diff_hash: str,
     *,
     session_factory=None,
+    expected_phase_changed_at: datetime | None = None,
+    expected_authority_fingerprint: str | None = None,
+    expected_project_observation_fingerprint: str | None = None,
+    enforce_phase_epoch: bool = False,
 ) -> dict[str, Any] | None:
     """Re-attempt promotion of a ``promotion_failed`` version WITHOUT re-auditing.
 
@@ -10110,13 +10124,11 @@ async def _reattempt_promotion_failed_in_dedicated_session(
     the qualifier's own promote write.
 
     **Why it cannot self-deadlock.**  ``run_qualification`` calls this from its
-    PRE-LOCK section — before it takes its own FOR UPDATE on the version row — so
-    the fresh session's ``SELECT ... FOR UPDATE`` never blocks on a lock held by
-    the same logical caller.  The strategic caller's Project lock is
-    ``FOR NO KEY UPDATE`` (``lock_project_then_task``), which does NOT conflict
-    with the ``FOR KEY SHARE`` an ``open_version`` FK-insert takes on the Project
-    row, and the promote chain never UPDATEs the Project row — so the dedicated
-    promote cannot deadlock against a concurrent strategic cycle either.
+    PRE-LOCK section — before it takes its own release-authority locks — and its
+    caller commits the prior redrive session before opening this dedicated
+    Project-then-Version session.  The fresh session therefore never waits on a
+    lock retained by the same logical caller.  The strong Project lock also
+    serializes exact version cuts and other promotion writers in canonical order.
 
     **Idempotency / no double-promote.**  Reuses ``promote()``'s existing
     machinery: the ``_candidate_already_on_main`` ancestry check routes an
@@ -10135,7 +10147,16 @@ async def _reattempt_promotion_failed_in_dedicated_session(
     async with factory() as session:
         try:
             result = await _reattempt_promotion_failed_locked(
-                session, version_id, candidate_sha, candidate_diff_hash
+                session,
+                version_id,
+                candidate_sha,
+                candidate_diff_hash,
+                expected_phase_changed_at=expected_phase_changed_at,
+                expected_authority_fingerprint=expected_authority_fingerprint,
+                expected_project_observation_fingerprint=(
+                    expected_project_observation_fingerprint
+                ),
+                enforce_phase_epoch=enforce_phase_epoch,
             )
         except Exception:
             try:
@@ -10154,7 +10175,11 @@ async def _reattempt_promotion_failed_in_dedicated_session(
     # resolved outcome re-triggers the strategic agent so it re-plans.  Only when
     # a promote actually ran (result is not None) — a no-op reuse leaves the
     # version exactly as it was.
-    if result is not None:
+    if result is not None and result.get("status") not in {
+        "superseded_phase_epoch",
+        "superseded_qualification_state",
+        "superseded_project_observation_state",
+    }:
         await _maybe_reconcile_after_promotion_conflict(
             version_id, result, session_factory=session_factory
         )
@@ -10200,18 +10225,7 @@ async def _force_promote_locked(
     re-enters ``promote()`` on the current candidate, mirroring
     ``_finalize_locked_version``'s commit discipline.
     """
-    version = (
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == version_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        )
-        .scalars()
-        .first()
-    )
+    version = await lock_project_then_version(session, version_id)
     if version is None:
         return {"status": "version_not_found"}
     if version.status != "open":
@@ -10463,6 +10477,8 @@ async def _finalize_locked_version(
     timeout_now: datetime | None,
     *,
     expected_attempt_id: uuid.UUID | str | None = None,
+    _observation_packet: dict[str, Any] | None = None,
+    _observation_round: int = 0,
 ) -> dict[str, Any] | None:
     """Lock + finalize one version within an already-open dedicated session.
 
@@ -10536,12 +10552,25 @@ async def _finalize_locked_version(
 
     # Run external gates only for an admitted, terminal-child unlocked peek.
     # A rare readiness race resolves the gates later under the decision lock.
-    _pre_gates: dict[str, Any] | None = None
+    _pre_gates: dict[str, Any] | None = (
+        dict(_observation_packet) if _observation_packet is not None else None
+    )
     if (
-        early_admission == release_task_admission.AUTOMATIC_TASK_CREATION_ALLOWED
+        _pre_gates is None
+        and early_admission
+        == release_task_admission.AUTOMATIC_TASK_CREATION_ALLOWED
         and not pre_timeout_expired
         and await _required_children_terminal(session, peek)
     ):
+        pre_gate_project = await session.get(Project, peek_project_id)
+        if pre_gate_project is None:
+            return None
+        pre_version_authority_fingerprint = (
+            qualification_finalize_authority_fingerprint(peek)
+        )
+        pre_project_observation_fingerprint = (
+            qualification_project_observation_fingerprint(pre_gate_project)
+        )
         # All three are pinned to the immutable candidate_sha and are read-only
         # against GitHub; their results are valid for the entire finalize attempt.
         pre_ci_green, pre_ci_resolution = await _resolve_ci_at_finalize(
@@ -10563,6 +10592,7 @@ async def _finalize_locked_version(
             session, peek
         )
         _pre_gates = {
+            "_observation_protocol": True,
             "ci_green": pre_ci_green,
             "ci_resolution": pre_ci_resolution,
             "migration_verdict": pre_migration_verdict,
@@ -10570,11 +10600,16 @@ async def _finalize_locked_version(
             "apply_verdict": pre_apply_verdict,
             "apply_detail": pre_apply_detail,
             "candidate_authorship_measurement": pre_authorship_measurement,
+            "version_authority_fingerprint": (
+                pre_version_authority_fingerprint
+            ),
+            "project_observation_fingerprint": (
+                pre_project_observation_fingerprint
+            ),
         }
         if pre_ci_resolution.get("state") == _CI_NO_CHECKS:
-            _pre_proj_for_ci_gate = await session.get(Project, peek.project_id)
             _pre_gates["ci_required"] = _ci_required_for_finalize(
-                _pre_proj_for_ci_gate, pre_ci_resolution
+                pre_gate_project, pre_ci_resolution
             )
         # Clear any failed-closed DBAPI transaction before taking row locks.
         await session.rollback()
@@ -10638,6 +10673,24 @@ async def _finalize_locked_version(
         locked_attempt_uuid, qual.get("candidate_sha"), _pre_gates is not None
     ):
         return None
+    if _pre_gates is not None:
+        locked_project = await session.get(
+            Project, version.project_id, populate_existing=True
+        )
+        if (
+            locked_project is None
+            or qualification_finalize_authority_fingerprint(version)
+            != _pre_gates["version_authority_fingerprint"]
+            or qualification_project_observation_fingerprint(locked_project)
+            != _pre_gates["project_observation_fingerprint"]
+        ):
+            await session.rollback()
+            logger.info(
+                "[RELEASE_QUALIFIER] finalize: v%d external gate packet was "
+                "superseded before apply",
+                version.version_number,
+            )
+            return None
 
     _deploy_state_locked = await session.get(
         DeploymentState, 1, populate_existing=True
@@ -10695,13 +10748,51 @@ async def _finalize_locked_version(
         if resumed_from_admission_deferral:
             await session.commit()
         return None
+    if _pre_gates is None:
+        # Readiness can flip after the unlocked peek (for example, the sibling
+        # child commits terminal while this finalizer waits for authority).
+        # Never fall back to provider/subprocess gates under Project/Version
+        # locks.  Persist only a bounded admission-resume transition, if one
+        # occurred, and let the completion event or scheduled sweep re-enter
+        # through the normal unlocked observation path.
+        if resumed_from_admission_deferral:
+            await session.commit()
+        else:
+            await session.rollback()
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize: v%d became ready after the "
+            "unlocked gate peek; deferring one cycle for a complete gate packet",
+            version.version_number,
+        )
+        return None
 
     # Finalize on the dedicated session.  _finalize_qualification may call
     # promote(), whose intermediate commit + re-lock are now safe: this session
     # holds only qualifier state.  Pass the pre-computed gate results so the
     # function does NOT re-run the GitHub-bound gates under the row lock.
-    result = await _finalize_qualification(session, version, _pre_gates=_pre_gates)
+    try:
+        result = await _finalize_qualification(
+            session, version, _pre_gates=_pre_gates
+        )
+    except FinalizeObservationRequired as exc:
+        if _observation_round >= 3:
+            await session.rollback()
+            return {"status": "pending", "reason": "observation_retry_exhausted"}
+        extended = await extend_finalize_observation_packet(
+            session, version_id, _pre_gates, exc.kind
+        )
+        if extended is None:
+            return None
+        return await _finalize_locked_version(
+            session,
+            version_id,
+            timeout_now,
+            expected_attempt_id=expected_attempt_id,
+            _observation_packet=extended,
+            _observation_round=_observation_round + 1,
+        )
     await session.commit()
+    dispatch_postcommit_infra_notification(result)
     return result
 
 async def maybe_finalize_qualification(

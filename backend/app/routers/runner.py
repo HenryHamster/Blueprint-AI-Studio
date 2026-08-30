@@ -80,6 +80,10 @@ from app.runner_decline import (
     record_runner_decline,
 )
 from app.task_capabilities import agent_capability_slice
+from app.strategic_cold_successor_authority import (
+    cold_successor_capability_slice,
+    enforce_cold_successor_task_authority,
+)
 from app.workbench_events import (
     SURFACE_RUNTIME,
     SURFACE_STRATEGIC_SESSION,
@@ -1402,6 +1406,21 @@ async def next_task(
 
     resolvable: list[Task] = []
     for candidate in candidates:
+        try:
+            cold_successor_capability_slice(
+                candidate,
+                agent_capability_slice((candidate.first_payload or {}).get("type", "")),
+            )
+            candidate_project = await session.get(Project, candidate.project_id)
+            enforce_cold_successor_task_authority(
+                candidate_project.vision if candidate_project is not None else None,
+                candidate,
+            )
+        except HTTPException as exc:
+            reason = str(exc.detail)
+            _note_skip(candidate, SKIP_CODE_CAPABILITY_MISMATCH, reason)
+            to_release_capability.append((candidate, reason))
+            continue
         # DETERMINISTIC capability mismatch, checked FIRST: a browser-required task
         # was pinned to this runner but the runner reports no usable Chromium. The
         # mismatch is a property of the hardware, not a transient pool cooldown, so
@@ -1618,6 +1637,9 @@ async def next_task(
     # calls /api/agent/claim.  The task stays in PROVISIONING so claim can still
     # perform the PROVISIONING → IN_PROGRESS transition (same contract as GCP VMs).
     task_type = (task.first_payload or {}).get("type", "")
+    capability_slice = cold_successor_capability_slice(
+        task, agent_capability_slice(task_type)
+    )
     task.started_at = _utcnow()
     session.add(task)
     await session.commit()
@@ -1640,7 +1662,7 @@ async def next_task(
             (task.first_payload or {}).get("resident_session") is True
             or (task.context or {}).get("_resident_session") is True
         ),
-        "capability_slice": agent_capability_slice(task_type),
+        "capability_slice": capability_slice,
         "credentials": credentials,
     }
 

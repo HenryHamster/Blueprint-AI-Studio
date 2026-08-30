@@ -261,12 +261,24 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
         source_path="backend/app/approved_pr_stranding.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "routers/admin_release_version_projections.py"): GoverningCap(
+        source_path="backend/app/routers/admin_release_version_projections.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_activation.py"): GoverningCap(
         source_path="backend/app/release_activation.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "release_activation_receipt.py"): GoverningCap(
+        source_path="backend/app/release_activation_receipt.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_artifacts.py"): GoverningCap(
         source_path="backend/app/release_artifacts.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_authority_lock.py"): GoverningCap(
+        source_path="backend/app/release_authority_lock.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
     ("backend", "release_commit_authorship.py"): GoverningCap(
@@ -289,6 +301,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
         source_path="backend/app/release_prepromotion_rehearsal.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "release_prepromotion_gradeability.py"): GoverningCap(
+        source_path="backend/app/release_prepromotion_gradeability.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_promotion.py"): GoverningCap(
         source_path="backend/app/release_promotion.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
@@ -299,6 +315,18 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
     ),
     ("backend", "release_qualification_deferral.py"): GoverningCap(
         source_path="backend/app/release_qualification_deferral.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualification_authority.py"): GoverningCap(
+        source_path="backend/app/release_qualification_authority.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualification_intents.py"): GoverningCap(
+        source_path="backend/app/release_qualification_intents.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_qualification_observation_protocol.py"): GoverningCap(
+        source_path="backend/app/release_qualification_observation_protocol.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
     ("backend", "release_qualifier.py"): GoverningCap(
@@ -341,6 +369,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
         source_path="backend/app/release_serving_confirmation.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "release_serving_observation.py"): GoverningCap(
+        source_path="backend/app/release_serving_observation.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_stall_alerts.py"): GoverningCap(
         source_path="backend/app/release_stall_alerts.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
@@ -351,6 +383,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
     ),
     ("backend", "release_version.py"): GoverningCap(
         source_path="backend/app/release_version.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
+    ("backend", "release_version_cut.py"): GoverningCap(
+        source_path="backend/app/release_version_cut.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
 }

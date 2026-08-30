@@ -304,8 +304,64 @@ export interface LatestAudit {
   } | null;
 }
 
+export interface InfraFailureAgentErrorEvidence {
+  schema: 1;
+  exit_code?: number;
+  duration_ms?: number;
+  provider_api_error_status?: number;
+  model_output_seen?: boolean;
+  result_event_seen?: boolean;
+  provider_result_is_error?: boolean;
+  provider?: string;
+  auth_mode?: string;
+  exit_signal?: string;
+  last_stream_event?: string;
+  classified?: string;
+  provider_result_subtype?: string;
+  provider_terminal_reason?: string;
+  provider_error_source?: string;
+  provider_error_code?: string;
+  output_tail?: string;
+}
+
+export interface InfraFailureAttemptEvidence {
+  attempt_ordinal?: number;
+  status?: string;
+  vm_provisioned_at?: string;
+  vm_stopped_at?: string;
+  terminal_at?: string;
+  failure_category?: string;
+  child_tail?: string;
+  agent_error?: InfraFailureAgentErrorEvidence;
+}
+
+export interface InfraFailureEventEvidence {
+  leg?: string;
+  failed_task_id?: string;
+  replacement_task_id?: string;
+  status?: string;
+  failure_category?: string;
+  terminal_at?: string;
+  task_attempt_ordinal?: number;
+  label?: string;
+  respawn_count?: number;
+  attempt_trace: InfraFailureAttemptEvidence[];
+  attempt_trace_total: number;
+  attempt_trace_truncated: boolean;
+}
+
+export interface InfraFailureEvidence {
+  schema_version: 1;
+  events: InfraFailureEventEvidence[];
+  events_total: number;
+  events_truncated: boolean;
+  attempts_total: number;
+  attempts_truncated: boolean;
+}
+
 export interface VersionQualification {
   status: QualificationStatus | null;
+  qualification_attempt_id?: string | null;
   confidence: number | null;
   threshold: number | null;
   sub_scores: VersionQualificationSubScores | null;
@@ -318,6 +374,7 @@ export interface VersionQualification {
   candidate_sha?: string | null;
   // Infra-failure context (populated only when status=infra_failure).
   error?: string | null;
+  infra_failure_evidence?: InfraFailureEvidence | null;
   consecutive_infra_errors?: number | null;
   // True when the same migration-apply gate failure has repeated 3+ times with
   // an identical infra-failure signature. The operator hotfix-deploy channel is
@@ -600,8 +657,12 @@ export interface RequalificationReadiness {
 }
 
 export interface CurrentVersion {
+  id?: string;
   version_number: number;
+  status?: string;
   phase: string;
+  base_sha?: string | null;
+  candidate_sha?: string | null;
   phase_changed_at: string | null;
   phase_reasoning: string | null;
   goal: string | null;
@@ -749,6 +810,10 @@ export interface RecentVersion {
   version_number: number;
   status: string;
   phase?: string | null;
+  base_sha?: string | null;
+  candidate_sha?: string | null;
+  version_cut_receipt?: VersionCutReceipt | null;
+  version_cut_followups?: VersionCutFollowups | null;
   opened_at: string;
   promoted_at: string | null;
   qualification_attempts: number;
@@ -1049,35 +1114,197 @@ export async function setVersionGoal(
   return res.json();
 }
 
-export interface CutVersionResponse {
-  abandoned_version: {
-    version_number: number;
-    status: string;
-  };
-  new_version: {
+export interface VersionCutReceipt {
+  schema_version: number;
+  status: 'committed';
+  idempotency_key: string;
+  request_fingerprint: string;
+  project_id: string;
+  operator_id: string;
+  operator_display: string;
+  reason: string | null;
+  expected_version_id: string;
+  expected_version_number: number;
+  expected_integration_sha: string;
+  expected_integration_identity: string;
+  observed_repository_owner: string;
+  observed_repository_name: string;
+  observed_integration_branch: string;
+  observed_integration_sha: string;
+  observed_at: string;
+  abandoned_version_id: string;
+  abandoned_version_number: number;
+  abandoned_status: 'abandoned';
+  abandoned_base_sha: string | null;
+  abandoned_candidate_sha: string | null;
+  abandoned_opened_at: string;
+  successor_version_id: string;
+  successor_version_number: number;
+  successor_status: 'open';
+  successor_phase: 'build';
+  successor_goal: null;
+  successor_base_sha: string;
+  successor_candidate_sha: null;
+  successor_opened_at: string;
+  committed_at: string;
+}
+
+export interface VersionCutFollowups {
+  schema_version: number;
+  status: 'pending' | 'complete' | 'invalid';
+  attempts: number;
+  created_at: string | null;
+  last_attempt_at: string | null;
+  completed_at: string | null;
+  last_error: string | null;
+  lease_expires_at: string | null;
+}
+
+export interface VersionCutRequest {
+  reason: string | null;
+  idempotency_key: string;
+  expected_version_id: string;
+  expected_version_number: number;
+  expected_integration_sha: string;
+  expected_integration_identity: string;
+}
+
+export interface VersionCutReadyContext {
+  status: 'ready';
+  replayed: false;
+  version: {
+    id: string;
     version_number: number;
     phase: string;
+    status: string;
+    base_sha: string | null;
+    candidate_sha: string | null;
+  };
+  integration: {
+    owner: string;
+    repo: string;
+    branch: string;
+    head_sha: string;
+    identity_token: string;
+    observed_at: string;
+  };
+}
+
+export interface VersionCutCommittedContext {
+  status: 'committed';
+  replayed: true;
+  receipt: VersionCutReceipt;
+  followups: VersionCutFollowups;
+}
+
+export type VersionCutContext = VersionCutReadyContext | VersionCutCommittedContext;
+
+export class VersionCutRequestError extends Error {
+  readonly status: number;
+  readonly code: string | null;
+  readonly current: Record<string, unknown> | null;
+
+  constructor(
+    message: string,
+    status: number,
+    code: string | null,
+    current: Record<string, unknown> | null,
+  ) {
+    super(message);
+    this.name = 'VersionCutRequestError';
+    this.status = status;
+    this.code = code;
+    this.current = current;
+  }
+}
+
+function isVersionCutRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function versionCutError(res: Response, data: unknown, fallback: string): VersionCutRequestError {
+  const body = isVersionCutRecord(data) ? data : {};
+  const error = isVersionCutRecord(body.error) ? body.error : {};
+  const raw = error.message ?? body.detail;
+  const detail = isVersionCutRecord(raw) ? raw : null;
+  const message = typeof detail?.message === 'string'
+    ? detail.message
+    : typeof raw === 'string'
+      ? raw
+      : fallback;
+  return new VersionCutRequestError(
+    message,
+    res.status,
+    typeof detail?.code === 'string' ? detail.code : null,
+    isVersionCutRecord(detail?.current) ? detail.current : null,
+  );
+}
+
+export async function getVersionCutContext(
+  projectId: string,
+  idempotencyKey?: string,
+): Promise<VersionCutContext> {
+  if (idempotencyKey !== undefined && !idempotencyKey.trim()) {
+    throw new VersionCutRequestError(
+      'Version-cut idempotency key must be non-empty.',
+      422,
+      'version_cut_invalid_request',
+      null,
+    );
+  }
+  const query = idempotencyKey !== undefined
+    ? `?idempotency_key=${encodeURIComponent(idempotencyKey)}`
+    : '';
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/version-cut-context${query}`,
+    { cache: 'no-store' },
+    2,
+    30000,
+    undefined,
+    false,
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw versionCutError(res, data, `Failed to read version-cut context: ${res.status}`);
+  }
+  return data;
+}
+
+export interface CutVersionResponse {
+  replayed: boolean;
+  receipt: VersionCutReceipt;
+  followups: VersionCutFollowups;
+  abandoned_version: {
+    id: string;
+    version_number: number;
+    status: string;
+    base_sha: string | null;
+    candidate_sha: string | null;
+    abandoned_at: string;
+  };
+  new_version: {
+    id: string;
+    version_number: number;
+    status: string;
+    phase: string;
     goal: string | null;
+    base_sha: string | null;
+    candidate_sha: string | null;
     opened_at: string;
   };
 }
 
 export async function cutVersion(
   projectId: string,
-  reason?: string,
-  idempotencyKey?: string,
+  requestBody: string,
 ): Promise<CutVersionResponse> {
   const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-cut`, {
     method: 'POST',
-    body: JSON.stringify({
-      reason: reason ?? '',
-      ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
-    }),
+    body: requestBody,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const detail = data?.detail || data?.error?.message || `Failed to cut version: ${res.status}`;
-    throw new Error(detail);
+    throw versionCutError(res, data, `Failed to cut version: ${res.status}`);
   }
   return data;
 }
@@ -1331,10 +1558,12 @@ export async function triggerQualify(projectId: string): Promise<QualifyTriggerR
 export interface QualificationVerdictRecord {
   id: string;
   release_version_id: string;
+  qualification_attempt_id?: string | null;
   candidate_sha: string;
   confidence: number | null;
   sub_scores: VersionQualificationSubScores | null;
   blocker: string | null;
+  infra_failure_evidence?: InfraFailureEvidence | null;
   audit_missing_reason: string | null;
   audit_findings?: AuditFinding[] | null;
   excluded_audit_findings?: AuditFinding[] | null;
