@@ -5779,12 +5779,15 @@ def cmd_strategic(args: argparse.Namespace) -> None:
         _strategic_send(args)
     elif sub == "cold-successor-start":
         return _strategic_cold_successor_start(args)
+    elif sub == "cold-successor-preview":
+        _strategic_cold_successor_preview(args)
     elif sub == "cold-successor-status":
         _strategic_cold_successor_status(args)
     else:
         print(
             "Usage: blueprint strategic "
-            "{start|stop|chat|send|cold-successor-start|cold-successor-status}",
+            "{start|stop|chat|send|cold-successor-preview|cold-successor-start|"
+            "cold-successor-status}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -6021,6 +6024,7 @@ def _cold_successor_effect(pid: str, request: dict) -> str:
         "expected_predecessor_worker_generation": request[
             "expected_predecessor_worker_generation"
         ],
+        "expected_core_sha256": request["expected_core_sha256"],
     }
     return hashlib.sha256(
         json.dumps(effect, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -6036,6 +6040,7 @@ def _cold_successor_retry_argv(pid: str, request: dict) -> list[str]:
         request["expected_predecessor_session_id"],
         "--expected-predecessor-worker-generation",
         str(request["expected_predecessor_worker_generation"]),
+        "--expected-core-sha256", request["expected_core_sha256"],
     ]
     if request["expected_predecessor_task_id"] is not None:
         argv.extend([
@@ -6050,6 +6055,7 @@ def _cold_successor_status_matches(
     *,
     fingerprint: str,
     launch_effect_sha256: str,
+    expected_core_sha256: str,
 ) -> bool:
     return bool(
         isinstance(status_row, dict)
@@ -6057,6 +6063,7 @@ def _cold_successor_status_matches(
         and status_row.get("proof_state") != "absent"
         and status_row.get("idempotency_fingerprint") == fingerprint
         and status_row.get("launch_effect_sha256") == launch_effect_sha256
+        and status_row.get("core_sha256") == expected_core_sha256
         and _is_canonical_cold_uuid(status_row.get("task_id"))
         and isinstance(status_row.get("session_id"), str)
         and bool(status_row["session_id"])
@@ -6091,6 +6098,7 @@ def _strategic_cold_successor_start(args: argparse.Namespace) -> int:
     key = str(args.idempotency_key)
     predecessor_session = str(args.expected_predecessor_session_id)
     predecessor_task = getattr(args, "expected_predecessor_task_id", None)
+    expected_core_sha256 = str(args.expected_core_sha256)
     if (
         not _is_canonical_cold_uuid(args.runner_id)
         or (
@@ -6103,6 +6111,7 @@ def _strategic_cold_successor_start(args: argparse.Namespace) -> int:
         or not predecessor_session
         or predecessor_session != predecessor_session.strip()
         or len(predecessor_session) > 255
+        or re.fullmatch(r"[0-9a-f]{64}", expected_core_sha256) is None
     ):
         print("ERROR: cold-successor exact authority values are invalid.", file=sys.stderr)
         return 1
@@ -6114,6 +6123,7 @@ def _strategic_cold_successor_start(args: argparse.Namespace) -> int:
         "expected_predecessor_worker_generation": (
             args.expected_predecessor_worker_generation
         ),
+        "expected_core_sha256": expected_core_sha256,
     }
     fingerprint = hashlib.sha256(key.encode("utf-8")).hexdigest()
     effect_sha = _cold_successor_effect(pid, request)
@@ -6127,6 +6137,7 @@ def _strategic_cold_successor_start(args: argparse.Namespace) -> int:
         current,
         fingerprint=fingerprint,
         launch_effect_sha256=effect_sha,
+        expected_core_sha256=expected_core_sha256,
     ):
         _emit(args, current, _render_cold_successor_status)
         return 0
@@ -6143,6 +6154,7 @@ def _strategic_cold_successor_start(args: argparse.Namespace) -> int:
         f"- predecessor session: {predecessor_session}\n"
         f"- predecessor task: {predecessor_task or '-'}\n"
         f"- predecessor generation: {request['expected_predecessor_worker_generation']}\n"
+        f"- durable source core: {expected_core_sha256}\n"
         f"- stable idempotency key: {key}"
     )
     if not _confirm(prompt, getattr(args, "yes", False)):
@@ -6171,6 +6183,7 @@ def _strategic_cold_successor_start(args: argparse.Namespace) -> int:
         reconciled,
         fingerprint=fingerprint,
         launch_effect_sha256=effect_sha,
+        expected_core_sha256=expected_core_sha256,
     ):
         _emit(args, reconciled, _render_cold_successor_status)
         return 0
@@ -6190,6 +6203,25 @@ def _render_cold_successor_status(row: dict) -> None:
     print(f"  runner:      {row.get('runner_id', '-')}")
     print(f"  task_status: {row.get('task_status', '-')}")
     print(f"  core_sha256: {row.get('core_sha256', '-')}")
+
+
+def _strategic_cold_successor_preview(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    row = api(
+        "GET",
+        f"/api/admin/projects/{pid}/strategic-session/cold-successor/preview",
+    )
+    _emit(args, row, _render_cold_successor_preview)
+
+
+def _render_cold_successor_preview(row: dict) -> None:
+    print("=== COLD SUCCESSOR SOURCE PREVIEW ===")
+    print(f"  core_sha256: {row.get('core_sha256', '-')}")
+    print(f"  problem_model_sha256: {row.get('problem_model_sha256', '-')}")
+    print(f"  running_update_sha256: {row.get('running_update_sha256', '-')}")
+    print(f"  strategic_memory_sha256: {row.get('strategic_memory_sha256', '-')}")
+    print(f"  strategic_memory_document_count: {row.get('strategic_memory_document_count', '-')}")
+    print(f"  payload_byte_count: {row.get('payload_byte_count', '-')}")
 
 
 def _strategic_cold_successor_status(args: argparse.Namespace) -> None:
@@ -10375,8 +10407,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=range(1, 2_147_483_648),
         metavar="N",
     )
+    p_strat_cold_start.add_argument("--expected-core-sha256", required=True)
     p_strat_cold_start.add_argument(
         "--yes", action="store_true", help="Skip the confirmation prompt.")
+    strategic_sub.add_parser(
+        "cold-successor-preview", parents=[common],
+        help="Read the exact durable source hashes for a cold successor.")
     strategic_sub.add_parser(
         "cold-successor-status", parents=[common],
         help="Read the canonical cold-successor proof receipt.")

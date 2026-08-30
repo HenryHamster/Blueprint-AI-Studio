@@ -12,6 +12,7 @@ RUNNER_ID = "11111111-1111-4111-8111-111111111111"
 PREDECESSOR_TASK_ID = "22222222-2222-4222-8222-222222222222"
 SUCCESSOR_TASK_ID = "33333333-3333-4333-8333-333333333333"
 IDEMPOTENCY_KEY = "v57-cold-successor-proof"
+EXPECTED_CORE_SHA256 = "a" * 64
 
 
 def _request():
@@ -21,6 +22,7 @@ def _request():
         "expected_predecessor_session_id": "ss-v57-predecessor",
         "expected_predecessor_task_id": PREDECESSOR_TASK_ID,
         "expected_predecessor_worker_generation": 7,
+        "expected_core_sha256": EXPECTED_CORE_SHA256,
     }
 
 
@@ -39,7 +41,7 @@ def _status(request=None, **overrides):
         "launch_effect_sha256": blueprint._cold_successor_effect(
             PROJECT_ID, request
         ),
-        "core_sha256": "a" * 64,
+        "core_sha256": request["expected_core_sha256"],
         "task_status": "PROVISIONING",
     }
     row.update(overrides)
@@ -63,6 +65,8 @@ def _argv():
         PREDECESSOR_TASK_ID,
         "--expected-predecessor-worker-generation",
         "7",
+        "--expected-core-sha256",
+        EXPECTED_CORE_SHA256,
         "--yes",
     ]
 
@@ -177,9 +181,21 @@ def test_status_is_read_only_and_uses_the_canonical_owner_route(
     monkeypatch, capsys
 ):
     calls = []
+    preview = {
+        "kind": "blueprint.cold_successor_preview.v1",
+        "project_id": PROJECT_ID,
+        "core_sha256": EXPECTED_CORE_SHA256,
+        "problem_model_sha256": "b" * 64,
+        "running_update_sha256": "c" * 64,
+        "strategic_memory_sha256": "d" * 64,
+        "strategic_memory_document_count": 1,
+        "payload_byte_count": 2048,
+    }
 
     def fake_api(method, path, body=None, timeout=30, *, raw_body=None):
         calls.append((method, path))
+        if path.endswith("/preview"):
+            return preview
         return _status(proof_state="succeeded", task_status="COMPLETED")
 
     _wire(monkeypatch, fake_api, read_only=True)
@@ -195,3 +211,12 @@ def test_status_is_read_only_and_uses_the_canonical_owner_route(
         "GET",
         f"/api/admin/projects/{PROJECT_ID}/strategic-session/cold-successor",
     )]
+    assert blueprint.main([
+        "--json", "strategic", "cold-successor-preview",
+        "--project-id", PROJECT_ID,
+    ]) == 0
+    assert json.loads(capsys.readouterr().out) == preview
+    assert calls[-1] == (
+        "GET",
+        f"/api/admin/projects/{PROJECT_ID}/strategic-session/cold-successor/preview",
+    )

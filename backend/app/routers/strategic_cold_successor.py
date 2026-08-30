@@ -21,6 +21,7 @@ from app.strategic_cold_successor_lifecycle import (
     cold_successor_status,
     heartbeat_cold_successor,
     launch_cold_successor,
+    preview_cold_successor,
     read_cold_successor_receipt,
     terminal_cold_successor,
 )
@@ -28,6 +29,18 @@ from app.strategic_cold_successor_authority import COLD_SUCCESSOR_LAUNCH_MODE
 
 
 router = APIRouter(tags=["strategic-cold-successor"])
+
+
+@router.get("/api/admin/projects/{project_id}/strategic-session/cold-successor/preview")
+async def preview_cold_successor_route(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    return await preview_cold_successor(session, project_id)
 
 
 @router.post("/api/admin/projects/{project_id}/strategic-session/cold-successor/start")
