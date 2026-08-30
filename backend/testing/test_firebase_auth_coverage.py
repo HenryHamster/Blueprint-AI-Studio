@@ -35,7 +35,7 @@ from app.auth import (
     get_metrics_reader,
     AGENT_JWT_ALGORITHM,
 )
-from app.models import AllowedUser, LocalRunner, Project, _utcnow
+from app.models import AllowedUser, LocalRunner, Project, Task, _utcnow
 
 
 def _creds(token="fake-firebase-token"):
@@ -601,28 +601,38 @@ class TestMetricsReaderFirebasePath:
     @pytest.mark.asyncio
     async def test_agent_jwt_takes_metrics_reader_path(self, db_session):
         """A valid agent JWT is accepted by get_metrics_reader without hitting Firebase."""
+        project = Project(name="Firebase metrics", user_id="metrics-owner")
+        db_session.add(project)
+        await db_session.flush()
+        task = Task(
+            project_id=project.id,
+            vm_instance_id="metrics-vm-001",
+            payloads=[{"type": "research"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
         token = create_agent_token(
-            task_id="metrics-task-001",
+            task_id=str(task.id),
             vm_instance_id="metrics-vm-001",
             task_type="research",
-            project_id="proj-metrics",
+            project_id=str(project.id),
         )
         creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
         result = await get_metrics_reader(credentials=creds, session=db_session)
         assert result["role"] == "metrics_reader"
-        assert result["sub"] == "metrics-task-001"
+        assert result["sub"] == str(task.id)
 
     @pytest.mark.asyncio
-    async def test_vm_scoped_token_takes_metrics_reader_path(self, db_session):
-        """A valid VM-scoped token is accepted by get_metrics_reader."""
+    async def test_vm_scoped_token_is_rejected_by_metrics_reader(self, db_session):
+        """A VM-scoped token has no persisted task authority for metrics."""
         token = create_vm_scoped_token(
             vm_instance_id="pool-vm-metrics-001",
             project_id="proj-vm-metrics",
         )
         creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
-        result = await get_metrics_reader(credentials=creds, session=db_session)
-        assert result["role"] == "metrics_reader"
-        assert result["vm_instance_id"] == "pool-vm-metrics-001"
+        with pytest.raises(HTTPException) as rejected:
+            await get_metrics_reader(credentials=creds, session=db_session)
+        assert rejected.value.status_code == 403
 
 
 # ---------------------------------------------------------------------------

@@ -5503,7 +5503,7 @@ def _render_strategic_cycle(d: dict) -> None:
 # ── strategic (resident session: start / stop / chat) ─────────────────────────
 
 def cmd_strategic(args: argparse.Namespace) -> None:
-    """Dispatch resident Strategic session subcommands: start / stop / chat / send."""
+    """Dispatch resident Strategic session and cold-successor subcommands."""
     sub = getattr(args, "strategic_cmd", None)
     if sub == "start":
         _strategic_start(args)
@@ -5513,8 +5513,16 @@ def cmd_strategic(args: argparse.Namespace) -> None:
         _strategic_chat(args)
     elif sub == "send":
         _strategic_send(args)
+    elif sub == "cold-successor-start":
+        return _strategic_cold_successor_start(args)
+    elif sub == "cold-successor-status":
+        _strategic_cold_successor_status(args)
     else:
-        print("Usage: blueprint strategic {start|stop|chat|send}", file=sys.stderr)
+        print(
+            "Usage: blueprint strategic "
+            "{start|stop|chat|send|cold-successor-start|cold-successor-status}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
@@ -5727,6 +5735,206 @@ def _strategic_send(args: argparse.Namespace) -> None:
         lambda row: print(f"  Strategic message sent: {row.get('id', '?')}"),
     )
     _report_arming(result, lane="strategic")
+
+
+def _is_canonical_cold_uuid(value: object) -> bool:
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value
+    except (TypeError, ValueError):
+        return False
+
+
+def _cold_successor_effect(pid: str, request: dict) -> str:
+    effect = {
+        "project_id": pid,
+        "runner_id": request["runner_id"],
+        "expected_predecessor_session_id": request[
+            "expected_predecessor_session_id"
+        ],
+        "expected_predecessor_task_id": request[
+            "expected_predecessor_task_id"
+        ],
+        "expected_predecessor_worker_generation": request[
+            "expected_predecessor_worker_generation"
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(effect, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _cold_successor_retry_argv(pid: str, request: dict) -> list[str]:
+    argv = [
+        "strategic", "cold-successor-start", "--project-id", pid,
+        "--runner-id", request["runner_id"],
+        "--idempotency-key", request["idempotency_key"],
+        "--expected-predecessor-session-id",
+        request["expected_predecessor_session_id"],
+        "--expected-predecessor-worker-generation",
+        str(request["expected_predecessor_worker_generation"]),
+    ]
+    if request["expected_predecessor_task_id"] is not None:
+        argv.extend([
+            "--expected-predecessor-task-id",
+            request["expected_predecessor_task_id"],
+        ])
+    return argv
+
+
+def _cold_successor_status_matches(
+    status_row: object,
+    *,
+    fingerprint: str,
+    launch_effect_sha256: str,
+) -> bool:
+    return bool(
+        isinstance(status_row, dict)
+        and status_row.get("launch_mode") == "cold_successor"
+        and status_row.get("proof_state") != "absent"
+        and status_row.get("idempotency_fingerprint") == fingerprint
+        and status_row.get("launch_effect_sha256") == launch_effect_sha256
+        and _is_canonical_cold_uuid(status_row.get("task_id"))
+        and isinstance(status_row.get("session_id"), str)
+        and bool(status_row["session_id"])
+    )
+
+
+def _emit_cold_successor_failure(
+    args: argparse.Namespace,
+    message: str,
+    retry_argv: list[str],
+) -> int:
+    payload = {
+        "status": "not_launched_or_ambiguous",
+        "message": message,
+        "retry_argv": retry_argv,
+    }
+    if _json_mode(args):
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"ERROR: {message}", file=sys.stderr)
+        print(
+            f"Exact reconciliation command: blueprint {shlex.join(retry_argv)}",
+            file=sys.stderr,
+        )
+    return 1
+
+
+def _strategic_cold_successor_start(args: argparse.Namespace) -> int:
+    """Launch once and reconcile the exact cold-successor authority receipt."""
+    _require_write_config("strategic cold-successor-start")
+    pid = get_project_id(getattr(args, "project_id", None))
+    key = str(args.idempotency_key)
+    predecessor_session = str(args.expected_predecessor_session_id)
+    predecessor_task = getattr(args, "expected_predecessor_task_id", None)
+    if (
+        not _is_canonical_cold_uuid(args.runner_id)
+        or (
+            predecessor_task is not None
+            and not _is_canonical_cold_uuid(predecessor_task)
+        )
+        or not key
+        or key != key.strip()
+        or len(key) > 255
+        or not predecessor_session
+        or predecessor_session != predecessor_session.strip()
+        or len(predecessor_session) > 255
+    ):
+        print("ERROR: cold-successor exact authority values are invalid.", file=sys.stderr)
+        return 1
+    request = {
+        "runner_id": args.runner_id,
+        "idempotency_key": key,
+        "expected_predecessor_session_id": predecessor_session,
+        "expected_predecessor_task_id": predecessor_task,
+        "expected_predecessor_worker_generation": (
+            args.expected_predecessor_worker_generation
+        ),
+    }
+    fingerprint = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    effect_sha = _cold_successor_effect(pid, request)
+    status_path = (
+        f"/api/admin/projects/{pid}/strategic-session/cold-successor"
+        "?missing_ok=true"
+    )
+    retry_argv = _cold_successor_retry_argv(pid, request)
+    current = api("GET", status_path)
+    if _cold_successor_status_matches(
+        current,
+        fingerprint=fingerprint,
+        launch_effect_sha256=effect_sha,
+    ):
+        _emit(args, current, _render_cold_successor_status)
+        return 0
+    if isinstance(current, dict) and current.get("proof_state") != "absent":
+        return _emit_cold_successor_failure(
+            args,
+            "a different or inconsistent cold-successor proof is already canonical",
+            retry_argv,
+        )
+    prompt = (
+        "Launch the transcript-free cold successor with exact authority?\n"
+        f"- project: {pid}\n"
+        f"- runner: {request['runner_id']}\n"
+        f"- predecessor session: {predecessor_session}\n"
+        f"- predecessor task: {predecessor_task or '-'}\n"
+        f"- predecessor generation: {request['expected_predecessor_worker_generation']}\n"
+        f"- stable idempotency key: {key}"
+    )
+    if not _confirm(prompt, getattr(args, "yes", False)):
+        print("Aborted.")
+        return 0
+    raw_body = json.dumps(request, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    post_error: Exception | None = None
+    try:
+        api(
+            "POST",
+            f"/api/admin/projects/{pid}/strategic-session/cold-successor/start",
+            raw_body=raw_body,
+        )
+    except Exception as exc:  # noqa: BLE001 - dispatch may be ambiguous
+        post_error = exc
+    try:
+        reconciled = api("GET", status_path)
+    except APIError as exc:
+        detail = f"cold-successor readback failed: {exc}"
+        if post_error is not None:
+            detail = f"launch request and {detail}"
+        return _emit_cold_successor_failure(args, detail, retry_argv)
+    if _cold_successor_status_matches(
+        reconciled,
+        fingerprint=fingerprint,
+        launch_effect_sha256=effect_sha,
+    ):
+        _emit(args, reconciled, _render_cold_successor_status)
+        return 0
+    return _emit_cold_successor_failure(
+        args,
+        "exact cold-successor receipt was not observed; reconcile before retry",
+        retry_argv,
+    )
+
+
+def _render_cold_successor_status(row: dict) -> None:
+    print("=== COLD SUCCESSOR PROOF ===")
+    print(f"  proof_state: {row.get('proof_state', '?')}")
+    print(f"  session_id:  {row.get('session_id', '-')}")
+    print(f"  task_id:     {row.get('task_id', '-')}")
+    print(f"  generation:  {row.get('worker_generation', '-')}")
+    print(f"  runner:      {row.get('runner_id', '-')}")
+    print(f"  task_status: {row.get('task_status', '-')}")
+    print(f"  core_sha256: {row.get('core_sha256', '-')}")
+
+
+def _strategic_cold_successor_status(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    row = api(
+        "GET",
+        f"/api/admin/projects/{pid}/strategic-session/cold-successor",
+    )
+    _emit(args, row, _render_cold_successor_status)
 
 
 # ── trim-playbook-archive ─────────────────────────────────────────────────────
@@ -9877,6 +10085,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_strat_send.add_argument(
         "--idempotency-key", default=None,
         help="Optional stable retry key for exactly-once message creation.")
+    p_strat_cold_start = strategic_sub.add_parser(
+        "cold-successor-start", parents=[common],
+        help="Launch and reconcile one exact transcript-free successor proof.")
+    p_strat_cold_start.add_argument("--runner-id", required=True)
+    p_strat_cold_start.add_argument("--idempotency-key", required=True)
+    p_strat_cold_start.add_argument(
+        "--expected-predecessor-session-id", required=True)
+    p_strat_cold_start.add_argument(
+        "--expected-predecessor-task-id", default=None)
+    p_strat_cold_start.add_argument(
+        "--expected-predecessor-worker-generation",
+        required=True,
+        type=int,
+        choices=range(1, 2_147_483_648),
+        metavar="N",
+    )
+    p_strat_cold_start.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt.")
+    strategic_sub.add_parser(
+        "cold-successor-status", parents=[common],
+        help="Read the canonical cold-successor proof receipt.")
 
     # strategic-cycle
     p_sc = sub.add_parser("strategic-cycle", parents=[common],

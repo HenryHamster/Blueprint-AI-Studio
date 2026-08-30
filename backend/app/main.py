@@ -45,12 +45,17 @@ from app.models import (
 )
 from app.compute import provision_agent_vm  # noqa: F401  (re-exported for test patches; see main.py:108 docstring)
 from app.deployed_sha import resolve_deployed_sha
-from app.auth import get_current_user, get_current_user_optional, verify_agent_jwt
+from app.auth import (
+    get_current_user,
+    get_current_user_optional,
+    resolve_task_agent_authority,
+)
 from app.admin_helpers import _get_user_project
 from app.schemas import ArtifactDownloadResponse
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
 from app.routers.admin_project_strategic_session import router as admin_project_strategic_session_router
+from app.routers.strategic_cold_successor import router as strategic_cold_successor_router
 from app.routers.admin_project_consultations import router as admin_project_consultations_router
 from app.routers.admin_settings import router as admin_settings_router
 from app.routers.admin_migration_exemptions import (
@@ -1046,6 +1051,7 @@ app = FastAPI(
 app.include_router(admin_router)
 app.include_router(admin_projects_router)
 app.include_router(admin_project_strategic_session_router)
+app.include_router(strategic_cold_successor_router)
 app.include_router(admin_project_consultations_router)
 app.include_router(admin_settings_router)
 app.include_router(admin_migration_exemptions_router)
@@ -1577,19 +1583,14 @@ async def get_viewport_failure_screenshot_download_url(
     from app.viewport_evidence import viewport_object_name
 
     if x_agent_token is not None:
-        claims = verify_agent_jwt(x_agent_token)
-        task_id = claims.get("sub")
-        token_project_id = claims.get("project_id")
-        if not task_id:
-            raise HTTPException(status_code=403, detail="Agent token has no task scope")
-        if str(token_project_id) != str(project_id):
-            raise HTTPException(status_code=403, detail="Project mismatch")
-        result = await session.execute(
-            select(Task).where(Task.id == uuid.UUID(task_id))
+        _claims, task = await resolve_task_agent_authority(
+            x_agent_token,
+            session,
+            method="GET",
+            path="/api/admin/viewport-failures/download-url",
+            expected_project_id=project_id,
+            allow_released_task=True,
         )
-        task = result.scalar_one_or_none()
-        if task is None:
-            raise HTTPException(status_code=403, detail="Task not found")
         object_name = viewport_object_name(project_id, component, width)
         stamped_uri = (task.context or {}).get("viewport_failure_screenshot_uri", "")
         if not stamped_uri or not stamped_uri.endswith(object_name):
@@ -1653,15 +1654,14 @@ async def get_viewport_screenshot_download_url(
     )
 
     if x_agent_token is not None:
-        claims = verify_agent_jwt(x_agent_token)
-        token_task_id = claims.get("sub")
-        token_project_id = claims.get("project_id")
-        if not token_task_id:
-            raise HTTPException(status_code=403, detail="Agent token has no task scope")
-        # Project-scoped check only: review/fix agents need cross-task access to
-        # download screenshots from the source implementer task within the same project.
-        if str(token_project_id) != str(project_id):
-            raise HTTPException(status_code=403, detail="Project mismatch")
+        await resolve_task_agent_authority(
+            x_agent_token,
+            session,
+            method="GET",
+            path="/api/admin/viewport-shots/download-url",
+            expected_project_id=project_id,
+            allow_released_task=True,
+        )
     elif current_user is not None:
         await _get_user_project(project_id, current_user["user_id"], session)
     else:

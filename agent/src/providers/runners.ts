@@ -15,7 +15,9 @@ import {
 } from '../constants.js';
 import {
   WORKSPACE, ClaudeTimeoutError, getAgentToken, log, recordLlmCallStart,
-  recordLlmTokens, recordProviderReportedUsage, recordNumTurns, recordToolResultBytes, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
+  normalizeClaudeConfigContent, recordLlmTokens, recordProviderReportedUsage,
+  recordNumTurns, recordToolResultBytes, recordToolUse, sanitize, sendLog,
+  strVal, estimateTokensFromChars,
 } from '../index.js';
 import {
   AGENT_HELPER_NAMES,
@@ -862,6 +864,11 @@ export function buildIsolatedTextOnlyMemoryCommand(
   // that --allowedTools controls approval, not availability: --tools '' is
   // the actual built-in-tool boundary.
   command.args = isolatedClaudeArgs(command.args);
+  const claudeConfigPath = path.join(options.cwd, '.claude.json');
+  writePrivateFileSync(
+    claudeConfigPath,
+    normalizeClaudeConfigContent(claudeConfigPath, '{}', options.cwd),
+  );
   const mcpConfigPath = path.join(options.cwd, '.memory-empty-mcp.json');
   writePrivateFileSync(mcpConfigPath, '{"mcpServers":{}}\n');
   command.args.push(
@@ -1988,9 +1995,6 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                 const subtype = (obj as { subtype?: unknown }).subtype;
                 providerResultSubtype = typeof subtype === 'string' ? subtype : undefined;
                 const terminalReason = (obj as { terminal_reason?: unknown }).terminal_reason;
-                providerTerminalReason = typeof terminalReason === 'string'
-                  ? terminalReason
-                  : undefined;
                 const directApiStatus = (obj as { api_error_status?: unknown }).api_error_status;
                 const apiError = (obj as { api_error?: unknown }).api_error;
                 const nestedApiStatus = apiError && typeof apiError === 'object'
@@ -2006,6 +2010,13 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                 };
                 providerApiErrorStatus = parseApiStatus(directApiStatus)
                   ?? parseApiStatus(nestedApiStatus);
+                providerTerminalReason = typeof terminalReason === 'string'
+                  ? terminalReason
+                  : providerResultIsError === false
+                    && providerResultSubtype === 'success'
+                    && providerApiErrorStatus === undefined
+                    ? 'completed'
+                    : undefined;
                 lastResultText = (obj as { result?: string }).result ?? '';
                 sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
               }

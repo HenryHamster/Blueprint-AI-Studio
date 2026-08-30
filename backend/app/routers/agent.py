@@ -1107,9 +1107,9 @@ async def claim_task(
 
     # Marker validation is part of admission, before the claim transition.
     # A one-sided proof marker must never fall through to ordinary Resident.
-    cold_successor_capability_slice(task, {})
+    cold_claim_capability = cold_successor_capability_slice(task, {})
     claim_project = await session.get(Project, task.project_id)
-    enforce_cold_successor_task_authority(
+    is_cold_successor = enforce_cold_successor_task_authority(
         claim_project.vision if claim_project is not None else None,
         task,
     )
@@ -1151,6 +1151,53 @@ async def claim_task(
         session.add(task)
         await session.commit()
         await session.refresh(task)
+
+    if is_cold_successor:
+        # Cold-successor proof tasks execute a frozen text-only contract and
+        # have no repository, project-policy, artifact, or generic Resident
+        # authority. Return immediately after the durable claim transition so
+        # none of the ordinary claim enrichment can widen that boundary.
+        # Replays return the same projection from the persisted task payload.
+        cold_context = task.context if isinstance(task.context, dict) else {}
+        cold_response = {
+            "task_id": str(task.id),
+            "payloads": [task.first_payload],
+            "context": {
+                "_cold_successor": True,
+                "strategic_session_id": cold_context["strategic_session_id"],
+                "_resident_worker_generation": cold_context[
+                    "_resident_worker_generation"
+                ],
+            },
+            "project_metadata": {"project_id": str(task.project_id)},
+            "task_capability": cold_claim_capability,
+        }
+        # Record liveness only after the durable claim/JTI/predecessor boundary
+        # has succeeded. Rejected or superseded claims cannot keep a pin alive.
+        _shared_state.record_vm_heartbeat(vm_id)
+        claim_timing.mark("claim_transition")
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS},
+        )
+        claim_timing.mark("execution_contract")
+        _claim_metrics = claim_timing.finish(cold_response)
+        logger.info(
+            "[CLAIM_TIMING] task=%s type=%s vm=%s replay=%s total_ms=%s "
+            "response_bytes_approx=%s size_measurement_ms=%s phase_ms=%s",
+            task.id,
+            str((task.first_payload or {}).get("type") or "unknown"),
+            _truncate_vm_instance_id(vm_id),
+            idempotent_replay,
+            _claim_metrics["total_ms"],
+            _claim_metrics["response_bytes_approx"],
+            _claim_metrics["size_measurement_ms"],
+            json.dumps(
+                _claim_metrics["phase_ms"], sort_keys=True, separators=(",", ":")
+            ),
+        )
+        return cold_response
 
     # Backfill artifact prerequisites from already-completed direct dependencies.
     # A dependent queued after its producer completed never received the push-path

@@ -8421,6 +8421,7 @@ async def test_agent_format_compliance_snapshot_endpoint(
     task = make_task(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
+        vm_instance_id="vm-fc-test-1",
     )
     db_session.add(task)
     await db_session.commit()
@@ -8438,7 +8439,11 @@ async def test_agent_format_compliance_snapshot_endpoint(
     await write_snapshot(db_session, project.id)
     await db_session.commit()
 
-    token = create_agent_token(str(task.id), "vm-fc-test-1")
+    token = create_agent_token(
+        str(task.id),
+        "vm-fc-test-1",
+        project_id=str(project.id),
+    )
     resp = await client.get(
         "/api/agent/efficiency-snapshot/format-compliance",
         headers={"x-agent-token": token},

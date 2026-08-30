@@ -91,6 +91,7 @@ from app.task_lifecycle import (
     PostCommitFinalCommitFailed,
     PostCommitLocked,
 )
+from app.strategic_cold_successor_authority import cold_successor_marker_state
 from app.rollup_management import _check_and_trigger_rollup
 from app.payload_schemas import validate_internal_payload as _validate_internal_payload
 from app.task_completion import _compute_first_attempt_succeeded
@@ -152,6 +153,8 @@ def _agent_status_needs_project_authority(
     return bool(
         task is not None
         and (
+            cold_successor_marker_state(task) != "ordinary"
+            or
             (task.context or {}).get("_resident_session") is True
             or payload.status == TaskStatus.FAILED
             or payload.artifact_type == ArtifactType.DEBUG_RESULT
@@ -1400,6 +1403,13 @@ async def update_agent_status(
             status_code=429,
             detail="Task row locked, retry",
             headers={"Retry-After": "5"},
+        )
+
+    cold_marker_state = cold_successor_marker_state(task)
+    if cold_marker_state != "ordinary":
+        raise HTTPException(
+            status_code=409,
+            detail="Cold successor tasks require the dedicated terminal protocol",
         )
 
     if locked_resident_project is not None:

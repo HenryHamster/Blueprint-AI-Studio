@@ -130,7 +130,11 @@ class TestDigestLatencyEndpoint:
         assert data["tier_counts"]["l3_on_demand"] >= 1
 
     @pytest.mark.asyncio
-    async def test_endpoint_accepts_agent_jwt(self, override_get_session):
+    async def test_endpoint_accepts_agent_jwt(
+        self,
+        override_get_session,
+        db_session,
+    ):
         """GET /api/admin/digest-latency-stats returns 200 with a valid agent JWT.
 
         The endpoint lives on metrics_router (registered directly in main.py without
@@ -139,15 +143,27 @@ class TestDigestLatencyEndpoint:
         """
         from app.auth import create_agent_token
         from app.main import app
+        from app.models import Project, Task
         from httpx import ASGITransport, AsyncClient
 
         record_digest_request(0.5, "l2_shared_cache")
 
+        project = Project(name="Digest metrics", user_id="metrics-owner")
+        db_session.add(project)
+        await db_session.flush()
+        task = Task(
+            project_id=project.id,
+            vm_instance_id="metrics-probe-vm-001",
+            payloads=[{"type": "research"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+
         token = create_agent_token(
-            task_id="metrics-probe-task-001",
+            task_id=str(task.id),
             vm_instance_id="metrics-probe-vm-001",
             task_type="research",
-            project_id="00000000-0000-0000-0000-000000000001",
+            project_id=str(project.id),
         )
         # No get_current_user override — the real dependency stack must pass.
         async with AsyncClient(

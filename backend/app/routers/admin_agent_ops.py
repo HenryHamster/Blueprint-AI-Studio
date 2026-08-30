@@ -1475,6 +1475,9 @@ async def strategic_operation(
 
     # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)
     project = await _lock_project_or_429(session, task.project_id)
+    from app.strategic_cold_successor_authority import reject_active_cold_successor
+
+    reject_active_cold_successor(project.vision)
 
     # Message mutations follow Project -> sequence -> Task. The Project lock is
     # the strongest lock this operation needs, so no later lock upgrade can

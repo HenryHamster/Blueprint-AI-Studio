@@ -10562,14 +10562,19 @@ async def test_agent_ws_receive_loop_rejects_terminated_task(mocker, caplog):
 
     task_id = uuid.uuid4()
     project_id = uuid.uuid4()
+    vm_id = "agent-vm-receive-deny"
 
-    token = create_agent_token(str(task_id), str(project_id))
+    token = create_agent_token(
+        str(task_id),
+        vm_id,
+        project_id=str(project_id),
+    )
 
     # Mock task returned by initial DB auth lookup
     mock_task = MagicMock()
     mock_task.id = task_id
     mock_task.project_id = project_id
-    mock_task.vm_instance_id = None
+    mock_task.vm_instance_id = vm_id
     mock_task.status = TaskStatus.IN_PROGRESS
 
     mock_execute_result = MagicMock()
@@ -10612,7 +10617,7 @@ async def test_agent_ws_receive_loop_rejects_terminated_task(mocker, caplog):
         reason="ws_deny_list_hit",
         path=f"/api/agent/ws/{task_id}",
         task_id=str(task_id),
-        token_vm_instance_id=str(project_id),
+        token_vm_instance_id=vm_id,
     )
 
     # Clean up deny-list entry
@@ -11178,13 +11183,18 @@ async def test_agent_ws_closes_on_termination_without_messages(mocker):
 
     task_id = uuid.uuid4()
     project_id = uuid.uuid4()
+    vm_id = "agent-vm-silent-deny"
 
-    token = create_agent_token(str(task_id), str(project_id))
+    token = create_agent_token(
+        str(task_id),
+        vm_id,
+        project_id=str(project_id),
+    )
 
     mock_task = MagicMock()
     mock_task.id = task_id
     mock_task.project_id = project_id
-    mock_task.vm_instance_id = None
+    mock_task.vm_instance_id = vm_id
     mock_task.status = TaskStatus.IN_PROGRESS
 
     mock_execute_result = MagicMock()
@@ -11257,24 +11267,29 @@ async def test_agent_ws_closes_on_db_fallback_when_denylist_misses(
 
     task_id = uuid.uuid4()
     project_id = uuid.uuid4()
+    vm_id = "agent-vm-db-fallback"
 
     # Ensure deny-list does NOT contain the task — this is the cache-miss case
     agent_module._terminated_task_ids.pop(str(task_id), None)
 
-    token = create_agent_token(str(task_id), str(project_id))
+    token = create_agent_token(
+        str(task_id),
+        vm_id,
+        project_id=str(project_id),
+    )
 
     # Initial auth-time task: IN_PROGRESS so the handshake succeeds
     initial_task = MagicMock()
     initial_task.id = task_id
     initial_task.project_id = project_id
-    initial_task.vm_instance_id = None
+    initial_task.vm_instance_id = vm_id
     initial_task.status = TaskStatus.IN_PROGRESS
 
     # DB-fallback task: now terminal (COMPLETED) — must trigger a close
     terminal_task = MagicMock()
     terminal_task.id = task_id
     terminal_task.project_id = project_id
-    terminal_task.vm_instance_id = None
+    terminal_task.vm_instance_id = vm_id
     terminal_task.status = terminal_status
 
     auth_execute_result = MagicMock()

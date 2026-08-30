@@ -56,6 +56,9 @@ from app.field_encryption import decrypt_field
 from app.github import generate_installation_access_token
 from app.models import Project, Task, UserIntegration, _utcnow
 from app.secrets_manager import get_user_secret
+from app.strategic_cold_successor_authority import (
+    reject_cold_successor_repository_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +319,7 @@ async def get_github_token_for_task(
         task = (await session.execute(stmt)).scalars().first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    reject_cold_successor_repository_authority(task)
 
     project_id_str = str(task.project_id)
 

@@ -100,7 +100,11 @@ import {
   provisionAmbientHelpers,
   syncAgentHelpersToPath,
 } from './runners.js';
-import { recordLlmTokens, recordToolResultBytes } from '../index.js';
+import {
+  normalizeClaudeConfigContent,
+  recordLlmTokens,
+  recordToolResultBytes,
+} from '../index.js';
 import { CLAUDE_RESULT_GRACE_MS, MAX_OUTPUT_BYTES } from '../constants.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
@@ -244,6 +248,16 @@ describe('provider CLI backend-verification runtime', () => {
 
 describe('isolated receipt-only runner contract', () => {
   it('uses a fresh cwd/env and proves no built-in or MCP tool surface', () => {
+    const normalizedConfig = JSON.stringify({
+      hasCompletedOnboarding: true,
+      projects: {
+        '/isolated': {
+          hasTrustDialogAccepted: true,
+          allowedTools: [],
+        },
+      },
+    });
+    vi.mocked(normalizeClaudeConfigContent).mockReturnValueOnce(normalizedConfig);
     const runner = {
       provider: 'anthropic' as const,
       authMode: 'api_key' as const,
@@ -308,6 +322,16 @@ describe('isolated receipt-only runner contract', () => {
       ANTHROPIC_API_KEY: 'provider-only', CLAUDE_CODE_EFFORT_LEVEL: 'high',
     });
     expect(command.timeoutMs).toBe(90_000);
+    expect(normalizeClaudeConfigContent).toHaveBeenCalledWith(
+      path.join('/isolated', '.claude.json'),
+      '{}',
+      '/isolated',
+    );
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      path.join('/isolated', '.claude.json'),
+      normalizedConfig,
+      expect.objectContaining({ mode: 0o600 }),
+    );
     expect(fs.writeFileSync).toHaveBeenCalledWith(
       path.join('/isolated', '.memory-empty-mcp.json'),
       '{"mcpServers":{}}\n',
@@ -486,6 +510,11 @@ describe('drainJsonChunks — result event dispatch', () => {
   });
 
   it.each([
+    [
+      'minimal clean success normalizes completed',
+      { is_error: false, subtype: 'success' },
+      { isError: false, subtype: 'success', reason: 'completed', status: undefined },
+    ],
     [
       'true/direct numeric status',
       { is_error: true, subtype: 'error', terminal_reason: 'completed', api_error_status: 201 },
