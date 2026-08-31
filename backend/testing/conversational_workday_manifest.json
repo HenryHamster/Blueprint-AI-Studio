@@ -519,9 +519,10 @@
         "TestProbeLlmClis::test_codex_landlock_probe_rejects_abi_without_ioctl_mediation",
         "TestProbeLlmClis::test_codex_landlock_probe_rejects_unknown_future_abi",
         "TestProbeLlmClis::test_preflight_broker_relays_and_tears_down_one_exact_connection",
+        "TestProbeLlmClis::test_preflight_restricted_child_failure_precedes_broker_teardown_receipt",
         "TestProbeLlmClis::test_agent_plan_probe_reports_sandbox_missing_resident_flag"
       ],
-      "test_count": 194
+      "test_count": 195
     },
     {
       "path": "scripts/test_local_runner.py",
@@ -529,7 +530,7 @@
       "test_ids": [
         "TestLlmCliBackendProbe::test_bwrap_backend_probes_the_exact_agent_plan_when_available"
       ],
-      "test_count": 717
+      "test_count": 718
     },
     {
       "path": "agent/src/index.provider-runner.test.ts",

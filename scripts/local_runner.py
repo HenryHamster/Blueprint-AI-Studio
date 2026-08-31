@@ -4785,6 +4785,7 @@ _IMAGE_LLM_CLI_PROBE_CACHE: dict[
     tuple[str, str], tuple[float, dict[str, dict]]
 ] = {}
 _IMAGE_LLM_CLI_PROBE_TTL_SECONDS = 300.0
+_RESIDENT_CAPABILITY_WORKSPACE_SENTINEL = ".blueprint-resident-preflight-sentinel"
 _TRANSIENT_CLI_PROBE_REASONS = frozenset(
     {
         "version_probe_timeout",
@@ -4896,6 +4897,17 @@ def _probe_llm_clis_for_agent_backend(
             with tempfile.TemporaryDirectory(
                 prefix="blueprint-cli-boundary-", dir=probe_parent
             ) as workspace:
+                # The Resident profile preflight proves that the task repository
+                # is mechanically unreadable.  Seed the synthetic capability
+                # workspace with one ordinary file so that proof exercises a
+                # real deny-read/deny-write target instead of failing before the
+                # Landlock boundary on an empty directory.
+                sentinel = os.path.join(
+                    workspace, _RESIDENT_CAPABILITY_WORKSPACE_SENTINEL
+                )
+                with open(sentinel, "w", encoding="utf-8") as handle:
+                    handle.write("resident capability repository sentinel\n")
+                os.chmod(sentinel, 0o600)
                 plan = iso.plan_agent_execution(
                     caps=caps,
                     agent_binary=agent_binary,
@@ -9288,6 +9300,7 @@ def _preflight(
     agent_image: str | None = None,
     project_verification: dict | None = None,
     resource_ledger: "_ResourceLedger | None" = None,
+    llm_clis: dict[str, dict] | None = None,
 ) -> dict:
     """Print the aligned preflight block; return a dict of the decisions.
 
@@ -9386,6 +9399,8 @@ def _preflight(
     }
     if project_verification is not None:
         heartbeat_body["project_verification"] = project_verification
+    if llm_clis is not None:
+        heartbeat_body["llm_clis"] = llm_clis
     probe = _probe_orchestrator(orchestrator_url, token, heartbeat_body)
     orchestrator_ok = probe["orchestrator_ok"]
     token_valid = probe["token_valid"]
@@ -9493,6 +9508,24 @@ def _preflight(
             else f"INCAPABLE — {project_verification.get('reason') or 'probe failed'}"
         )
         _fmt("verification", verification_state)
+
+    resident_profile_ok = True
+    if llm_clis is not None:
+        codex = llm_clis.get("codex") or {}
+        if codex.get("present") is True and codex.get("healthy") is True:
+            resident_profile_ok = bool(
+                codex.get("resident_ready") is True
+                and codex.get("resident_profile_ready") is True
+            )
+            if resident_profile_ok:
+                _fmt("codex resident", "READY (exact bwrap profile passed)")
+            else:
+                reason = (
+                    codex.get("capability_probe_detail")
+                    or codex.get("capability_probe_reason")
+                    or "profile probe failed"
+                )
+                _fmt("codex resident", f"NOT READY — {reason}")
 
     # Provider credential check. Host env credentials are a FALLBACK only: the
     # orchestrator ships per-task pool credentials via the /next-task claim path,
@@ -9606,6 +9639,7 @@ def _preflight(
         (token_valid or token_401)
         and ws_writable
         and (claimable[iso.CLASS_AGENT] or claimable[iso.CLASS_COMPUTE])
+        and resident_profile_ok
     )
     return {
         "orchestrator_ok": orchestrator_ok,
@@ -9619,6 +9653,7 @@ def _preflight(
         "supervised": bool(supervisor_state["supervised"]),
         "supervisor_evidence": supervisor_state["evidence"],
         "setup_ok": setup_ok,
+        "resident_profile_ok": resident_profile_ok,
         "enrolled_max_concurrent": enrolled_max_concurrent,
         # Kept private to startup: a daemon whose first contact loses DNS/default
         # route can repeat the exact non-claiming heartbeat without re-running
@@ -10300,6 +10335,20 @@ def main() -> None:
     )
     verification_state = _VerificationToolchainState(project_verification)
 
+    # `--check` must exercise the same exact bwrap CLI/profile boundary that the
+    # running heartbeat advertises.  This keeps a synthetic-workspace or
+    # Landlock composition defect from remaining invisible until after deploy.
+    preflight_llm_clis = None
+    if check_mode and caps.bwrap_ok and agent_binary is not None:
+        _, preflight_llm_clis = _probe_llm_clis_for_agent_backend(
+            iso.BACKEND_BWRAP,
+            agent_image,
+            caps=caps,
+            agent_binary=agent_binary,
+            workspace_root=_workspace_root(),
+            verification_toolchain=initial_verification_toolchain,
+        )
+
     # LOUD warning (Fix 2): a docker-only box (docker + agent image usable, but NO
     # bwrap) can run ONLY the read-only agent slice (iso.AGENT_DOCKER_TYPES). The
     # runner CANNOT self-restrict its task_types — that is operator-configured
@@ -10348,7 +10397,7 @@ def main() -> None:
     result = _preflight(
         orchestrator_url, token, agent_binary, caps, gpu_state,
         max_concurrent, max_concurrent_compute, agent_image,
-        project_verification, resource_ledger,
+        project_verification, resource_ledger, preflight_llm_clis,
     )
     claimable = result["claimable"]
     gpu_capabilities = result["gpu_caps"]
