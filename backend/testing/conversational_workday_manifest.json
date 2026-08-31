@@ -512,7 +512,7 @@
         "startResidentCodexSession > retains tracking and scratch after an undeliverable kill until late close",
         "startResidentCodexSession > settles child idle even when asynchronous scratch cleanup needs a retry"
       ],
-      "test_count": 31
+      "test_count": 32
     },
     {
       "path": "scripts/test_resident_landlock_preflight.py",
