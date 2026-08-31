@@ -29,6 +29,7 @@ is pending an operator install of bubblewrap.
 
 from __future__ import annotations
 
+import json
 import os
 import posixpath
 import re
@@ -729,6 +730,7 @@ def detect_gpus() -> tuple[tuple[int, ...], tuple[str, ...]]:
 _LLM_CLI_NAMES: tuple[str, ...] = ("claude", "codex", "gemini")
 MIN_CODEX_CLI_VERSION: tuple[int, int, int] = (0, 150, 1)
 CODEX_RESIDENT_PROFILE_HOME = "/tmp/blueprint-resident-codex-home"
+CODEX_RESIDENT_PREFLIGHT_CONTAINER = "/opt/agent/src/_agent_scripts/resident_landlock_preflight.py"
 CLAUDE_RESIDENT_REQUIRED_FLAGS: frozenset[str] = frozenset(
     {
         "--input-format",
@@ -816,7 +818,11 @@ def _with_codex_resident_capabilities(
             }
         )
         return enriched
-    if profile_completed is None or profile_completed.returncode != 0:
+    if (
+        profile_completed is None
+        or profile_completed.returncode != 0
+        or failure_reason is not None
+    ):
         enriched.update(
             {
                 "resident_ready": False,
@@ -883,79 +889,38 @@ def _codex_resident_help_args() -> tuple[list[str], list[str]]:
     return ["exec", "--help"], ["exec", "resume", "--help"]
 
 
-def _codex_resident_profile_args() -> list[str]:
-    """Strict, quota-free parse probe for the Resident runtime contract."""
-    return [
-        "app-server",
-        "--strict-config",
-        "--listen",
-        "stdio://",
-        "-c",
-        'permissions.resident-read-only.extends=":read-only"',
-        "-c",
-        f'permissions.resident-read-only.filesystem={{"/tmp/blueprint-resident-profile-probe"="write","{CODEX_RESIDENT_PROFILE_HOME}"="deny"}}',
-        "-c",
-        "permissions.resident-read-only.network.enabled=true",
-        "-c",
-        'permissions.resident-read-only.network.mode="limited"',
-        "-c",
-        'permissions.resident-read-only.network.domains={"blueprint-api"="allow"}',
-        "-c",
-        "features.network_proxy=true",
-        "-c",
-        'default_permissions="resident-read-only"',
-        "-c",
-        'approval_policy="never"',
-        "-c",
-        'web_search="disabled"',
-        "-c",
-        "tools.web_search=false",
-        "-c",
-        'shell_environment_policy.inherit="none"',
-        "-c",
-        "shell_environment_policy.ignore_default_excludes=false",
-        "-c",
-        'shell_environment_policy.set.HOME="/tmp/blueprint-resident-profile-probe"',
-        "-c",
-        "mcp_servers={}",
-        "-c",
-        'mcp_servers.workday.command="/bin/false"',
-        "-c",
-        "mcp_servers.workday.args=[]",
-        "-c",
-        'mcp_servers.workday.env.RESIDENT_REPLY_RECEIPT_PATH="/tmp/blueprint-resident-profile-probe/receipt.json"',
-        "-c",
-        "mcp_servers.workday.enabled=false",
-        "-c",
-        "mcp_servers.workday.required=true",
-        "-c",
-        'mcp_servers.workday.enabled_tools=["reply_to_operator"]',
-        "-c",
-        'mcp_servers.workday.default_tools_approval_mode="approve"',
-    ]
-
-
 def _probe_codex_resident_profile(
-    command_prefix: list[str],
+    command: list[str],
     *,
     timeout: float,
     env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess | None, str | None]:
     try:
         completed = subprocess.run(
-            [*command_prefix, *_codex_resident_profile_args()],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
+            command, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, timeout=timeout, env=env,
         )
     except subprocess.TimeoutExpired:
-        return None, "profile_probe_timeout"
+        return None, "resident_landlock_preflight_timeout"
     except (OSError, subprocess.SubprocessError):
-        return None, "profile_probe_error"
+        return None, "resident_landlock_preflight_error"
     if completed.returncode != 0:
-        return completed, "profile_probe_failed"
+        return completed, "resident_landlock_preflight_failed"
+    try:
+        marker = json.loads((completed.stdout or "").strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        return completed, "resident_landlock_marker_invalid"
+    expected = {
+        "filesystem": True, "mcp": True, "codex_config": True,
+        "broker_transport": True, "credential_isolated": True,
+        "three_tool_mcp": True, "codex_proxy_config": True,
+        "broker_teardown": True,
+        "nested_namespace": False,
+    }
+    if marker.get("kind") != "blueprint.resident_landlock_preflight.v1" or any(
+        marker.get(key) != value for key, value in expected.items()
+    ) or not isinstance(marker.get("abi"), int) or not 5 <= marker["abi"] <= 8:
+        return completed, "resident_landlock_marker_invalid"
     return completed, None
 
 
@@ -1148,9 +1113,16 @@ def probe_llm_clis(*, env: dict[str, str] | None = None) -> dict[str, dict]:
                             profile_env = dict(os.environ if env is None else env)
                             profile_env["CODEX_HOME"] = codex_home
                             profile_env["HOME"] = codex_home
+                            preflight = os.path.join(
+                                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "agent", "src", "_agent_scripts", "resident_landlock_preflight.py",
+                            )
                             profile_result, profile_reason = (
                                 _probe_codex_resident_profile(
-                                    [path], timeout=10, env=profile_env
+                                    [sys.executable, "-I", preflight,
+                                     "--runtime-root", codex_home,
+                                     "--codex", path, "--timeout", "12"],
+                                    timeout=15, env=profile_env
                                 )
                             )
                     result[name] = _with_resident_capabilities(
@@ -1299,7 +1271,7 @@ def probe_container_llm_clis(
                                         "run",
                                         "--rm",
                                         "--entrypoint",
-                                        name,
+                                        "python3",
                                         "--env",
                                         f"CODEX_HOME={CODEX_RESIDENT_PROFILE_HOME}",
                                         "--env",
@@ -1307,8 +1279,11 @@ def probe_container_llm_clis(
                                         "--tmpfs",
                                         CODEX_RESIDENT_PROFILE_HOME,
                                         image,
+                                        "-I", CODEX_RESIDENT_PREFLIGHT_CONTAINER,
+                                        "--runtime-root", f"{CODEX_RESIDENT_PROFILE_HOME}/preflight",
+                                        "--codex", name, "--timeout", "12",
                                     ],
-                                    timeout=20,
+                                    timeout=25,
                                 )
                             )
                         result[name] = _with_resident_capabilities(
@@ -2552,20 +2527,35 @@ def probe_agent_plan_llm_clis(plan: ExecutionPlan) -> dict[str, dict]:
                         and resume_help is not None
                         and resume_help.returncode == 0
                     ):
-                        profile_env = dict(plan.env)
+                        profile_env = {
+                            key: value
+                            for key, value in plan.env.items()
+                            if key in {"PATH", "LANG", "LC_ALL", "TERM"}
+                        }
                         profile_env["CODEX_HOME"] = CODEX_RESIDENT_PROFILE_HOME
                         profile_env["HOME"] = CODEX_RESIDENT_PROFILE_HOME
-                        profile_prefix = [
+                        profile_env["TMPDIR"] = CODEX_RESIDENT_PROFILE_HOME
+                        agent_entry = plan.argv[-1]
+                        agent_root = os.path.dirname(os.path.dirname(agent_entry))
+                        preflight = os.path.join(
+                            agent_root, "src", "_agent_scripts",
+                            "resident_landlock_preflight.py",
+                        )
+                        profile_command = [
                             *prefix[:-1],
                             "--dir",
                             CODEX_RESIDENT_PROFILE_HOME,
                             "--",
-                            executable,
+                            "/usr/bin/python3", "-I", preflight,
+                            "--runtime-root", CODEX_RESIDENT_PROFILE_HOME,
+                            "--codex", executable,
+                            "--repository-root", SANDBOX_WORKSPACE,
+                            "--timeout", "12",
                         ]
                         profile_result, profile_reason = (
                             _probe_codex_resident_profile(
-                                profile_prefix,
-                                timeout=10,
+                                profile_command,
+                                timeout=15,
                                 env=profile_env,
                             )
                         )

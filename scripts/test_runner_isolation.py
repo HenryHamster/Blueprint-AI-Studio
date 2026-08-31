@@ -7,11 +7,15 @@ validation of a real bwrap/apptainer launch on the DGX is pending an operator
 install of bubblewrap.
 """
 
+import importlib.util
+import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2146,6 +2150,14 @@ class TestCapabilitiesInventory(unittest.TestCase):
 # ── LLM CLI probe ────────────────────────────────────────────────────────────
 
 class TestProbeLlmClis(unittest.TestCase):
+    LANDLOCK_MARKER = json.dumps({
+        "kind": "blueprint.resident_landlock_preflight.v1", "abi": 8,
+        "filesystem": True, "mcp": True, "codex_config": True,
+        "broker_transport": True, "credential_isolated": True,
+        "three_tool_mcp": True, "codex_proxy_config": True,
+        "broker_teardown": True,
+        "nested_namespace": False,
+    })
     """probe_llm_clis: checks shutil.which + subprocess.run for each LLM CLI."""
 
     @staticmethod
@@ -2161,7 +2173,9 @@ class TestProbeLlmClis(unittest.TestCase):
                     args=args,
                     returncode=0,
                     stdout=(
-                        "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
+                        self.LANDLOCK_MARKER
+                        if any(str(arg).endswith("resident_landlock_preflight.py") for arg in args)
+                        else "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
                         if args[-1] == "--help" and args[0].endswith("codex")
                         else "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
                         if args[-1] == "--help"
@@ -2187,31 +2201,114 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertIn("0.2.0", result["gemini"]["version"])
 
     def test_codex_profile_probe_is_strict_quota_free_and_permission_bounded(self):
-        args = iso._codex_resident_profile_args()
-        joined = " ".join(args)
-        self.assertEqual(args[:4], ["app-server", "--strict-config", "--listen", "stdio://"])
-        for required in (
-            "permissions.resident-read-only.extends",
-            "permissions.resident-read-only.filesystem",
-            "permissions.resident-read-only.network.domains",
-            "features.network_proxy=true",
-            'approval_policy="never"',
-            'web_search="disabled"',
-            "tools.web_search=false",
-            'shell_environment_policy.inherit="none"',
-            "mcp_servers={}",
-            'mcp_servers.workday.command="/bin/false"',
-            "mcp_servers.workday.args=[]",
-            "mcp_servers.workday.env.RESIDENT_REPLY_RECEIPT_PATH=",
-            "mcp_servers.workday.enabled=false",
-            "mcp_servers.workday.required=true",
-            'mcp_servers.workday.enabled_tools=["reply_to_operator"]',
-            'mcp_servers.workday.default_tools_approval_mode="approve"',
-        ):
-            self.assertIn(required, joined)
-        self.assertNotIn(" exec ", f" {joined} ")
-        self.assertNotIn("--model", args)
-        self.assertFalse(any("API_KEY" in arg or "auth" in arg.lower() for arg in args))
+        source = (
+            Path(__file__).parents[1]
+            / "agent/src/_agent_scripts/resident_landlock_preflight.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("resident_landlock_exec.py", source)
+        self.assertIn("repository truncate", source)
+        self.assertIn("credential truncate", source)
+        self.assertIn("authority state list", source)
+        self.assertIn('open("/dev/null", "r+b"', source)
+        self.assertIn("MCP tool contract was not completed", source)
+        self.assertIn("resident_mcp_socket_client.mjs", source)
+        self.assertIn("mcp_servers.workday.default_tools_approval_mode", source)
+        self.assertIn('"app-server", "--strict-config"', source)
+        self.assertNotIn("use_legacy_landlock", source)
+        self.assertNotIn('"sandbox"', source)
+        self.assertNotIn("--model", source)
+
+    def test_codex_landlock_probe_executes_read_only_write_canary(self):
+        marker = {
+            "kind": "blueprint.resident_landlock_preflight.v1", "abi": 8,
+            "filesystem": True, "mcp": True, "codex_config": True,
+            "broker_transport": True, "credential_isolated": True,
+            "three_tool_mcp": True, "codex_proxy_config": True,
+            "broker_teardown": True,
+            "nested_namespace": False,
+        }
+        completed = subprocess.CompletedProcess(["preflight"], 0, json.dumps(marker), "")
+        with mock.patch.object(iso.subprocess, "run", return_value=completed):
+            result, reason = iso._probe_codex_resident_profile(["preflight"], timeout=10)
+        self.assertIs(result, completed)
+        self.assertIsNone(reason)
+
+    def test_codex_landlock_probe_rejects_exit_zero_with_incomplete_marker(self):
+        marker = {
+            "kind": "blueprint.resident_landlock_preflight.v1", "abi": 8,
+            "filesystem": True, "mcp": True, "codex_config": False,
+            "broker_transport": True, "credential_isolated": True,
+            "three_tool_mcp": True, "codex_proxy_config": False,
+            "broker_teardown": True,
+            "nested_namespace": False,
+        }
+        completed = subprocess.CompletedProcess(["preflight"], 0, json.dumps(marker), "")
+        with mock.patch.object(iso.subprocess, "run", return_value=completed):
+            result, reason = iso._probe_codex_resident_profile(["preflight"], timeout=10)
+        self.assertIs(result, completed)
+        self.assertEqual(reason, "resident_landlock_marker_invalid")
+
+    def test_codex_landlock_probe_rejects_abi_without_ioctl_mediation(self):
+        marker = {
+            "kind": "blueprint.resident_landlock_preflight.v1", "abi": 4,
+            "filesystem": True, "mcp": True, "codex_config": True,
+            "broker_transport": True, "credential_isolated": True,
+            "three_tool_mcp": True, "codex_proxy_config": True,
+            "broker_teardown": True,
+            "nested_namespace": False,
+        }
+        completed = subprocess.CompletedProcess(["preflight"], 0, json.dumps(marker), "")
+        with mock.patch.object(iso.subprocess, "run", return_value=completed):
+            result, reason = iso._probe_codex_resident_profile(["preflight"], timeout=10)
+        self.assertIs(result, completed)
+        self.assertEqual(reason, "resident_landlock_marker_invalid")
+
+    def test_codex_landlock_probe_rejects_unknown_future_abi(self):
+        marker = json.loads(self.LANDLOCK_MARKER)
+        marker["abi"] = 9
+        completed = subprocess.CompletedProcess(["preflight"], 0, json.dumps(marker), "")
+        with mock.patch.object(iso.subprocess, "run", return_value=completed):
+            result, reason = iso._probe_codex_resident_profile(["preflight"], timeout=10)
+        self.assertIs(result, completed)
+        self.assertEqual(reason, "resident_landlock_marker_invalid")
+
+    def test_preflight_broker_relays_and_tears_down_one_exact_connection(self):
+        source = (
+            Path(__file__).parents[1]
+            / "agent/src/_agent_scripts/resident_landlock_preflight.py"
+        )
+        spec = importlib.util.spec_from_file_location("resident_landlock_preflight", source)
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix="blueprint-rmcp-test-") as root:
+            socket_path = Path(root) / "blueprint-resident-mcp-test.sock"
+            ready = threading.Event()
+            stop = threading.Event()
+            errors = []
+            metrics = {"connections": 0, "active": 0}
+            broker = threading.Thread(
+                target=module.serve_broker,
+                args=(
+                    socket_path,
+                    [sys.executable, "-u", "-c", "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+                    {"PATH": os.environ.get("PATH", "")},
+                    ready, stop, errors, metrics,
+                ),
+            )
+            broker.start()
+            self.assertTrue(ready.wait(timeout=2))
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(socket_path))
+                client.sendall(b"broker-proof")
+                client.shutdown(socket.SHUT_WR)
+                self.assertEqual(client.recv(64), b"broker-proof")
+            stop.set()
+            broker.join(timeout=3)
+            self.assertFalse(broker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(metrics, {"connections": 1, "active": 0})
+            self.assertFalse(socket_path.exists())
 
     def test_codex_profile_failure_preserves_ordinary_health_but_blocks_resident(self):
         flags = "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
@@ -2266,11 +2363,11 @@ class TestProbeLlmClis(unittest.TestCase):
         ):
             completed, reason = iso._probe_codex_resident_profile(["codex"], timeout=10)
         self.assertIsNone(completed)
-        self.assertEqual(reason, "profile_probe_timeout")
+        self.assertEqual(reason, "resident_landlock_preflight_timeout")
         with mock.patch.object(iso.subprocess, "run", side_effect=OSError("missing")):
             completed, reason = iso._probe_codex_resident_profile(["codex"], timeout=10)
         self.assertIsNone(completed)
-        self.assertEqual(reason, "profile_probe_error")
+        self.assertEqual(reason, "resident_landlock_preflight_error")
 
     def test_agent_plan_probe_uses_exact_bwrap_boundary(self):
         plan = iso.ExecutionPlan(
@@ -2286,6 +2383,8 @@ class TestProbeLlmClis(unittest.TestCase):
                 output = "/sandbox/bin/codex\n"
             elif args[-2:] == ["-c", "command -v gemini"]:
                 output = "/sandbox/bin/gemini\n"
+            elif any(str(arg).endswith("resident_landlock_preflight.py") for arg in args):
+                output = self.LANDLOCK_MARKER
             elif args[-1] == "--help":
                 output = (
                     "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
@@ -2307,9 +2406,9 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertTrue(result["codex"]["resident_ready"])
         self.assertTrue(result["codex"]["resident_profile_ready"])
         self.assertEqual(run.call_count, 10)
-        profile_calls = [
-            call for call in run.call_args_list if "app-server" in call.args[0]
-        ]
+        profile_calls = [call for call in run.call_args_list
+                         if any(str(arg).endswith("resident_landlock_preflight.py")
+                                for arg in call.args[0])]
         self.assertEqual(len(profile_calls), 1)
         profile_argv = profile_calls[0].args[0]
         profile_separator = profile_argv.index("--")
@@ -2318,7 +2417,7 @@ class TestProbeLlmClis(unittest.TestCase):
             ["--dir", iso.CODEX_RESIDENT_PROFILE_HOME],
         )
         for call in run.call_args_list:
-            if "app-server" in call.args[0]:
+            if call in profile_calls:
                 self.assertEqual(call.args[0][:3], plan.argv[:3])
                 self.assertEqual(call.kwargs["env"]["PATH"], plan.env["PATH"])
                 self.assertEqual(
@@ -2326,8 +2425,16 @@ class TestProbeLlmClis(unittest.TestCase):
                     iso.CODEX_RESIDENT_PROFILE_HOME,
                 )
                 self.assertEqual(
+                    call.kwargs["env"]["TMPDIR"],
+                    iso.CODEX_RESIDENT_PROFILE_HOME,
+                )
+                self.assertNotIn("AGENT_TOKEN_FILE", call.kwargs["env"])
+                self.assertEqual(
                     call.kwargs["env"]["HOME"], iso.CODEX_RESIDENT_PROFILE_HOME
                 )
+                self.assertIn("resident_landlock_preflight.py", " ".join(call.args[0]))
+                self.assertNotIn("use_legacy_landlock", call.args[0])
+                self.assertNotIn("sandbox", call.args[0])
             else:
                 self.assertEqual(call.args[0][:4], plan.argv[:4])
                 self.assertEqual(call.kwargs["env"], plan.env)
@@ -2369,7 +2476,9 @@ class TestProbeLlmClis(unittest.TestCase):
                     args=args,
                     returncode=0,
                     stdout=(
-                        "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
+                        self.LANDLOCK_MARKER
+                        if any(str(arg).endswith("resident_landlock_preflight.py") for arg in args)
+                        else "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
                         if args[-1] == "--help" and args[0].endswith("codex")
                         else "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
                         if args[-1] == "--help"
@@ -2384,7 +2493,7 @@ class TestProbeLlmClis(unittest.TestCase):
             iso.probe_llm_clis(env=safe_env)
         self.assertEqual(run.call_count, 7)
         for call in run.call_args_list:
-            if "app-server" in call.args[0]:
+            if any(str(arg).endswith("resident_landlock_preflight.py") for arg in call.args[0]):
                 self.assertEqual(call.kwargs["env"]["PATH"], safe_env["PATH"])
                 self.assertNotEqual(call.kwargs["env"]["HOME"], safe_env["HOME"])
                 self.assertEqual(
@@ -2503,7 +2612,9 @@ class TestProbeLlmClis(unittest.TestCase):
         def fake_run(args, **kwargs):
             cli = args[args.index("--entrypoint") + 1]
             output = (
-                "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
+                self.LANDLOCK_MARKER
+                if any(str(arg).endswith("resident_landlock_preflight.py") for arg in args)
+                else "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
                 if cli == "codex" and args[-1] == "--help"
                 else "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
                 if args[-1] == "--help"
@@ -2519,7 +2630,8 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertTrue(result["claude"]["resident_ready"])
         self.assertEqual(run.call_count, 7)
         profile_calls = [
-            call.args[0] for call in run.call_args_list if "app-server" in call.args[0]
+            call.args[0] for call in run.call_args_list
+            if any(str(arg).endswith("resident_landlock_preflight.py") for arg in call.args[0])
         ]
         self.assertEqual(len(profile_calls), 1)
         self.assertIn(f"CODEX_HOME={iso.CODEX_RESIDENT_PROFILE_HOME}", profile_calls[0])
@@ -2528,10 +2640,14 @@ class TestProbeLlmClis(unittest.TestCase):
             profile_calls[0][profile_calls[0].index("--tmpfs") + 1],
             iso.CODEX_RESIDENT_PROFILE_HOME,
         )
+        self.assertEqual(
+            profile_calls[0][profile_calls[0].index("--runtime-root") + 1],
+            f"{iso.CODEX_RESIDENT_PROFILE_HOME}/preflight",
+        )
         for call in run.call_args_list:
             self.assertEqual(call.args[0][0:2], ["docker", "run"])
             self.assertIn("agent:test", call.args[0])
-            if "app-server" not in call.args[0]:
+            if not any(str(arg).endswith("resident_landlock_preflight.py") for arg in call.args[0]):
                 self.assertNotIn("--env", call.args[0])
 
     def test_container_probe_broken_codex_is_ineligible_despite_host(self):

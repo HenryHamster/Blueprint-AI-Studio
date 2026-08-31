@@ -228,6 +228,7 @@
     "prompts/context-prefix.ts": 1950,
     "handlers/research-plan-sections.ts": 1800,
     "providers/resident-session.ts": 1550,
+    "providers/resident-codex-session.ts": 1600,
     "handlers/verify-tests.ts": 1750
   },
   "frontend": {

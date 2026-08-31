@@ -37,6 +37,32 @@ import path from 'path';
  * readers so they always agree on one location).
  */
 export const AGENT_TOKEN_FILE_ENV = 'AGENT_TOKEN_FILE';
+const agentTokenMirrors = new Set<string>();
+
+/**
+ * Register a private task-local mirror for a restricted Resident helper.
+ * Token refreshes update every mirror atomically; the returned disposer fences
+ * the path before the Resident runtime directory is removed.
+ */
+export function registerAgentTokenMirror(target: string): () => void {
+  if (!path.isAbsolute(target)) throw new Error('agent token mirror path must be absolute');
+  agentTokenMirrors.add(target);
+  return () => { agentTokenMirrors.delete(target); };
+}
+
+function writeTokenAtomically(target: string, token: string): boolean {
+  const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(tmp, token, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
+    fs.renameSync(tmp, target);
+    try { fs.chmodSync(target, 0o600); } catch { /* best effort */ }
+    return true;
+  } catch {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort rollback */ }
+    return false;
+  }
+}
 
 /**
  * Resolve the intended absolute path of the live agent-token file. Honors an
@@ -80,22 +106,14 @@ export function ensureAgentTokenFileEnv(): string {
  */
 export function writeAgentTokenFile(token: string): boolean {
   const configured = process.env[AGENT_TOKEN_FILE_ENV];
-  if (!configured || !configured.trim() || !token) return false;
-  const target = configured.trim();
-  try {
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-    // temp + atomic rename so a helper reading concurrently never observes a
-    // truncated/half-written token.
-    const tmp = `${target}.tmp`;
-    fs.writeFileSync(tmp, token, { encoding: 'utf-8', mode: 0o600 });
-    fs.renameSync(tmp, target);
-    // Re-assert perms in case a pre-existing file had looser bits (no-op on
-    // platforms that don't model POSIX modes, e.g. Windows dev).
-    try { fs.chmodSync(target, 0o600); } catch { /* best effort */ }
-    return true;
-  } catch {
-    return false;
-  }
+  if (!token) return false;
+  const targets = [
+    ...(configured?.trim() ? [configured.trim()] : []),
+    ...agentTokenMirrors,
+  ];
+  if (targets.length === 0) return false;
+  const results = [...new Set(targets)].map((target) => writeTokenAtomically(target, token));
+  return results.every(Boolean);
 }
 
 /**

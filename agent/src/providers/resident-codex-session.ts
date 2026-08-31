@@ -1,18 +1,22 @@
 import { spawn } from 'child_process';
 import fs from 'fs';
-import os from 'os';
+import net from 'net';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import {
-  WORKSPACE, recordLlmCallStart, recordLlmTokens,
+  recordLlmCallStart, recordLlmTokens,
   recordNumTurns, recordProviderReportedUsage, sanitize,
 } from '../index.js';
 import {
   DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS,
   PROCESS_KILL_GRACE_MS,
 } from '../constants.js';
-import { isStrategicMutation } from './resident-stream.js';
-import { RESIDENT_REPLY_TOOL_NAME } from './resident-reply-tool.js';
+import {
+  RESIDENT_PROJECT_READ_TOOL_NAME,
+  RESIDENT_REPLY_TOOL_NAME,
+  RESIDENT_STRATEGIC_TOOL_NAME,
+} from './resident-reply-tool.js';
 import { matchesAuthFailure, matchesRateLimit } from './runners.js';
 import type { ProviderRunner, RunnerCommand } from './runners.js';
 import type {
@@ -24,8 +28,18 @@ const DEFAULT_TURN_STALL_MS = 120_000;
 const DEFAULT_IDLE_CEILING_MS = 30 * 60_000;
 const INTERRUPT_GRACE_MS = 4_000;
 const FORCE_SETTLE_MS = 20_000;
+const MCP_BROKER_DRAIN_MS = 1_000;
 const OPERATOR_REPLY_TYPES = new Set(['NOTE', 'QUESTION', 'FEEDBACK', 'BUG_REPORT', 'BLOCKER']);
 const REPLY_ACCEPTED_TEXT = 'Workday reply accepted for delivery.';
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+const RESIDENT_LANDLOCK_EXEC = path.resolve(
+  moduleDir,
+  '../_agent_scripts/resident_landlock_exec.py',
+);
+const RESIDENT_MCP_SOCKET_CLIENT = path.resolve(
+  moduleDir,
+  '../_agent_scripts/resident_mcp_socket_client.mjs',
+);
 const REQUIRED_READ_ONLY_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit']);
 const SAFE_MCP_ENV_KEYS = new Set([
   'RESIDENT_REPLY_RECEIPT_PATH',
@@ -33,30 +47,42 @@ const SAFE_MCP_ENV_KEYS = new Set([
   'CALL_RESIDENT_ROLE',
   'CALL_LOCAL_STAGE_DIR',
   'CALL_TURN_RECEIPT_PATH',
+  'RESIDENT_STRATEGIC_HELPER_PATH',
+  'RESIDENT_STRATEGIC_OPS_PATH',
+  'RESIDENT_PROJECT_READ_HELPER_PATH',
+  'RESIDENT_PROJECT_READS_PATH',
+  'RESIDENT_STRATEGIC_PATH',
+  'RESIDENT_STRATEGIC_LANG',
+  'RESIDENT_STRATEGIC_TERM',
+  'ORCHESTRATOR_URL',
+  'AGENT_TOKEN_FILE',
+  'BLUEPRINT_RESIDENT_INCARNATION_ID',
+  'BLUEPRINT_RESIDENT_REPLY_KEY_PATH',
+  'BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH',
+  'BLUEPRINT_RESIDENT_STAGED_REPLY_PATH',
+  'BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH',
 ]);
 const CODEX_PROCESS_ENV_KEYS = new Set([
-  'HOME', 'PATH', 'LANG', 'TERM',
-  'ORCHESTRATOR_URL', 'TASK_ID', 'AGENT_TOKEN_FILE',
-  'BLUEPRINT_RESIDENT_INCARNATION_ID',
-  'BLUEPRINT_RESIDENT_REPLY_KEY_PATH',
-  'BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH',
-  'BLUEPRINT_RESIDENT_STAGED_REPLY_PATH',
-  'BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH',
-]);
-const RESIDENT_SHELL_ENV_KEYS = new Set([
-  'PATH', 'LANG', 'TERM', 'ORCHESTRATOR_URL', 'TASK_ID', 'AGENT_TOKEN_FILE',
-  'BLUEPRINT_RESIDENT_INCARNATION_ID',
-  'BLUEPRINT_RESIDENT_REPLY_KEY_PATH',
-  'BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH',
-  'BLUEPRINT_RESIDENT_STAGED_REPLY_PATH',
-  'BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH',
+  'PATH', 'LANG', 'LC_ALL', 'TERM', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
 ]);
 const CODEX_RESIDENT_BOUNDARY = [
-  'Codex Resident commands run inside an enforced read-only, no-approval sandbox.',
-  'Do not attempt filesystem writes or approval escalation.',
-  'For required temporary files, write only below $TMPDIR; never write to /tmp directly.',
-  'Repository synchronization is coordinator-owned; do not run git fetch or change refs.',
+  'Codex Resident runs without native shell, repository, Git, or local file tools.',
+  'Do not invoke ./strategic, ./fetch, ./design-doc, ./messages, apply_patch, or any command path.',
+  `Use ${RESIDENT_STRATEGIC_TOOL_NAME} for strategic mutations and pass exact JSON values directly.`,
+  `Use ${RESIDENT_PROJECT_READ_TOOL_NAME} for bounded canonical precondition checks and readback.`,
+  `Use ${RESIDENT_REPLY_TOOL_NAME} only for the complete operator-facing reply.`,
+  'Reuse a stable idempotency_key only for a byte-identical strategic retry; after ambiguity, reconcile canonically before retrying.',
+  'Native local writes are denied; trusted Workday MCP helpers alone use the private Resident scratch for bounded staging.',
 ].join(' ');
+
+const FORCED_DISABLED_FEATURES = [
+  'shell_tool', 'unified_exec', 'apply_patch_freeform', 'apps', 'browser_use', 'browser_use_external',
+  'browser_use_full_cdp_access', 'computer_use', 'goals', 'hooks',
+  'image_generation', 'in_app_browser', 'multi_agent', 'plugins',
+  'remote_plugin', 'skill_mcp_dependency_install', 'skill_search',
+  'tool_suggest', 'view_image', 'auth_elicitation',
+  'tool_call_mcp_elicitation', 'code_mode', 'code_mode_host',
+] as const;
 
 interface CodexTurn {
   resolve: (result: ResidentTurnResult) => void;
@@ -104,12 +130,60 @@ function tomlString(value: string): string {
   return JSON.stringify(value);
 }
 
-function tomlStringArray(values: readonly string[]): string {
-  return `[${values.map(tomlString).join(',')}]`;
+function resolveExecutable(command: string, env: NodeJS.ProcessEnv): string {
+  const candidates = path.isAbsolute(command)
+    ? [command]
+    : (env.PATH ?? '/usr/local/bin:/usr/bin:/bin')
+      .split(path.delimiter)
+      .filter(Boolean)
+      .map((entry) => path.join(entry, command));
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      const resolved = fs.realpathSync(candidate);
+      if (fs.statSync(resolved).isFile()) return resolved;
+    } catch { /* keep searching the trusted runner PATH */ }
+  }
+  throw new Error('Codex Resident command is not an executable on the trusted runner PATH');
 }
 
-function tomlStringMap(entries: ReadonlyArray<readonly [string, string]>): string {
-  return `{${entries.map(([key, value]) => `${tomlString(key)}=${tomlString(value)}`).join(',')}}`;
+function existingCanonicalPaths(values: readonly string[]): string[] {
+  const result: string[] = [];
+  for (const value of values) {
+    try {
+      const resolved = fs.realpathSync(value);
+      if (!result.includes(resolved)) result.push(resolved);
+    } catch { /* optional system path is absent in this runner image */ }
+  }
+  return result;
+}
+
+function executableRuntimeRoots(executable: string): string[] {
+  const marker = `${path.sep}node_modules${path.sep}`;
+  const markerAt = executable.indexOf(marker);
+  if (markerAt < 0) return [executable];
+  const segments = executable.slice(markerAt + marker.length).split(path.sep);
+  const packageSegments = segments[0]?.startsWith('@') ? segments.slice(0, 2) : segments.slice(0, 1);
+  return [
+    executable,
+    executable.slice(0, markerAt + marker.length) + packageSegments.join(path.sep),
+  ];
+}
+
+function replaceFileAtomically(target: string, contents: Buffer): void {
+  const temporary = `${target}.resident-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  try {
+    fs.writeFileSync(temporary, contents, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporary, target);
+    fs.chmodSync(target, 0o600);
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch { /* best-effort rollback */ }
+    throw error;
+  }
+}
+
+function tomlStringArray(values: readonly string[]): string {
+  return `[${values.map(tomlString).join(',')}]`;
 }
 
 function safeConfigKey(value: string, label: string): string {
@@ -117,8 +191,19 @@ function safeConfigKey(value: string, label: string): string {
   return value;
 }
 
-function codexMcpArgs(opts: ResidentSessionOptions): string[] {
-  if (!opts.replyTool) return ['-c', 'mcp_servers={}'];
+interface ResidentMcpBrokerSpec {
+  name: string;
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  socketPath: string;
+}
+
+function codexMcpArgs(
+  opts: ResidentSessionOptions,
+  socketRoot: string,
+): { args: string[]; brokers: ResidentMcpBrokerSpec[] } {
+  if (!opts.replyTool) return { args: ['-c', 'mcp_servers={}'], brokers: [] };
   let parsed: unknown;
   try {
     parsed = JSON.parse(fs.readFileSync(opts.replyTool.mcpConfigPath, 'utf8'));
@@ -142,6 +227,7 @@ function codexMcpArgs(opts: ResidentSessionOptions): string[] {
     allowedByServer.set(match[1], tools);
   }
   const args = ['-c', 'mcp_servers={}'];
+  const brokers: ResidentMcpBrokerSpec[] = [];
   for (const [serverName, enabledTools] of allowedByServer) {
     const server = (rawServers as Record<string, unknown>)[serverName];
     if (!server || typeof server !== 'object' || Array.isArray(server)) {
@@ -152,14 +238,15 @@ function codexMcpArgs(opts: ResidentSessionOptions): string[] {
       throw new Error(`Resident MCP server ${serverName} has no command`);
     }
     const serverKey = safeConfigKey(serverName, 'server name');
-    args.push('-c', `mcp_servers.${serverKey}.command=${tomlString(config.command)}`);
+    const upstreamArgs: string[] = [];
     const serverArgs = config.args;
     if (serverArgs !== undefined) {
       if (!Array.isArray(serverArgs) || serverArgs.some((item) => typeof item !== 'string')) {
         throw new Error(`Resident MCP server ${serverName} args must be strings`);
       }
-      args.push('-c', `mcp_servers.${serverKey}.args=${tomlStringArray(serverArgs as string[])}`);
+      upstreamArgs.push(...serverArgs as string[]);
     }
+    const upstreamEnv: NodeJS.ProcessEnv = {};
     const serverEnv = config.env;
     if (serverEnv !== undefined) {
       if (!serverEnv || typeof serverEnv !== 'object' || Array.isArray(serverEnv)) {
@@ -170,12 +257,24 @@ function codexMcpArgs(opts: ResidentSessionOptions): string[] {
         if (!SAFE_MCP_ENV_KEYS.has(envName)) {
           throw new Error(`Resident MCP server ${serverName} env key ${envName} is not allowed`);
         }
-        args.push(
-          '-c',
-          `mcp_servers.${serverKey}.env.${safeConfigKey(envName, 'environment key')}=${tomlString(envValue)}`,
-        );
+        upstreamEnv[safeConfigKey(envName, 'environment key')] = envValue;
       }
     }
+    const socketPath = path.join(
+      socketRoot,
+      `blueprint-resident-mcp-${process.pid}-${Math.random().toString(16).slice(2)}-${serverKey}.sock`,
+    );
+    brokers.push({
+      name: serverKey,
+      command: config.command,
+      args: upstreamArgs,
+      env: upstreamEnv,
+      socketPath,
+    });
+    args.push(
+      '-c', `mcp_servers.${serverKey}.command=${tomlString(process.execPath)}`,
+      '-c', `mcp_servers.${serverKey}.args=${tomlStringArray([RESIDENT_MCP_SOCKET_CLIENT, socketPath])}`,
+    );
     args.push(
       '-c', `mcp_servers.${serverKey}.enabled=true`,
       '-c', `mcp_servers.${serverKey}.required=true`,
@@ -183,15 +282,15 @@ function codexMcpArgs(opts: ResidentSessionOptions): string[] {
       '-c', `mcp_servers.${serverKey}.default_tools_approval_mode=${tomlString('approve')}`,
     );
   }
-  return args;
+  return { args, brokers };
 }
 
 function normalizeCommonArgs(
   base: RunnerCommand,
   opts: ResidentSessionOptions,
   scratchDir: string,
-  childEnv: NodeJS.ProcessEnv,
-): string[] {
+  socketRoot: string,
+): { args: string[]; brokers: ResidentMcpBrokerSpec[] } {
   if (base.args[0] !== 'exec') throw new Error('Codex Resident runner must start with codex exec');
   const valueFlags = new Set(['-c', '--config', '-m', '--model', '--enable', '--disable', '--thread-source']);
   const flagOnly = new Set([
@@ -211,6 +310,24 @@ function normalizeCommonArgs(
     if (valueFlags.has(arg)) {
       const value = base.args.at(index + 1);
       if (value === undefined || value.startsWith('-')) throw new Error(`Codex Resident flag ${arg} is missing a value`);
+      if (arg === '--enable' || arg === '--disable') {
+        if (value === 'use_legacy_landlock' || FORCED_DISABLED_FEATURES.some((feature) => feature === value)) {
+          index += 1;
+          continue;
+        }
+      }
+      if (arg === '-c' || arg === '--config') {
+        const key = value.split('=', 1)[0];
+        if (
+          key === 'sandbox_mode' || key === 'approval_policy'
+          || key === 'default_permissions' || key.startsWith('permissions.')
+          || key.startsWith('sandbox_workspace_write.')
+          || key === 'features.use_legacy_landlock'
+          || FORCED_DISABLED_FEATURES.some((feature) => key === `features.${feature}`)
+        ) {
+          throw new Error(`Codex Resident runner cannot override protected config ${key}`);
+        }
+      }
       common.push(arg, value);
       index += 1;
     } else if (arg === '--dangerously-bypass-approvals-and-sandbox') {
@@ -227,38 +344,15 @@ function normalizeCommonArgs(
   if (!common.includes('--skip-git-repo-check')) common.push('--skip-git-repo-check');
   if (!common.includes('--ignore-user-config')) common.push('--ignore-user-config');
   if (!common.includes('--strict-config')) common.push('--strict-config');
-  common.push(...codexMcpArgs(opts));
-  const orchestratorUrl = base.env.ORCHESTRATOR_URL;
-  let orchestratorHost = '';
-  try {
-    const parsed = new URL(orchestratorUrl);
-    if (
-      !['http:', 'https:'].includes(parsed.protocol)
-      || parsed.username || parsed.password
-      || !parsed.hostname
-      || parsed.hostname.includes('*')
-      || !/^[A-Za-z0-9.:-]+$/.test(parsed.hostname)
-    ) {
-      throw new Error('unsupported control-plane URL');
-    }
-    orchestratorHost = parsed.hostname;
-  } catch {
-    throw new Error('Codex Resident requires an exact HTTP(S) control-plane host');
-  }
+  const mcp = codexMcpArgs(opts, socketRoot);
+  common.push(...mcp.args);
   // Append these last so provider translation cannot broaden the Resident.
-  // The named profile inherits a read-only filesystem and permits command
-  // network traffic only to this task's exact Blueprint control-plane host.
-  const filesystemRules: Array<readonly [string, string]> = [[scratchDir, 'write']];
-  const codexHome = childEnv.CODEX_HOME;
-  if (codexHome) filesystemRules.push([codexHome, 'deny']);
+  // The checked-in direct Landlock launcher is the sole inner filesystem
+  // authority. Codex's native sandbox is explicitly bypassed so it cannot
+  // attempt a nested namespace inside the runner's existing outer bwrap.
   common.push(
-    '-c', 'permissions.resident-read-only.extends=":read-only"',
-    '-c', `permissions.resident-read-only.filesystem=${tomlStringMap(filesystemRules)}`,
-    '-c', 'permissions.resident-read-only.network.enabled=true',
-    '-c', 'permissions.resident-read-only.network.mode="limited"',
-    '-c', `permissions.resident-read-only.network.domains=${tomlStringMap([[orchestratorHost, 'allow']])}`,
-    '-c', 'features.network_proxy=true',
-    '-c', 'default_permissions="resident-read-only"',
+    '--dangerously-bypass-approvals-and-sandbox',
+    ...FORCED_DISABLED_FEATURES.flatMap((feature) => ['--disable', feature]),
     '-c', 'approval_policy="never"',
     '-c', 'web_search="disabled"',
     '-c', 'tools.web_search=false',
@@ -266,21 +360,12 @@ function normalizeCommonArgs(
     '-c', 'shell_environment_policy.ignore_default_excludes=false',
     '-c', `shell_environment_policy.set.HOME=${tomlString(scratchDir)}`,
   );
-  for (const [envName, envValue] of Object.entries(childEnv)) {
-    if (
-      typeof envValue === 'string'
-      && (envName === 'TMPDIR' || RESIDENT_SHELL_ENV_KEYS.has(envName))
-    ) {
-      common.push(
-        '-c', `shell_environment_policy.set.${safeConfigKey(envName, 'shell environment key')}=${tomlString(envValue)}`,
-      );
-    }
-  }
+  common.push('-c', `shell_environment_policy.set.TMPDIR=${tomlString(scratchDir)}`);
   const developerInstructions = [opts.appendSystemPrompt, CODEX_RESIDENT_BOUNDARY]
     .filter((value): value is string => Boolean(value))
     .join('\n\n');
   common.push('-c', `developer_instructions=${tomlString(developerInstructions)}`);
-  return common;
+  return { args: common, brokers: mcp.brokers };
 }
 
 function operatorReply(input: unknown): ResidentOperatorReply | null {
@@ -296,14 +381,15 @@ function operatorReply(input: unknown): ResidentOperatorReply | null {
   return { content, type };
 }
 
-function strategicAcknowledged(output: unknown): boolean {
-  if (typeof output !== 'string') return false;
-  let parsed: unknown;
-  try { parsed = JSON.parse(output.trim()); } catch { return false; }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
-  const receipt = parsed as Record<string, unknown>;
-  if (receipt.applied === false || receipt.status === 'refused' || receipt.http_status === 409) return false;
-  return receipt.applied === true || receipt.status === 'ok';
+function mcpStrategicAcknowledged(result: unknown): boolean {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
+  const raw = result as Record<string, unknown>;
+  const structured = raw.structured_content ?? raw.structuredContent;
+  if (!structured || typeof structured !== 'object' || Array.isArray(structured)) return false;
+  const receipt = structured as Record<string, unknown>;
+  return receipt.outcome === 'applied'
+    && receipt.applied === true
+    && receipt.commit_acknowledged === true;
 }
 
 function mcpReplyAccepted(result: unknown): boolean {
@@ -377,29 +463,121 @@ export function startResidentCodexSession(
   if ([...REQUIRED_READ_ONLY_TOOLS].some((tool) => !disallowed.has(tool))) {
     throw new Error('Codex Resident requires the complete read-only tool boundary');
   }
-  const workspace = opts.workspace ?? WORKSPACE;
+  const isolation = opts.codexIsolation;
+  if (!isolation || isolation.readwritePaths.length !== 1) {
+    throw new Error('Codex Resident requires one exact direct-Landlock scratch root');
+  }
+  if (!fs.existsSync(RESIDENT_LANDLOCK_EXEC) || !fs.existsSync(RESIDENT_MCP_SOCKET_CLIENT)) {
+    throw new Error('Codex Resident direct-Landlock runtime is unavailable');
+  }
+  const allowedMcpTools = new Set(
+    (opts.replyTool?.allowedTools ?? [opts.replyTool?.toolName ?? RESIDENT_REPLY_TOOL_NAME]),
+  );
   const turnTimeoutMs = opts.turnTimeoutMs ?? DEFAULT_TURN_STALL_MS;
   const hardTurnTimeoutMs = opts.hardTurnTimeoutMs
     ?? Math.max(DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS, turnTimeoutMs + FORCE_SETTLE_MS);
   const idleCeilingMs = opts.idleCeilingMs ?? DEFAULT_IDLE_CEILING_MS;
-  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blueprint-resident-codex-'));
+  const isolationRoot = fs.realpathSync(isolation.readwritePaths[0]);
+  const scratchDir = fs.mkdtempSync(path.join(isolationRoot, '.codex-session-'));
   fs.chmodSync(scratchDir, 0o700);
+  let mcpSocketRoot = '';
+  try {
+    mcpSocketRoot = fs.mkdtempSync('/tmp/blueprint-rmcp-');
+    fs.chmodSync(mcpSocketRoot, 0o700);
+  } catch (error) {
+    fs.rmSync(scratchDir, { recursive: true, force: true });
+    throw error;
+  }
+  const rollbackSetup = (): void => {
+    fs.rmSync(scratchDir, { recursive: true, force: true });
+    fs.rmSync(mcpSocketRoot, { recursive: true, force: true });
+  };
   const mergedEnv = { ...runnerBase.env, ...opts.env };
-  const childEnv: NodeJS.ProcessEnv = { TMPDIR: scratchDir };
+  let codexExecutable: string;
+  try {
+    codexExecutable = resolveExecutable(runnerBase.command, mergedEnv);
+  } catch (error) {
+    rollbackSetup();
+    throw error;
+  }
+  const childEnv: NodeJS.ProcessEnv = {
+    HOME: scratchDir,
+    TMPDIR: scratchDir,
+  };
   for (const [envName, envValue] of Object.entries(mergedEnv)) {
     if (CODEX_PROCESS_ENV_KEYS.has(envName)) childEnv[envName] = envValue;
   }
-  if (runner.authMode === 'oauth') {
-    if (mergedEnv.CODEX_HOME) childEnv.CODEX_HOME = mergedEnv.CODEX_HOME;
-  } else {
-    if (mergedEnv.OPENAI_API_KEY) childEnv.OPENAI_API_KEY = mergedEnv.OPENAI_API_KEY;
-    if (mergedEnv.CODEX_API_KEY) childEnv.CODEX_API_KEY = mergedEnv.CODEX_API_KEY;
+  childEnv.PATH ??= '/usr/local/bin:/usr/bin:/bin';
+  let sourceOAuthAuthPath: string | null = null;
+  let scratchOAuthAuthPath: string | null = null;
+  try {
+    if (runner.authMode === 'oauth') {
+      const sourceHome = mergedEnv.CODEX_HOME;
+      if (!sourceHome || !path.isAbsolute(sourceHome)) {
+        throw new Error('OAuth Codex Resident requires an absolute authoritative CODEX_HOME');
+      }
+      if (!isolation.persistOAuthCredential) {
+        throw new Error('OAuth Codex Resident requires fenced credential persistence');
+      }
+      sourceOAuthAuthPath = path.join(sourceHome, 'auth.json');
+      if (!fs.statSync(sourceOAuthAuthPath).isFile()) {
+        throw new Error('OAuth Codex Resident authoritative auth.json is unavailable');
+      }
+      const scratchCodexHome = path.join(scratchDir, 'codex-home');
+      fs.mkdirSync(scratchCodexHome, { mode: 0o700 });
+      scratchOAuthAuthPath = path.join(scratchCodexHome, 'auth.json');
+      fs.copyFileSync(sourceOAuthAuthPath, scratchOAuthAuthPath, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(scratchOAuthAuthPath, 0o600);
+      childEnv.CODEX_HOME = scratchCodexHome;
+    } else {
+      if (mergedEnv.OPENAI_API_KEY) childEnv.OPENAI_API_KEY = mergedEnv.OPENAI_API_KEY;
+      if (mergedEnv.CODEX_API_KEY) childEnv.CODEX_API_KEY = mergedEnv.CODEX_API_KEY;
+    }
+  } catch (error) {
+    rollbackSetup();
+    throw error;
   }
   let commonArgs: string[];
+  let mcpBrokerSpecs: ResidentMcpBrokerSpec[];
   try {
-    commonArgs = normalizeCommonArgs(runnerBase, opts, scratchDir, childEnv);
+    const normalized = normalizeCommonArgs(runnerBase, opts, scratchDir, mcpSocketRoot);
+    commonArgs = normalized.args;
+    mcpBrokerSpecs = normalized.brokers;
   } catch (error) {
-    fs.rmSync(scratchDir, { recursive: true, force: true });
+    rollbackSetup();
+    throw error;
+  }
+  const readonlyPaths = existingCanonicalPaths([
+    '/usr', '/usr/local', '/bin', '/sbin', '/lib', '/lib64', '/etc',
+    '/dev/urandom', '/dev/random',
+    ...isolation.readonlyPaths,
+    ...executableRuntimeRoots(codexExecutable),
+    ...executableRuntimeRoots(process.execPath),
+    RESIDENT_MCP_SOCKET_CLIENT,
+    ...(opts.replyTool ? [opts.replyTool.mcpConfigPath] : []),
+  ]);
+  const denyReadPaths = existingCanonicalPaths([
+    ...isolation.denyReadPaths,
+    ...(sourceOAuthAuthPath ? [sourceOAuthAuthPath] : []),
+  ]);
+  const denyWritePaths = existingCanonicalPaths([
+    ...isolation.denyWritePaths,
+    ...isolation.readonlyPaths,
+    ...(sourceOAuthAuthPath ? [sourceOAuthAuthPath] : []),
+  ]);
+  const landlockPolicy = JSON.stringify({
+    version: 1,
+    readonly_paths: readonlyPaths,
+    // Keep trusted MCP staging/receipt authority outside Codex's fresh HOME/CWD.
+    readwrite_paths: [scratchDir],
+    deny_read_paths: denyReadPaths,
+    deny_write_paths: denyWritePaths,
+  });
+  let landlockPython: string;
+  try {
+    landlockPython = resolveExecutable('python3', { PATH: childEnv.PATH });
+  } catch (error) {
+    rollbackSetup();
     throw error;
   }
   const listeners: Array<(event: ResidentSessionEvent) => void> = [];
@@ -409,12 +587,27 @@ export function startResidentCodexSession(
   let closed = false;
   let active: CodexTurn | null = null;
   let activeChild: ReturnType<typeof spawn> | null = null;
+  let finalizingClosedChild: CodexTurn | null = null;
+  const oauthPersistenceByGeneration = new Map<number, Promise<void>>();
   let childGeneration = 0;
   let lastExitCode: number | null = null;
   let failureTail = '';
   let terminalFailure: 'rate_limited' | 'dead_auth' | null = null;
   let idleTimer: NodeJS.Timeout | null = null;
   const imagePaths = new Set<string>();
+  const mcpBrokerServers: net.Server[] = [];
+  const mcpBrokerSockets = new Set<net.Socket>();
+  const mcpBrokerChildren = new Set<ReturnType<typeof spawn>>();
+  const mcpBrokerTermTimers = new Map<ReturnType<typeof spawn>, NodeJS.Timeout>();
+  const mcpBrokerKillTimers = new Map<ReturnType<typeof spawn>, NodeJS.Timeout>();
+  let mcpBrokersShuttingDown = false;
+  let mcpBrokerFailure: Error | null = null;
+  let mcpBrokerDrainTimer: NodeJS.Timeout | null = null;
+  let mcpBrokersReady = mcpBrokerSpecs.length === 0;
+  let mcpBrokersReadyObserved: Promise<void> = Promise.resolve();
+  let pendingBrokerSettle: {
+    turn: CodexTurn; processGone: boolean; childConfirmedGone: boolean;
+  } | null = null;
   let scratchSafeToRemove = true;
   let scratchRemoved = false;
 
@@ -434,8 +627,94 @@ export function startResidentCodexSession(
       imagePaths.delete(imagePath);
     }
   };
+  const failMcpBroker = (name: string, error: unknown, reason = 'mcp_broker_failed'): void => {
+    const detail = `Resident MCP broker ${name} failed: ${sanitize(String(error)).slice(-1_000)}`;
+    mcpBrokerFailure = error instanceof Error ? error : new Error(detail);
+    failureTail = boundedTail(failureTail, `\n${detail}`);
+    alive = false;
+    if (active) {
+      active.appliedStrategicOp = false;
+      active.sentOperatorMessage = false;
+      active.operatorReply = null;
+      if (!active.providerFailed) markFailure(active, reason, detail);
+      if (!pendingBrokerSettle) beginTermination(active, 'SIGTERM');
+    } else {
+      closed = true;
+      cleanupScratch();
+      resolveIdle();
+    }
+  };
+  const reconcileBrokerDrain = (): boolean => {
+    if (mcpBrokerChildren.size > 0 || !pendingBrokerSettle) return false;
+    if (mcpBrokerDrainTimer) clearTimeout(mcpBrokerDrainTimer);
+    mcpBrokerDrainTimer = null;
+    const pending = pendingBrokerSettle;
+    pendingBrokerSettle = null;
+    settle(pending.turn, pending.processGone, pending.childConfirmedGone);
+    return true;
+  };
+  const terminateMcpBrokerChild = (child: ReturnType<typeof spawn>): void => {
+    if (mcpBrokerTermTimers.has(child) || mcpBrokerKillTimers.has(child)) return;
+    try { child.kill('SIGTERM'); } catch { /* close/error reconciliation below is authoritative */ }
+    const termTimer = setTimeout(() => {
+      mcpBrokerTermTimers.delete(child);
+      if (!mcpBrokerChildren.has(child)) return;
+      try { child.kill('SIGKILL'); } catch { /* close/error reconciliation below is authoritative */ }
+      const killTimer = setTimeout(() => {
+        mcpBrokerKillTimers.delete(child);
+        if (!mcpBrokerChildren.has(child)) return;
+        let gone = typeof child.pid !== 'number';
+        if (typeof child.pid === 'number') {
+          try { process.kill(child.pid, 0); } catch (error) {
+            const code = error && typeof error === 'object' && 'code' in error
+              ? String((error as { code?: unknown }).code) : '';
+            gone = code === 'ESRCH';
+          }
+          if (gone) unregisterChildPid(child.pid);
+        }
+        if (gone) {
+          mcpBrokerChildren.delete(child);
+          if (reconcileBrokerDrain()) return;
+          cleanupScratch();
+          resolveIdle();
+          return;
+        }
+        scratchSafeToRemove = false;
+        failureTail = boundedTail(failureTail, '\nresident_mcp_broker_remained_live_after_sigkill');
+        if (pendingBrokerSettle) {
+          const pending = pendingBrokerSettle;
+          pendingBrokerSettle = null;
+          alive = false;
+          markFailure(
+            pending.turn,
+            'mcp_broker_kill_failed',
+            'Resident MCP broker remained live after SIGKILL grace',
+          );
+          settle(pending.turn, false, false);
+        }
+      }, PROCESS_KILL_GRACE_MS);
+      mcpBrokerKillTimers.set(child, killTimer);
+    }, PROCESS_KILL_GRACE_MS);
+    mcpBrokerTermTimers.set(child, termTimer);
+  };
+  const shutdownMcpBrokers = (): void => {
+    if (mcpBrokersShuttingDown) return;
+    mcpBrokersShuttingDown = true;
+    for (const server of mcpBrokerServers) {
+      try { server.close(); } catch { /* not yet listening or already closed */ }
+    }
+    for (const socket of mcpBrokerSockets) socket.destroy();
+    for (const child of mcpBrokerChildren) terminateMcpBrokerChild(child);
+    for (const spec of mcpBrokerSpecs) {
+      try { fs.unlinkSync(spec.socketPath); } catch { /* absent or already removed */ }
+    }
+  };
   const cleanupScratch = (): boolean => {
     if (scratchRemoved) return true;
+    shutdownMcpBrokers();
+    if (mcpBrokerChildren.size > 0) return false;
+    try { fs.rmSync(mcpSocketRoot, { recursive: true, force: true }); } catch { /* already revoked */ }
+    if (active || activeChild || finalizingClosedChild) return false;
     if (!scratchSafeToRemove) return false;
     try {
       fs.rmSync(scratchDir, { recursive: true, force: true });
@@ -446,8 +725,151 @@ export function startResidentCodexSession(
       return false;
     }
   };
+  const persistOAuthFromScratch = async (): Promise<void> => {
+    if (!sourceOAuthAuthPath || !scratchOAuthAuthPath) return;
+    const scratchCredential = fs.readFileSync(scratchOAuthAuthPath);
+    let authoritative = fs.readFileSync(sourceOAuthAuthPath);
+    if (scratchCredential.equals(authoritative)) return;
+    replaceFileAtomically(sourceOAuthAuthPath, scratchCredential);
+    await isolation.persistOAuthCredential?.();
+    authoritative = fs.readFileSync(sourceOAuthAuthPath);
+    replaceFileAtomically(scratchOAuthAuthPath, authoritative);
+  };
+  const persistOAuthForGeneration = (generation: number): Promise<void> => {
+    const existing = oauthPersistenceByGeneration.get(generation);
+    if (existing) return existing;
+    const attempt = Promise.resolve().then(persistOAuthFromScratch);
+    oauthPersistenceByGeneration.set(generation, attempt);
+    return attempt;
+  };
   const resolveIdle = (): void => {
+    if (active || activeChild || mcpBrokerChildren.size > 0) return;
     while (idleWaiters.length) idleWaiters.shift()?.();
+  };
+  const startMcpBrokers = (): Promise<void> => {
+    const trustedRoots = isolation.readonlyPaths.map((root) => fs.realpathSync(root));
+    const trustedNode = fs.realpathSync(process.execPath);
+    const activeNames = new Set<string>();
+    const readiness: Promise<void>[] = [];
+    for (const spec of mcpBrokerSpecs) {
+      const upstreamExecutable = resolveExecutable(spec.command, mergedEnv);
+      if (upstreamExecutable !== trustedNode || spec.args.length !== 1) {
+        throw new Error(`Resident MCP broker ${spec.name} must launch one exact trusted Node script`);
+      }
+      const upstreamScript = fs.realpathSync(spec.args[0]);
+      const relativeToTrustedRoot = trustedRoots.some((root) => {
+        const relative = path.relative(root, upstreamScript);
+        return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+      });
+      const scriptInfo = fs.statSync(upstreamScript);
+      if (
+        !relativeToTrustedRoot || !scriptInfo.isFile()
+        || scriptInfo.mode & 0o022 || path.extname(upstreamScript) !== '.mjs'
+      ) {
+        throw new Error(`Resident MCP broker ${spec.name} script is outside the immutable generation`);
+      }
+      const server = net.createServer((socket) => {
+        if (mcpBrokersShuttingDown || activeNames.has(spec.name)) {
+          socket.destroy();
+          return;
+        }
+        activeNames.add(spec.name);
+        mcpBrokerSockets.add(socket);
+        const upstreamEnv: NodeJS.ProcessEnv = {
+          HOME: scratchDir,
+          TMPDIR: scratchDir,
+        };
+        for (const [key, value] of Object.entries(mergedEnv)) {
+          if (CODEX_PROCESS_ENV_KEYS.has(key)) upstreamEnv[key] = value;
+        }
+        upstreamEnv.PATH ??= '/usr/local/bin:/usr/bin:/bin';
+        Object.assign(upstreamEnv, spec.env);
+        let upstream: ReturnType<typeof spawn>;
+        try {
+          upstream = spawn(upstreamExecutable, [upstreamScript], {
+            cwd: scratchDir, env: upstreamEnv, stdio: ['pipe', 'pipe', 'pipe'],
+          });
+        } catch (error) {
+          activeNames.delete(spec.name);
+          socket.destroy();
+          failMcpBroker(spec.name, error);
+          return;
+        }
+        const upstreamInput = upstream.stdin;
+        const upstreamOutput = upstream.stdout;
+        const upstreamError = upstream.stderr;
+        if (!upstreamInput || !upstreamOutput || !upstreamError) {
+          try { upstream.kill('SIGKILL'); } catch { /* launch reconciliation owns cleanup */ }
+          activeNames.delete(spec.name);
+          socket.destroy();
+          failMcpBroker(spec.name, 'trusted upstream stdio was not piped');
+          return;
+        }
+        mcpBrokerChildren.add(upstream);
+        if (typeof upstream.pid === 'number') registerChildPid(upstream.pid);
+        let upstreamStderr = '';
+        upstreamError.on('data', (data: Buffer) => {
+          upstreamStderr = boundedTail(upstreamStderr, sanitize(data.toString()), 2_000);
+        });
+        upstreamInput.on('error', () => { socket.destroy(); });
+        socket.on('error', () => { /* close below fences the exact upstream */ });
+        socket.pipe(upstreamInput);
+        upstreamOutput.pipe(socket);
+        socket.once('close', () => {
+          mcpBrokerSockets.delete(socket);
+          // EOF fences new requests but lets an already-started typed helper
+          // reach its own receipt/timeout boundary. Forced session teardown
+          // signals the MCP parent, whose checked-in handler kills its helper
+          // process group before exiting.
+          try { upstreamInput.end(); } catch { /* already drained */ }
+        });
+        upstream.once('error', (error: Error) => {
+          failMcpBroker(spec.name, error);
+          socket.destroy();
+        });
+        upstream.once('close', (code: number | null) => {
+          const termTimer = mcpBrokerTermTimers.get(upstream);
+          if (termTimer) clearTimeout(termTimer);
+          mcpBrokerTermTimers.delete(upstream);
+          const killTimer = mcpBrokerKillTimers.get(upstream);
+          if (killTimer) clearTimeout(killTimer);
+          mcpBrokerKillTimers.delete(upstream);
+          if (typeof upstream.pid === 'number') unregisterChildPid(upstream.pid);
+          mcpBrokerChildren.delete(upstream);
+          activeNames.delete(spec.name);
+          if (code !== 0 && !mcpBrokersShuttingDown) {
+            failMcpBroker(spec.name, upstreamStderr || `exit code ${String(code)}`);
+          }
+          socket.end();
+          if (reconcileBrokerDrain()) return;
+          if (!alive || closed) cleanupScratch();
+          resolveIdle();
+        });
+      });
+      server.maxConnections = 1;
+      mcpBrokerServers.push(server);
+      readiness.push(new Promise<void>((resolve, reject) => {
+        const startupError = (error: Error): void => { reject(error); };
+        server.once('error', startupError);
+        server.listen(spec.socketPath, () => {
+          try {
+            fs.chmodSync(spec.socketPath, 0o600);
+            if ((fs.statSync(spec.socketPath).mode & 0o777) !== 0o600) {
+              throw new Error('private socket mode is not 0600');
+            }
+          } catch (error) {
+            try { server.close(); } catch { /* startup rejection owns cleanup */ }
+            reject(error instanceof Error ? error : new Error(String(error)));
+            return;
+          }
+          server.off('error', startupError);
+          server.on('error', (error) => { failMcpBroker(spec.name, error); });
+          resolve();
+        });
+      }));
+      server.unref();
+    }
+    return Promise.all(readiness).then(() => undefined);
   };
   const clearTimers = (turn: CodexTurn): void => {
     if (turn.stallTimer) clearTimeout(turn.stallTimer);
@@ -506,6 +928,23 @@ export function startResidentCodexSession(
     childConfirmedGone = processGone,
   ): void => {
     if (active !== turn) return;
+    if (childConfirmedGone && mcpBrokerChildren.size > 0) {
+      activeChild = null;
+      clearTimers(turn);
+      cleanupImages();
+      pendingBrokerSettle = { turn, processGone, childConfirmedGone };
+      if (!alive || closed) shutdownMcpBrokers();
+      if (!mcpBrokerDrainTimer) {
+        mcpBrokerDrainTimer = setTimeout(() => {
+          mcpBrokerDrainTimer = null;
+          if (active !== turn || !pendingBrokerSettle || mcpBrokerChildren.size === 0) return;
+          failMcpBroker('drain', 'upstream did not close after Codex completion', 'mcp_broker_drain_timeout');
+          shutdownMcpBrokers();
+        }, MCP_BROKER_DRAIN_MS);
+      }
+      return;
+    }
+    pendingBrokerSettle = null;
     active = null;
     if (childConfirmedGone) activeChild = null;
     clearTimers(turn);
@@ -525,6 +964,25 @@ export function startResidentCodexSession(
     turn.failureCategory = classify(failureTail);
     terminalFailure = turn.failureCategory;
     trace(turn, 'error', reason, true);
+  };
+  const settleGoneAfterOAuth = (turn: CodexTurn): void => {
+    if (active !== turn || finalizingClosedChild === turn) return;
+    activeChild = null;
+    clearTimers(turn);
+    cleanupImages();
+    finalizingClosedChild = turn;
+    void persistOAuthForGeneration(turn.childGeneration).then(() => {
+      if (active !== turn) return;
+      finalizingClosedChild = null;
+      settle(turn, true, true);
+    }).catch((error: unknown) => {
+      if (active !== turn) return;
+      finalizingClosedChild = null;
+      scratchSafeToRemove = false;
+      markFailure(turn, 'oauth_rotation_failed', String(error));
+      alive = false;
+      settle(turn, true, true);
+    });
   };
   const signalTurn = (
     turn: CodexTurn,
@@ -560,8 +1018,10 @@ export function startResidentCodexSession(
       if (initialResult === 'failed') {
         scratchSafeToRemove = false;
         markFailure(turn, 'kill_failed', `Could not deliver ${initial} to Codex child`);
+        settle(turn, false, false);
+      } else {
+        settleGoneAfterOAuth(turn);
       }
-      settle(turn, initialResult === 'gone', initialResult === 'gone');
       return;
     }
     const escalateToKill = (): void => {
@@ -571,8 +1031,10 @@ export function startResidentCodexSession(
         if (killResult === 'failed') {
           scratchSafeToRemove = false;
           markFailure(turn, 'kill_failed', 'Could not deliver SIGKILL to Codex child');
+          settle(turn, false, false);
+        } else {
+          settleGoneAfterOAuth(turn);
         }
-        settle(turn, killResult === 'gone', killResult === 'gone');
         return;
       }
       turn.settleTimer = setTimeout(() => {
@@ -592,8 +1054,10 @@ export function startResidentCodexSession(
         if (!processGone) {
           scratchSafeToRemove = false;
           markFailure(turn, 'kill_failed', 'Codex child remained live after SIGKILL grace');
+          settle(turn, false, false);
+        } else {
+          settleGoneAfterOAuth(turn);
         }
-        settle(turn, processGone, processGone);
       }, PROCESS_KILL_GRACE_MS);
     };
     if (initial === 'SIGINT') {
@@ -604,8 +1068,10 @@ export function startResidentCodexSession(
           if (termResult === 'failed') {
             scratchSafeToRemove = false;
             markFailure(turn, 'kill_failed', 'Could not deliver SIGTERM to Codex child');
+            settle(turn, false, false);
+          } else {
+            settleGoneAfterOAuth(turn);
           }
-          settle(turn, termResult === 'gone', termResult === 'gone');
           return;
         }
         turn.killTimer = setTimeout(escalateToKill, PROCESS_KILL_GRACE_MS);
@@ -654,6 +1120,28 @@ export function startResidentCodexSession(
       return;
     }
     const mcpTool = typeof item.tool === 'string' ? item.tool : '';
+    const mcpServer = typeof item.server === 'string' ? item.server : '';
+    const fullMcpTool = mcpServer && mcpTool ? `mcp__${mcpServer}__${mcpTool}` : '';
+    const unexpectedLocal = itemType === 'command_execution'
+      || itemType === 'file_change'
+      || itemType === 'web_search'
+      || itemType === 'todo_list';
+    const unexpectedMcp = itemType === 'mcp_tool_call' && !allowedMcpTools.has(fullMcpTool);
+    const unknownItem = !['mcp_tool_call', 'reasoning', 'agent_message'].includes(itemType);
+    if (unexpectedLocal || unexpectedMcp || unknownItem) {
+      if (!turn.providerFailed) {
+        markFailure(
+          turn,
+          unexpectedMcp ? 'unexpected_mcp_tool' : 'unexpected_local_tool',
+          unexpectedMcp ? 'Codex attempted a non-allowlisted MCP tool' : 'Codex attempted a forbidden local tool',
+        );
+      }
+      turn.sentOperatorMessage = false;
+      turn.operatorReply = null;
+      alive = false;
+      beginTermination(turn, 'SIGINT');
+      return;
+    }
     const toolName = itemType === 'command_execution' ? 'Bash'
       : itemType === 'file_change' ? 'apply_patch'
         : itemType === 'mcp_tool_call' ? `MCP:${mcpTool}`
@@ -673,15 +1161,15 @@ export function startResidentCodexSession(
       const activityKind = itemType === 'command_execution' ? 'command'
         : itemType === 'file_change' ? 'file' : 'tool';
       emit({ kind: 'tool', toolName, activity: { kind: activityKind, text: toolName } });
-      if (itemType === 'command_execution' && typeof item.command === 'string' && isStrategicMutation(item.command)) {
-        turn.pendingStrategic.add(id);
-      }
-      if (itemType === 'mcp_tool_call') {
+      if (itemType === 'mcp_tool_call' && started) {
         const server = item.server;
         const tool = item.tool;
         if (server === 'workday' && tool === 'reply_to_operator') {
           const reply = operatorReply(item.arguments);
           if (reply) turn.pendingReplies.set(id, reply);
+        }
+        if (server === 'workday' && tool === 'strategic_operation') {
+          turn.pendingStrategic.add(id);
         }
       }
     }
@@ -693,7 +1181,12 @@ export function startResidentCodexSession(
     const succeeded = status === 'completed' && (itemType !== 'command_execution' || exitCode === 0);
     trace(turn, 'tool_result', toolName, !succeeded);
     emit({ kind: 'activity', activity: { kind: 'tool_result', text: `${toolName}: ${status || 'completed'}` } });
-    if (turn.pendingStrategic.delete(id) && succeeded && strategicAcknowledged(item.aggregated_output)) {
+    if (
+      turn.pendingStrategic.delete(id)
+      && succeeded
+      && item.error == null
+      && mcpStrategicAcknowledged(item.result)
+    ) {
       turn.appliedStrategicOp = true;
     }
     const reply = turn.pendingReplies.get(id);
@@ -779,11 +1272,15 @@ export function startResidentCodexSession(
 
   const startChild = (turn: CodexTurn, prompt: string, turnImages: string[]): void => {
     const resume = sessionIdValue !== null;
-    const args = resume
+    const codexArgs = resume
       ? ['exec', 'resume', ...commonArgs, ...turnImages.flatMap((image) => ['-i', image]), sessionIdValue as string, '-']
       : ['exec', ...commonArgs, ...turnImages.flatMap((image) => ['-i', image]), '-'];
-    const child = spawn(runnerBase.command, args, {
-      cwd: workspace,
+    const child = spawn(landlockPython, [
+      '-I', RESIDENT_LANDLOCK_EXEC,
+      '--policy-json', landlockPolicy,
+      '--', codexExecutable, ...codexArgs,
+    ], {
+      cwd: scratchDir,
       env: childEnv,
       detached: true,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -817,23 +1314,48 @@ export function startResidentCodexSession(
       alive = false;
       beginTermination(turn, 'SIGINT');
     });
-    child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+    child.on('close', (code: number | null, signal: NodeJS.Signals | null) => { void (async () => {
       if (typeof pid === 'number') unregisterChildPid(pid);
       if (active !== turn || turn.childGeneration !== generation) {
-        if (activeChild?.pid === pid) activeChild = null;
-        scratchSafeToRemove = true;
         cleanupImages();
+        try {
+          await persistOAuthForGeneration(generation);
+          scratchSafeToRemove = true;
+        } catch (error) {
+          scratchSafeToRemove = false;
+          failureTail = boundedTail(
+            failureTail,
+            `\noauth_rotation_failed: ${sanitize(String(error)).slice(-2_000)}`,
+          );
+        }
+        if (activeChild?.pid === pid) activeChild = null;
         if (!alive || closed) cleanupScratch();
         if (!active && !activeChild) resolveIdle();
         return;
       }
       if (carry.trim()) handleLine(turn, carry);
+      // The close event is the exact process-reaped boundary. Revoke the PID
+      // authority and all process timers before an asynchronous credential CAS;
+      // otherwise a timeout or close() could signal a reused PID and settle the
+      // turn while the only refreshed credential is still being reconciled.
+      if (activeChild?.pid === pid) activeChild = null;
+      clearTimers(turn);
+      cleanupImages();
+      finalizingClosedChild = turn;
       lastExitCode = code;
       const cleanExit = code === 0 && signal === null;
       const validThread = turn.threadReceiptValid && sessionIdValue !== null;
-      const success = cleanExit && turn.terminalCompleted && !turn.terminalFailed && !turn.providerFailed && validThread;
+      let success = cleanExit && turn.terminalCompleted && !turn.terminalFailed && !turn.providerFailed && validThread;
+      try {
+        await persistOAuthForGeneration(generation);
+      } catch (error) {
+        scratchSafeToRemove = false;
+        markFailure(turn, 'oauth_rotation_failed', String(error));
+        success = false;
+      }
       if (!success && !turn.providerFailed && !turn.interrupted) {
-        const reason = !validThread ? 'missing_thread_id'
+        const reason = stderr.includes('resident_landlock:') ? 'resident_landlock_failed'
+          : !validThread ? 'missing_thread_id'
           : !turn.terminalCompleted ? 'missing_turn_completed'
             : !cleanExit ? 'process_exit' : 'terminal_failure';
         markFailure(turn, reason, stderr || `Codex exited code=${String(code)} signal=${String(signal)}`);
@@ -851,8 +1373,16 @@ export function startResidentCodexSession(
         failureTail = '';
         terminalFailure = null;
       }
+      finalizingClosedChild = null;
       settle(turn, turn.interrupted || !success, true);
-    });
+    })().catch((error: unknown) => {
+      if (active !== turn || turn.childGeneration !== generation) return;
+      finalizingClosedChild = null;
+      scratchSafeToRemove = false;
+      markFailure(turn, 'oauth_rotation_failed', String(error));
+      alive = false;
+      settle(turn, true, true);
+    }); });
     child.stdin.on('error', (error: Error) => {
       if (active !== turn || turn.childGeneration !== generation) return;
       markFailure(turn, 'stdin_write_failed', error.message);
@@ -877,9 +1407,12 @@ export function startResidentCodexSession(
       const inert: CodexTurn = {
         resolve: () => undefined, childGeneration, startedAtMs: now, lastActivityAtMs: now,
         firstTokenAtMs: null, resultText: '', accumulated: '', interrupted: false,
-        timedOut: false, hardTimedOut: false, providerFailed: false,
-        failureCategory: terminalFailure, failureDetail: null, providerTerminalReason: null,
-        providerOutputTail: null, sawToolUse: false, appliedStrategicOp: false,
+        timedOut: false, hardTimedOut: false, providerFailed: mcpBrokerFailure !== null,
+        failureCategory: terminalFailure,
+        failureDetail: mcpBrokerFailure ? sanitize(mcpBrokerFailure.message).slice(-2_000) : null,
+        providerTerminalReason: mcpBrokerFailure ? 'mcp_broker_failed' : null,
+        providerOutputTail: mcpBrokerFailure ? sanitize(mcpBrokerFailure.message).slice(-2_000) : null,
+        sawToolUse: false, appliedStrategicOp: false,
         sentOperatorMessage: false, operatorReply: null, inputTokens: 0, toolCallCount: 0,
         totalToolCallDurationMs: 0, toolStarts: new Map(), seenTools: new Set(),
         pendingReplies: new Map(), pendingStrategic: new Set(), trace: [], traceTruncated: false,
@@ -926,19 +1459,28 @@ export function startResidentCodexSession(
       if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
       armStall(turn);
       armHard(turn);
-      try {
-        startChild(turn, materialized.prompt, materialized.imagePaths);
-      } catch (error) {
-        markFailure(turn, 'spawn_error', String(error));
-        alive = false;
-        if (activeChild?.pid) beginTermination(turn, 'SIGINT');
-        else settle(turn, true, true);
-      }
+      const launch = (): void => {
+        if (active !== turn || mcpBrokerFailure) return;
+        try {
+          startChild(turn, materialized.prompt, materialized.imagePaths);
+        } catch (error) {
+          markFailure(turn, 'spawn_error', String(error));
+          alive = false;
+          if (activeChild?.pid) beginTermination(turn, 'SIGINT');
+          else settle(turn, true, true);
+        }
+      };
+      if (mcpBrokersReady) launch();
+      else void mcpBrokersReadyObserved.then(launch);
     });
   }
 
   function interrupt(): void {
     if (!active || closed) return;
+    if (finalizingClosedChild === active) {
+      alive = false;
+      return;
+    }
     active.interrupted = true;
     alive = false;
     beginTermination(active, 'SIGINT');
@@ -952,6 +1494,7 @@ export function startResidentCodexSession(
       idleTimer = null;
     }
     if (active) {
+      if (finalizingClosedChild === active) return;
       const turn = active;
       turn.interrupted = true;
       beginTermination(turn, 'SIGINT');
@@ -963,6 +1506,18 @@ export function startResidentCodexSession(
     resolveIdle();
   }
 
+  try {
+    mcpBrokersReadyObserved = startMcpBrokers().then(() => {
+      mcpBrokersReady = true;
+    }).catch((error: unknown) => {
+      failMcpBroker('startup', error);
+    });
+  } catch (error) {
+    alive = false;
+    closed = true;
+    cleanupScratch();
+    throw error;
+  }
   armIdle();
   return {
     sendTurn,
@@ -971,7 +1526,7 @@ export function startResidentCodexSession(
     onEvent: (listener) => { listeners.push(listener); },
     touch: armIdle,
     waitForIdle: () => {
-      if (!active && !activeChild) {
+      if (!active && !activeChild && mcpBrokerChildren.size === 0) {
         if (closed && !scratchRemoved) cleanupScratch();
         return Promise.resolve();
       }
@@ -986,6 +1541,7 @@ export function startResidentCodexSession(
     isAlive: () => alive && !closed,
     exitCode: () => lastExitCode,
     failureCategory: () => terminalFailure ?? classify(failureTail),
+    privateRuntimeCleanupSafe: () => scratchSafeToRemove,
     exitDiagnostic: () => alive ? null : [
       `exit_code=${lastExitCode ?? 'null'}`,
       activeChild?.pid ? `active_child_pid=${activeChild.pid}` : '',

@@ -6,6 +6,7 @@ import {
   AGENT_TOKEN_FILE_ENV,
   agentTokenFilePath,
   ensureAgentTokenFileEnv,
+  registerAgentTokenMirror,
   writeAgentTokenFile,
   agentTokenShellFn,
   GITHUB_TOKEN_FILE_ENV,
@@ -110,6 +111,30 @@ describe('writeAgentTokenFile', () => {
     } else {
       // POSIX perms are not modeled on Windows — just assert the file exists.
       expect(fs.existsSync(target)).toBe(true);
+    }
+  });
+
+  it('refreshes every registered Resident mirror until it is fenced', () => {
+    const configured = path.join(tmpRoot, 'configured', 'agent.jwt');
+    const residentOne = path.join(tmpRoot, 'resident-one', 'agent.jwt');
+    const residentTwo = path.join(tmpRoot, 'resident-two', 'agent.jwt');
+    process.env[AGENT_TOKEN_FILE_ENV] = configured;
+    const unregisterOne = registerAgentTokenMirror(residentOne);
+    const unregisterTwo = registerAgentTokenMirror(residentTwo);
+    try {
+      expect(writeAgentTokenFile('jwt-first')).toBe(true);
+      expect(fs.readFileSync(configured, 'utf-8')).toBe('jwt-first');
+      expect(fs.readFileSync(residentOne, 'utf-8')).toBe('jwt-first');
+      expect(fs.readFileSync(residentTwo, 'utf-8')).toBe('jwt-first');
+
+      unregisterOne();
+      expect(writeAgentTokenFile('jwt-refreshed')).toBe(true);
+      expect(fs.readFileSync(configured, 'utf-8')).toBe('jwt-refreshed');
+      expect(fs.readFileSync(residentOne, 'utf-8')).toBe('jwt-first');
+      expect(fs.readFileSync(residentTwo, 'utf-8')).toBe('jwt-refreshed');
+    } finally {
+      unregisterOne();
+      unregisterTwo();
     }
   });
 });

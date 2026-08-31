@@ -45,6 +45,14 @@ const typedFastMocks = vi.hoisted(() => ({
   abandonDispositionWithConfirmation: vi.fn((..._args: unknown[]) => 'fallback'),
 }));
 
+const tokenFileMocks = vi.hoisted(() => {
+  const unregister = vi.fn();
+  return {
+    unregister,
+    registerAgentTokenMirror: vi.fn((_target: string) => unregister),
+  };
+});
+
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // Only SessionStreamer is under test; stub the handler's heavy dependencies so
 // importing strategic-resident.ts stays light. strategic-resident-lib.js (which
@@ -115,11 +123,17 @@ vi.mock('../providers/runners.js', () => ({
   buildIsolatedTextOnlyMemoryCommand: vi.fn(),
   runIsolatedTextOnlyMemory: vi.fn(),
 }));
+vi.mock('../token-file.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../token-file.js')>(),
+  registerAgentTokenMirror: tokenFileMocks.registerAgentTokenMirror,
+}));
 vi.mock('../providers/resident-session.js', () => ({
   startResidentClaudeSession: vi.fn(),
 }));
 vi.mock('../providers/resident-reply-tool.js', () => ({
   RESIDENT_REPLY_TOOL_NAME: 'mcp__workday__reply_to_operator',
+  RESIDENT_STRATEGIC_TOOL_NAME: 'mcp__workday__strategic_operation',
+  RESIDENT_PROJECT_READ_TOOL_NAME: 'mcp__workday__project_read',
   provisionResidentReplyTool: mockProvisionResidentReplyTool,
 }));
 // Existing Workday tests stub only the native reply MCP path.  The new
@@ -6600,12 +6614,16 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     const paths = residentReplyRuntimePaths('task-runtime-boundary');
     expect(paths.runtimeDir.startsWith(`${path.resolve(workspace)}${path.sep}`)).toBe(false);
     expect(paths.replyReceiptPath).toBe(path.join(
-      paths.runtimeDir,
+      paths.stateDir,
       '.resident-reply-receipt.json',
     ));
     expect(paths.privateTurnMarkerPath).toBe(path.join(
-      paths.runtimeDir,
+      paths.stateDir,
       '.resident-private-workday-turn',
+    ));
+    expect(paths.mcpRootDir).toBe(path.join(paths.runtimeDir, 'mcp'));
+    expect(paths.agentTokenPath).toBe(path.join(
+      paths.runtimeDir, 'agent-token', 'agent-token.jwt',
     ));
     const competing = residentReplyRuntimePaths(
       'task-runtime-boundary',
@@ -7140,6 +7158,7 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(mockStartSession).toHaveBeenCalledTimes(2);
     // old subprocess was closed before the new one was started
     expect(session1.close).toHaveBeenCalled();
+    expect(session1.waitForIdle).toHaveBeenCalled();
     // recovery session received the prime (compaction checkpoint)
     expect(session2.sendTurn).toHaveBeenCalledTimes(1);
     // helpers were re-provisioned into the recreated checkout (startup + recovery = 2 calls each)
@@ -7147,6 +7166,28 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(mockWriteStrategicHelpers.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(mockWriteArtifactsHelper.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(mockProvisionAmbientHelpers.mock.calls.length).toBeGreaterThanOrEqual(2);
+    const provisionCalls = mockProvisionResidentReplyTool.mock.calls;
+    expect(provisionCalls.length).toBeGreaterThanOrEqual(2);
+    const startupConfig = provisionCalls[provisionCalls.length - 2]?.[1] as {
+      strategic?: Record<string, unknown>;
+    };
+    const recoveryConfig = provisionCalls[provisionCalls.length - 1]?.[1] as {
+      strategic?: Record<string, unknown>;
+    };
+    expect(startupConfig.strategic?.helperPath).toMatch(/\/mcp\/generation-1\/strategic$/);
+    expect(startupConfig.strategic?.readHelperPath).toMatch(/\/mcp\/generation-1\/fetch$/);
+    expect(recoveryConfig.strategic?.helperPath).toMatch(/\/mcp\/generation-2\/strategic$/);
+    expect(recoveryConfig.strategic?.readHelperPath).toMatch(/\/mcp\/generation-2\/fetch$/);
+    const stableStrategic = (value: Record<string, unknown> | undefined) => {
+      if (!value) return value;
+      const stable = { ...value };
+      delete stable.helperPath;
+      delete stable.readHelperPath;
+      return stable;
+    };
+    expect(stableStrategic(recoveryConfig.strategic)).toEqual(
+      stableStrategic(startupConfig.strategic),
+    );
   });
 
   it('stops gracefully when the workspace-recovery prime returns processGone', async () => {
@@ -8654,6 +8695,9 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     mockSendLog.mockReset();
     mockSendWsFrame.mockReset();
     mockSendWsFrame.mockReturnValue(true);
+    replyToolPaths.current = null;
+    tokenFileMocks.registerAgentTokenMirror.mockClear();
+    tokenFileMocks.unregister.mockClear();
     vi.spyOn(fs, 'existsSync').mockReturnValue(true);
   });
 
@@ -8795,6 +8839,11 @@ describe('handleStrategicResident - failed-turn recovery', () => {
 
     expect(heartbeatCount).toBe(2);
     expect(mockStartSession).not.toHaveBeenCalled();
+    expect(tokenFileMocks.registerAgentTokenMirror).not.toHaveBeenCalled();
+    const unadmittedPaths = replyToolPaths.current;
+    if (unadmittedPaths === null) throw new Error('expected unadmitted reply runtime paths');
+    const unadmittedRuntime = path.dirname(path.dirname(unadmittedPaths.receiptPath));
+    expect(() => fs.lstatSync(unadmittedRuntime)).toThrow();
     expect(persistAndPostStatus).not.toHaveBeenCalled();
     expect(statusRef.value).not.toBe('Resident strategic session ended');
   });
@@ -9189,6 +9238,129 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     ) as Record<string, unknown>;
     expect(terminal).toMatchObject({ status: 'FAILED' });
     expect(terminal.logs).toContain('provider_process_uncontrolled');
+  });
+
+  it('preserves private provider state when credential recovery forbids cleanup', async () => {
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [{
+          id: 'msg-oauth-retained',
+          content: 'Complete only after credential persistence.',
+          created_at: new Date().toISOString(),
+          from_type: 'user',
+        }] });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true, stop_requested: false });
+    const unsafeCleanupSession = Object.assign(makeSession(
+      () => Promise.resolve(turnResult({
+        providerFailed: true,
+        providerTerminalReason: 'oauth_rotation_failed',
+        failureDetail: 'authoritative credential write denied',
+        processGone: true,
+      })),
+      () => true,
+    ), {
+      privateRuntimeCleanupSafe: vi.fn(() => false),
+    });
+    unsafeCleanupSession.exitDiagnostic.mockReturnValue(
+      'provider_output_tail=oauth_rotation_failed',
+    );
+    mockStartSession.mockReturnValue(unsafeCleanupSession);
+
+    await handleStrategicResident(
+      'task-oauth-retained',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-oauth-retained' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    const retainedPaths = replyToolPaths.current;
+    if (retainedPaths === null) throw new Error('reply runtime was not provisioned');
+    const retainedRuntime = path.dirname(path.dirname(retainedPaths.receiptPath));
+    expect(fs.lstatSync(retainedRuntime).isDirectory()).toBe(true);
+    expect(tokenFileMocks.unregister).toHaveBeenCalledTimes(1);
+    expect(unsafeCleanupSession.privateRuntimeCleanupSafe).toHaveBeenCalled();
+    fs.rmSync(retainedRuntime, { recursive: true, force: true });
+  });
+
+  it('fails teardown when task-token revocation cannot be proven', async () => {
+    vi.mocked(persistAndPostStatus).mockClear();
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [{
+          id: 'msg-token-revocation-failure',
+          content: 'Stop after the provider failure.',
+          created_at: new Date().toISOString(),
+          from_type: 'user',
+        }] });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true, stop_requested: false });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        providerFailed: true,
+        providerTerminalReason: 'rate_limited',
+        failureCategory: 'rate_limited',
+        failureDetail: 'bounded provider failure',
+        processGone: true,
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    let mirroredTokenPath = '';
+    tokenFileMocks.registerAgentTokenMirror.mockImplementationOnce((target: string) => {
+      mirroredTokenPath = target;
+      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(target, 'test-task-token', { mode: 0o600 });
+      return tokenFileMocks.unregister;
+    });
+    const realUnlinkSync = fs.unlinkSync;
+    let revocationAttempted = false;
+    const unlinkSpy = vi.spyOn(fs, 'unlinkSync').mockImplementation((target) => {
+      if (String(target) === mirroredTokenPath) {
+        revocationAttempted = true;
+        throw Object.assign(new Error('token unlink denied'), { code: 'EACCES' });
+      }
+      realUnlinkSync(target);
+    });
+
+    await handleStrategicResident(
+      'task-token-revocation-failure',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-token-revocation-failure' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(revocationAttempted).toBe(true);
+    expect(tokenFileMocks.unregister).toHaveBeenCalledTimes(1);
+    expect(fs.readFileSync(mirroredTokenPath, 'utf8')).toBe('test-task-token');
+    const terminal = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(terminal).toMatchObject({ status: 'FAILED' });
+    expect(terminal.logs).toContain('agent_token_revocation_failed');
+    expect(mockSendLog).toHaveBeenCalledWith(
+      null,
+      expect.stringContaining('agent token revocation could not be proven'),
+    );
+    unlinkSpy.mockRestore();
+    fs.rmSync(path.dirname(path.dirname(mirroredTokenPath)), { recursive: true, force: true });
   });
 
   it('stays silent after incarnation loss even when provider teardown cannot settle', async () => {

@@ -38,7 +38,8 @@ vi.mock('../index.js', () => ({
   recordNumTurns: vi.fn(),
 }));
 
-vi.mock('../token-file.js', () => ({
+vi.mock('../token-file.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../token-file.js')>(),
   writeAgentTokenFile: vi.fn(),
   jsonFieldShellFn: vi.fn(() => ''),
 }));
@@ -58,6 +59,18 @@ vi.mock('./resident-stream.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./resident-stream.js')>();
   return real;
 });
+
+vi.mock('./resident-codex-session.js', () => ({
+  startResidentCodexSession: vi.fn(() => ({
+    sendTurn: vi.fn(() => Promise.resolve({ processGone: false })),
+    interrupt: vi.fn(),
+    close: vi.fn(),
+    waitForIdle: vi.fn(() => Promise.resolve()),
+    isAlive: vi.fn(() => true),
+    onEvent: vi.fn(() => () => undefined),
+    sessionId: vi.fn(() => null),
+  })),
+}));
 
 vi.mock('./runners.js', () => ({
   syncAgentHelpersToPath: vi.fn(() => '/tmp/blueprint-agent-bin-test'),
@@ -87,6 +100,7 @@ vi.mock('./runners.js', () => ({
 import { spawn } from 'child_process';
 import fs from 'fs';
 import { startResidentClaudeSession } from './resident-session.js';
+import { startResidentCodexSession } from './resident-codex-session.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import {
   getAgentToken, normalizeClaudeConfigContent, recordLlmTokens, recordProviderReportedUsage,
@@ -197,8 +211,6 @@ describe('startResidentClaudeSession', () => {
   });
 
   it('selects the Codex Resident adapter for a qualified OpenAI runner', async () => {
-    const ctl = makeControllableChild();
-    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
     vi.mocked(getProviderRunner).mockReturnValueOnce({
       provider: 'openai',
       authMode: 'oauth',
@@ -218,19 +230,25 @@ describe('startResidentClaudeSession', () => {
     const session = startResidentClaudeSession({
       workspace: '/workspace',
       disallowedTools: ['Write', 'Edit', 'NotebookEdit'],
+      codexIsolation: {
+        agentTokenPath: '/resident/mcp/agent-token.jwt',
+        readonlyPaths: ['/resident/mcp'],
+        readwritePaths: ['/resident/state'],
+        denyReadPaths: ['/workspace'],
+        denyWritePaths: ['/workspace', '/resident/mcp'],
+        persistOAuthCredential: vi.fn(() => Promise.resolve()),
+      },
     });
-    const turn = session.sendTurn('hello Codex');
-    const [, args] = vi.mocked(spawn).mock.calls[0] as unknown as [string, string[]];
-    expect(args[0]).toBe('exec');
-    expect(args).toContain('--json');
-    expect(args).not.toContain('--input-format');
-    expect(args).toContain('default_permissions="resident-read-only"');
+    await expect(session.sendTurn('hello Codex')).resolves.toMatchObject({ processGone: false });
     expect(writeAgentTokenFile).toHaveBeenCalledWith('fresh-codex-token');
     expect(vi.mocked(writeAgentTokenFile).mock.invocationCallOrder[0])
-      .toBeLessThan(vi.mocked(spawn).mock.invocationCallOrder[0]);
+      .toBeLessThan(vi.mocked(startResidentCodexSession).mock.invocationCallOrder[0]);
+    const codexCall = vi.mocked(startResidentCodexSession).mock.calls[0];
+    expect(codexCall[0].workspace).toBe('/workspace');
+    expect(codexCall[0].codexIsolation?.readwritePaths).toEqual(['/resident/state']);
+    expect(codexCall[1]).toMatchObject({ provider: 'openai', authMode: 'oauth' });
+    expect(codexCall[2]).toMatchObject({ outputMode: 'codex-jsonl' });
     session.close();
-    await vi.advanceTimersByTimeAsync(14_000);
-    await expect(turn).resolves.toMatchObject({ processGone: true });
   });
 
   it('refuses a Codex Resident before spawn when the current task token file cannot be seeded', () => {
