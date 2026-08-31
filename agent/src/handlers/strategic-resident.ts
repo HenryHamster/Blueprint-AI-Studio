@@ -6760,7 +6760,7 @@ export async function handleStrategicResident(
     terminalProviderFailure.value ?? session.failureCategory?.() ?? null,
   );
   const exitDiagnostic = status === 'FAILED'
-    ? [session.exitDiagnostic?.(), lastGenericProviderFailureDetail]
+    ? [lastGenericProviderFailureDetail, session.exitDiagnostic?.()]
       .filter((value, index, values): value is string => (
         typeof value === 'string' && value.length > 0 && values.indexOf(value) === index
       ))
