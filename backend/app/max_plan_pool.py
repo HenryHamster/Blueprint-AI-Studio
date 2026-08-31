@@ -543,6 +543,14 @@ EXACT_MODEL_ROUTE_CONTEXT_KEY = "_strategic_exact_model_route"
 EXACT_MODEL_ROUTE_EFFORTS: frozenset[str] = frozenset(
     {"low", "medium", "high", "max"}
 )
+# Codex 0.150.1 exposes gpt-5.6-sol through Responses Lite.  That surface does
+# not include the allowlisted Workday MCP namespace, so a Resident can complete
+# provider turns without ever receiving the reply tool.  gpt-5.5 is the
+# strongest installed OpenAI model whose ordinary tool surface passed the exact
+# exec + resume Resident preflight.  Keep this override Resident-specific:
+# ordinary OpenAI work can continue to use the global tier map, while an exact
+# server-authored route remains authoritative.
+RESIDENT_OPENAI_COMPATIBLE_MODEL = "gpt-5.5"
 
 
 def resolve_exact_model_route(context: Any) -> tuple[str, str, str] | None:
@@ -578,6 +586,26 @@ def exact_model_route_marker_is_invalid(context: Any) -> bool:
         and EXACT_MODEL_ROUTE_CONTEXT_KEY in context
         and resolve_exact_model_route(context) is None
     )
+
+
+def _resident_compatible_provider_model(
+    task: Any,
+    provider_name: str,
+    model: str | None,
+    *,
+    exact_route_is_valid: bool,
+) -> str | None:
+    """Return the production-proven OpenAI model for a non-exact Resident route."""
+
+    if exact_route_is_valid:
+        return model
+    if (
+        provider_name == LLMProviderName.OPENAI.value
+        and _task_type(task) == "strategic_review"
+        and _task_context(task).get("_resident_session") is True
+    ):
+        return RESIDENT_OPENAI_COMPATIBLE_MODEL
+    return model
 
 
 def _accountless_auth_mode(
@@ -5280,7 +5308,14 @@ async def select_llm_runtime_for_task(
     if model_preferences:
         for pref in model_preferences:
             provider_name = pref["provider"]
-            model_name = pref["model"]
+            model_name = _resident_compatible_provider_model(
+                task,
+                provider_name,
+                pref["model"],
+                exact_route_is_valid=exact_route_is_valid,
+            )
+            if not model_name:
+                continue
             sub_reasons = _sub_reasons()
             account = await select_max_plan_account(
                 user_id=user_id,
@@ -5327,6 +5362,13 @@ async def select_llm_runtime_for_task(
         intended_model = _settings_bag_model(
             intended_settings
         ) or get_provider(intended_provider).tier_to_model(quality_tier, runtime_config)
+    if intended_provider:
+        intended_model = _resident_compatible_provider_model(
+            task,
+            intended_provider,
+            intended_model,
+            exact_route_is_valid=exact_route_is_valid,
+        )
 
     # Balanced mode: pool all listed providers' accounts and pick globally by
     # (health, -load). An explicit per-task provider/model still pins the
@@ -5344,6 +5386,12 @@ async def select_llm_runtime_for_task(
                 model = bag_model
             else:
                 model = provider.tier_to_model(quality_tier, runtime_config)
+            model = _resident_compatible_provider_model(
+                task,
+                provider_name,
+                model,
+                exact_route_is_valid=exact_route_is_valid,
+            )
             if not model:
                 continue
             provider_models.append((provider_name, model))
@@ -5411,6 +5459,12 @@ async def select_llm_runtime_for_task(
             model = bag_model
         else:
             model = provider.tier_to_model(quality_tier, runtime_config)
+        model = _resident_compatible_provider_model(
+            task,
+            provider_name,
+            model,
+            exact_route_is_valid=exact_route_is_valid,
+        )
         if not model:
             continue
         sub_reasons = _sub_reasons()
@@ -5561,6 +5615,12 @@ async def select_llm_runtime_for_task(
             explicit_model
             or _settings_bag_model(fallback_settings)
             or provider.tier_to_model(quality_tier, runtime_config)
+        )
+        fallback_model = _resident_compatible_provider_model(
+            task,
+            fallback_provider,
+            fallback_model,
+            exact_route_is_valid=exact_route_is_valid,
         )
         fallback_settings = _settings_for_selected_model(
             task, runtime_config, fallback_provider, fallback_model

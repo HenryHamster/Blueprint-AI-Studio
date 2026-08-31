@@ -63,6 +63,11 @@ class TestResidentLandlockPreflight(unittest.TestCase):
         self.assertIn('"type":"message"', response_bodies[5])
 
     def test_project_read_keeps_exact_mcp_bounds_before_codex_projection(self):
+        self.assertEqual(PREFLIGHT.CODEX_PREFLIGHT_MODEL, "gpt-5.5")
+        self.assertEqual(
+            PREFLIGHT.CODEX_DIRECT_MCP_EXPOSURE,
+            'mcp_servers.workday.omit_tools_from=["deferred"]',
+        )
         self.assertEqual(
             PREFLIGHT.PROJECT_READ_DESCRIPTION,
             "Read one bounded canonical Blueprint project resource for "

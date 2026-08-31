@@ -57,6 +57,8 @@ REPLY_TO_OPERATOR_MCP_INPUT_SCHEMA = {
 }
 INITIAL_REPLY_CONTENT = "Blueprint Resident initial native reply preflight passed."
 RESUME_REPLY_CONTENT = "Blueprint Resident resumed native reply preflight passed."
+CODEX_PREFLIGHT_MODEL = "gpt-5.5"
+CODEX_DIRECT_MCP_EXPOSURE = 'mcp_servers.workday.omit_tools_from=["deferred"]'
 SYSTEM_READONLY_ROOTS = (
     "/usr", "/usr/local", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/etc",
 )
@@ -258,7 +260,30 @@ def validate_responses_mcp_roundtrips(requests: list[dict]) -> None:
             and tool.get("name") == "mcp__workday"
         ]
         if len(namespace_tools) != 1:
-            abort(f"Codex turn {logical_turn} omitted the exact Workday namespace")
+            lite_tool_groups = [
+                {
+                    "role": item.get("role"),
+                    "groups": [
+                        {
+                            "type": group.get("type"),
+                            "name": group.get("name"),
+                            "children": [
+                                child.get("name") for child in group.get("tools", [])
+                                if isinstance(child, dict)
+                            ],
+                        }
+                        for group in item.get("tools", [])
+                        if isinstance(group, dict)
+                    ],
+                }
+                for item in initial.get("input", [])
+                if isinstance(item, dict) and isinstance(item.get("tools"), list)
+            ]
+            abort(
+                f"Codex turn {logical_turn} omitted the exact Workday namespace; "
+                f"top_level={bounded_json(initial.get('tools'))} "
+                f"responses_lite={bounded_json(lite_tool_groups)}"
+            )
         namespace = namespace_tools[0]
         if not isinstance(namespace.get("description"), str):
             abort(f"Codex turn {logical_turn} Workday namespace has no description")
@@ -869,7 +894,10 @@ def run_restricted_child(options: argparse.Namespace) -> int:
             "--json", "--skip-git-repo-check", "--ignore-user-config", "--strict-config",
             "--dangerously-bypass-approvals-and-sandbox",
             *(part for feature in CODEX_DISABLED_FEATURES for part in ("--disable", feature)),
-            "-m", "blueprint-preflight",
+            # Use the production Resident model profile, whose native tool-search
+            # capability is what defers external MCP tools unless explicitly
+            # excluded below. A made-up model silently misses that failure mode.
+            "-m", CODEX_PREFLIGHT_MODEL,
             "-c", 'approval_policy="never"',
             "-c", 'web_search="disabled"',
             "-c", "tools.web_search=false",
@@ -888,6 +916,7 @@ def run_restricted_child(options: argparse.Namespace) -> int:
             "-c", "mcp_servers.workday.enabled=true",
             "-c", "mcp_servers.workday.required=true",
             "-c", 'mcp_servers.workday.enabled_tools=["reply_to_operator","strategic_operation","project_read"]',
+            "-c", CODEX_DIRECT_MCP_EXPOSURE,
             "-c", 'mcp_servers.workday.default_tools_approval_mode="approve"',
             "-c", 'shell_environment_policy.inherit="none"',
             "-c", "shell_environment_policy.ignore_default_excludes=false",
