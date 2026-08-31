@@ -22,6 +22,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
 import app.metrics_integrity_sweep as mis
+from app import acceptance_criteria as ac
 from app.metrics_integrity_sweep import (
     CheckResult,
     CheckStatus,
@@ -7154,6 +7155,83 @@ async def test_unmapped_acceptance_criteria_ok_when_criterion_mapped(db):
 
 
 @pytest.mark.asyncio
+async def test_unmapped_acceptance_criteria_excludes_authorship_policy_from_counts(db):
+    """Authorship policy rows do not inflate ordinary mapping metrics."""
+    project = await _project(db)
+    version, ordinary = await _open_version_with_criterion(
+        db, project, text="Ordinary unmapped criterion"
+    )
+    await ac.create_criterion(
+        db,
+        project.id,
+        version.id,
+        "No operator-authored commits",
+        evidence_contract={
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 0},
+        },
+    )
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_unmapped_acceptance_criteria(ctx)
+    flagged = [r for r in results if r.status == CheckStatus.FLAGGED]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    result = flagged[0]
+    assert result.self_reported == 1
+    assert result.ground_truth == 0
+    assert result.delta == 1
+    assert ordinary.criterion_key in result.detail
+
+
+@pytest.mark.asyncio
+async def test_unmapped_acceptance_criteria_skips_policy_only_version(db):
+    """A machine-policy-only version has no ordinary mapping obligation."""
+    project = await _project(db)
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db.add(version)
+    await db.commit()
+    policy = await ac.create_criterion(
+        db,
+        project.id,
+        version.id,
+        "No operator-authored commits",
+        evidence_contract={
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 0},
+        },
+    )
+    project.problem_model = {
+        "intent": {"current_focus": f"Honor policy {policy.criterion_key}"}
+    }
+    db.add(project)
+    await db.commit()
+
+    summary = await ac.get_version_coverage_summary(db, version.id)
+    report = summary["phantom_bookkeeping"]
+    assert summary["total"] == 0
+    assert report["registered_count"] == 0
+    assert report["phantom_keys"] == []
+    assert report["zero_registered"] is False
+    assert report["has_drift"] is False
+    assert await ac.get_unmapped_active_criterion_keys(
+        db, project.id, version.id
+    ) == []
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_unmapped_acceptance_criteria(ctx)
+    mine = [result for result in results if result.subject == str(project.id)]
+    assert len(mine) == 1
+    assert mine[0].status == CheckStatus.SKIPPED
+    assert "no ordinary active criteria" in mine[0].detail
+
+
+@pytest.mark.asyncio
 async def test_unmapped_acceptance_criteria_skips_no_open_version(db):
     """Project with no open version → SKIPPED for that project."""
     project = await _project(db)
@@ -7183,7 +7261,7 @@ async def test_unmapped_acceptance_criteria_skips_no_active_criteria(db):
     mine = [r for r in results if r.subject == str(project.id)]
     assert len(mine) == 1
     assert mine[0].status == CheckStatus.SKIPPED
-    assert "no active criteria" in mine[0].detail
+    assert "no ordinary active criteria" in mine[0].detail
 
 
 # --- check_research_quality_grader_pass_rate --------------------------------

@@ -110,7 +110,7 @@ from app.release_qualification_authority import (
     _lock_exact_qualification_authority,
     _measure_candidate_operator_authorship,
     _measured_authorship_receipt_for_audit_spawn,
-    _observe_ci_unresolved_promotion_pending,
+    _observe_ci_unresolved_promotion_pending,  # noqa: F401 - protocol re-export
     qualification_authority_fingerprint,
     qualification_finalize_authority_fingerprint,
     qualification_project_observation_fingerprint,
@@ -120,6 +120,11 @@ from app.release_qualification_observation_protocol import (
     CI_RECOVERY,
     FinalizeObservationRequired,
     extend_finalize_observation_packet,
+)
+from app.release_qualification_control import (
+    automatic_qualification_start_block,
+    qualification_continuation_block,
+    qualification_start_block,
 )
 from app.release_commit_authorship import (
     authorship_category_evidence,
@@ -340,16 +345,19 @@ from app.release_qualifier_audit_surface import (
     compute_audited_surface_hash,  # noqa: F401 — re-exported for callers/tests
 )
 
-# Size governance: this module's cap in backend/testing/module_size_limits.json.
-# Bumped 10300 -> 10800 (tight governing raise) when the authorship evidence
-# contract and reconciliation hard-deadline logic brought the module to 10549
-# lines, past the historically governing 10500. The raise keeps only a small
-# explicit margin (~250 lines, <3% of the cap) — NOT an unbounded generic bump,
-# which reintroduces the ~2k dead-headroom value the governance test rejects.
-# Keep the JSON entry in sync with this constant — the governance test in
-# test_release_qualifier.py cross-checks them, so an over-loosened cap regresses
-# red instead of silently widening headroom past the point the guardrail fires.
+# Size governance is intentionally tight. Tests cross-check this constant and
+# reject the broad headroom that previously let this module grow silently.
 _MODULE_SIZE_GOVERNANCE_CAP: int = 10900
+_REUSE_PROMOTE_NOOP_STATUSES: frozenset[str] = frozenset(
+    {
+        "automatic_qualification_disabled",
+        "project_paused",
+        "task_admission_deferred",
+        "superseded_phase_epoch",
+        "superseded_qualification_state",
+        "superseded_project_observation_state",
+    }
+)
 
 # Product probes are opt-in parts of a qualification attempt's decision
 # contract. Keep the set closed: silently dropping an unknown value would let a
@@ -2301,8 +2309,19 @@ async def run_qualification(
     continued_attempt_id = _coerce_qualification_attempt_id(
         qualification_attempt_id
     )
+    if qualification_attempt_id is not None and continued_attempt_id is None:
+        return {"status": "invalid_qualification_attempt_id"}
+    if explicit_request and auto_trigger:
+        return {"status": "invalid_qualification_authority"}
     attempt_id = continued_attempt_id or uuid.uuid4()
     is_new_attempt = continued_attempt_id is None
+    async def _lock_authority(**kwargs):
+        return await _lock_exact_qualification_authority(
+            session,
+            fresh_automatic=auto_trigger and is_new_attempt,
+            qualification_attempt_id=continued_attempt_id,
+            **kwargs,
+        )
     retry_episode = max(0, int(retry_episode or 0))
     prior_qual = version.last_qualification or {}
     if exact_authority is None:
@@ -2385,6 +2404,18 @@ async def run_qualification(
         )
         return {"status": "explicit_request_required"}
 
+    continuation_block = qualification_continuation_block(
+        version, continued_attempt_id
+    )
+    if continuation_block is not None:
+        return continuation_block
+    if auto_trigger and is_new_attempt:
+        automatic_block = await automatic_qualification_start_block(
+            session, project_id
+        )
+        if automatic_block is not None:
+            return automatic_block
+
     # Drop a product probe the open version's ACTIVE rubric cannot satisfy
     # BEFORE any qualification work (credential resolution, candidate SHA
     # resolution, locking, or child spawn) is spent.  The walkthrough_e2e
@@ -2431,8 +2462,7 @@ async def run_qualification(
     # be overwritten by a concurrent configuration observation.
     if not resolve_project_promotion_enabled(project_id):
         locked_version, authority_block = (
-            await _lock_exact_qualification_authority(
-                session,
+            await _lock_authority(
                 project_id=project_id,
                 version_id=version.id,
                 version_number=version.version_number,
@@ -2533,8 +2563,7 @@ async def run_qualification(
 
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:
-        version, authority_block = await _lock_exact_qualification_authority(
-            session,
+        version, authority_block = await _lock_authority(
             project_id=project_id,
             version_id=version.id,
             version_number=version.version_number,
@@ -2594,8 +2623,7 @@ async def run_qualification(
             repo,
             exc,
         )
-        version, authority_block = await _lock_exact_qualification_authority(
-            session,
+        version, authority_block = await _lock_authority(
             project_id=project_id,
             version_id=version.id,
             version_number=version.version_number,
@@ -2746,8 +2774,7 @@ async def run_qualification(
         if _sync_gate is not None:
             deferral_record = _sync_gate.pop("_deferral_record", None)
             version, authority_block = (
-                await _lock_exact_qualification_authority(
-                    session,
+                await _lock_authority(
                     project_id=project_id,
                     version_id=version.id,
                     version_number=version.version_number,
@@ -2789,8 +2816,7 @@ async def run_qualification(
             int(_pre_lock_qual.get("promotion_failure_count") or 0) >=
             _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS):
         if exact_authority:
-            version, authority_block = await _lock_exact_qualification_authority(
-                session,
+            version, authority_block = await _lock_authority(
                 project_id=project_id,
                 version_id=version.id,
                 version_number=version.version_number,
@@ -2814,18 +2840,9 @@ async def run_qualification(
         < _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS
     ):
         if not allow_synchronous_reuse_promote:
-            # DEFER the reuse-promote to the sweep re-driver (review finding 1).
-            # promote() → _record_promotion_success synchronously activates staged
-            # directions via a nested UPDATE on a SEPARATE connection.  Run from a
-            # caller that holds row locks — notably the STRATEGIC transaction, which
-            # may hold the very Direction/Project rows that UPDATE needs — the
-            # await-suspended caller would hang forever (Postgres can't see the
-            # cross-connection wait cycle, so its deadlock detector never fires).
-            # ONLY the promotion_failed sweep re-driver runs OUTSIDE any lock-holding
-            # request AND re-drives promotion_failed every cycle, so it is the sole
-            # caller that sets allow_synchronous_reuse_promote.  Return a no-op
-            # deferral here (NOT a re-audit — that would re-introduce the treadmill);
-            # the sweep performs the promote safely on its next pass.
+            # Only the sweep may reuse-promote outside a lock-holding request;
+            # doing it inside Strategic can self-block direction activation.
+            # Defer without re-auditing so the sweep retries safely next cycle.
             logger.info(
                 "[RELEASE_QUALIFIER] run_qualification: v%d is promotion_failed with "
                 "an unchanged audited surface — DEFERRING the passing-audit "
@@ -2834,8 +2851,7 @@ async def run_qualification(
                 version.version_number,
             )
             if exact_authority:
-                version, authority_block = await _lock_exact_qualification_authority(
-                    session,
+                version, authority_block = await _lock_authority(
                     project_id=project_id,
                     version_id=version.id,
                     version_number=version.version_number,
@@ -2859,13 +2875,10 @@ async def run_qualification(
                 project_observation_fingerprint
             ),
             enforce_phase_epoch=True,
+            fresh_automatic=auto_trigger and is_new_attempt,
         )
         if _reuse_result is not None:
-            if _reuse_result.get("status") in {
-                "superseded_phase_epoch",
-                "superseded_qualification_state",
-                "superseded_project_observation_state",
-            }:
+            if _reuse_result.get("status") in _REUSE_PROMOTE_NOOP_STATUSES:
                 return _reuse_result
             logger.info(
                 "[RELEASE_QUALIFIER] run_qualification: v%d reused the PASSING "
@@ -2893,8 +2906,7 @@ async def run_qualification(
 
     # 4. Project -> ReleaseVersion serialization prevents duplicate children;
     #    populate_existing also defeats a caller's stale cached version row.
-    locked_version, authority_block = await _lock_exact_qualification_authority(
-        session,
+    locked_version, authority_block = await _lock_authority(
         project_id=project_id,
         version_id=version.id,
         version_number=version.version_number,
@@ -3112,28 +3124,6 @@ async def run_qualification(
     # same qualification attempt inherits the frozen selection; a new request
     # with no selection runs no product probe. The selection was strictly
     # normalized before any GitHub I/O above.
-    if continued_attempt_id is not None:
-        projected_attempt_id = _coerce_qualification_attempt_id(
-            prior_qual.get("qualification_attempt_id")
-        ) or _coerce_qualification_attempt_id(
-            version.active_qualification_attempt_id
-        )
-        if (
-            projected_attempt_id is not None
-            and projected_attempt_id != continued_attempt_id
-        ):
-            logger.info(
-                "[RELEASE_QUALIFIER] refusing stale retry attempt %s for v%d; "
-                "active attempt is %s",
-                continued_attempt_id,
-                version.version_number,
-                projected_attempt_id,
-            )
-            return {
-                "status": "stale_qualification_attempt",
-                "qualification_attempt_id": str(continued_attempt_id),
-                "active_qualification_attempt_id": str(projected_attempt_id),
-            }
     prior_status = prior_qual.get("status")
     ci_unresolved_recovered_same_sha = (
         prior_status == "not_promoted"
@@ -9997,6 +9987,7 @@ async def _reattempt_promotion_failed_locked(
     expected_authority_fingerprint: str | None = None,
     expected_project_observation_fingerprint: str | None = None,
     enforce_phase_epoch: bool = False,
+    fresh_automatic: bool = False,
 ) -> dict[str, Any] | None:
     """Lock + re-promote a ``promotion_failed`` version on an open dedicated session.
 
@@ -10015,6 +10006,14 @@ async def _reattempt_promotion_failed_locked(
     version = await lock_project_then_version(session, version_id)
     if version is None:
         return None
+    start_block = await qualification_start_block(
+        session,
+        version.project_id,
+        version.version_number,
+        fresh_automatic=fresh_automatic,
+    )
+    if start_block is not None:
+        return start_block
     locked_project = await session.get(
         Project, version.project_id, populate_existing=True
     )
@@ -10108,6 +10107,7 @@ async def _reattempt_promotion_failed_in_dedicated_session(
     expected_authority_fingerprint: str | None = None,
     expected_project_observation_fingerprint: str | None = None,
     enforce_phase_epoch: bool = False,
+    fresh_automatic: bool = False,
 ) -> dict[str, Any] | None:
     """Re-attempt promotion of a ``promotion_failed`` version WITHOUT re-auditing.
 
@@ -10157,6 +10157,7 @@ async def _reattempt_promotion_failed_in_dedicated_session(
                     expected_project_observation_fingerprint
                 ),
                 enforce_phase_epoch=enforce_phase_epoch,
+                fresh_automatic=fresh_automatic,
             )
         except Exception:
             try:
@@ -10169,17 +10170,8 @@ async def _reattempt_promotion_failed_in_dedicated_session(
                 )
             raise
 
-    # The dedicated session has now committed + closed.  Run the same post-commit
-    # hooks the finalize path runs (outside the session + row lock, best-effort):
-    # a merge-conflict failure triggers a main → automain reconciliation, and any
-    # resolved outcome re-triggers the strategic agent so it re-plans.  Only when
-    # a promote actually ran (result is not None) — a no-op reuse leaves the
-    # version exactly as it was.
-    if result is not None and result.get("status") not in {
-        "superseded_phase_epoch",
-        "superseded_qualification_state",
-        "superseded_project_observation_state",
-    }:
+    # Only a real promotion attempt runs post-commit hooks; authority no-ops do not.
+    if result is not None and result.get("status") not in _REUSE_PROMOTE_NOOP_STATUSES:
         await _maybe_reconcile_after_promotion_conflict(
             version_id, result, session_factory=session_factory
         )

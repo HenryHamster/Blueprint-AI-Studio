@@ -4441,16 +4441,22 @@ async def get_unmapped_active_criterion_keys(
     (health sweeps, API endpoints, diagnostics) can flag the gap without going
     through the full coverage-summary query.
 
-    Returns a sorted list of criterion_key strings (empty list when all active
-    criteria are mapped or when there are no active criteria).
+    Returns a sorted list of ordinary criterion_key strings (empty list when
+    all ordinary active criteria are mapped or when there are no ordinary
+    active criteria). Machine-enforced authorship policy criteria do not rely
+    on Direction merge evidence and are intentionally excluded.
     """
-    key_result = await session.execute(
-        select(VersionAcceptanceCriterion.criterion_key).where(
+    criterion_result = await session.execute(
+        select(VersionAcceptanceCriterion).where(
             VersionAcceptanceCriterion.release_version_id == release_version_id,
             VersionAcceptanceCriterion.status == "active",
         )
     )
-    active_keys: set[str] = set(key_result.scalars().all())
+    active_keys = {
+        criterion.criterion_key
+        for criterion in criterion_result.scalars().all()
+        if not is_operator_authorship_criterion(criterion)
+    }
     if not active_keys:
         return []
 
@@ -4703,7 +4709,12 @@ async def get_version_coverage_summary(
             current_version = await current_open_version(session, _rv.project_id)
             if current_version is not None and current_version.id == _rv.id:
                 _project = await session.get(Project, _rv.project_id)
-                registered_keys = {
+                all_active_keys = {
+                    c.criterion_key
+                    for c in criteria_in_order
+                    if c.status == "active"
+                }
+                ordinary_registered_keys = {
                     c.criterion_key
                     for c in criteria_in_order
                     if c.status == "active"
@@ -4717,10 +4728,12 @@ async def get_version_coverage_summary(
                     else set()
                 )
                 phantom_bookkeeping = reconcile_criterion_key_references(
-                    registered_keys, referenced_keys
+                    all_active_keys, referenced_keys
                 )
                 phantom_bookkeeping["referenced_keys"] = sorted(referenced_keys)
-                phantom_bookkeeping["registered_count"] = len(registered_keys)
+                phantom_bookkeeping["registered_count"] = len(
+                    ordinary_registered_keys
+                )
         except Exception:
             logger.exception(
                 "phantom-bookkeeping drift guard failed for version %s",

@@ -90,7 +90,13 @@ _app_database._LazyEngine._engine = engine
 def _postgres_cleanup_tables():
     """Return a FK-order delete list (children before parents)."""
     ordered_tables = list(reversed(SQLModel.metadata.sorted_tables))
-    return ordered_tables
+    # This append-only ledger is deleted only through its Project FK cascade;
+    # a direct child-first DELETE is correctly rejected by its DB trigger.
+    return [
+        table
+        for table in ordered_tables
+        if table.name != "releasequalificationcontrolrevision"
+    ]
 
 
 @pytest_asyncio.fixture(scope="function")

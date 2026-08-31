@@ -14,10 +14,15 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
+    ReleaseQualificationControlRevision,
     ReleaseQualificationIntent,
     ReleaseVersion,
     Task,
     TaskStatus,
+)
+from app.release_qualification_control import (
+    apply_qualification_control,
+    qualification_control_readback,
 )
 from app.release_qualification_intents import (
     QUALIFICATION_INTENT_MAX_ATTEMPTS,
@@ -306,6 +311,83 @@ async def test_paused_intent_stays_due_then_applies_once(db_session, mocker):
         session_factory=factory,
     )
     assert apply_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_held_automatic_control_allows_exact_resident_intent_once(
+    db_session, mocker
+):
+    project, version = await _make_project_and_version(
+        db_session,
+        phase="stabilize",
+    )
+    project_id = project.id
+    version_id = version.id
+    task = await _source_task(db_session, project)
+    intent = await prepare_qualification_intent(
+        db_session,
+        request={"reason": "one Resident qualification", "probes": []},
+        task=task,
+        project=project,
+        authority_key="workday:v57-qualification",
+        authority_kind="managed_workday_operation",
+    )
+    assert intent is not None
+    intent_id = intent.id
+    await apply_qualification_control(
+        db_session,
+        project_id=project_id,
+        expected_revision=0,
+        automatic_starts_enabled=False,
+        idempotency_key="hold-before-resident-intent",
+        actor_user_id="test-user-123",
+        reason="Fence automatic qualification before exact Resident intent",
+    )
+    await db_session.commit()
+
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new_callable=mocker.AsyncMock,
+        return_value={"status": "success", "head_sha": "a" * 40},
+    )
+    mocker.patch(
+        "app.strategic_spawning.ci_compliance_qualify_gate",
+        return_value={"blocked": False},
+    )
+    mocker.patch(
+        "app.release_qualifier._drop_incompatible_product_probes",
+        new_callable=mocker.AsyncMock,
+        return_value=(set(), None),
+    )
+    mocker.patch(
+        "app.release_qualifier.resolve_project_promotion_enabled",
+        return_value=False,
+    )
+    factory = _shared_session_factory(db_session)
+    assert await drain_qualification_intent(intent_id, session_factory=factory)
+
+    await db_session.refresh(intent)
+    await db_session.refresh(version)
+    assert intent.status == "applied"
+    assert intent.attempt_count == 1
+    assert intent.result["delivery_state"] == "committed"
+    assert intent.result["status"] == "external_blocker"
+    assert version.id == version_id
+    assert version.last_qualification["blocker"] == "promotion_disabled"
+    assert not await drain_qualification_intent(intent_id, session_factory=factory)
+    control = await qualification_control_readback(db_session, project_id)
+    assert control["current"]["revision"] == 1
+    assert control["current"]["automatic_starts_enabled"] is False
+    rows = (
+        await db_session.execute(
+            select(ReleaseQualificationControlRevision).where(
+                ReleaseQualificationControlRevision.project_id == project_id
+            )
+        )
+    ).scalars().all()
+    assert [row.idempotency_key for row in rows] == [
+        "hold-before-resident-intent"
+    ]
 
 
 @pytest.mark.asyncio

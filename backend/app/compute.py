@@ -1181,8 +1181,10 @@ async def fleet_serving_source_sha(
         # window here matches the fleet panel's own runner-liveness definition
         # (_runner_liveness_health) rather than inventing a second staleness rule.
         stale_cutoff = _utcnow() - timedelta(seconds=_get_liveness_seconds())
-        runner_stmt = select(LocalRunner.agent_source_sha).where(
-            LocalRunner.agent_source_sha.is_not(None),
+        runner_stmt = select(
+            LocalRunner.agent_source_sha,
+            LocalRunner.source_sha,
+        ).where(
             LocalRunner.status == "active",
             LocalRunner.last_seen_at.is_not(None),
             LocalRunner.last_seen_at >= stale_cutoff,
@@ -1193,27 +1195,7 @@ async def fleet_serving_source_sha(
         observed_shas.update(
             source_sha
             for row in runner_rows
-            if (source_sha := _full_source_sha(row[0])) is not None
-        )
-        if promoted_sha in observed_shas:
-            return True
-
-        # The runner's own clean ``git describe`` identity (LocalRunner.source_sha)
-        # is a second, independent observation of the same fleet class; it folds
-        # into the same union under the same liveness window.
-        runner_stmt = select(LocalRunner.source_sha).where(
-            LocalRunner.last_seen_at >= stale_cutoff,
-            LocalRunner.source_sha.is_not(None),
-            LocalRunner.status == "active",
-            LocalRunner.last_seen_at.is_not(None),
-        )
-        if project_id is not None:
-            runner_stmt = runner_stmt.where(runner_allowed_for_project(project_id))
-        runner_rows = (await session.execute(runner_stmt)).all()
-        observed_shas.update(
-            source_sha
-            for row in runner_rows
-            if (source_sha := _full_source_sha(row[0])) is not None
+            if (source_sha := _full_source_sha(row[0] or row[1])) is not None
         )
         if promoted_sha in observed_shas:
             return True

@@ -1157,6 +1157,65 @@ async def test_coverage_summary_no_phantom_when_prose_matches(db_session):
 
 
 @pytest.mark.asyncio
+async def test_policy_criterion_is_registered_but_not_ordinary_coverage(db_session):
+    """An active authorship policy is valid without a Direction mapping."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    ordinary = await ac.create_criterion(
+        db_session, project.id, version.id, "Ordinary product outcome"
+    )
+    policy = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "No operator-authored commits",
+        evidence_contract={
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 0},
+        },
+    )
+    direction = _make_direction(
+        project.id, "policy-boundary", [ordinary.criterion_key], "active"
+    )
+    project.problem_model = {
+        "intent": {
+            "current_focus": (
+                f"Deliver {ordinary.criterion_key} under policy "
+                f"{policy.criterion_key}"
+            )
+        }
+    }
+    db_session.add_all([project, direction])
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    report = summary["phantom_bookkeeping"]
+    assert summary["total"] == 1
+    assert report["registered_count"] == 1
+    assert report["referenced_keys"] == sorted(
+        [ordinary.criterion_key, policy.criterion_key]
+    )
+    assert report["phantom_keys"] == []
+    assert report["zero_registered"] is False
+    assert report["has_drift"] is False
+    assert direction.criterion_keys == [ordinary.criterion_key]
+
+    updated_problem_model = dict(project.problem_model or {})
+    updated_intent = dict(updated_problem_model.get("intent") or {})
+    updated_intent["current_focus"] = (
+        f"{updated_intent['current_focus']} unknown c-deadbeef"
+    )
+    updated_problem_model["intent"] = updated_intent
+    project.problem_model = updated_problem_model
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    drifted = await ac.get_version_coverage_summary(db_session, version.id)
+    assert drifted["phantom_bookkeeping"]["phantom_keys"] == ["c-deadbeef"]
+
+
+@pytest.mark.asyncio
 async def test_coverage_summary_scopes_direction_references_by_lifecycle_and_version(
     db_session,
 ):
@@ -2114,6 +2173,31 @@ async def test_get_unmapped_active_criterion_keys_excludes_inactive(db_session):
     )
     assert result == [c_active.criterion_key]
     assert c_retracted.criterion_key not in result
+
+
+@pytest.mark.asyncio
+async def test_get_unmapped_active_criterion_keys_excludes_authorship_policy(db_session):
+    """Machine-policy gates do not require ordinary Direction evidence."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    ordinary = await ac.create_criterion(
+        db_session, project.id, version.id, "Ordinary unmapped criterion"
+    )
+    await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "No operator-authored commits",
+        evidence_contract={
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 0},
+        },
+    )
+
+    result = await ac.get_unmapped_active_criterion_keys(
+        db_session, project.id, version.id
+    )
+    assert result == [ordinary.criterion_key]
 
 
 @pytest.mark.asyncio
