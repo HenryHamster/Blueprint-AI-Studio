@@ -1389,6 +1389,7 @@ runtime_config: Dict = {
         "research",
         "plan",
         "security_audit",
+        "strategic_review",
     ],
     # Deterministic holdback fraction for the language-aware repo-map trial.
     # Tasks whose stable per-task hash falls below this threshold run WITHOUT

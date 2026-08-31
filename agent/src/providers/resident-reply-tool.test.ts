@@ -13,7 +13,7 @@ function runMcp(scriptPath: string, env: NodeJS.ProcessEnv, requests: unknown[])
     encoding: 'utf8',
     env,
   });
-  return output.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  return output.trim().split('\n').filter(Boolean).map((line): unknown => JSON.parse(line) as unknown);
 }
 
 describe('Resident Workday reply MCP tool', () => {
@@ -34,9 +34,14 @@ describe('Resident Workday reply MCP tool', () => {
         params: { name: 'reply_to_operator', arguments: { content: 'not deliverable' } },
       }]) as Array<Record<string, unknown>>;
 
-      const result = responses[0].result as { isError?: boolean; content: Array<{ text: string }> };
+      const result = responses[0].result as {
+        isError?: boolean;
+        content: Array<{ text: string }>;
+        structuredContent: { accepted: boolean };
+      };
       expect(result.isError).not.toBe(true);
       expect(result.content[0].text).toContain('No active operator turn is armed');
+      expect(result.structuredContent.accepted).toBe(false);
       expect(fs.existsSync(stagedReplyPath)).toBe(false);
     } finally {
       fs.rmSync(workspace, { recursive: true, force: true });
@@ -74,6 +79,8 @@ describe('Resident Workday reply MCP tool', () => {
       ]);
       expect((responses[2].result as { content: Array<{ text: string }> }).content[0].text)
         .toContain('accepted for delivery');
+      expect((responses[2].result as { structuredContent: { accepted: boolean } }).structuredContent.accepted)
+        .toBe(true);
       expect(JSON.parse(fs.readFileSync(stagedReplyPath, 'utf8'))).toEqual({
         type: 'QUESTION',
         content: 'Here is the actual reply.',

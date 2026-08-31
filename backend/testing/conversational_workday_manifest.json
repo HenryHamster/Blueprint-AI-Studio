@@ -486,7 +486,24 @@
         "startResidentClaudeSession > counts long-running nested sub-agent output as parent-turn activity",
         "startResidentClaudeSession > exposes meaningful progress and retains bounded head-plus-tail terminal trace evidence"
       ],
-      "test_count": 50
+      "test_count": 53
+    },
+    {
+      "path": "agent/src/providers/resident-codex-session.test.ts",
+      "reason": "Protects the OpenAI Codex Resident process-per-turn adapter: strict read-only profile isolation, exact thread resume identity, receipt-bound strategic/reply acknowledgements, bounded child termination, and cleanup/idle liveness.",
+      "test_ids": [
+        "startResidentCodexSession > uses exact thread identity for a second exec resume turn",
+        "startResidentCodexSession > revokes an accepted reply when the resumed process has a $label thread receipt [case 1]",
+        "startResidentCodexSession > revokes an accepted reply when the resumed process has a $label thread receipt [case 2]",
+        "startResidentCodexSession > revokes an accepted reply after $label [case 1]",
+        "startResidentCodexSession > revokes an accepted reply after $label [case 2]",
+        "startResidentCodexSession > requires exact successful command and MCP receipts before acknowledging authority",
+        "startResidentCodexSession > rejects unsafe sandbox translations and requires the complete read-only contract",
+        "startResidentCodexSession > bounds an interrupt through SIGKILL when the child emits no close event",
+        "startResidentCodexSession > retains tracking and scratch after an undeliverable kill until late close",
+        "startResidentCodexSession > settles child idle even when asynchronous scratch cleanup needs a retry"
+      ],
+      "test_count": 18
     },
     {
       "path": "scripts/test_runner_isolation.py",
@@ -496,7 +513,7 @@
         "TestProbeLlmClis::test_agent_plan_probe_uses_exact_bwrap_boundary",
         "TestProbeLlmClis::test_agent_plan_probe_reports_sandbox_missing_resident_flag"
       ],
-      "test_count": 184
+      "test_count": 189
     },
     {
       "path": "scripts/test_local_runner.py",
@@ -504,7 +521,7 @@
       "test_ids": [
         "TestLlmCliBackendProbe::test_bwrap_backend_probes_the_exact_agent_plan_when_available"
       ],
-      "test_count": 712
+      "test_count": 717
     },
     {
       "path": "agent/src/index.provider-runner.test.ts",
@@ -767,6 +784,7 @@
         "handleStrategicResident - failed-turn recovery > exits silently on terminal initial admission error: %s [case 2]",
         "handleStrategicResident - failed-turn recovery > extends a legacy claim after backend upgrade when a retry batch grows",
         "handleStrategicResident - failed-turn recovery > fails closed before the model when an operator batch has no stable message id",
+        "handleStrategicResident - failed-turn recovery > fails closed without replacement when the provider child cannot be killed",
         "handleStrategicResident - failed-turn recovery > folds the checkpoint into the first operator turn after bounded wedged preemption",
         "handleStrategicResident - failed-turn recovery > keeps chat alive without autonomous authority when process incarnation is held",
         "handleStrategicResident - failed-turn recovery > keeps local terminal state silent when the fenced terminal post is rejected",
@@ -784,6 +802,7 @@
         "handleStrategicResident - failed-turn recovery > revalidates an existing claim before retrying the provider turn",
         "handleStrategicResident - failed-turn recovery > sends the first text-only operator turn as one stream-json content item",
         "handleStrategicResident - failed-turn recovery > splits an aggregate required-image overflow into bounded same-timestamp model turns",
+        "handleStrategicResident - failed-turn recovery > stays silent after incarnation loss even when provider teardown cannot settle",
         "handleStrategicResident - failed-turn recovery > stops before any further model work when reply receipt cleanup fails after a turn",
         "handleStrategicResident - failed-turn recovery > uses distinct immutable receipts when M2 arrives after atomic M1 reply",
         "handleStrategicResident - failed-turn recovery > waits through retryable legacy grace without publishing loser helpers",
@@ -904,7 +923,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 155
+      "test_count": 157
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",

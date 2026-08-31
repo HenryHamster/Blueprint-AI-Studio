@@ -1,5 +1,6 @@
 import json
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from app.max_plan_pool import (
 )
 from app.llm_cost_attribution import compute_llm_cost_breakdown
 from app.models import TaskStatus
+from app.providers.base import UsageSnapshot
 from app.task_blocked import reset_task_for_fresh_attempt
 from app.orchestrator import (
     _resolve_env_runtime_fallback,
@@ -120,6 +122,14 @@ def _task(*, payload=None, context=None):
     return SimpleNamespace(
         payloads=[payload or {}],
         context=context or {},
+    )
+
+
+def _known_usage(utilization: float, now: datetime) -> UsageSnapshot:
+    return UsageSnapshot(
+        known=True,
+        window_utilizations={"five_hour": utilization},
+        probed_at=now.isoformat(),
     )
 
 
@@ -626,6 +636,7 @@ async def test_select_llm_runtime_balanced_mode_picks_less_loaded_provider(
     (health_score, -active_tasks). With zero-history accounts the health score
     ties, so the provider with fewer active tasks should win — no bias by
     list order."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     busy_anthropic = {
         "id": "acct-anthropic",
         "user_id": _TEST_USER,
@@ -636,6 +647,8 @@ async def test_select_llm_runtime_balanced_mode_picks_less_loaded_provider(
         "runtime_ready": True,
         "enabled": True,
         "active_tasks": 3,
+        "usage_snapshot": _known_usage(18.0, now),
+        "usage_snapshot_at": now,
     }
     idle_openai = {
         "id": "acct-openai",
@@ -647,6 +660,8 @@ async def test_select_llm_runtime_balanced_mode_picks_less_loaded_provider(
         "runtime_ready": True,
         "enabled": True,
         "active_tasks": 0,
+        "usage_snapshot": _known_usage(99.0, now),
+        "usage_snapshot_at": now,
     }
     _max_plan_pools.setdefault(_TEST_USER, []).extend([busy_anthropic, idle_openai])
     _account_by_id[busy_anthropic["id"]] = busy_anthropic
@@ -686,6 +701,7 @@ async def test_select_llm_runtime_balanced_mode_picks_less_loaded_provider(
 async def test_select_llm_runtime_preferred_mode_honors_list_order(clean_runtime_pool):
     """Preferred mode tries providers in list order. First listed wins even
     when it's busier, unless it's fully exhausted."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     busy_anthropic = {
         "id": "acct-anthropic",
         "user_id": _TEST_USER,
@@ -696,6 +712,8 @@ async def test_select_llm_runtime_preferred_mode_honors_list_order(clean_runtime
         "runtime_ready": True,
         "enabled": True,
         "active_tasks": 3,
+        "usage_snapshot": _known_usage(99.0, now),
+        "usage_snapshot_at": now,
     }
     idle_openai = {
         "id": "acct-openai",
@@ -707,6 +725,8 @@ async def test_select_llm_runtime_preferred_mode_honors_list_order(clean_runtime
         "runtime_ready": True,
         "enabled": True,
         "active_tasks": 0,
+        "usage_snapshot": _known_usage(18.0, now),
+        "usage_snapshot_at": now,
     }
     _max_plan_pools.setdefault(_TEST_USER, []).extend([busy_anthropic, idle_openai])
     _account_by_id[busy_anthropic["id"]] = busy_anthropic

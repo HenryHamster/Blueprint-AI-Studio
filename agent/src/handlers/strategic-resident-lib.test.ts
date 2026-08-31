@@ -1672,7 +1672,7 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
     // set-running-update requires a file path, not inline markdown
     expect(p).toContain('set-running-update');
     expect(p).toContain('FILE PATH');
-    expect(p).toContain('/tmp/running_update.md');
+    expect(p).toContain('$TMPDIR/running_update.md');
     expect(p).toContain('reads the file');
     expect(p).toContain('passing markdown as argv fails');
   });

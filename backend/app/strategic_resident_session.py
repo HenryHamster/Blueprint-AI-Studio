@@ -420,7 +420,7 @@ _RESIDENT_STRATEGIC_TASK_TYPE = "strategic_review"
 # an explicit per-task routing constraint instead of inheriting the broader
 # strategic category preference (which may validly put OpenAI first for normal
 # one-shot strategic reviews).
-_RESIDENT_PROVIDER_PREFERENCE = ("anthropic", "zai", "deepseek")
+_RESIDENT_PROVIDER_PREFERENCE = ("anthropic", "openai", "zai", "deepseek")
 
 # A live strategic_review task is only *adoptable* into a resident session while
 # it has NOT yet begun executing. Handler dispatch — the one-shot

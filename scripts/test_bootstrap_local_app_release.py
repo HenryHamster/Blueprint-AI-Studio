@@ -839,7 +839,6 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             try:
                 with (
                     unittest.mock.patch.object(blueprint, "_RELEASE_SOCKET_PATH", str(socket_path)),
-                    unittest.mock.patch.object(blueprint, "_RELEASE_SOCKET_TIMEOUT_SECONDS", 0.03),
                     unittest.mock.patch.object(blueprint, "_require_write_config"),
                     unittest.mock.patch.object(
                         blueprint, "_read_live_approved_activation", return_value=promoted
@@ -874,9 +873,17 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     ),
                 ):
                     server.start()
-                    self.assertFalse(blueprint._deploy_agent_once(args))
+                    with unittest.mock.patch.object(
+                        blueprint, "_RELEASE_SOCKET_TIMEOUT_SECONDS", 0.03
+                    ):
+                        self.assertFalse(blueprint._deploy_agent_once(args))
                     server.join(timeout=2)
                     self.assertFalse(server.is_alive())
+                    state = json.loads(Path(args.state_path).read_text(encoding="utf-8"))
+                    self.assertEqual(state["phase"], "accepted")
+                    self.assertEqual(state["operation_id"], operation_id)
+                    self.assertEqual(state["digest"], digest)
+                    self.assertEqual(state["activation_attempts"], 1)
                     self.assertEqual(count_path.read_text(encoding="utf-8"), "release\n")
                     self.assertEqual(
                         [item for item in calls if item[0] == "POST"], [],

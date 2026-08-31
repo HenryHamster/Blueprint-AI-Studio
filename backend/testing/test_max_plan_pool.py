@@ -236,10 +236,10 @@ class TestFilterProvidersByCLI:
         result = _filter_providers_by_cli(["anthropic", "openai"], clis)
         assert result == ["openai"]
 
-    def test_resident_readiness_blocks_only_resident_claude_routes(self):
+    def test_resident_readiness_blocks_only_unqualified_resident_routes(self):
         clis = {
             "claude": {"present": True, "resident_ready": False},
-            "codex": {"present": True},
+            "codex": {"present": True, "resident_ready": True},
         }
         assert _filter_providers_by_cli(
             ["anthropic", "openai"], clis
@@ -3898,6 +3898,59 @@ class TestRestoreUsageState:
         _restore_usage_state(empty, None, None)
         assert empty == {}
 
+    def test_newer_legacy_known_snapshot_clears_older_failure(self):
+        success_at = _utcnow()
+        failure_at = success_at - timedelta(seconds=30)
+        entry: dict = {}
+        _restore_usage_state(
+            entry,
+            (None, None, failure_at, failure_at, "authentication"),
+            {
+                "source": "oauth_usage_probe",
+                "updated_at": success_at.isoformat(),
+                "five_hour": {"utilization": 18.0},
+            },
+        )
+        assert entry["usage_snapshot_at"] == success_at
+        assert entry["usage_probe_attempt_at"] == success_at
+        assert "usage_probe_failure_kind" not in entry
+        assert "usage_probe_failed_at" not in entry
+
+    def test_equal_known_attempt_clears_failure(self):
+        at = _utcnow()
+        entry: dict = {}
+        _restore_usage_state(
+            entry,
+            (None, None, at, at, "rate_limited"),
+            {
+                "source": "oauth_usage_probe",
+                "updated_at": at.isoformat(),
+                "five_hour": {"utilization": 20.0},
+                "last_attempt_at": at.isoformat(),
+                "last_attempt_status": "known",
+            },
+        )
+        assert entry["usage_probe_attempt_at"] == at
+        assert "usage_probe_failure_kind" not in entry
+        assert "usage_probe_failed_at" not in entry
+
+    def test_newer_failure_survives_older_known_snapshot(self):
+        failure_at = _utcnow()
+        success_at = failure_at - timedelta(seconds=30)
+        entry: dict = {}
+        _restore_usage_state(
+            entry,
+            (None, None, failure_at, failure_at, "authentication"),
+            {
+                "source": "oauth_usage_probe",
+                "updated_at": success_at.isoformat(),
+                "five_hour": {"utilization": 18.0},
+            },
+        )
+        assert entry["usage_probe_attempt_at"] == failure_at
+        assert entry["usage_probe_failure_kind"] == "authentication"
+        assert entry["usage_probe_failed_at"] == failure_at
+
 
 @pytest.mark.asyncio
 class TestRefreshUsageMeterSnapshots:
@@ -6079,7 +6132,7 @@ class TestSelectLLMRuntimeFiltersByRunnerCLIs:
             runtime_config=runtime_config,
             runner_available_clis={
                 "claude": {"present": True, "resident_ready": False},
-                "codex": {"present": True},
+                "codex": {"present": True, "resident_ready": True},
             },
         )
 

@@ -1458,7 +1458,7 @@ def _load_runner_token() -> str | None:
 _MANAGED_CLI_POLICY: dict[str, tuple[str, str]] = {
     # Codex accepts compatible newer versions, but repair/bootstrap uses the
     # reviewed exact version so a registry change cannot silently alter runners.
-    "codex": ("@openai/codex", "0.144.1"),
+    "codex": ("@openai/codex", "0.150.1"),
     # Preserve the existing Docker/Packer policy for Claude Code: current latest.
     "claude": ("@anthropic-ai/claude-code", "latest"),
 }
@@ -4791,8 +4791,30 @@ _TRANSIENT_CLI_PROBE_REASONS = frozenset(
         "version_probe_error",
         "version_probe_failed",
         "container_probe_error",
+        "help_probe_timeout",
+        "help_probe_error",
+        "help_probe_failed",
+        "container_help_probe_timeout",
+        "container_help_probe_error",
+        "exec_help_probe_timeout",
+        "exec_help_probe_error",
+        "exec_help_probe_failed",
+        "resume_help_probe_timeout",
+        "resume_help_probe_error",
+        "resume_help_probe_failed",
+        "profile_probe_timeout",
+        "profile_probe_error",
     }
 )
+
+
+def _cli_probe_transient_reason(info: dict) -> str | None:
+    """Return the transient failure carried by either probe layer."""
+    for field in ("reason", "capability_probe_reason"):
+        value = info.get(field)
+        if value in _TRANSIENT_CLI_PROBE_REASONS:
+            return value
+    return None
 
 
 def _agent_image_identity(agent_image: str) -> str | None:
@@ -4850,7 +4872,7 @@ def _probe_llm_clis_for_agent_backend(
         # not the same cached failure twice.
         if cache_key is not None and not any(
             isinstance(info, dict)
-            and info.get("reason") in _TRANSIENT_CLI_PROBE_REASONS
+            and _cli_probe_transient_reason(info) is not None
             for info in probed.values()
         ):
             # Discard results for older IDs behind the same mutable tag.
@@ -4909,17 +4931,21 @@ def _stabilize_llm_cli_probe(
     for name, raw in current.items():
         info = dict(raw) if isinstance(raw, dict) else {}
         key = (source, name)
-        if info.get("healthy") is True:
+        transient_reason = _cli_probe_transient_reason(info)
+        capability_failed = info.get("resident_ready") is False
+        if info.get("healthy") is True and not (
+            transient_reason is not None and capability_failed
+        ):
             last_healthy[key] = dict(info)
             transient_failures.pop(key, None)
             stabilized[name] = info
             continue
-        if info.get("reason") in _TRANSIENT_CLI_PROBE_REASONS and key in last_healthy:
+        if transient_reason is not None and key in last_healthy:
             count = transient_failures.get(key, 0) + 1
             transient_failures[key] = count
             if count < 2:
                 previous = dict(last_healthy[key])
-                previous["probe_warning"] = info.get("reason")
+                previous["probe_warning"] = transient_reason
                 previous["probe_stale"] = True
                 stabilized[name] = previous
                 continue
@@ -4983,27 +5009,37 @@ def _intersect_llm_cli_health(
             backend: info.get("version") or None
             for backend, info in details.items()
         }
-        if name == "claude":
-            readiness = [info.get("resident_ready") for info in details.values()]
-            explicit_readiness = [value for value in readiness if isinstance(value, bool)]
-            if explicit_readiness:
-                selected["resident_ready"] = (
-                    len(explicit_readiness) == len(readiness)
-                    and all(explicit_readiness)
-                )
-                selected["missing_resident_flags"] = sorted(
-                    {
-                        flag
-                        for info in details.values()
-                        for flag in (info.get("missing_resident_flags") or [])
-                        if isinstance(flag, str)
-                    }
-                )[:16]
-                selected["capability_probe_reason"] = (
-                    None
-                    if selected["resident_ready"]
-                    else "missing_or_unverified_on_selectable_backend"
-                )
+        readiness = [info.get("resident_ready") for info in details.values()]
+        explicit_readiness = [value for value in readiness if isinstance(value, bool)]
+        if explicit_readiness:
+            selected["resident_ready"] = (
+                len(explicit_readiness) == len(readiness)
+                and all(explicit_readiness)
+            )
+            selected["missing_resident_flags"] = sorted(
+                {
+                    flag
+                    for info in details.values()
+                    for flag in (info.get("missing_resident_flags") or [])
+                    if isinstance(flag, str)
+                }
+            )[:16]
+            selected["capability_probe_reason"] = (
+                None
+                if selected["resident_ready"]
+                else "missing_or_unverified_on_selectable_backend"
+            )
+        profile_readiness = [
+            info.get("resident_profile_ready") for info in details.values()
+        ]
+        explicit_profile_readiness = [
+            value for value in profile_readiness if isinstance(value, bool)
+        ]
+        if explicit_profile_readiness:
+            selected["resident_profile_ready"] = (
+                len(explicit_profile_readiness) == len(profile_readiness)
+                and all(explicit_profile_readiness)
+            )
         if failed:
             selected.update(
                 {

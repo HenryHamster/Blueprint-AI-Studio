@@ -929,7 +929,9 @@ def _healthy_llm_clis():
         },
         "codex": {
             "present": True, "executable_found": True, "healthy": True,
-            "version": "codex-cli 0.144.1", "reason": None,
+            "version": "codex-cli 0.150.1", "reason": None,
+            "resident_ready": True, "resident_profile_ready": True,
+            "missing_resident_flags": [], "capability_probe_reason": None,
         },
         "gemini": {
             "present": True, "executable_found": True, "healthy": True,
@@ -1137,6 +1139,43 @@ class TestLlmCliBackendProbe(unittest.TestCase):
             "missing_or_unverified_on_selectable_backend",
         )
 
+    def test_hybrid_requires_codex_resident_capability_proof_from_every_backend(self):
+        legacy_image_health = _healthy_llm_clis()
+        legacy_image_health["codex"].pop("resident_ready")
+        legacy_image_health["codex"].pop("resident_profile_ready")
+        legacy_image_health["codex"].pop("missing_resident_flags")
+        legacy_image_health["codex"].pop("capability_probe_reason")
+
+        body = self._hybrid_heartbeat(
+            host_health=_healthy_llm_clis(),
+            image_health=legacy_image_health,
+        )
+
+        self.assertTrue(body["llm_clis"]["codex"]["healthy"])
+        self.assertFalse(body["llm_clis"]["codex"]["resident_ready"])
+        self.assertFalse(body["llm_clis"]["codex"]["resident_profile_ready"])
+        self.assertEqual(
+            body["llm_clis"]["codex"]["capability_probe_reason"],
+            "missing_or_unverified_on_selectable_backend",
+        )
+
+    def test_hybrid_intersects_codex_profile_readiness_across_backends(self):
+        image_health = _healthy_llm_clis()
+        image_health["codex"].update({
+            "resident_ready": False,
+            "resident_profile_ready": False,
+            "capability_probe_reason": "profile_probe_failed",
+        })
+
+        body = self._hybrid_heartbeat(
+            host_health=_healthy_llm_clis(),
+            image_health=image_health,
+        )
+
+        self.assertTrue(body["llm_clis"]["codex"]["healthy"])
+        self.assertFalse(body["llm_clis"]["codex"]["resident_ready"])
+        self.assertFalse(body["llm_clis"]["codex"]["resident_profile_ready"])
+
     def test_same_tag_new_image_id_invalidates_cached_probe(self):
         identities = iter(("sha256:old", "sha256:new"))
         with patch.object(
@@ -1183,6 +1222,89 @@ class TestLlmCliBackendProbe(unittest.TestCase):
         self.assertTrue(first["codex"]["probe_stale"])
         self.assertEqual(first["codex"]["probe_warning"], "version_probe_timeout")
         self.assertFalse(second["codex"]["healthy"])
+
+    def test_transient_resident_probe_grace_then_withdraws_only_resident_readiness(self):
+        last_healthy = {}
+        failures = {}
+        source = "host"
+        healthy = _healthy_llm_clis()
+        local_runner._stabilize_llm_cli_probe(
+            source, healthy, last_healthy, failures
+        )
+        transient = _healthy_llm_clis()
+        transient["codex"].update({
+            "resident_ready": False,
+            "resident_profile_ready": False,
+            "capability_probe_reason": "profile_probe_timeout",
+        })
+
+        first = local_runner._stabilize_llm_cli_probe(
+            source, transient, last_healthy, failures
+        )
+        second = local_runner._stabilize_llm_cli_probe(
+            source, transient, last_healthy, failures
+        )
+
+        self.assertTrue(first["codex"]["resident_ready"])
+        self.assertTrue(first["codex"]["probe_stale"])
+        self.assertEqual(first["codex"]["probe_warning"], "profile_probe_timeout")
+        self.assertTrue(second["codex"]["healthy"])
+        self.assertFalse(second["codex"]["resident_ready"])
+
+    def test_transient_resident_probe_is_not_cached_for_immutable_image(self):
+        transient = _healthy_llm_clis()
+        transient["codex"].update({
+            "resident_ready": False,
+            "resident_profile_ready": False,
+            "capability_probe_reason": "profile_probe_error",
+        })
+        with patch.object(
+            local_runner, "_agent_image_identity", return_value="sha256:transient"
+        ), patch.object(
+            iso, "probe_container_llm_clis", return_value=transient
+        ) as container_probe:
+            local_runner._probe_llm_clis_for_agent_backend(
+                iso.BACKEND_DOCKER, "registry/agent:prod"
+            )
+            local_runner._probe_llm_clis_for_agent_backend(
+                iso.BACKEND_DOCKER, "registry/agent:prod"
+            )
+
+        self.assertEqual(container_probe.call_count, 2)
+
+    def test_transient_claude_help_probe_is_not_cached_and_gets_one_grace(self):
+        transient = _healthy_llm_clis()
+        transient["claude"].update({
+            "resident_ready": False,
+            "capability_probe_reason": "container_help_probe_timeout",
+        })
+        with patch.object(
+            local_runner, "_agent_image_identity", return_value="sha256:claude-transient"
+        ), patch.object(
+            iso, "probe_container_llm_clis", return_value=transient
+        ) as container_probe:
+            local_runner._probe_llm_clis_for_agent_backend(
+                iso.BACKEND_DOCKER, "registry/agent:prod"
+            )
+            local_runner._probe_llm_clis_for_agent_backend(
+                iso.BACKEND_DOCKER, "registry/agent:prod"
+            )
+        self.assertEqual(container_probe.call_count, 2)
+
+        last_healthy = {}
+        failures = {}
+        local_runner._stabilize_llm_cli_probe(
+            "image", _healthy_llm_clis(), last_healthy, failures
+        )
+        first = local_runner._stabilize_llm_cli_probe(
+            "image", transient, last_healthy, failures
+        )
+        second = local_runner._stabilize_llm_cli_probe(
+            "image", transient, last_healthy, failures
+        )
+        self.assertTrue(first["claude"]["resident_ready"])
+        self.assertTrue(first["claude"]["probe_stale"])
+        self.assertFalse(second["claude"]["resident_ready"])
 
     def test_deterministic_failure_has_no_grace(self):
         last_healthy = {}
@@ -1233,7 +1355,7 @@ class TestManagedCliMaintenance(unittest.TestCase):
             Path(os.path.join(bin_dir, "codex")).write_text("shim")
             return subprocess.CompletedProcess(args, 0, stdout="installed", stderr="")
         return subprocess.CompletedProcess(
-            args, 0, stdout="codex-cli 0.144.1", stderr=""
+            args, 0, stdout="codex-cli 0.150.1", stderr=""
         )
 
     def test_stages_verifies_and_atomically_activates(self):
@@ -1245,14 +1367,14 @@ class TestManagedCliMaintenance(unittest.TestCase):
              ):
             self.assertTrue(
                 local_runner._install_managed_cli(
-                    "codex", "/tools/npm", "@openai/codex", "0.144.1"
+                    "codex", "/tools/npm", "@openai/codex", "0.150.1"
                 )
             )
 
         manifest = local_runner._read_json(
             os.path.join(self.tmp.name, "codex", "active.json")
         )
-        self.assertEqual(manifest["version"], "0.144.1")
+        self.assertEqual(manifest["version"], "0.150.1")
         active_bin = local_runner._managed_cli_bin("codex")
         self.assertIsNotNone(active_bin)
         self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], active_bin)
@@ -1267,7 +1389,7 @@ class TestManagedCliMaintenance(unittest.TestCase):
              ):
             self.assertTrue(
                 local_runner._install_managed_cli(
-                    "codex", "/tools/npm", "@openai/codex", "0.144.1"
+                    "codex", "/tools/npm", "@openai/codex", "0.150.1"
                 )
             )
         active_path = os.path.join(self.tmp.name, "codex", "active.json")
@@ -1277,14 +1399,14 @@ class TestManagedCliMaintenance(unittest.TestCase):
             if "install" in args:
                 return self._successful_install_run(args, **kwargs)
             return subprocess.CompletedProcess(
-                args, 0, stdout="codex-cli 0.143.0", stderr=""
+                args, 0, stdout="codex-cli 0.149.9", stderr=""
             )
 
         with patch.object(local_runner.shutil, "which", side_effect=self._which), \
              patch.object(local_runner.subprocess, "run", side_effect=old_version):
             self.assertFalse(
                 local_runner._install_managed_cli(
-                    "codex", "/tools/npm", "@openai/codex", "0.144.1"
+                    "codex", "/tools/npm", "@openai/codex", "0.150.1"
                 )
             )
         self.assertEqual(local_runner._read_json(active_path), before)
@@ -1295,7 +1417,7 @@ class TestManagedCliMaintenance(unittest.TestCase):
             "present": False,
             "executable_found": True,
             "healthy": False,
-            "version": "codex-cli 0.143.0",
+            "version": "codex-cli 0.149.9",
             "reason": "unsupported_version",
         }
         with patch.object(local_runner.shutil, "which", return_value="/tools/npm"), \
@@ -1306,7 +1428,7 @@ class TestManagedCliMaintenance(unittest.TestCase):
             local_runner._maintain_host_llm_clis_once(now=1000)
 
         install.assert_called_once_with(
-            "codex", "/tools/npm", "@openai/codex", "0.144.1"
+            "codex", "/tools/npm", "@openai/codex", "0.150.1"
         )
 
     def test_current_claude_without_resident_flags_is_repaired(self):
@@ -1471,7 +1593,7 @@ class TestManagedCliMaintenance(unittest.TestCase):
             )
             self.assertTrue(
                 local_runner._install_managed_cli(
-                    "codex", "/tools/npm", "@openai/codex", "0.144.1"
+                    "codex", "/tools/npm", "@openai/codex", "0.150.1"
                 )
             )
 
@@ -6097,7 +6219,7 @@ class TestGpuDetection(unittest.TestCase):
         probed["codex"] = iso._llm_cli_result(
             "codex",
             subprocess.CompletedProcess(
-                ["codex", "--version"], 0, stdout="codex-cli 0.143.0", stderr=""
+                ["codex", "--version"], 0, stdout="codex-cli 0.149.9", stderr=""
             ),
         )
 
@@ -10707,7 +10829,7 @@ class TestProviderCredentialCheck(unittest.TestCase):
              patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
              patch.object(
                  br, "_codex_prerequisite",
-                 return_value=br.Prereq("codex", True, "codex-cli 0.144.1 (/usr/bin/codex)"),
+                 return_value=br.Prereq("codex", True, "codex-cli 0.150.1 (/usr/bin/codex)"),
              ), \
              patch.object(br, "run_local_runner", return_value=0):
             rc = br.main(["check"])
