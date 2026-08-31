@@ -55,10 +55,30 @@ REPLY_TO_OPERATOR_MCP_INPUT_SCHEMA = {
     "required": ["content"],
     "additionalProperties": False,
 }
-INITIAL_REPLY_CONTENT = "Blueprint Resident initial native reply preflight passed."
-RESUME_REPLY_CONTENT = "Blueprint Resident resumed native reply preflight passed."
+GREETING_PROMPT = (
+    "Initialize this long-lived Resident session. Do not call any tool. "
+    "Reply with the exact greeting acknowledgement requested by the harness."
+)
+GREETING_RESULT = "Blueprint Resident greeting continuity preflight ready."
+PRIVATE_PACKET_SENTINEL = "BLUEPRINT_PRIVATE_WORKDAY_PACKET_PREFLIGHT_V1"
+PRIVATE_REPLY_CONTENT = "Blueprint Resident private packet native reply preflight passed."
+PRIVATE_FINAL_RESULT = "Blueprint preflight private packet tool dispatch complete."
 CODEX_PREFLIGHT_MODEL = "gpt-5.5"
 CODEX_DIRECT_MCP_EXPOSURE = 'mcp_servers.workday.omit_tools_from=["deferred"]'
+CODEX_RESIDENT_MCP_BOUNDARY = (
+    "The only permitted MCP calls are reply_to_operator, strategic_operation, "
+    "and project_read; they are already directly available. Never call "
+    "list_mcp_resources, list_mcp_resource_templates, read_mcp_resource, "
+    "tools/list, resources/list, resources/templates/list, resources/read, "
+    "or any MCP discovery path."
+)
+FORBIDDEN_MCP_DISCOVERY_METHODS = {
+    "resources/list", "resources/templates/list", "resources/read",
+}
+FORBIDDEN_MCP_DISCOVERY_TOOLS = {
+    "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource",
+    "mcp_server_discovery", "server_discovery",
+}
 SYSTEM_READONLY_ROOTS = (
     "/usr", "/usr/local", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/etc",
 )
@@ -70,6 +90,65 @@ CODEX_DISABLED_FEATURES = (
     "view_image", "auth_elicitation", "tool_call_mcp_elicitation", "code_mode",
     "code_mode_host",
 )
+
+
+def private_packet_call_specs() -> list[dict]:
+    """Return the exact multi-step Workday packet exercised after greeting."""
+    return [
+        {
+            "tool": "project_read",
+            "arguments": {"resource": "running-update"},
+        },
+        {
+            "tool": "strategic_operation",
+            "arguments": {
+                "operation": "set-running-update",
+                "data": {"markdown": "# Private packet phase 1\nCanonical read completed."},
+                "idempotency_key": "resident-private-packet-phase-1",
+            },
+        },
+        {
+            "tool": "project_read",
+            "arguments": {"resource": "running-update"},
+        },
+        {
+            "tool": "strategic_operation",
+            "arguments": {
+                "operation": "set-running-update",
+                "data": {"markdown": "# Private packet phase 2\nPost-write read reconciled."},
+                "idempotency_key": "resident-private-packet-phase-2",
+            },
+        },
+        {
+            "tool": "project_read",
+            "arguments": {"resource": "running-update"},
+        },
+        {
+            "tool": "reply_to_operator",
+            "arguments": {
+                "content": PRIVATE_REPLY_CONTENT,
+                "message_type": "NOTE",
+            },
+        },
+    ]
+
+
+PRIVATE_PACKET_PROMPT = "\n".join((
+    "This is a bounded private Workday packet on the already-open Resident thread.",
+    f"Packet contract: {PRIVATE_PACKET_SENTINEL}",
+    "Use only the three directly visible workday tools; do not search for MCP servers or resources.",
+    "Execute this exact causal sequence without parallel calls:",
+    "1. project_read running-update.",
+    "2. strategic_operation set-running-update with phase-1 data and stable key.",
+    "3. project_read running-update to reconcile the first receipt.",
+    "4. strategic_operation set-running-update with phase-2 data and a distinct stable key.",
+    "5. project_read running-update to reconcile the second receipt.",
+    "6. reply_to_operator once with NOTE and the exact requested acceptance text.",
+    "Never substitute ordinary assistant text for the native reply.",
+    "The packet intentionally carries enough context to exercise long-turn continuation:",
+    *(f"Context checkpoint {index:02d}: preserve exact thread and receipt ordering."
+      for index in range(1, 25)),
+))
 
 
 def abort(reason: str) -> "NoReturn":
@@ -120,7 +199,7 @@ def start_responses_fixture() -> tuple[ThreadingHTTPServer, threading.Thread, li
         protocol_version = "HTTP/1.1"
 
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
-            if self.path != "/v1/responses" or len(requests) >= 6:
+            if self.path != "/v1/responses" or len(requests) >= 8:
                 self.send_error(404)
                 return
             try:
@@ -136,37 +215,34 @@ def start_responses_fixture() -> tuple[ThreadingHTTPServer, threading.Thread, li
             request_number = len(requests)
             response_id = f"resp_blueprint_preflight_{request_number}"
             model = str(payload.get("model") or "blueprint-preflight")
-            logical_turn = (request_number + 2) // 3
-            turn_stage = (request_number - 1) % 3
-            if turn_stage == 0:
+            if request_number == 1:
                 output = [{
-                    "id": f"fc_blueprint_project_read_{logical_turn}",
-                    "type": "function_call", "status": "completed",
-                    "call_id": f"call_blueprint_project_read_{logical_turn}",
-                    "namespace": "mcp__workday", "name": "project_read",
-                    "arguments": '{"resource":"running-update"}',
-                }]
-            elif turn_stage == 1:
-                reply_content = (
-                    INITIAL_REPLY_CONTENT if logical_turn == 1 else RESUME_REPLY_CONTENT
-                )
-                output = [{
-                    "id": f"fc_blueprint_reply_{logical_turn}",
-                    "type": "function_call", "status": "completed",
-                    "call_id": f"call_blueprint_reply_{logical_turn}",
-                    "namespace": "mcp__workday", "name": "reply_to_operator",
-                    "arguments": json.dumps({
-                        "content": reply_content,
-                        "message_type": "NOTE",
-                    }, separators=(",", ":")),
-                }]
-            else:
-                output = [{
-                    "id": f"msg_blueprint_preflight_{logical_turn}",
+                    "id": "msg_blueprint_greeting",
                     "type": "message", "status": "completed",
                     "role": "assistant", "content": [{
                         "type": "output_text",
-                        "text": "Blueprint preflight native tool dispatch complete.",
+                        "text": GREETING_RESULT,
+                        "annotations": [],
+                    }],
+                }]
+            elif request_number <= 1 + len(private_packet_call_specs()):
+                call_index = request_number - 2
+                spec = private_packet_call_specs()[call_index]
+                tool = spec["tool"]
+                output = [{
+                    "id": f"fc_blueprint_private_{call_index + 1}",
+                    "type": "function_call", "status": "completed",
+                    "call_id": f"call_blueprint_private_{call_index + 1}",
+                    "namespace": "mcp__workday", "name": tool,
+                    "arguments": json.dumps(spec["arguments"], separators=(",", ":")),
+                }]
+            else:
+                output = [{
+                    "id": "msg_blueprint_private_complete",
+                    "type": "message", "status": "completed",
+                    "role": "assistant", "content": [{
+                        "type": "output_text",
+                        "text": PRIVATE_FINAL_RESULT,
                         "annotations": [],
                     }],
                 }]
@@ -217,18 +293,79 @@ def start_responses_fixture() -> tuple[ThreadingHTTPServer, threading.Thread, li
     return server, thread, requests
 
 
-def validate_responses_mcp_roundtrips(requests: list[dict]) -> None:
-    if len(requests) != 6:
-        abort(f"Codex loopback provider received {len(requests)} requests, expected six")
+def validate_strategic_receipt(value: object, arguments: dict, label: str) -> None:
+    valid_fingerprint = False
+    valid_operation_id = False
+    if isinstance(value, dict):
+        try:
+            uuid.UUID(str(value.get("operation_id")))
+            valid_operation_id = True
+            valid_fingerprint = len(
+                bytes.fromhex(str(value.get("operation_fingerprint")))
+            ) == 32
+        except ValueError:
+            pass
+    if (
+        not isinstance(value, dict)
+        or value.get("outcome") != "applied"
+        or value.get("applied") is not True
+        or value.get("commit_acknowledged") is not True
+        or value.get("receipt_confirmed") is not True
+        or value.get("operation") != arguments["operation"]
+        or value.get("idempotency_key") != arguments["idempotency_key"]
+        or not valid_operation_id
+        or not valid_fingerprint
+    ):
+        abort(f"{label} returned an invalid strategic receipt; actual={bounded_json(value)}")
+
+
+def parse_responses_tool_output(raw_output: object, label: str) -> object:
+    if not isinstance(raw_output, str):
+        abort(f"{label} omitted its structured MCP output")
+    prefix = re.match(r'^Wall time: [0-9]+\.[0-9]{4} seconds\nOutput:\n', raw_output)
+    try:
+        return json.loads(raw_output[prefix.end():]) if prefix else None
+    except json.JSONDecodeError:
+        abort(f"{label} emitted invalid structured MCP output")
+
+
+def validate_direct_workday_namespace(request: dict, request_number: int) -> None:
+    tools = request.get("tools")
+    namespace_tools = [
+        tool for tool in tools or []
+        if isinstance(tool, dict)
+        and tool.get("type") == "namespace"
+        and tool.get("name") == "mcp__workday"
+    ] if isinstance(tools, list) else []
+    if len(namespace_tools) != 1:
+        abort(
+            f"Codex request {request_number} omitted the direct Workday "
+            f"namespace; actual={bounded_json(tools)}"
+        )
+    namespace = namespace_tools[0]
+    children = namespace.get("tools")
+    if not isinstance(namespace.get("description"), str) or not isinstance(children, list):
+        abort(f"Codex request {request_number} Workday namespace is incomplete")
+    child_names = [
+        child.get("name") for child in children if isinstance(child, dict)
+    ]
+    if (
+        len(child_names) != len(children)
+        or len(set(child_names)) != len(child_names)
+        or set(child_names)
+        != {"reply_to_operator", "strategic_operation", "project_read"}
+    ):
+        abort(
+            f"Codex request {request_number} exposed a non-exact Workday namespace; "
+            f"actual={bounded_json(child_names)}"
+        )
     expected_project_read_child = {
         "type": "function",
         "name": "project_read",
         "description": PROJECT_READ_DESCRIPTION,
         "strict": False,
-        # Codex's Responses namespace projection preserves the accepted field
-        # names and resource enum, but deliberately removes minLength and
-        # maxLength. The direct MCP discovery check below separately proves
-        # that the upstream server still advertises the bounded id contract.
+        # Codex's Responses projection deliberately drops string length bounds;
+        # direct MCP discovery below separately proves the upstream contract.
         "parameters": {
             "type": "object",
             "properties": {
@@ -246,184 +383,114 @@ def validate_responses_mcp_roundtrips(requests: list[dict]) -> None:
         "strict": False,
         "parameters": REPLY_TO_OPERATOR_MCP_INPUT_SCHEMA,
     }
-    expected_output_prefix = re.compile(
-        r'^Wall time: [0-9]+\.[0-9]{4} seconds\nOutput:\n'
-    )
-    for logical_turn, offset in enumerate((0, 3), start=1):
-        initial = requests[offset]
-        project_continuation = requests[offset + 1]
-        reply_continuation = requests[offset + 2]
-        namespace_tools = [
-            tool for tool in initial.get("tools", [])
-            if isinstance(tool, dict)
-            and tool.get("type") == "namespace"
-            and tool.get("name") == "mcp__workday"
-        ]
-        if len(namespace_tools) != 1:
-            lite_tool_groups = [
-                {
-                    "role": item.get("role"),
-                    "groups": [
-                        {
-                            "type": group.get("type"),
-                            "name": group.get("name"),
-                            "children": [
-                                child.get("name") for child in group.get("tools", [])
-                                if isinstance(child, dict)
-                            ],
-                        }
-                        for group in item.get("tools", [])
-                        if isinstance(group, dict)
-                    ],
-                }
-                for item in initial.get("input", [])
-                if isinstance(item, dict) and isinstance(item.get("tools"), list)
-            ]
-            abort(
-                f"Codex turn {logical_turn} omitted the exact Workday namespace; "
-                f"top_level={bounded_json(initial.get('tools'))} "
-                f"responses_lite={bounded_json(lite_tool_groups)}"
-            )
-        namespace = namespace_tools[0]
-        if not isinstance(namespace.get("description"), str):
-            abort(f"Codex turn {logical_turn} Workday namespace has no description")
-        children = namespace.get("tools")
-        if not isinstance(children, list) or expected_project_read_child not in children:
-            actual_children = [
-                child for child in children or []
-                if isinstance(child, dict) and child.get("name") == "project_read"
-            ] if isinstance(children, list) else children
-            abort(
-                f"Codex turn {logical_turn} exposed the wrong project_read schema; "
-                f"expected={bounded_json(expected_project_read_child)} "
-                f"actual={bounded_json(actual_children)}"
-            )
-        if expected_reply_child not in children:
-            actual_children = [
+    for expected_child in (expected_project_read_child, expected_reply_child):
+        if expected_child not in children:
+            actual = [
                 child for child in children
-                if isinstance(child, dict) and child.get("name") == "reply_to_operator"
+                if isinstance(child, dict) and child.get("name") == expected_child["name"]
             ]
             abort(
-                f"Codex turn {logical_turn} exposed the wrong reply_to_operator schema; "
-                f"expected={bounded_json(expected_reply_child)} "
-                f"actual={bounded_json(actual_children)}"
+                f"Codex request {request_number} exposed the wrong "
+                f"{expected_child['name']} schema; expected={bounded_json(expected_child)} "
+                f"actual={bounded_json(actual)}"
             )
-        child_names = [
-            child.get("name") for child in children if isinstance(child, dict)
-        ]
-        if (
-            len(child_names) != len(children)
-            or len(set(child_names)) != len(child_names)
-            or set(child_names)
-            != {"reply_to_operator", "strategic_operation", "project_read"}
-        ):
-            abort(f"Codex turn {logical_turn} exposed an unbounded Workday namespace")
+    input_items = request.get("input")
+    if isinstance(input_items, list):
+        for item in input_items:
+            if not isinstance(item, dict):
+                continue
+            method = item.get("method")
+            tool_name = item.get("name") or item.get("tool")
+            if (
+                method in FORBIDDEN_MCP_DISCOVERY_METHODS
+                or tool_name in FORBIDDEN_MCP_DISCOVERY_TOOLS
+                or item.get("type") in FORBIDDEN_MCP_DISCOVERY_TOOLS
+            ):
+                abort(
+                    f"Codex request {request_number} attempted MCP resource/server "
+                    f"discovery; item={bounded_json(item)}"
+                )
 
-        project_items = project_continuation.get("input")
-        reply_items = reply_continuation.get("input")
-        if not isinstance(project_items, list) or not isinstance(reply_items, list):
-            abort(f"Codex turn {logical_turn} continuation input is not structured")
-        project_call_id = f"call_blueprint_project_read_{logical_turn}"
-        project_calls = [
-            (index, item) for index, item in enumerate(project_items)
-            if isinstance(item, dict)
-            and item.get("type") == "function_call"
-            and item.get("call_id") == project_call_id
-        ]
-        project_outputs = [
-            (index, item) for index, item in enumerate(project_items)
-            if isinstance(item, dict)
-            and item.get("type") == "function_call_output"
-            and item.get("call_id") == project_call_id
-        ]
-        if (
-            len(project_calls) != 1
-            or len(project_outputs) != 1
-            or project_calls[0][0] >= project_outputs[0][0]
-        ):
-            abort(f"Codex turn {logical_turn} did not round-trip project_read")
-        call, output = project_calls[0][1], project_outputs[0][1]
-        if any((
-            call.get("id") != f"fc_blueprint_project_read_{logical_turn}",
-            call.get("namespace") != "mcp__workday",
-            call.get("name") != "project_read",
-            call.get("arguments") != '{"resource":"running-update"}',
-        )):
-            abort(f"Codex turn {logical_turn} changed the namespaced function call")
-        raw_output = output.get("output")
-        if not isinstance(raw_output, str):
-            abort(f"Codex turn {logical_turn} returned an invalid MCP output receipt")
-        prefix = expected_output_prefix.match(raw_output)
-        try:
-            structured_output = json.loads(raw_output[prefix.end():]) if prefix else None
-        except json.JSONDecodeError:
-            structured_output = None
-        if structured_output != {"resource": "running-update", "bytes": 40}:
-            abort(f"Codex turn {logical_turn} returned an invalid project_read receipt")
 
-        reply_call_id = f"call_blueprint_reply_{logical_turn}"
-        reply_calls = [
-            (index, item) for index, item in enumerate(reply_items)
-            if isinstance(item, dict)
-            and item.get("type") == "function_call"
-            and item.get("call_id") == reply_call_id
-        ]
-        reply_outputs = [
-            (index, item) for index, item in enumerate(reply_items)
-            if isinstance(item, dict)
-            and item.get("type") == "function_call_output"
-            and item.get("call_id") == reply_call_id
-        ]
-        retained_project_outputs = [
-            (index, item) for index, item in enumerate(reply_items)
-            if isinstance(item, dict)
-            and item.get("type") == "function_call_output"
-            and item.get("call_id") == project_call_id
-        ]
-        if (
-            len(reply_calls) != 1
-            or len(reply_outputs) != 1
-            or len(retained_project_outputs) != 1
-            or not (
-                retained_project_outputs[0][0]
-                < reply_calls[0][0]
-                < reply_outputs[0][0]
-            )
-        ):
-            abort(
-                f"Codex turn {logical_turn} did not round-trip one ordered "
-                "reply_to_operator result"
-            )
-        reply_call, reply_output = reply_calls[0][1], reply_outputs[0][1]
-        expected_reply_content = (
-            INITIAL_REPLY_CONTENT if logical_turn == 1 else RESUME_REPLY_CONTENT
+def validate_responses_mcp_roundtrips(requests: list[dict]) -> None:
+    expected_calls = private_packet_call_specs()
+    expected_requests = len(expected_calls) + 2
+    if len(requests) != expected_requests:
+        abort(
+            f"Codex loopback provider received {len(requests)} requests, "
+            f"expected {expected_requests}"
         )
-        if any((
-            reply_call.get("id") != f"fc_blueprint_reply_{logical_turn}",
-            reply_call.get("namespace") != "mcp__workday",
-            reply_call.get("name") != "reply_to_operator",
-            reply_call.get("arguments") != json.dumps({
-                "content": expected_reply_content,
-                "message_type": "NOTE",
-            }, separators=(",", ":")),
-        )):
-            abort(f"Codex turn {logical_turn} changed the native reply function call")
-        raw_reply_output = reply_output.get("output")
-        if not isinstance(raw_reply_output, str):
-            abort(f"Codex turn {logical_turn} omitted the native reply receipt")
-        reply_prefix = expected_output_prefix.match(raw_reply_output)
-        try:
-            structured_reply = (
-                json.loads(raw_reply_output[reply_prefix.end():])
-                if reply_prefix else None
-            )
-        except json.JSONDecodeError:
-            structured_reply = None
-        if structured_reply != {"accepted": True}:
+    for request_number, request in enumerate(requests, start=1):
+        validate_direct_workday_namespace(request, request_number)
+    greeting_wire = json.dumps(requests[0].get("input"), sort_keys=True)
+    if GREETING_PROMPT not in greeting_wire:
+        abort("Codex initial request omitted the exact greeting prompt")
+    private_wire = json.dumps(requests[1].get("input"), sort_keys=True)
+    if PRIVATE_PACKET_SENTINEL not in private_wire:
+        abort("Codex resume request omitted the long private Workday packet")
+    if GREETING_RESULT not in private_wire:
+        abort("Codex resume request omitted the greeting continuity context")
+
+    previous_output_index = -1
+    for call_index, spec in enumerate(expected_calls):
+        continuation = requests[call_index + 2]
+        items = continuation.get("input")
+        if not isinstance(items, list):
+            abort(f"Codex private call {call_index + 1} continuation is not structured")
+        call_id = f"call_blueprint_private_{call_index + 1}"
+        calls = [
+            (index, item) for index, item in enumerate(items)
+            if isinstance(item, dict)
+            and item.get("type") == "function_call"
+            and item.get("call_id") == call_id
+        ]
+        outputs = [
+            (index, item) for index, item in enumerate(items)
+            if isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and item.get("call_id") == call_id
+        ]
+        if (
+            len(calls) != 1
+            or len(outputs) != 1
+            or not (previous_output_index < calls[0][0] < outputs[0][0])
+        ):
             abort(
-                f"Codex turn {logical_turn} native reply was not accepted; "
-                f"actual={bounded_json(structured_reply)}"
+                f"Codex private call {call_index + 1} did not round-trip in exact order"
             )
+        call = calls[0][1]
+        if any((
+            call.get("id") != f"fc_blueprint_private_{call_index + 1}",
+            call.get("namespace") != "mcp__workday",
+            call.get("name") != spec["tool"],
+            call.get("arguments")
+            != json.dumps(spec["arguments"], separators=(",", ":")),
+        )):
+            abort(
+                f"Codex private call {call_index + 1} changed the namespaced "
+                f"{spec['tool']} call"
+            )
+        structured = parse_responses_tool_output(
+            outputs[0][1].get("output"),
+            f"Codex private call {call_index + 1} {spec['tool']}",
+        )
+        if spec["tool"] == "project_read":
+            if structured != {"resource": "running-update", "bytes": 40}:
+                abort(
+                    f"Codex private call {call_index + 1} returned an invalid "
+                    "project_read receipt"
+                )
+        elif spec["tool"] == "strategic_operation":
+            validate_strategic_receipt(
+                structured, spec["arguments"],
+                f"Codex private call {call_index + 1}",
+            )
+        elif structured != {"accepted": True}:
+            abort(
+                f"Codex private call {call_index + 1} native reply was not accepted; "
+                f"actual={bounded_json(structured)}"
+            )
+        previous_output_index = outputs[0][0]
 
 
 def run_codex_turn(
@@ -431,7 +498,8 @@ def run_codex_turn(
     prompt: str,
     timeout: float,
     *,
-    reply_content: str,
+    expected_calls: list[dict],
+    expected_agent_message: str,
     turn_label: str,
 ) -> tuple[str, str, bool]:
     try:
@@ -487,31 +555,25 @@ def run_codex_turn(
         and event["item"].get("type") == "agent_message"
         and isinstance(event["item"].get("text"), str)
     ]
-    if len(mcp_started) != 2 or len(mcp_completed) != 2:
-        if any(reply_content in message for message in agent_messages):
+    expected_reply = next(
+        (spec["arguments"]["content"] for spec in expected_calls
+         if spec["tool"] == "reply_to_operator"),
+        None,
+    )
+    if len(mcp_started) != len(expected_calls) or len(mcp_completed) != len(
+        expected_calls
+    ):
+        if expected_reply and any(expected_reply in message for message in agent_messages):
             abort(
                 f"Codex {turn_label} substituted ordinary text for the native "
                 "reply_to_operator call"
             )
         abort(
-            f"Codex {turn_label} omitted an exact native MCP dispatch; "
+            f"Codex {turn_label} emitted the wrong native MCP dispatch count; "
+            f"expected={bounded_json([spec['tool'] for spec in expected_calls])} "
             f"started={bounded_json([item.get('tool') for _, item in mcp_started])} "
             f"completed={bounded_json([item.get('tool') for _, item in mcp_completed])}"
         )
-    started_by_tool = {item.get("tool"): (index, item) for index, item in mcp_started}
-    completed_by_tool = {item.get("tool"): (index, item) for index, item in mcp_completed}
-    if set(started_by_tool) != {"project_read", "reply_to_operator"} or set(
-        completed_by_tool
-    ) != {"project_read", "reply_to_operator"}:
-        abort(
-            f"Codex {turn_label} dispatched the wrong native MCP tools; "
-            f"started={bounded_json(sorted(str(key) for key in started_by_tool))} "
-            f"completed={bounded_json(sorted(str(key) for key in completed_by_tool))}"
-        )
-    project_started_index, project_started = started_by_tool["project_read"]
-    project_completed_index, project_completed = completed_by_tool["project_read"]
-    reply_started_index, reply_started = started_by_tool["reply_to_operator"]
-    reply_completed_index, reply_completed = completed_by_tool["reply_to_operator"]
     thread_index = next(
         index for index, event in enumerate(events)
         if event.get("type") == "thread.started"
@@ -520,73 +582,75 @@ def run_codex_turn(
         index for index, event in enumerate(events)
         if event.get("type") == "turn.completed"
     )
-    project_dispatch_id = project_started.get("id")
-    if (
-        not isinstance(project_dispatch_id, str)
-        or not project_dispatch_id
-        or project_dispatch_id != project_completed.get("id")
-        or not (
-            thread_index
-            < project_started_index
-            < project_completed_index
-            < reply_started_index
-            < reply_completed_index
-            < terminal_index
-        )
-        or project_started.get("server") != "workday"
-        or project_started.get("arguments") != {"resource": "running-update"}
-        or project_completed.get("server") != "workday"
-        or project_completed.get("status") != "completed"
-        or project_completed.get("error") is not None
+    previous_completed_index = thread_index
+    for call_number, (spec, started_receipt, completed_receipt) in enumerate(
+        zip(expected_calls, mcp_started, mcp_completed, strict=True),
+        start=1,
     ):
-        abort(f"Codex {turn_label} emitted the wrong project_read identity or terminal")
-    result_payload = project_completed.get("result")
-    if not isinstance(result_payload, dict):
-        abort("Codex exec MCP receipt omitted its structured result")
-    content = result_payload.get("content")
-    if (
-        content != [{
-            "type": "text",
-            "text": '{"markdown": "preflight running update"}',
-        }]
-        or result_payload.get("is_error") is True
-        or result_payload.get("structured_content")
-        != {"resource": "running-update", "bytes": 40}
-    ):
-        abort(f"Codex {turn_label} did not preserve the project_read result")
-    reply_dispatch_id = reply_started.get("id")
-    if (
-        not isinstance(reply_dispatch_id, str)
-        or not reply_dispatch_id
-        or reply_dispatch_id != reply_completed.get("id")
-        or reply_started.get("server") != "workday"
-        or reply_started.get("arguments") != {
-            "content": reply_content,
-            "message_type": "NOTE",
-        }
-        or reply_completed.get("server") != "workday"
-        or reply_completed.get("status") != "completed"
-        or reply_completed.get("error") is not None
-    ):
+        started_index, started = started_receipt
+        completed_index, completed = completed_receipt
+        dispatch_id = started.get("id")
+        if (
+            not isinstance(dispatch_id, str)
+            or not dispatch_id
+            or dispatch_id != completed.get("id")
+            or not (
+                previous_completed_index < started_index < completed_index < terminal_index
+            )
+            or started.get("server") != "workday"
+            or started.get("tool") != spec["tool"]
+            or started.get("arguments") != spec["arguments"]
+            or completed.get("server") != "workday"
+            or completed.get("tool") != spec["tool"]
+            or completed.get("status") != "completed"
+            or completed.get("error") is not None
+        ):
+            abort(
+                f"Codex {turn_label} call {call_number} emitted the wrong "
+                f"{spec['tool']} identity or terminal; started={bounded_json(started)} "
+                f"completed={bounded_json(completed)}"
+            )
+        result_payload = completed.get("result")
+        if not isinstance(result_payload, dict) or result_payload.get("is_error") is True:
+            abort(
+                f"Codex {turn_label} call {call_number} omitted a successful "
+                f"{spec['tool']} receipt; actual={bounded_json(result_payload)}"
+            )
+        structured = result_payload.get("structured_content")
+        if spec["tool"] == "project_read":
+            if (
+                result_payload.get("content") != [{
+                    "type": "text",
+                    "text": '{"markdown": "preflight running update"}',
+                }]
+                or structured != {"resource": "running-update", "bytes": 40}
+            ):
+                abort(
+                    f"Codex {turn_label} call {call_number} did not preserve the "
+                    "project_read result"
+                )
+        elif spec["tool"] == "strategic_operation":
+            validate_strategic_receipt(
+                structured, spec["arguments"],
+                f"Codex {turn_label} call {call_number}",
+            )
+        elif (
+            result_payload.get("content") != [{
+                "type": "text", "text": "Workday reply accepted for delivery.",
+            }]
+            or structured != {"accepted": True}
+        ):
+            abort(
+                f"Codex {turn_label} call {call_number} native reply_to_operator "
+                f"was rejected; actual={bounded_json(result_payload)}"
+            )
+        previous_completed_index = completed_index
+    if agent_messages != [expected_agent_message]:
         abort(
-            f"Codex {turn_label} emitted the wrong reply_to_operator identity or terminal; "
-            f"started={bounded_json(reply_started)} completed={bounded_json(reply_completed)}"
+            f"Codex {turn_label} emitted the wrong bounded agent acknowledgement; "
+            f"actual={bounded_json(agent_messages)}"
         )
-    reply_result = reply_completed.get("result")
-    if not isinstance(reply_result, dict):
-        abort(f"Codex {turn_label} native reply receipt omitted its structured result")
-    if (
-        reply_result.get("content") != [{
-            "type": "text", "text": "Workday reply accepted for delivery.",
-        }]
-        or reply_result.get("is_error") is True
-        or reply_result.get("structured_content") != {"accepted": True}
-    ):
-        abort(
-            f"Codex {turn_label} native reply_to_operator call was rejected; "
-            f"actual={bounded_json(reply_result)}"
-        )
-    if any(reply_content in message for message in agent_messages):
+    if expected_reply and any(expected_reply in message for message in agent_messages):
         abort(
             f"Codex {turn_label} duplicated the native reply as ordinary agent text"
         )
@@ -604,6 +668,7 @@ def serve_broker(
     stop: threading.Event,
     errors: list[str],
     metrics: dict[str, int],
+    protocol_trace: list[dict],
 ) -> None:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -619,6 +684,14 @@ def serve_broker(
                 continue
             metrics["connections"] += 1
             metrics["active"] += 1
+            connection_number = metrics["connections"]
+            connection_trace = {
+                "connection": connection_number,
+                "methods": [],
+                "tool_calls": [],
+                "parse_errors": 0,
+            }
+            protocol_trace.append(connection_trace)
             connection_env = dict(upstream_env)
             staged_reply_path = connection_env.get("RESIDENT_STAGED_REPLY_PATH", "")
             if staged_reply_path:
@@ -634,16 +707,40 @@ def serve_broker(
                 start_new_session=True,
             )
 
-            def input_relay() -> None:
+            def input_relay(
+                client: socket.socket = connection,
+                child: subprocess.Popen = process,
+                trace: dict = connection_trace,
+            ) -> None:
+                pending = b""
                 try:
-                    while data := connection.recv(65_536):
-                        process.stdin.write(data)
-                        process.stdin.flush()
+                    while data := client.recv(65_536):
+                        child.stdin.write(data)
+                        child.stdin.flush()
+                        pending += data
+                        while b"\n" in pending:
+                            raw_line, pending = pending.split(b"\n", 1)
+                            if not raw_line.strip():
+                                continue
+                            try:
+                                request = json.loads(raw_line)
+                            except (UnicodeDecodeError, json.JSONDecodeError):
+                                trace["parse_errors"] += 1
+                                continue
+                            method = request.get("method") if isinstance(request, dict) else None
+                            if isinstance(method, str):
+                                trace["methods"].append(method)
+                            params = request.get("params") if isinstance(request, dict) else None
+                            tool_name = params.get("name") if isinstance(params, dict) else None
+                            if method == "tools/call" and isinstance(tool_name, str):
+                                trace["tool_calls"].append(tool_name)
+                    if pending.strip():
+                        trace["parse_errors"] += 1
                 except (BrokenPipeError, ConnectionError, OSError):
                     pass
                 finally:
                     try:
-                        process.stdin.close()
+                        child.stdin.close()
                     except (BrokenPipeError, OSError):
                         pass
 
@@ -663,7 +760,10 @@ def serve_broker(
             output_thread = threading.Thread(target=output_relay, daemon=True)
             input_thread.start()
             output_thread.start()
-            deadline = time.monotonic() + 10
+            # The resumed quota-free probe performs six sequential native
+            # calls. Keep its broker lifetime below the controller's 24s gate
+            # while allowing the exact long-packet sequence to drain.
+            deadline = time.monotonic() + 15
             while process.poll() is None and not stop.is_set() and time.monotonic() < deadline:
                 time.sleep(0.05)
             timed_out = process.poll() is None and not stop.is_set()
@@ -687,6 +787,64 @@ def serve_broker(
     finally:
         server.close()
         socket_path.unlink(missing_ok=True)
+
+
+def validate_broker_protocol_trace(protocol_trace: list[dict]) -> None:
+    if len(protocol_trace) != 3:
+        abort(
+            f"private MCP broker recorded {len(protocol_trace)} protocol traces, "
+            "expected three"
+        )
+    expected_tool_calls = (
+        ["project_read", "strategic_operation", "reply_to_operator"],
+        [],
+        [spec["tool"] for spec in private_packet_call_specs()],
+    )
+    allowed_methods = {
+        "initialize", "notifications/initialized", "tools/list", "tools/call", "ping",
+    }
+    for connection_number, (trace, expected_calls) in enumerate(
+        zip(protocol_trace, expected_tool_calls, strict=True),
+        start=1,
+    ):
+        methods = trace.get("methods")
+        tool_calls = trace.get("tool_calls")
+        if (
+            trace.get("connection") != connection_number
+            or trace.get("parse_errors") != 0
+            or not isinstance(methods, list)
+            or not isinstance(tool_calls, list)
+        ):
+            abort(
+                f"private MCP connection {connection_number} trace is invalid; "
+                f"actual={bounded_json(trace)}"
+            )
+        forbidden_methods = [
+            method for method in methods
+            if method in FORBIDDEN_MCP_DISCOVERY_METHODS or method not in allowed_methods
+        ]
+        forbidden_tools = [
+            tool for tool in tool_calls if tool in FORBIDDEN_MCP_DISCOVERY_TOOLS
+        ]
+        if forbidden_methods or forbidden_tools:
+            abort(
+                f"private MCP connection {connection_number} attempted resource/server "
+                f"discovery; methods={bounded_json(forbidden_methods)} "
+                f"tools={bounded_json(forbidden_tools)}"
+            )
+        if methods.count("initialize") != 1 or methods.count("tools/list") != 1:
+            abort(
+                f"private MCP connection {connection_number} omitted its one bounded "
+                f"tool handshake; methods={bounded_json(methods)}"
+            )
+        if tool_calls != expected_calls or methods.count("tools/call") != len(
+            expected_calls
+        ):
+            abort(
+                f"private MCP connection {connection_number} used the wrong direct "
+                f"Workday calls; expected={bounded_json(expected_calls)} "
+                f"actual={bounded_json(tool_calls)}"
+            )
 
 
 def run_restricted_child(options: argparse.Namespace) -> int:
@@ -924,37 +1082,38 @@ def run_restricted_child(options: argparse.Namespace) -> int:
             "-c", f"shell_environment_policy.set.TMPDIR={json.dumps(str(scratch))}",
             "-c", (
                 'developer_instructions="Use no filesystem or shell tools. '
-                'Call workday.project_read exactly once for running-update, '
-                'then call workday.reply_to_operator exactly once with the '
-                'message_type and content requested by the prompt. A normal '
-                'assistant message never substitutes for reply_to_operator. '
-                'After the reply is accepted, return only a neutral completion '
-                'acknowledgement and do not repeat the reply content."'
+                'For the initialization greeting, call no tool and return only '
+                'the requested greeting acknowledgement. For a private Workday '
+                'packet, use only the three directly visible workday tools and '
+                'execute its exact ordered read, strategic operation, reconciliation, '
+                'and reply sequence. '
+                f'{CODEX_RESIDENT_MCP_BOUNDARY} '
+                'A normal assistant message never substitutes for reply_to_operator. '
+                'After the native reply is accepted, return only the requested '
+                'neutral completion acknowledgement."'
             ),
         ]
         try:
             codex = os.path.realpath(options.codex)
-            thread_id, _, exec_mcp = run_codex_turn(
+            thread_id, _, greeting_complete = run_codex_turn(
                 [codex, "exec", *common, "-"],
-                "Read running-update once, then deliver this reply using the native "
-                "reply_to_operator tool with message_type NOTE: "
-                f"{INITIAL_REPLY_CONTENT}",
-                10,
-                reply_content=INITIAL_REPLY_CONTENT,
-                turn_label="initial turn",
+                GREETING_PROMPT,
+                7,
+                expected_calls=[],
+                expected_agent_message=GREETING_RESULT,
+                turn_label="initial greeting",
             )
             codex_exec_turn = True
-            resumed_id, _, resume_mcp = run_codex_turn(
+            resumed_id, _, private_packet_complete = run_codex_turn(
                 [codex, "exec", "resume", *common, thread_id, "-"],
-                "Read running-update once, then deliver this reply using the native "
-                "reply_to_operator tool with message_type NOTE: "
-                f"{RESUME_REPLY_CONTENT}",
-                10,
-                reply_content=RESUME_REPLY_CONTENT,
-                turn_label="resumed turn",
+                PRIVATE_PACKET_PROMPT,
+                14,
+                expected_calls=private_packet_call_specs(),
+                expected_agent_message=PRIVATE_FINAL_RESULT,
+                turn_label="resumed private packet",
             )
             codex_resume_turn = True
-            codex_mcp_dispatch = exec_mcp and resume_mcp
+            codex_mcp_dispatch = greeting_complete and private_packet_complete
             exact_thread_identity = resumed_id == thread_id
             if not exact_thread_identity:
                 abort("Codex resume changed the exact thread identity")
@@ -984,6 +1143,8 @@ def run_restricted_child(options: argparse.Namespace) -> int:
         "loopback_provider": codex_exec_turn and codex_resume_turn,
         "codex_mcp_dispatch": codex_mcp_dispatch,
         "codex_native_reply": codex_mcp_dispatch,
+        "codex_private_packet": codex_mcp_dispatch,
+        "codex_no_mcp_discovery": codex_mcp_dispatch,
         "nested_namespace": False,
     }, separators=(",", ":")))
     return 0
@@ -1056,6 +1217,7 @@ def controller(options: argparse.Namespace) -> int:
     broker_stop = threading.Event()
     broker_errors: list[str] = []
     broker_metrics = {"connections": 0, "active": 0}
+    broker_protocol_trace: list[dict] = []
     broker_env = {
         "PATH": f"{Path(node).resolve().parent}:/usr/local/bin:/usr/bin:/bin",
         "HOME": str(scratch),
@@ -1073,7 +1235,8 @@ def controller(options: argparse.Namespace) -> int:
     broker_thread = threading.Thread(
         target=serve_broker,
         args=(socket_path, [os.path.realpath(node), str(mcp_script)], broker_env,
-              broker_ready, broker_stop, broker_errors, broker_metrics),
+              broker_ready, broker_stop, broker_errors, broker_metrics,
+              broker_protocol_trace),
         daemon=True,
     )
     broker_thread.start()
@@ -1169,14 +1332,12 @@ def controller(options: argparse.Namespace) -> int:
     # initialize the required MCP server, and every connection must drain.
     if broker_metrics != {"connections": 3, "active": 0}:
         abort(f"private MCP broker teardown receipt is invalid: {broker_metrics}")
-    expected_staged_replies = (
-        "preflight reply",
-        INITIAL_REPLY_CONTENT,
-        RESUME_REPLY_CONTENT,
-    )
-    for connection_number, expected_content in enumerate(
-        expected_staged_replies, start=1,
-    ):
+    validate_broker_protocol_trace(broker_protocol_trace)
+    expected_staged_replies = {
+        1: "preflight reply",
+        3: PRIVATE_REPLY_CONTENT,
+    }
+    for connection_number, expected_content in expected_staged_replies.items():
         staged_connection = Path(f"{staged}.connection-{connection_number}")
         try:
             staged_reply = json.loads(staged_connection.read_text(encoding="utf-8"))
@@ -1195,6 +1356,9 @@ def controller(options: argparse.Namespace) -> int:
                 f"MCP connection {connection_number} staged the wrong receipt-bound "
                 f"native reply; actual={bounded_json(staged_reply)}"
             )
+    greeting_staged = Path(f"{staged}.connection-2")
+    if greeting_staged.exists():
+        abort("greeting connection unexpectedly staged an operator reply")
     if "credential sentinel" in result.stdout or "credential sentinel" in result.stderr:
         abort("restricted preflight output exposed credential bytes")
     marker = json.loads(result.stdout.strip().splitlines()[-1])
