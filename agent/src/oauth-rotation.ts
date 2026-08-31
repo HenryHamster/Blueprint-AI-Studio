@@ -29,6 +29,18 @@ function hashFileOrNull(path: string): string | null {
   }
 }
 
+function replaceOAuthCredentialAtomically(path: string, contents: string): void {
+  const temporary = `${path}.adopt-${process.pid}`;
+  try {
+    fs.writeFileSync(temporary, contents, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
+    fs.renameSync(temporary, path);
+    fs.chmodSync(path, 0o600);
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch { /* best-effort rollback */ }
+    throw error;
+  }
+}
+
 let initialOAuthAuthHash: string | null = null;
 
 export function recordInitialOAuthAuthHash(): void {
@@ -76,7 +88,7 @@ export async function rotateOAuthCredentialsIfChanged(
     }
     // Another VM won the compare-and-swap. Adopt the authoritative credential
     // instead of failing the task or overwriting the newer token.
-    fs.writeFileSync(path, replacement, { encoding: 'utf-8', mode: 0o600 });
+    replaceOAuthCredentialAtomically(path, replacement);
     initialOAuthAuthHash = hashFileOrNull(path);
     if (initialOAuthAuthHash === null) {
       throw new Error(`adopt refreshed OAuth credential at ${path} failed`);

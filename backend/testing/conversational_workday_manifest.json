@@ -490,20 +490,24 @@
     },
     {
       "path": "agent/src/providers/resident-codex-session.test.ts",
-      "reason": "Protects the OpenAI Codex Resident process-per-turn adapter: strict read-only profile isolation, exact thread resume identity, receipt-bound strategic/reply acknowledgements, bounded child termination, and cleanup/idle liveness.",
+      "reason": "Protects the OpenAI Codex Resident process-per-turn adapter: direct-Landlock isolation, credential-free MCP broker transport, exact thread resume identity, receipt-bound acknowledgements, bounded child termination, and cleanup/idle liveness.",
       "test_ids": [
         "startResidentCodexSession > uses exact thread identity for a second exec resume turn",
+        "startResidentCodexSession > fences OAuth persistence before settlement and adopts the authoritative CAS winner",
+        "startResidentCodexSession > retains private OAuth state when authoritative persistence fails",
         "startResidentCodexSession > revokes an accepted reply when the resumed process has a $label thread receipt [case 1]",
         "startResidentCodexSession > revokes an accepted reply when the resumed process has a $label thread receipt [case 2]",
         "startResidentCodexSession > revokes an accepted reply after $label [case 1]",
         "startResidentCodexSession > revokes an accepted reply after $label [case 2]",
         "startResidentCodexSession > requires exact successful MCP receipts before acknowledging delivery",
+        "startResidentCodexSession > fails closed before Codex spawn when private broker socket setup fails",
+        "startResidentCodexSession > keeps the task token behind the credential-free MCP socket boundary",
         "startResidentCodexSession > rejects unsafe sandbox translations and requires the complete read-only contract",
         "startResidentCodexSession > bounds an interrupt through SIGKILL when the child emits no close event",
         "startResidentCodexSession > retains tracking and scratch after an undeliverable kill until late close",
         "startResidentCodexSession > settles child idle even when asynchronous scratch cleanup needs a retry"
       ],
-      "test_count": 25
+      "test_count": 29
     },
     {
       "path": "scripts/test_runner_isolation.py",
@@ -511,9 +515,13 @@
       "test_ids": [
         "TestAgentPlan::test_host_selected_provider_cli_precedes_legacy_node_directory",
         "TestProbeLlmClis::test_agent_plan_probe_uses_exact_bwrap_boundary",
+        "TestProbeLlmClis::test_codex_landlock_probe_rejects_exit_zero_with_incomplete_marker",
+        "TestProbeLlmClis::test_codex_landlock_probe_rejects_abi_without_ioctl_mediation",
+        "TestProbeLlmClis::test_codex_landlock_probe_rejects_unknown_future_abi",
+        "TestProbeLlmClis::test_preflight_broker_relays_and_tears_down_one_exact_connection",
         "TestProbeLlmClis::test_agent_plan_probe_reports_sandbox_missing_resident_flag"
       ],
-      "test_count": 190
+      "test_count": 194
     },
     {
       "path": "scripts/test_local_runner.py",
@@ -783,6 +791,7 @@
         "handleStrategicResident - failed-turn recovery > exits silently on terminal initial admission error: %s [case 1]",
         "handleStrategicResident - failed-turn recovery > exits silently on terminal initial admission error: %s [case 2]",
         "handleStrategicResident - failed-turn recovery > extends a legacy claim after backend upgrade when a retry batch grows",
+        "handleStrategicResident - failed-turn recovery > fails teardown when task-token revocation cannot be proven",
         "handleStrategicResident - failed-turn recovery > fails closed before the model when an operator batch has no stable message id",
         "handleStrategicResident - failed-turn recovery > fails closed without replacement when the provider child cannot be killed",
         "handleStrategicResident - failed-turn recovery > folds the checkpoint into the first operator turn after bounded wedged preemption",
@@ -790,6 +799,7 @@
         "handleStrategicResident - failed-turn recovery > keeps local terminal state silent when the fenced terminal post is rejected",
         "handleStrategicResident - failed-turn recovery > leaves inbound messages open when native reply persistence fails",
         "handleStrategicResident - failed-turn recovery > preserves conversation_claim_lost as the terminal replacement cause",
+        "handleStrategicResident - failed-turn recovery > preserves private provider state when credential recovery forbids cleanup",
         "handleStrategicResident - failed-turn recovery > re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply",
         "handleStrategicResident - failed-turn recovery > replaces the worker after the native reply protocol fails twice",
         "handleStrategicResident - failed-turn recovery > restarts after prompt SIGINT process exit and answers the queued operator message",
@@ -923,7 +933,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 157
+      "test_count": 159
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",

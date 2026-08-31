@@ -1,13 +1,19 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
-const { mockReadFileSync, mockWriteFileSync, mockExistsSync } = vi.hoisted(() => {
+const {
+  mockReadFileSync, mockWriteFileSync, mockExistsSync,
+  mockRenameSync, mockUnlinkSync, mockChmodSync,
+} = vi.hoisted(() => {
   const mockReadFileSync = vi.fn();
   const mockWriteFileSync = vi.fn();
   const mockExistsSync = vi.fn().mockReturnValue(false);
   process.env.PROVIDER = 'openai';
   process.env.AUTH_MODE = 'oauth';
   delete process.env.CODEX_HOME;
-  return { mockReadFileSync, mockWriteFileSync, mockExistsSync };
+  return {
+    mockReadFileSync, mockWriteFileSync, mockExistsSync,
+    mockRenameSync: vi.fn(), mockUnlinkSync: vi.fn(), mockChmodSync: vi.fn(),
+  };
 });
 
 vi.mock('fs', () => ({
@@ -15,6 +21,9 @@ vi.mock('fs', () => ({
     readFileSync: mockReadFileSync,
     writeFileSync: mockWriteFileSync,
     existsSync: mockExistsSync,
+    renameSync: mockRenameSync,
+    unlinkSync: mockUnlinkSync,
+    chmodSync: mockChmodSync,
   },
 }));
 
@@ -110,9 +119,13 @@ describe('rotateOAuthCredentialsIfChanged', () => {
     await rotateOAuthCredentialsIfChanged('task-loser', apiPostFn);
 
     expect(mockWriteFileSync).toHaveBeenCalledWith(
-      '/opt/agent/openai/auth.json',
+      expect.stringMatching(/^\/opt\/agent\/openai\/auth\.json\.adopt-/),
       'winner-token-data',
-      { encoding: 'utf-8', mode: 0o600 },
+      { encoding: 'utf-8', mode: 0o600, flag: 'wx' },
+    );
+    expect(mockRenameSync).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/opt\/agent\/openai\/auth\.json\.adopt-/),
+      '/opt/agent/openai/auth.json',
     );
   });
 
@@ -135,9 +148,13 @@ describe('rotateOAuthCredentialsIfChanged', () => {
 
     expect(mockExistsSync).toHaveBeenCalledWith('/workspace/opt/agent/openai/auth.json');
     expect(mockWriteFileSync).toHaveBeenCalledWith(
-      '/workspace/opt/agent/openai/auth.json',
+      expect.stringMatching(/^\/workspace\/opt\/agent\/openai\/auth\.json\.adopt-/),
       'winner-token-data',
-      { encoding: 'utf-8', mode: 0o600 },
+      { encoding: 'utf-8', mode: 0o600, flag: 'wx' },
+    );
+    expect(mockRenameSync).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/workspace\/opt\/agent\/openai\/auth\.json\.adopt-/),
+      '/workspace/opt/agent/openai/auth.json',
     );
   });
 

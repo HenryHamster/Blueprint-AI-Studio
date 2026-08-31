@@ -249,6 +249,8 @@ export interface ResidentSession {
   exitCode(): number | null;
   /** Classified terminal provider failure from bounded stderr/stream errors. */
   failureCategory?(): 'rate_limited' | 'dead_auth' | null;
+  /** False when private provider state must be retained for credential recovery. */
+  privateRuntimeCleanupSafe?(): boolean;
   /**
    * Bounded, redacted diagnostic for a child-process exit when startup fails
    * before the resident can accept a turn.
@@ -275,6 +277,18 @@ export interface ResidentSessionOptions {
   onExit?: (code: number | null) => void;
   /** Required native MCP reply tool for this Resident session. */
   replyTool?: { mcpConfigPath: string; toolName?: string; allowedTools?: readonly string[] };
+  /**
+   * Exact outer-runner paths for the namespace-free Codex Landlock child.
+   * Codex sessions fail closed when this boundary or OAuth persistence is absent.
+   */
+  codexIsolation?: {
+    agentTokenPath: string;
+    readonlyPaths: readonly string[];
+    readwritePaths: readonly string[];
+    denyReadPaths: readonly string[];
+    denyWritePaths: readonly string[];
+    persistOAuthCredential?: () => Promise<void>;
+  };
   /**
    * Restricted foreground launch supplied by the Call Coordinator.  Unlike the
    * ordinary coding Resident it has an empty cwd, a filtered environment, and
@@ -366,7 +380,15 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     ? writeAgentTokenFile(getAgentToken())
     : false;
   if (runnerBase.outputMode === 'codex-jsonl' && !opts.foregroundLaunch) {
-    if (!tokenFileSeeded) {
+    const exactTokenPath = opts.codexIsolation?.agentTokenPath;
+    let exactTokenSeeded = false;
+    if (exactTokenPath) {
+      try {
+        const info = fs.lstatSync(exactTokenPath);
+        exactTokenSeeded = info.isFile() && !info.isSymbolicLink() && info.size > 0;
+      } catch { /* exact mirror remains unavailable */ }
+    }
+    if (!tokenFileSeeded && !exactTokenSeeded) {
       throw new Error('Codex Resident requires a current task token file');
     }
     return startResidentCodexSession(opts, runner, runnerBase);

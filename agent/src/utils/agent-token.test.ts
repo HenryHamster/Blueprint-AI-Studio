@@ -4,7 +4,8 @@ import { expectCalledWith } from './typed-mock-call.js';
 // Mock the two token-persistence modules the GitHub-token refresh callback
 // touches so the refresh path can be exercised without writing real files or
 // shelling out to git. Only the symbols agent-token.ts imports need to exist.
-vi.mock('../token-file.js', () => ({
+vi.mock('../token-file.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../token-file.js')>(),
   writeGithubTokenFile: vi.fn(),
   jsonFieldShellFn: vi.fn(() => ''),
 }));

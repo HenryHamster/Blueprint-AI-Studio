@@ -6,6 +6,7 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog,
   apiGet, apiPost, persistAndPostStatus, resolveBaseBranch,
+  rotateOAuthCredentialsIfChanged,
   recordResidentTurnLatency, getResidentTurnLatencyTelemetry,
   recordOperatorDecisionCapture, getOperatorDecisionCaptureTelemetry,
 } from '../index.js';
@@ -34,7 +35,9 @@ import {
   provisionResidentReplyTool, RESIDENT_PROJECT_READ_TOOL_NAME,
   RESIDENT_REPLY_TOOL_NAME, RESIDENT_STRATEGIC_TOOL_NAME,
 } from '../providers/resident-reply-tool.js';
-import { agentTokenFilePath } from '../token-file.js';
+import {
+  registerAgentTokenMirror,
+} from '../token-file.js';
 import {
   buildDirSummaryText,
   buildOpenMessagesText,
@@ -161,6 +164,9 @@ export const CALL_OPERATOR_RECONNECT_GRACE_MS = 30_000;
 
 export interface ResidentReplyRuntimePaths {
   runtimeDir: string;
+  stateDir: string;
+  mcpRootDir: string;
+  agentTokenPath: string;
   replyKeyPath: string;
   replyReceiptPath: string;
   stagedReplyPath: string;
@@ -192,13 +198,37 @@ export function residentReplyRuntimePaths(
     'blueprint-resident-reply',
     `${taskSlug}-${process.pid}-${incarnationSlug}`,
   );
+  const stateDir = path.join(runtimeDir, 'state');
   return {
     runtimeDir,
-    replyKeyPath: path.join(runtimeDir, '.resident-reply-idempotency-key'),
-    replyReceiptPath: path.join(runtimeDir, '.resident-reply-receipt.json'),
-    stagedReplyPath: path.join(runtimeDir, '.resident-reply-staged-message.json'),
-    privateTurnMarkerPath: path.join(runtimeDir, '.resident-private-workday-turn'),
+    stateDir,
+    mcpRootDir: path.join(runtimeDir, 'mcp'),
+    agentTokenPath: path.join(runtimeDir, 'agent-token', 'agent-token.jwt'),
+    replyKeyPath: path.join(stateDir, '.resident-reply-idempotency-key'),
+    replyReceiptPath: path.join(stateDir, '.resident-reply-receipt.json'),
+    stagedReplyPath: path.join(stateDir, '.resident-reply-staged-message.json'),
+    privateTurnMarkerPath: path.join(stateDir, '.resident-private-workday-turn'),
   };
+}
+
+function revokeResidentAgentToken(tokenPath: string): { revoked: boolean; detail?: string } {
+  try {
+    fs.unlinkSync(tokenPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') {
+      return { revoked: false, detail: `unlink failed (${code ?? 'unknown'})` };
+    }
+  }
+  try {
+    fs.lstatSync(tokenPath);
+    return { revoked: false, detail: 'token path still exists after unlink' };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === 'ENOENT'
+      ? { revoked: true }
+      : { revoked: false, detail: `absence check failed (${code ?? 'unknown'})` };
+  }
 }
 
 export interface ResidentReplyReceipt {
@@ -644,6 +674,8 @@ export async function handleStrategicResident(
   } = replyRuntime;
   fs.mkdirSync(replyRuntime.runtimeDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(replyRuntime.runtimeDir, 0o700);
+  fs.mkdirSync(replyRuntime.stateDir, { mode: 0o700 });
+  fs.mkdirSync(replyRuntime.mcpRootDir, { mode: 0o700 });
   const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
   const projectId = strVal(projectMetadata?.project_id);
   const ctx = task.context && typeof task.context === 'object'
@@ -690,7 +722,7 @@ export async function handleStrategicResident(
       || /no longer active|session\/task\/generation mismatch/i.test(message);
   };
   const cleanupUnadmittedRuntime = (): void => {
-    try { fs.rmdirSync(replyRuntime.runtimeDir); } catch { /* best effort */ }
+    try { fs.rmSync(replyRuntime.runtimeDir, { recursive: true, force: true }); } catch { /* best effort */ }
   };
   const activeAdmissionDeadline = (): number | null => {
     const deadlines = [legacyAdmissionDeadline, admissionTransportDeadline]
@@ -1112,13 +1144,10 @@ export async function handleStrategicResident(
   let callMediaReconciling: Promise<void> | null = null;
   // Private Workday packets use a separate, task-local directory. They are
   // never browser transport and never a public reply capability.
-  const callRuntimeDir = path.join(replyRuntime.runtimeDir, 'call-coordinator');
+  const callRuntimeDir = path.join(replyRuntime.stateDir, 'call-coordinator');
   const workdayCallStageDir = path.join(callRuntimeDir, 'workday-stage');
   fs.mkdirSync(workdayCallStageDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(callRuntimeDir, 0o700);
-  let workdayCallTool = provisionCallResidentTool(WORKSPACE, 'workday', {
-    stageDir: workdayCallStageDir,
-  });
   let foregroundCall: ForegroundCallController | null = null;
   // Typed Fast is deliberately independent from voice. It is a restricted
   // child sharing the Resident's *conversation authority*, not a second
@@ -1558,25 +1587,55 @@ export async function handleStrategicResident(
     DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS,
     consultationAbandonDeadlineMs(cfg.autonomousTurnTimeoutMs),
   );
-  let residentReplyTool = provisionResidentReplyTool(WORKSPACE, {
-    receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
-    stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
-    strategic: {
-      helperPath: path.join(WORKSPACE, 'strategic'),
-      readHelperPath: path.join(WORKSPACE, 'fetch'),
-      readVerbs: STRATEGIC_FETCH_VERBS,
-      orchestratorUrl: process.env.ORCHESTRATOR_URL || 'http://localhost:8080',
-      agentTokenFile: agentTokenFilePath(),
-      incarnationId: residentProcessIncarnation,
+  let mcpGeneration = 0;
+  const provisionResidentMcpGeneration = (): { generationDir: string; configPath: string } => {
+    const generationDir = path.join(replyRuntime.mcpRootDir, `generation-${++mcpGeneration}`);
+    fs.mkdirSync(generationDir, { mode: 0o700 });
+    writeStrategicHelpers(taskId, projectId, generationDir, {
       replyKeyPath: RESIDENT_REPLY_KEY_PATH,
       replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
       stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+      residentIncarnationId: residentProcessIncarnation,
       privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
-    },
-  });
-  let residentCallMcpConfigPath = mergeCallMcpConfigs(
-    WORKSPACE, residentReplyTool.configPath, workdayCallTool.configPath,
-  );
+    });
+    const replyTool = provisionResidentReplyTool(generationDir, {
+      receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
+      stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+      strategic: {
+        helperPath: path.join(generationDir, 'strategic'),
+        readHelperPath: path.join(generationDir, 'fetch'),
+        readVerbs: STRATEGIC_FETCH_VERBS,
+        orchestratorUrl: process.env.ORCHESTRATOR_URL || 'http://localhost:8080',
+        agentTokenFile: replyRuntime.agentTokenPath,
+        incarnationId: residentProcessIncarnation,
+        replyKeyPath: RESIDENT_REPLY_KEY_PATH,
+        replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
+        stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+        privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
+      },
+    });
+    const callTool = provisionCallResidentTool(generationDir, 'workday', {
+      stageDir: workdayCallStageDir,
+    });
+    const configPath = mergeCallMcpConfigs(
+      generationDir, replyTool.configPath, callTool.configPath,
+    );
+    for (const entry of fs.readdirSync(generationDir)) {
+      const target = path.join(generationDir, entry);
+      if (!fs.statSync(target).isFile()) continue;
+      const executable = fs.statSync(target).mode & 0o111;
+      fs.chmodSync(target, executable ? 0o500 : 0o400);
+    }
+    return { generationDir, configPath };
+  };
+  let residentMcpGeneration: { generationDir: string; configPath: string };
+  try {
+    residentMcpGeneration = provisionResidentMcpGeneration();
+  } catch (error) {
+    cleanupUnadmittedRuntime();
+    throw error;
+  }
+  let residentCallMcpConfigPath = residentMcpGeneration.configPath;
   const residentSessionOptions = () => ({
     model,
     effort,
@@ -1602,6 +1661,14 @@ export async function handleStrategicResident(
         RESIDENT_PROJECT_READ_TOOL_NAME,
         'mcp__call__emit_call_packet',
       ],
+    },
+    codexIsolation: {
+      agentTokenPath: replyRuntime.agentTokenPath,
+      readonlyPaths: [residentMcpGeneration.generationDir],
+      readwritePaths: [replyRuntime.stateDir],
+      denyReadPaths: [WORKSPACE, replyRuntime.agentTokenPath],
+      denyWritePaths: [WORKSPACE, residentMcpGeneration.generationDir, replyRuntime.agentTokenPath],
+      persistOAuthCredential: () => rotateOAuthCredentialsIfChanged(taskId),
     },
   });
 
@@ -1666,9 +1733,21 @@ export async function handleStrategicResident(
       }
     }
   }
-  let session: ResidentSession = startResidentClaudeSession({
-    ...residentSessionOptions(),
-  });
+  // Do not publish a refreshable token capability until the exact launch
+  // authority has survived its final CAS renewal. Every earlier exit removes
+  // the unadmitted runtime; registering before this point would let a later
+  // token refresh silently recreate it.
+  const unregisterResidentTokenMirror = registerAgentTokenMirror(replyRuntime.agentTokenPath);
+  let session: ResidentSession;
+  try {
+    session = startResidentClaudeSession({
+      ...residentSessionOptions(),
+    });
+  } catch (error) {
+    unregisterResidentTokenMirror();
+    cleanupUnadmittedRuntime();
+    throw error;
+  }
   bindSessionEvents(session);
 
   let firstTurnSent = false;
@@ -2021,6 +2100,13 @@ export async function handleStrategicResident(
   const providerTurnFailed = (r: ResidentTurnResult): boolean => {
     if (r.providerTerminalReason === 'kill_failed' && !r.processGone) {
       stopReason = 'provider_process_uncontrolled';
+      return true;
+    }
+    if (
+      r.providerTerminalReason === 'resident_landlock_failed'
+      || r.providerTerminalReason === 'oauth_rotation_failed'
+    ) {
+      stopReason = r.providerTerminalReason;
       return true;
     }
     // Child-close paths can classify the provider failure from their buffered
@@ -5870,29 +5956,6 @@ export async function handleStrategicResident(
             privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
           });
           provisionAmbientHelpers(taskId, WORKSPACE);
-          residentReplyTool = provisionResidentReplyTool(WORKSPACE, {
-            receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
-            stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
-            strategic: {
-              helperPath: path.join(WORKSPACE, 'strategic'),
-              readHelperPath: path.join(WORKSPACE, 'fetch'),
-              readVerbs: STRATEGIC_FETCH_VERBS,
-              orchestratorUrl: process.env.ORCHESTRATOR_URL || 'http://localhost:8080',
-              agentTokenFile: agentTokenFilePath(),
-              incarnationId: residentProcessIncarnation,
-              replyKeyPath: RESIDENT_REPLY_KEY_PATH,
-              replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
-              stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
-              privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
-            },
-          });
-          workdayCallTool = provisionCallResidentTool(WORKSPACE, 'workday', {
-            stageDir: workdayCallStageDir,
-          });
-          residentCallMcpConfigPath = mergeCallMcpConfigs(
-            WORKSPACE, residentReplyTool.configPath, workdayCallTool.configPath,
-          );
-          sendLog(ws, '[resident] workspace recovery — helper tools re-provisioned\n');
 
           // Restart the subprocess so its cwd points to the new directory inode.
           // The live subprocess is still attached to the deleted inode.
@@ -5906,6 +5969,9 @@ export async function handleStrategicResident(
             );
             break;
           }
+          residentMcpGeneration = provisionResidentMcpGeneration();
+          residentCallMcpConfigPath = residentMcpGeneration.configPath;
+          sendLog(ws, '[resident] workspace recovery — immutable MCP generation re-provisioned\n');
           const recoverySession = startResidentClaudeSession({
             ...residentSessionOptions(),
           });
@@ -6641,12 +6707,31 @@ export async function handleStrategicResident(
     await retireCallSpeech();
     session.close();
     const sessionIdle = await waitForResidentSessionIdle(session);
+    const runtimeCleanupSafe = session.privateRuntimeCleanupSafe?.() ?? true;
+    unregisterResidentTokenMirror();
+    const tokenRevocation = revokeResidentAgentToken(replyRuntime.agentTokenPath);
+    if (!tokenRevocation.revoked) {
+      stopReason = 'agent_token_revocation_failed';
+      sendLog(
+        ws,
+        `[resident] agent token revocation could not be proven; preserving private runtime (${tokenRevocation.detail ?? 'unknown failure'})\n`,
+      );
+    }
     if (!sessionIdle) {
       if (!residentAuthority.incarnationLost) {
-        stopReason = 'provider_process_uncontrolled';
+        stopReason = tokenRevocation.revoked
+          ? 'provider_process_uncontrolled'
+          : 'provider_process_uncontrolled_agent_token_revocation_failed';
         sendLog(
           ws,
           `[resident] provider child did not settle during bounded teardown; preserving reply runtime until capability revocation (${session.exitDiagnostic?.() ?? `session_id=${session.sessionId() ?? 'unknown'}`})\n`,
+        );
+      }
+    } else if (!runtimeCleanupSafe || !tokenRevocation.revoked) {
+      if (!residentAuthority.incarnationLost) {
+        sendLog(
+          ws,
+          `[resident] preserving private provider state for credential recovery (${session.exitDiagnostic?.() ?? `session_id=${session.sessionId() ?? 'unknown'}`})\n`,
         );
       }
     } else {
@@ -6657,7 +6742,7 @@ export async function handleStrategicResident(
         );
         removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
         removeResidentReplyKeyAtPath(RESIDENT_PRIVATE_TURN_MARKER_PATH);
-        fs.rmdirSync(replyRuntime.runtimeDir);
+        fs.rmSync(replyRuntime.runtimeDir, { recursive: true, force: true });
       } catch (e) {
         sendLog(ws, `[resident] reply runtime cleanup incomplete (non-fatal): ${String(e)}\n`);
       }
