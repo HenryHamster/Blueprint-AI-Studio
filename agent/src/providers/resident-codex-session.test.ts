@@ -238,6 +238,8 @@ describe('startResidentCodexSession', () => {
       && arg.includes('Claude-only legacy vocabulary')
       && arg.includes('mcp__workday__project_read')
       && arg.includes('mcp__workday__strategic_operation')
+      && arg.includes('replaces ./strategic help/schema')
+      && arg.includes('set-running-update sends data')
     ))).toBe(true);
     expect(firstArgs).not.toContain('resume');
     expect(firstArgs.at(-1)).toBe('-');

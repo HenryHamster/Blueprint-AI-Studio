@@ -335,7 +335,7 @@ def run_restricted_child(options: argparse.Namespace) -> int:
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
-            "name": "project_read", "arguments": {"resource": "running_update"},
+            "name": "project_read", "arguments": {"resource": "running-update"},
         }},
         {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
             "name": "strategic_operation", "arguments": {
@@ -377,9 +377,34 @@ def run_restricted_child(options: argparse.Namespace) -> int:
         "reply_to_operator", "strategic_operation", "project_read",
     ]:
         abort("MCP three-tool contract was not exposed")
+    strategic_tool = next(
+        (tool for tool in tools if tool.get("name") == "strategic_operation"),
+        None,
+    )
+    contract_marker = "contract-json="
+    contract_description = (
+        strategic_tool.get("inputSchema", {})
+        .get("properties", {})
+        .get("data", {})
+        .get("description", "")
+    ) if isinstance(strategic_tool, dict) else ""
+    try:
+        contract_offset = contract_description.index(contract_marker)
+        advertised_contracts = json.loads(
+            contract_description[contract_offset + len(contract_marker):]
+        )
+    except (ValueError, TypeError, json.JSONDecodeError):
+        abort("MCP strategic discovery contract is invalid")
+    if advertised_contracts.get("set-running-update") != {
+        "required": ["markdown"],
+        "fields": ["markdown"],
+        "requirements": ["markdown must be a string."],
+        "example": {"markdown": "# Current status\n..."},
+    }:
+        abort("MCP strategic discovery contract is incomplete")
     expected_project = json.dumps({"markdown": "preflight running update"})
     if (
-        project_read.get("resource") != "running_update"
+        project_read.get("resource") != "running-update"
         or project_read.get("bytes") != len(expected_project.encode())
         or project_text != expected_project
     ):
@@ -528,13 +553,15 @@ def controller(options: argparse.Namespace) -> int:
     strategic_ops = authority_state / "strategic-ops.json"
     strategic_ops.write_text(json.dumps({
         "set-running-update": {
-            "backend_op": "set-running-update",
+            "backend_op": "set_running_update",
             "required": ["markdown"],
             "fields": ["markdown"],
+            "requirements": ["markdown must be a string."],
+            "example": {"markdown": "# Current status\n..."},
         },
     }), encoding="utf-8")
     project_reads = authority_state / "project-reads.json"
-    project_reads.write_text(json.dumps(["running_update"]), encoding="utf-8")
+    project_reads.write_text(json.dumps(["running-update"]), encoding="utf-8")
     private_marker = authority_state / "private-turn.json"
     private_marker.write_text(json.dumps({
         "kind": "typed-consultation",

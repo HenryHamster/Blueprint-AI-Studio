@@ -115,6 +115,14 @@ describe('generated ./strategic CLI derives from the registry', () => {
     expect(spawn?.fields).toContain('release_base_branch');
     expect(spawn?.fields).toContain('model');
     expect(spawn?.fields).toContain('effort');
+    expect(spawn?.example).toMatchObject({
+      acceptance_evidence: {
+        kind: 'named_test',
+        test_path: expect.any(String),
+      },
+    });
+    expect(spawn?.requirements?.join('\n')).toContain('criteria inherited from direction_id');
+    expect(spawn?.requirements?.join('\n')).toContain('test_path');
     expect(spawn?.notes?.join('\n')).toContain('model and effort are an exact pair');
     expect(spawn?.notes?.join('\n')).toContain('never falls through');
     expect(spawn?.notes?.join('\n')).toContain(
@@ -135,6 +143,27 @@ describe('generated ./strategic CLI derives from the registry', () => {
     expect(memory?.fields).toContain('supersedes_id');
     expect(memory?.notes?.join('\n')).toContain('tagged handoff must include expected_head_id');
     expect(memory?.notes?.join('\n')).toContain('expected_head_id and supersedes_id to the same exact');
+    expect(memory?.requirements?.join('\n')).toContain('body or note');
+    expect(memory?.requirements?.join('\n')).toContain('tags includes handoff');
+    const runningUpdate = cliOpInput('set-running-update');
+    expect(runningUpdate?.required).toEqual(['markdown']);
+    const acceptance = cliOpInput('set-acceptance-criteria');
+    expect(acceptance?.fields).toEqual(['criteria', 'retract']);
+    expect(acceptance?.requirements?.join('\n')).toContain('direction_keys');
+    expect(acceptance?.requirements?.join('\n')).toContain('expected_text');
+    expect(acceptance?.requirements?.join('\n')).toContain('operator_authored_commits');
+    expect(acceptance?.requirements?.join('\n')).toContain('must omit direction_keys');
+    expect(acceptance?.example).toMatchObject({
+      criteria: [{
+        evidence_contract: {
+          type: 'operator_authored_commits',
+          predicate: { max_count: 0 },
+        },
+      }],
+    });
+    const qualification = cliOpInput('request-qualification');
+    expect(qualification?.example).not.toHaveProperty('probes');
+    expect(qualification?.requirements?.join('\n')).toContain('omit probes');
     const dismiss = cliOpInput('dismiss-knowledge');
     expect(dismiss?.fields).toContain('expected_handoff_head_ids');
     expect(dismiss?.fields).toContain('superseded_by_id');

@@ -70,6 +70,7 @@ const CODEX_RESIDENT_BOUNDARY = [
   'Do not invoke ./strategic, ./fetch, ./design-doc, ./messages, apply_patch, or any command path.',
   'Treat every shell, file, Git, repository, and ./helper instruction elsewhere as Claude-only legacy vocabulary; it never authorizes a local tool.',
   `Translate supported ./fetch intent to ${RESIDENT_PROJECT_READ_TOOL_NAME} and supported ./strategic intent to ${RESIDENT_STRATEGIC_TOOL_NAME} using exact JSON and receipt semantics.`,
+  `The ${RESIDENT_STRATEGIC_TOOL_NAME} data description embeds required and MCP-supported top-level fields, conditional/nested requirements, and valid examples; it replaces ./strategic help/schema. set-running-update sends data {"markdown":"..."} directly, never a file.`,
   'When a requested surface has no native Workday MCP contract, rely on the supplied canonical snapshot and report the limitation; never probe locally.',
   `Use ${RESIDENT_STRATEGIC_TOOL_NAME} for strategic mutations and pass exact JSON values directly.`,
   `Use ${RESIDENT_PROJECT_READ_TOOL_NAME} for bounded canonical precondition checks and readback.`,

@@ -58,6 +58,8 @@ export interface StrategicOpInputContract {
   required?: readonly string[];
   /** Accepted top-level fields when the operation has a narrow envelope. */
   fields?: readonly string[];
+  /** Compact conditional or nested rules needed to author a valid request. */
+  requirements?: readonly string[];
   /** A valid, deliberately small example used by `strategic schema <op>`. */
   example?: Record<string, unknown>;
   /** Compatibility detail worth surfacing before an agent learns it by 400. */
@@ -67,8 +69,10 @@ export interface StrategicOpInputContract {
 const jsonInput = (): StrategicOpInputContract => ({ kind: 'json' });
 const markdownInput = (): StrategicOpInputContract => ({
   kind: 'markdown',
+  required: ['markdown'],
   fields: ['markdown'],
   example: { markdown: '# Current status\n...' },
+  requirements: ['markdown must be a string of at most 100,000 characters.'],
   notes: ['Use --file for markdown. --stdin accepts raw markdown. --json accepts {"markdown":"..."}.'],
 });
 
@@ -175,8 +179,18 @@ const INPUTS = {
       title: 'Implement the verified pipeline repair',
       prompt: 'Apply the scoped fix and add regression coverage.',
       direction_id: 'd-pipeline-reliability',
+      acceptance_evidence: {
+        kind: 'named_test',
+        test_path: 'agent/src/providers/resident-reply-tool.test.ts',
+      },
       idempotency_key: 'pipeline-repair-v1',
     },
+    requirements: [
+      'type and title must be non-empty strings; type must be a strategist-spawnable task type.',
+      'prompt must be a non-empty string for every type except compute_experiment; compute_experiment may instead supply a non-empty hypothesis.',
+      'model and effort must be supplied together when pinning an exact provider-qualified route.',
+      'Explicit criterion_ids or criteria inherited from direction_id require acceptance_evidence exactly shaped as {"kind":"named_test","test_path":"<real test file>","test_id":"<optional substantive node id>"}.',
+    ],
     notes: [
       'Use this operation for bounded implementation, research, plan, design, and compute work under an existing strategic outcome.',
       'model and effort are an exact pair: supply both to pin one provider-qualified model/effort route, or omit both to retain the project routing defaults. A pinned route never falls through to a different provider/model.',
@@ -194,13 +208,41 @@ const INPUTS = {
       'input_artifact_job_id rehydrates the durable bundle of a TERMINAL compute job into $BLUEPRINT_ARTIFACT_DIR before the command runs, for train-then-evaluate, resuming a deadline-capped run, or sharing one preprocessing step. It requires declared_metric and no_progress_timeout_seconds and the launch is refused without that pair. declared_metric names the result key used for scoring/arm comparison; it is NOT the watchdog signal. The no-progress watchdog polls the MTIME of the file named by $BLUEPRINT_PROGRESS_FILE and kills the job (exit 125, no_progress_timeout) if it stops advancing, so the command MUST append a JSON line per step to that file (JSONL, one {"metric": ..., "value": ...} record per line, appended and flushed -- never rewritten).',
     ],
   },
+  set_acceptance_criteria: {
+    kind: 'json' as const,
+    fields: ['criteria', 'retract'],
+    example: {
+      criteria: [{
+        text: 'The candidate contains zero operator-authored commits.',
+        evidence_contract: {
+          type: 'operator_authored_commits',
+          predicate: { max_count: 0 },
+        },
+      }],
+    },
+    requirements: [
+      'criteria is optional and defaults to []; each item requires non-empty text and supports only text, direction_keys, criterion_key, expected_text, and evidence_contract.',
+      'For a new criterion omit criterion_key and expected_text; direction_keys is an optional array of direction keys to bind.',
+      'For an in-place rewrite supply non-empty criterion_key and string expected_text together with the replacement text.',
+      'evidence_contract is optional null or a supported closed machine contract; operator authorship is exactly {"type":"operator_authored_commits","predicate":{"max_count":<non-negative integer>}}.',
+      'An operator_authored_commits release-policy criterion must omit direction_keys so it remains unbound to ordinary product work.',
+      'retract is optional and defaults to []; each item requires non-empty criterion_key and reason, with optional string superseded_by_key.',
+    ],
+    notes: [
+      'New criteria receive server-generated stable criterion keys.',
+      'The strategist may not author the owner-only prepromotion_ci_build_smoke evidence contract.',
+    ],
+  },
   request_qualification: {
     kind: 'json' as const,
     fields: ['reason', 'probes'],
     example: {
       reason: 'The candidate is stable and the remaining release claims are ready for judgment.',
-      probes: ['walkthrough_e2e'],
     },
+    requirements: [
+      'For ordinary code and release qualification omit probes.',
+      'Use probes:["walkthrough_e2e"] only when the release claim specifically requires live product behavior.',
+    ],
     notes: [
       'Qualification is expensive; request it only at a meaningful stable checkpoint.',
       'Omit probes for ordinary code/release judgment. Request walkthrough_e2e only when the release claim requires live product behavior.',
@@ -347,6 +389,12 @@ const INPUTS = {
       supersedes_id: null,
       expected_head_id: null,
     },
+    requirements: [
+      'At least one of body or note must be a non-empty string; body is preferred and note is the legacy alias.',
+      'If tags includes handoff, expected_head_id is required and must be null only when no active handoff exists.',
+      'To replace a handoff, expected_head_id and supersedes_id must both equal the exact current handoff document UUID.',
+      'Ordinary memory must omit expected_head_id; non-null supersedes_id must name an active same-project strategic-memory document.',
+    ],
     notes: [
       'A write tagged handoff must include expected_head_id. Use null only when no active handoff exists.',
       'To replace a handoff, set expected_head_id and supersedes_id to the same exact current handoff document UUID.',
@@ -445,7 +493,7 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'set_evidence_progress', alias: 'set-evidence-progress', cli: true, prompt: true, internalReason: null,
     description: 'Record evidence-progress verdicts (gated by the challenge).' },
   { op: 'set_acceptance_criteria', alias: 'set-acceptance-criteria', cli: true, prompt: true, internalReason: null,
-    description: 'Author acceptance criteria for a direction/task.' },
+    description: 'Author acceptance criteria for a direction/task.', input: inputFor('set_acceptance_criteria') },
   { op: 'record_finding_resolution', alias: 'record-finding-resolution', cli: true, prompt: true, internalReason: null,
     description: 'Record a carried audit finding as resolved or code-verified stale in the re-qualification resolution ledger.' },
   { op: 'set_memory', alias: 'set-memory', cli: true, prompt: true, internalReason: null,
