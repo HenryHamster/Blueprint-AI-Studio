@@ -1792,6 +1792,7 @@ export async function handleStrategicResident(
   const terminalProviderFailure: { value: 'rate_limited' | 'dead_auth' | null } = { value: null };
   let genericProviderFailures = 0;
   let lastGenericProviderFailureDetail: string | null = null;
+  let lastOperatorReplyProtocolFailureDetail: string | null = null;
   let pendingRestartCheckpoint: string | null = null;
   // Consecutive turns whose per-turn stall watchdog fired. N in a row ⇒ the
   // session is wedged (not merely slow) ⇒ fail it rather than spin forever.
@@ -2677,6 +2678,9 @@ export async function handleStrategicResident(
     repairExhausted = false,
   ): Promise<'stop' | 'continue'> => {
     rollbackPendingOperatorAdmission();
+    lastOperatorReplyProtocolFailureDetail = sanitize(
+      `${reason}: ${detail}`,
+    ).slice(-4_000);
     operatorReplyProtocolFailures += 1;
     if (repairExhausted) {
       operatorReplyProtocolFailures = MAX_CONSECUTIVE_OPERATOR_REPLY_PROTOCOL_FAILURES;
@@ -6958,7 +6962,11 @@ export async function handleStrategicResident(
     terminalProviderFailure.value ?? session.failureCategory?.() ?? null,
   );
   const exitDiagnostic = status === 'FAILED'
-    ? [lastGenericProviderFailureDetail, session.exitDiagnostic?.()]
+    ? [
+      lastOperatorReplyProtocolFailureDetail,
+      lastGenericProviderFailureDetail,
+      session.exitDiagnostic?.(),
+    ]
       .filter((value, index, values): value is string => (
         typeof value === 'string' && value.length > 0 && values.indexOf(value) === index
       ))

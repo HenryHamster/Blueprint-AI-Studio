@@ -10908,6 +10908,9 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       && payload.status === 'FAILED'
       && payload.failure_category === 'resident_reply_protocol_failed'
       && String(payload.logs).includes('operator_reply_protocol_failed')
+      && String(payload.logs).includes('operator reply tool missing')
+      && String(payload.logs).includes('assistant_text_tail')
+      && String(payload.logs).includes('still missing the native reply')
     ))).toBe(true);
   });
 
