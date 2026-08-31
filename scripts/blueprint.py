@@ -11835,11 +11835,10 @@ def _execute_deploy(
     inplace: bool = False,
 ) -> None:
     """Execute the shim, then post the receipt as a distinct stage."""
-    operation_id = None
-    if promoted is not None and promoted.get("activation_requested_at"):
-        operation_id = _activation_operation_id(
-            get_project_id(getattr(args, "project_id", None)), promoted
-        )
+    project_id = get_project_id(getattr(args, "project_id", None))
+    operation_id = _deploy_operation_id(
+        project_id, promoted, digest=digest, revision=revision
+    )
     release_completed = _execute_deploy_shim(
         args,
         revision,
@@ -11848,13 +11847,20 @@ def _execute_deploy(
         operation_id=operation_id,
     )
     if release_completed is False:
+        receipt_transport = " --local" if inplace else (
+            f" --host {getattr(args, 'host', 'hamsterwheel')}"
+        )
         print(
             "Release handoff acceptance is ambiguous; do not retry activation. "
-            "Reconcile the root executor receipt and served revision before "
-            "recording an activation receipt.",
+            "Reconcile the exact root executor receipt and served revision with "
+            f"`blueprint deploy --receipt-only --sha {revision}{receipt_transport}` "
+            "before recording "
+            "an activation receipt; receipt-only never activates.",
             file=sys.stderr,
         )
         raise APIError("release handoff acceptance is ambiguous")
+    if inplace:
+        _require_local_served_revision(revision)
     print("Release activated. Runners self-update on their next heartbeat.")
     _post_activation_receipt(args, promoted, revision)
 
@@ -11900,6 +11906,64 @@ def _activation_operation_id(project_id: str, approved: dict) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def _manual_release_operation_id(
+    project_id: str,
+    digest: str,
+    revision: str,
+    promoted: dict | None,
+) -> str:
+    """Bind a manual operation to its artifact and predecessor serving state."""
+    if not isinstance(project_id, str) or not project_id:
+        raise APIError("manual release project identity is incomplete")
+    if not _DEPLOY_DIGEST_RE.fullmatch(digest):
+        raise APIError("manual release digest failed validation")
+    if not _DEPLOY_REVISION_RE.fullmatch(revision):
+        raise APIError("manual release revision failed validation")
+    predecessor_sha = None if promoted is None else promoted.get("served_sha")
+    predecessor_at = None if promoted is None else promoted.get("served_at")
+    if predecessor_sha is not None and not _DEPLOY_REVISION_RE.fullmatch(
+        predecessor_sha
+    ):
+        raise APIError("manual release predecessor revision failed validation")
+    if predecessor_at is not None and (
+        not isinstance(predecessor_at, str) or not predecessor_at
+    ):
+        raise APIError("manual release predecessor timestamp failed validation")
+    promoted_version_id = None if promoted is None else promoted.get("id")
+    if promoted_version_id is not None and (
+        not isinstance(promoted_version_id, str) or not promoted_version_id
+    ):
+        raise APIError("manual release promoted version identity is invalid")
+    canonical = json.dumps(
+        {
+            "digest": digest,
+            "kind": "manual_exact_artifact_release",
+            "predecessor_served_at": predecessor_at,
+            "predecessor_served_sha": predecessor_sha,
+            "project_id": project_id,
+            "promoted_version_id": promoted_version_id,
+            "revision": revision,
+            "version": 1,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _deploy_operation_id(
+    project_id: str,
+    promoted: dict | None,
+    *,
+    digest: str,
+    revision: str,
+) -> str:
+    """Preserve approval identity or derive the stable manual artifact identity."""
+    if promoted is not None and promoted.get("activation_requested_at"):
+        return _activation_operation_id(project_id, promoted)
+    return _manual_release_operation_id(project_id, digest, revision, promoted)
 
 
 def _deploy_agent_once(args: argparse.Namespace) -> bool:
@@ -12222,6 +12286,18 @@ def _local_served_sha() -> str | None:
         return None
     normalized_sha = sha.lower()
     return normalized_sha if _DEPLOY_REVISION_RE.fullmatch(normalized_sha) else None
+
+
+def _require_local_served_revision(expected_sha: str) -> None:
+    """Require fresh loopback evidence before recording a host-local receipt."""
+    served_sha = _local_served_sha()
+    if served_sha != expected_sha:
+        observed = served_sha or "unavailable"
+        raise APIError(
+            "local served revision does not match the exact root release receipt "
+            f"(expected {expected_sha}, observed {observed}); refusing to record "
+            "an activation receipt"
+        )
 
 
 def _pending_activation_confirmation(state: dict, expected_sha: str) -> str:
@@ -12734,10 +12810,11 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         return
     _require_write_config("deploy")
     if args.receipt_only:
-        if promoted is None or not promoted.get("activation_requested_at"):
-            raise APIError("receipt-only requires an exact approved activation")
-        operation_id = _activation_operation_id(
-            get_project_id(getattr(args, "project_id", None)), promoted
+        operation_id = _deploy_operation_id(
+            get_project_id(getattr(args, "project_id", None)),
+            promoted,
+            digest=digest,
+            revision=revision,
         )
         result = _execute_deploy_shim(
             args,
@@ -12749,6 +12826,9 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         )
         if result is not True:
             raise APIError("exact root activation receipt was not observed")
+        if args.local:
+            _require_local_served_revision(revision)
+        _post_activation_receipt(args, promoted, revision)
         print(f"  Root receipt: success ({operation_id})")
         return
     if not args.yes:
