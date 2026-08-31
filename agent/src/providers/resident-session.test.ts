@@ -224,7 +224,7 @@ describe('startResidentClaudeSession', () => {
     expect(args[0]).toBe('exec');
     expect(args).toContain('--json');
     expect(args).not.toContain('--input-format');
-    expect(args).toContain('default_permissions="resident-read-only"');
+    expect(args).toEqual(expect.arrayContaining(['-s', 'read-only', '--enable', 'use_legacy_landlock']));
     expect(writeAgentTokenFile).toHaveBeenCalledWith('fresh-codex-token');
     expect(vi.mocked(writeAgentTokenFile).mock.invocationCallOrder[0])
       .toBeLessThan(vi.mocked(spawn).mock.invocationCallOrder[0]);
