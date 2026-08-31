@@ -519,12 +519,14 @@
       "reason": "Protects the quota-free production-shaped Codex exec/resume preflight: four-request Responses namespace/function-call continuations, exact successful Workday MCP JSONL dispatch receipts, terminal authority, and fail-closed denial of native or unknown local tools.",
       "test_ids": [
         "TestResidentLandlockPreflight::test_loopback_responses_fixture_serves_two_tool_call_continuation_pairs",
-        "TestResidentLandlockPreflight::test_responses_roundtrip_requires_namespaced_schema_and_exact_mcp_output",
+        "TestResidentLandlockPreflight::test_project_read_keeps_exact_mcp_bounds_before_codex_projection",
+        "TestResidentLandlockPreflight::test_responses_roundtrip_accepts_codex_0150_bounded_schema_projection",
+        "TestResidentLandlockPreflight::test_responses_schema_mismatch_diagnostic_is_useful_and_bounded",
         "TestResidentLandlockPreflight::test_jsonl_transport_diagnostics_do_not_replace_terminal_authority",
         "TestResidentLandlockPreflight::test_jsonl_preflight_rejects_missing_mcp_dispatch",
         "TestResidentLandlockPreflight::test_jsonl_preflight_rejects_forbidden_local_items"
       ],
-      "test_count": 5
+      "test_count": 7
     },
     {
       "path": "scripts/test_runner_isolation.py",
