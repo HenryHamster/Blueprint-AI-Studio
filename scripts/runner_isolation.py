@@ -728,6 +728,7 @@ def detect_gpus() -> tuple[tuple[int, ...], tuple[str, ...]]:
 # Known LLM CLI binaries the runner may advertise in the heartbeat.
 _LLM_CLI_NAMES: tuple[str, ...] = ("claude", "codex", "gemini")
 MIN_CODEX_CLI_VERSION: tuple[int, int, int] = (0, 150, 1)
+CODEX_RESIDENT_PROFILE_HOME = "/tmp/blueprint-resident-codex-home"
 CLAUDE_RESIDENT_REQUIRED_FLAGS: frozenset[str] = frozenset(
     {
         "--input-format",
@@ -892,7 +893,7 @@ def _codex_resident_profile_args() -> list[str]:
         "-c",
         'permissions.resident-read-only.extends=":read-only"',
         "-c",
-        'permissions.resident-read-only.filesystem={"/tmp/blueprint-resident-profile-probe"="write","/tmp/blueprint-resident-codex-home"="deny"}',
+        f'permissions.resident-read-only.filesystem={{"/tmp/blueprint-resident-profile-probe"="write","{CODEX_RESIDENT_PROFILE_HOME}"="deny"}}',
         "-c",
         "permissions.resident-read-only.network.enabled=true",
         "-c",
@@ -1300,9 +1301,11 @@ def probe_container_llm_clis(
                                         "--entrypoint",
                                         name,
                                         "--env",
-                                        "CODEX_HOME=/tmp/blueprint-resident-codex-home",
+                                        f"CODEX_HOME={CODEX_RESIDENT_PROFILE_HOME}",
                                         "--env",
-                                        "HOME=/tmp/blueprint-resident-codex-home",
+                                        f"HOME={CODEX_RESIDENT_PROFILE_HOME}",
+                                        "--tmpfs",
+                                        CODEX_RESIDENT_PROFILE_HOME,
                                         image,
                                     ],
                                     timeout=20,
@@ -2550,12 +2553,18 @@ def probe_agent_plan_llm_clis(plan: ExecutionPlan) -> dict[str, dict]:
                         and resume_help.returncode == 0
                     ):
                         profile_env = dict(plan.env)
-                        profile_env["CODEX_HOME"] = (
-                            "/tmp/blueprint-resident-codex-home"
-                        )
+                        profile_env["CODEX_HOME"] = CODEX_RESIDENT_PROFILE_HOME
+                        profile_env["HOME"] = CODEX_RESIDENT_PROFILE_HOME
+                        profile_prefix = [
+                            *prefix[:-1],
+                            "--dir",
+                            CODEX_RESIDENT_PROFILE_HOME,
+                            "--",
+                            executable,
+                        ]
                         profile_result, profile_reason = (
                             _probe_codex_resident_profile(
-                                [*prefix, executable],
+                                profile_prefix,
                                 timeout=10,
                                 env=profile_env,
                             )

@@ -2307,15 +2307,29 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertTrue(result["codex"]["resident_ready"])
         self.assertTrue(result["codex"]["resident_profile_ready"])
         self.assertEqual(run.call_count, 10)
+        profile_calls = [
+            call for call in run.call_args_list if "app-server" in call.args[0]
+        ]
+        self.assertEqual(len(profile_calls), 1)
+        profile_argv = profile_calls[0].args[0]
+        profile_separator = profile_argv.index("--")
+        self.assertEqual(
+            profile_argv[profile_separator - 2 : profile_separator],
+            ["--dir", iso.CODEX_RESIDENT_PROFILE_HOME],
+        )
         for call in run.call_args_list:
-            self.assertEqual(call.args[0][:4], plan.argv[:4])
             if "app-server" in call.args[0]:
+                self.assertEqual(call.args[0][:3], plan.argv[:3])
                 self.assertEqual(call.kwargs["env"]["PATH"], plan.env["PATH"])
                 self.assertEqual(
                     call.kwargs["env"]["CODEX_HOME"],
-                    "/tmp/blueprint-resident-codex-home",
+                    iso.CODEX_RESIDENT_PROFILE_HOME,
+                )
+                self.assertEqual(
+                    call.kwargs["env"]["HOME"], iso.CODEX_RESIDENT_PROFILE_HOME
                 )
             else:
+                self.assertEqual(call.args[0][:4], plan.argv[:4])
                 self.assertEqual(call.kwargs["env"], plan.env)
 
     def test_agent_plan_probe_reports_sandbox_missing_resident_flag(self):
@@ -2508,8 +2522,12 @@ class TestProbeLlmClis(unittest.TestCase):
             call.args[0] for call in run.call_args_list if "app-server" in call.args[0]
         ]
         self.assertEqual(len(profile_calls), 1)
-        self.assertIn("CODEX_HOME=/tmp/blueprint-resident-codex-home", profile_calls[0])
-        self.assertIn("HOME=/tmp/blueprint-resident-codex-home", profile_calls[0])
+        self.assertIn(f"CODEX_HOME={iso.CODEX_RESIDENT_PROFILE_HOME}", profile_calls[0])
+        self.assertIn(f"HOME={iso.CODEX_RESIDENT_PROFILE_HOME}", profile_calls[0])
+        self.assertEqual(
+            profile_calls[0][profile_calls[0].index("--tmpfs") + 1],
+            iso.CODEX_RESIDENT_PROFILE_HOME,
+        )
         for call in run.call_args_list:
             self.assertEqual(call.args[0][0:2], ["docker", "run"])
             self.assertIn("agent:test", call.args[0])
