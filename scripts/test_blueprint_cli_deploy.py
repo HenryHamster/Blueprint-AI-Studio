@@ -444,7 +444,9 @@ def test_manual_operation_identity_changes_after_serving_predecessor_advances():
     assert before != after
 
 
-def test_receipt_only_approved_binding_preserves_approval_operation_id(monkeypatch):
+def test_remote_receipt_only_preserves_approval_id_and_posts_without_loopback(
+    monkeypatch,
+):
     revision = "5" * 40
     digest = "sha256:" + "6" * 64
     promoted = {
@@ -453,6 +455,7 @@ def test_receipt_only_approved_binding_preserves_approval_operation_id(monkeypat
         "activation_requested_at": "2026-08-31T01:02:03Z",
     }
     root_calls = []
+    receipts = []
     monkeypatch.setattr(blueprint, "_fetch_deploy_manifest", lambda _sha: {
         "run": {"createdAt": "now", "databaseId": 3},
         "digest": digest,
@@ -464,6 +467,16 @@ def test_receipt_only_approved_binding_preserves_approval_operation_id(monkeypat
         blueprint,
         "_execute_deploy_shim",
         lambda *args, **kwargs: root_calls.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "_local_served_sha",
+        lambda: pytest.fail("remote receipt reconciliation must not probe loopback"),
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "_post_activation_receipt",
+        lambda *args: receipts.append(args),
     )
     args = SimpleNamespace(
         sha=revision,
@@ -484,6 +497,7 @@ def test_receipt_only_approved_binding_preserves_approval_operation_id(monkeypat
         "operation_id": expected,
         "receipt_only": True,
     })]
+    assert receipts == [(args, promoted, revision)]
 
 
 def test_local_success_receipt_requires_exact_served_sha_before_api_receipt(

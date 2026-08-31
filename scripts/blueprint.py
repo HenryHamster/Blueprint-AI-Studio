@@ -12828,7 +12828,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             raise APIError("exact root activation receipt was not observed")
         if args.local:
             _require_local_served_revision(revision)
-            _post_activation_receipt(args, promoted, revision)
+        _post_activation_receipt(args, promoted, revision)
         print(f"  Root receipt: success ({operation_id})")
         return
     if not args.yes:
