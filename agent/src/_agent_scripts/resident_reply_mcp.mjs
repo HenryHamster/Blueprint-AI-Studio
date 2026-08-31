@@ -518,11 +518,20 @@ async function handleProjectRead(id, args) {
     return toolError(id, `project_read failed: ${completed.detail || 'helper did not complete cleanly'}`);
   }
   const text = completed.stdout.trim();
+  const receipt = {
+    resource,
+    ...(resourceId ? { id: resourceId } : {}),
+    bytes: Buffer.byteLength(text, 'utf8'),
+  };
   send({
     jsonrpc: '2.0', id,
     result: {
       content: [{ type: 'text', text }],
-      structuredContent: { resource, ...(resourceId ? { id: resourceId } : {}), bytes: Buffer.byteLength(text, 'utf8') },
+      // Codex gives structuredContent precedence when constructing the next
+      // model input. A metadata-only structured result therefore hid the
+      // canonical text above from the Resident. Keep the bounded receipt in
+      // MCP metadata and make the text body the only model-visible result.
+      _meta: { blueprintProjectReadReceipt: receipt },
     },
   });
 }
