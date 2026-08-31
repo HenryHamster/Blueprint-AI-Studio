@@ -271,6 +271,7 @@ function revokeResidentAgentToken(tokenPath: string): { revoked: boolean; detail
 export interface ResidentReplyReceipt {
   idempotency_key: string;
   covered_message_ids: string[];
+  reply_to_message_id: string;
 }
 
 export interface ResidentStagedReply {
@@ -278,6 +279,7 @@ export interface ResidentStagedReply {
   content: string;
   idempotency_key: string;
   covered_message_ids: string[];
+  reply_to_message_id: string;
   context?: Record<string, unknown>;
 }
 
@@ -374,6 +376,8 @@ export function readResidentStagedReplyAtPath(
     typeof parsed.type !== 'string' || !parsed.type.trim()
     || typeof parsed.content !== 'string' || !parsed.content.trim()
     || parsed.idempotency_key !== receipt.idempotency_key
+    || parsed.reply_to_message_id !== receipt.reply_to_message_id
+    || !expectedIds.includes(receipt.reply_to_message_id)
     || actualIds === null
     || actualIds.length !== expectedIds.length
     || actualIds.some((value, index) => value !== expectedIds[index])
@@ -388,6 +392,7 @@ export function readResidentStagedReplyAtPath(
     content: parsed.content.trim(),
     idempotency_key: parsed.idempotency_key,
     covered_message_ids: [...receipt.covered_message_ids],
+    reply_to_message_id: receipt.reply_to_message_id,
     ...(parsed.context === undefined ? {} : { context: parsed.context as Record<string, unknown> }),
   };
 }
@@ -2341,6 +2346,10 @@ export async function handleStrategicResident(
           content: text,
           idempotency_key: residentMessageKey('reply', anchorMessageId),
           covered_message_ids: coveredMessageIds,
+          context: {
+            ...(stagedReply.context ?? {}),
+            reply_to: stagedReply.reply_to_message_id,
+          },
           ...(activeConversationClaimId === null
             ? {}
             : {
@@ -2352,7 +2361,6 @@ export async function handleStrategicResident(
                     activeConversationClaimIncarnation,
                 }),
             }),
-          ...(stagedReply.context === undefined ? {} : { context: stagedReply.context }),
           resident_turn_state: residentTurnState,
         },
       });
@@ -5621,6 +5629,7 @@ export async function handleStrategicResident(
     const replyReceipt: ResidentReplyReceipt = {
       idempotency_key: residentMessageKey('reply', replyAnchorId),
       covered_message_ids: coveredMessageIds,
+      reply_to_message_id: replyAnchorId,
     };
 
     let ackTimer: ReturnType<typeof setTimeout> | null = null;

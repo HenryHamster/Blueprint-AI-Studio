@@ -59,7 +59,11 @@ describe('Resident Workday reply MCP tool', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'resident-reply-mcp-'));
     const receiptPath = path.join(workspace, '.resident-reply-receipt.json');
     const stagedReplyPath = path.join(workspace, '.resident-reply-staged-message.json');
-    const receipt = { idempotency_key: 'resident-reply-key', covered_message_ids: ['message-1', 'message-2'] };
+    const receipt = {
+      idempotency_key: 'resident-reply-key',
+      covered_message_ids: ['message-1', 'message-2'],
+      reply_to_message_id: 'message-1',
+    };
     fs.writeFileSync(receiptPath, JSON.stringify(receipt), { mode: 0o600 });
     try {
       const tool = provisionResidentReplyTool(workspace, { receiptPath, stagedReplyPath });
@@ -104,6 +108,7 @@ describe('Resident Workday reply MCP tool', () => {
     const stagedReplyPath = path.join(workspace, '.resident-reply-staged-message.json');
     fs.writeFileSync(receiptPath, JSON.stringify({
       idempotency_key: 'resident-reply-key', covered_message_ids: ['message-1'],
+      reply_to_message_id: 'message-1',
     }), { mode: 0o600 });
     try {
       const tool = provisionResidentReplyTool(workspace, { receiptPath, stagedReplyPath });

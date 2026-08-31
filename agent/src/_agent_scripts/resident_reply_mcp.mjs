@@ -121,6 +121,8 @@ function activeReceipt() {
     || typeof receipt.idempotency_key !== 'string' || !receipt.idempotency_key
     || !Array.isArray(receipt.covered_message_ids) || receipt.covered_message_ids.length === 0
     || receipt.covered_message_ids.some((id) => typeof id !== 'string' || !id)
+    || typeof receipt.reply_to_message_id !== 'string' || !receipt.reply_to_message_id
+    || !receipt.covered_message_ids.includes(receipt.reply_to_message_id)
   ) {
     throw new Error('resident reply receipt is invalid');
   }
@@ -245,6 +247,7 @@ function handleReply(id, args) {
       content,
       idempotency_key: receipt.idempotency_key,
       covered_message_ids: receipt.covered_message_ids,
+      reply_to_message_id: receipt.reply_to_message_id,
     });
     send({
       jsonrpc: '2.0', id,

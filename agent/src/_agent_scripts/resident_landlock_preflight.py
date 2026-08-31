@@ -1173,6 +1173,7 @@ def controller(options: argparse.Namespace) -> int:
     receipt.write_text(json.dumps({
         "idempotency_key": "resident-landlock-preflight",
         "covered_message_ids": ["preflight-message"],
+        "reply_to_message_id": "preflight-message",
     }), encoding="utf-8")
     source_dir = Path(__file__).resolve().parent
     mcp_script = mcp_dir / "resident_reply_mcp.mjs"
@@ -1351,6 +1352,7 @@ def controller(options: argparse.Namespace) -> int:
             "content": expected_content,
             "idempotency_key": "resident-landlock-preflight",
             "covered_message_ids": ["preflight-message"],
+            "reply_to_message_id": "preflight-message",
         }:
             abort(
                 f"MCP connection {connection_number} staged the wrong receipt-bound "
