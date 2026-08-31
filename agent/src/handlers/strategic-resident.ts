@@ -135,6 +135,7 @@ const MAX_CONSECUTIVE_OPERATOR_REPLY_PROTOCOL_FAILURES = 2;
 // place from checkpoint; a second in a row means recovery is not holding, so
 // the task ends FAILED with an honest reason instead of looping forever.
 const MAX_CONSECUTIVE_CONSULTATION_ABANDON_EXITS = 1;
+const RESIDENT_SESSION_TEARDOWN_TIMEOUT_MS = 15_000;
 const OPERATOR_PREEMPT_DEADLINE_MS = 10_000;
 const OPERATOR_HARD_TIMEOUT_GRACE_MS = 30_000;
 // Public conversation coordination must stay substantially cheaper than a
@@ -479,6 +480,23 @@ export function oldestStableInboundMessageId(
 export { SessionStreamer };
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
+
+const waitForResidentSessionIdle = (session: ResidentSession): Promise<boolean> => (
+  new Promise((resolve) => {
+    let settled = false;
+    const finish = (idle: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(idle);
+    };
+    const timer = setTimeout(() => { finish(false); }, RESIDENT_SESSION_TEARDOWN_TIMEOUT_MS);
+    void session.waitForIdle().then(
+      () => { finish(true); },
+      () => { finish(false); },
+    );
+  })
+);
 
 const TURN_DONE = Symbol('resident-turn-done');
 
@@ -1653,6 +1671,10 @@ export async function handleStrategicResident(
   // writer alongside the resumed cloud strategist. Losing authority NEVER ends
   // the session; only stop_requested / 401 does.
   let residentIncarnationHeld = true;
+  // Monotonic authority fence. Teardown diagnostics may refine the operational
+  // stop reason, but once this exact process loses its incarnation it must
+  // never publish terminal state or logs on behalf of the replacement.
+  const residentAuthority = { incarnationLost: false };
   // Set just before session.interrupt() is called on a typed Workday
   // consultation abandon (deadline expiry or a failed renewal). interrupt()
   // sends SIGINT, which kills the WHOLE Claude Code child process, not just
@@ -1978,6 +2000,10 @@ export async function handleStrategicResident(
     return false;
   };
   const providerTurnFailed = (r: ResidentTurnResult): boolean => {
+    if (r.providerTerminalReason === 'kill_failed' && !r.processGone) {
+      stopReason = 'provider_process_uncontrolled';
+      return true;
+    }
     // Child-close paths can classify the provider failure from their buffered
     // stderr tail even when no explicit provider-failed terminal event arrived.
     // Treat either signal as canonical so prompt-exit preemption never restarts
@@ -2588,6 +2614,7 @@ export async function handleStrategicResident(
     }
     if (resp.resident_incarnation_held === false) {
       stopReason = 'resident_incarnation_lost';
+      residentAuthority.incarnationLost = true;
       residentIncarnationHeld = false;
       authorityHeld = false;
     }
@@ -6574,16 +6601,27 @@ export async function handleStrategicResident(
     await callMedia.disconnect();
     await retireCallSpeech();
     session.close();
-    try {
-      removeResidentReplyArtifactsAtPaths(
-        RESIDENT_REPLY_KEY_PATH,
-        RESIDENT_REPLY_RECEIPT_PATH,
-      );
-      removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
-      removeResidentReplyKeyAtPath(RESIDENT_PRIVATE_TURN_MARKER_PATH);
-      fs.rmdirSync(replyRuntime.runtimeDir);
-    } catch (e) {
-      sendLog(ws, `[resident] reply runtime cleanup incomplete (non-fatal): ${String(e)}\n`);
+    const sessionIdle = await waitForResidentSessionIdle(session);
+    if (!sessionIdle) {
+      if (!residentAuthority.incarnationLost) {
+        stopReason = 'provider_process_uncontrolled';
+        sendLog(
+          ws,
+          `[resident] provider child did not settle during bounded teardown; preserving reply runtime until capability revocation (${session.exitDiagnostic?.() ?? `session_id=${session.sessionId() ?? 'unknown'}`})\n`,
+        );
+      }
+    } else {
+      try {
+        removeResidentReplyArtifactsAtPaths(
+          RESIDENT_REPLY_KEY_PATH,
+          RESIDENT_REPLY_RECEIPT_PATH,
+        );
+        removeResidentReplyKeyAtPath(RESIDENT_STAGED_REPLY_PATH);
+        removeResidentReplyKeyAtPath(RESIDENT_PRIVATE_TURN_MARKER_PATH);
+        fs.rmdirSync(replyRuntime.runtimeDir);
+      } catch (e) {
+        sendLog(ws, `[resident] reply runtime cleanup incomplete (non-fatal): ${String(e)}\n`);
+      }
     }
   }
 
@@ -6591,7 +6629,7 @@ export async function handleStrategicResident(
   // Consult the ACTUAL stop reason + process exit code: a crash / wedge is a
   // FAILED terminal, COMPLETED only on a clean operator/task-driven stop. A
   // session that limped or died must not report success.
-  if (stopReason === 'resident_incarnation_lost') return;
+  if (residentAuthority.incarnationLost) return;
   const { status, failureCategory } = resolveTerminalStatus(
     stopReason,
     session.exitCode(),

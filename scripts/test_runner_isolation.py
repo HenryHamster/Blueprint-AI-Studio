@@ -2161,9 +2161,11 @@ class TestProbeLlmClis(unittest.TestCase):
                     args=args,
                     returncode=0,
                     stdout=(
-                        "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
+                        "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
+                        if args[-1] == "--help" and args[0].endswith("codex")
+                        else "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
                         if args[-1] == "--help"
-                        else "codex-cli 0.144.1\n"
+                        else "codex-cli 0.150.1\n"
                         if args[0].endswith("codex")
                         else f"{args[0]} 0.2.0\n"
                     ),
@@ -2179,8 +2181,96 @@ class TestProbeLlmClis(unittest.TestCase):
             self.assertIsNone(result[name]["reason"])
         self.assertIn("0.2.0", result["claude"]["version"])
         self.assertTrue(result["claude"]["resident_ready"])
-        self.assertIn("0.144.1", result["codex"]["version"])
+        self.assertIn("0.150.1", result["codex"]["version"])
+        self.assertTrue(result["codex"]["resident_ready"])
+        self.assertTrue(result["codex"]["resident_profile_ready"])
         self.assertIn("0.2.0", result["gemini"]["version"])
+
+    def test_codex_profile_probe_is_strict_quota_free_and_permission_bounded(self):
+        args = iso._codex_resident_profile_args()
+        joined = " ".join(args)
+        self.assertEqual(args[:4], ["app-server", "--strict-config", "--listen", "stdio://"])
+        for required in (
+            "permissions.resident-read-only.extends",
+            "permissions.resident-read-only.filesystem",
+            "permissions.resident-read-only.network.domains",
+            "features.network_proxy=true",
+            'approval_policy="never"',
+            'web_search="disabled"',
+            "tools.web_search=false",
+            'shell_environment_policy.inherit="none"',
+            "mcp_servers={}",
+            'mcp_servers.workday.command="/bin/false"',
+            "mcp_servers.workday.args=[]",
+            "mcp_servers.workday.env.RESIDENT_REPLY_RECEIPT_PATH=",
+            "mcp_servers.workday.enabled=false",
+            "mcp_servers.workday.required=true",
+            'mcp_servers.workday.enabled_tools=["reply_to_operator"]',
+            'mcp_servers.workday.default_tools_approval_mode="approve"',
+        ):
+            self.assertIn(required, joined)
+        self.assertNotIn(" exec ", f" {joined} ")
+        self.assertNotIn("--model", args)
+        self.assertFalse(any("API_KEY" in arg or "auth" in arg.lower() for arg in args))
+
+    def test_codex_profile_failure_preserves_ordinary_health_but_blocks_resident(self):
+        flags = "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
+        help_result = subprocess.CompletedProcess(["codex"], 0, flags, "")
+        profile_result = subprocess.CompletedProcess(
+            ["codex"], 2, "",
+            "unknown field mcp_servers.workday.default_tools_approval_mode",
+        )
+        result = iso._with_codex_resident_capabilities(
+            {"present": True, "healthy": True},
+            help_result,
+            help_result,
+            profile_result,
+            failure_reason="profile_probe_failed",
+        )
+        self.assertTrue(result["healthy"])
+        self.assertFalse(result["resident_ready"])
+        self.assertFalse(result["resident_profile_ready"])
+        self.assertEqual(
+            result["missing_resident_flags"], ["profile:strict-runtime-config"]
+        )
+        self.assertEqual(result["capability_probe_reason"], "profile_probe_failed")
+
+    def test_codex_profile_success_is_distinct_from_missing_resume_flag(self):
+        all_flags = "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
+        exec_help = subprocess.CompletedProcess(["codex"], 0, all_flags, "")
+        resume_help = subprocess.CompletedProcess(
+            ["codex"], 0, all_flags.replace("--image", ""), ""
+        )
+        profile = subprocess.CompletedProcess(["codex"], 0, "", "")
+        result = iso._with_codex_resident_capabilities(
+            {"present": True, "healthy": True}, exec_help, resume_help, profile
+        )
+        self.assertFalse(result["resident_ready"])
+        self.assertTrue(result["resident_profile_ready"])
+        self.assertEqual(result["missing_resident_flags"], ["resume:--image"])
+
+    def test_codex_resume_probe_failure_marks_profile_unverified(self):
+        flags = "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
+        exec_help = subprocess.CompletedProcess(["codex"], 0, flags, "")
+        resume_help = subprocess.CompletedProcess(["codex"], 1, "", "failed")
+        result = iso._with_codex_resident_capabilities(
+            {"present": True, "healthy": True}, exec_help, resume_help, None
+        )
+        self.assertFalse(result["resident_ready"])
+        self.assertFalse(result["resident_profile_ready"])
+        self.assertEqual(result["capability_probe_reason"], "resume_help_probe_failed")
+
+    def test_codex_profile_probe_reports_timeout_and_launch_error(self):
+        with mock.patch.object(
+            iso.subprocess, "run", side_effect=subprocess.TimeoutExpired(["codex"], 10)
+        ):
+            completed, reason = iso._probe_codex_resident_profile(["codex"], timeout=10)
+        self.assertIsNone(completed)
+        self.assertEqual(reason, "profile_probe_timeout")
+        with mock.patch.object(iso.subprocess, "run", side_effect=OSError("missing")):
+            completed, reason = iso._probe_codex_resident_profile(["codex"], timeout=10)
+        self.assertIsNone(completed)
+        self.assertEqual(reason, "profile_probe_error")
 
     def test_agent_plan_probe_uses_exact_bwrap_boundary(self):
         plan = iso.ExecutionPlan(
@@ -2197,9 +2287,13 @@ class TestProbeLlmClis(unittest.TestCase):
             elif args[-2:] == ["-c", "command -v gemini"]:
                 output = "/sandbox/bin/gemini\n"
             elif args[-1] == "--help":
-                output = "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
+                output = (
+                    "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
+                    if any(str(arg).endswith("codex") for arg in args)
+                    else "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
+                )
             elif args[-2].endswith("codex"):
-                output = "codex-cli 0.144.1\n"
+                output = "codex-cli 0.150.1\n"
             else:
                 output = "cli 1.0.0\n"
             return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
@@ -2210,10 +2304,19 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertTrue(result["claude"]["resident_ready"])
         self.assertEqual(result["claude"]["boundary"], "agent_bwrap")
         self.assertEqual(result["claude"]["executable"], "/sandbox/bin/claude")
-        self.assertEqual(run.call_count, 7)
+        self.assertTrue(result["codex"]["resident_ready"])
+        self.assertTrue(result["codex"]["resident_profile_ready"])
+        self.assertEqual(run.call_count, 10)
         for call in run.call_args_list:
             self.assertEqual(call.args[0][:4], plan.argv[:4])
-            self.assertEqual(call.kwargs["env"], plan.env)
+            if "app-server" in call.args[0]:
+                self.assertEqual(call.kwargs["env"]["PATH"], plan.env["PATH"])
+                self.assertEqual(
+                    call.kwargs["env"]["CODEX_HOME"],
+                    "/tmp/blueprint-resident-codex-home",
+                )
+            else:
+                self.assertEqual(call.kwargs["env"], plan.env)
 
     def test_agent_plan_probe_reports_sandbox_missing_resident_flag(self):
         plan = iso.ExecutionPlan(
@@ -2252,9 +2355,11 @@ class TestProbeLlmClis(unittest.TestCase):
                     args=args,
                     returncode=0,
                     stdout=(
-                        "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
+                        "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
+                        if args[-1] == "--help" and args[0].endswith("codex")
+                        else "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
                         if args[-1] == "--help"
-                        else "codex-cli 0.144.1"
+                        else "codex-cli 0.150.1"
                         if args[0].endswith("codex")
                         else "cli 1.0.0"
                     ),
@@ -2263,9 +2368,16 @@ class TestProbeLlmClis(unittest.TestCase):
             ) as run,
         ):
             iso.probe_llm_clis(env=safe_env)
-        self.assertEqual(run.call_count, 4)
+        self.assertEqual(run.call_count, 7)
         for call in run.call_args_list:
-            self.assertEqual(call.kwargs["env"], safe_env)
+            if "app-server" in call.args[0]:
+                self.assertEqual(call.kwargs["env"]["PATH"], safe_env["PATH"])
+                self.assertNotEqual(call.kwargs["env"]["HOME"], safe_env["HOME"])
+                self.assertEqual(
+                    call.kwargs["env"]["CODEX_HOME"], call.kwargs["env"]["HOME"]
+                )
+            else:
+                self.assertEqual(call.kwargs["env"], safe_env)
 
     def test_all_absent(self):
         with mock.patch.object(iso, "_which", return_value=None):
@@ -2359,7 +2471,7 @@ class TestProbeLlmClis(unittest.TestCase):
                     args=args,
                     returncode=0,
                     stdout=(
-                        "codex-cli 0.143.0\n"
+                        "codex-cli 0.149.9\n"
                         if args[0].endswith("codex")
                         else f"{args[0]} 1.0.0\n"
                     ),
@@ -2370,27 +2482,39 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertTrue(result["codex"]["executable_found"])
         self.assertFalse(result["codex"]["healthy"])
         self.assertFalse(result["codex"]["present"])
-        self.assertEqual(result["codex"]["version"], "codex-cli 0.143.0")
+        self.assertEqual(result["codex"]["version"], "codex-cli 0.149.9")
         self.assertEqual(result["codex"]["reason"], "unsupported_version")
 
     def test_container_probe_uses_image_entrypoint_not_host_path(self):
         def fake_run(args, **kwargs):
             cli = args[args.index("--entrypoint") + 1]
             output = (
-                "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
+                "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
+                if cli == "codex" and args[-1] == "--help"
+                else "--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools"
                 if args[-1] == "--help"
-                else "codex-cli 0.144.1" if cli == "codex" else f"{cli} 1.0.0"
+                else "codex-cli 0.150.1" if cli == "codex" else f"{cli} 1.0.0"
             )
             return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
 
         with mock.patch.object(iso.subprocess, "run", side_effect=fake_run) as run:
             result = iso.probe_container_llm_clis("agent:test")
         self.assertTrue(result["codex"]["healthy"])
+        self.assertTrue(result["codex"]["resident_ready"])
+        self.assertTrue(result["codex"]["resident_profile_ready"])
         self.assertTrue(result["claude"]["resident_ready"])
-        self.assertEqual(run.call_count, 4)
+        self.assertEqual(run.call_count, 7)
+        profile_calls = [
+            call.args[0] for call in run.call_args_list if "app-server" in call.args[0]
+        ]
+        self.assertEqual(len(profile_calls), 1)
+        self.assertIn("CODEX_HOME=/tmp/blueprint-resident-codex-home", profile_calls[0])
+        self.assertIn("HOME=/tmp/blueprint-resident-codex-home", profile_calls[0])
         for call in run.call_args_list:
             self.assertEqual(call.args[0][0:2], ["docker", "run"])
             self.assertIn("agent:test", call.args[0])
+            if "app-server" not in call.args[0]:
+                self.assertNotIn("--env", call.args[0])
 
     def test_container_probe_broken_codex_is_ineligible_despite_host(self):
         def fake_run(args, **kwargs):
@@ -2416,7 +2540,7 @@ class TestProbeLlmClis(unittest.TestCase):
             cli = args[args.index("--entrypoint") + 1]
             if cli == "claude" and args[-1] == "--help":
                 raise subprocess.TimeoutExpired(args, kwargs.get("timeout", 20))
-            output = "codex-cli 0.144.1" if cli == "codex" else f"{cli} 1.0.0"
+            output = "codex-cli 0.150.1" if cli == "codex" else f"{cli} 1.0.0"
             return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
 
         with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
@@ -2435,7 +2559,7 @@ class TestProbeLlmClis(unittest.TestCase):
             cli = args[args.index("--entrypoint") + 1]
             if cli == "claude" and args[-1] == "--help":
                 raise OSError("runtime help failed")
-            output = "codex-cli 0.144.1" if cli == "codex" else f"{cli} 1.0.0"
+            output = "codex-cli 0.150.1" if cli == "codex" else f"{cli} 1.0.0"
             return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
 
         with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):

@@ -18,6 +18,7 @@ import {
   isStrategicMutation, type ResidentStreamEvent,
 } from './resident-stream.js';
 import { RESIDENT_REPLY_TOOL_NAME } from './resident-reply-tool.js';
+import { startResidentCodexSession } from './resident-codex-session.js';
 import {
   getProviderRunner, matchesAuthFailure, matchesRateLimit,
   probeClaudeCapabilities, stripUnsupportedClaudeOptionalArgs,
@@ -137,6 +138,11 @@ function strategicMutationAcknowledged(ev: ResidentStreamEvent): boolean {
     return false;
   }
   return receipt.applied === true || receipt.status === 'ok';
+}
+
+function residentReplyAcknowledged(ev: ResidentStreamEvent): boolean {
+  return !ev.isError
+    && ev.toolResultText?.trim() === 'Workday reply accepted for delivery.';
 }
 
 export interface ResidentTurnResult {
@@ -337,10 +343,9 @@ interface ActiveTurn {
 }
 
 /**
- * Start a resident Claude session. Requires a Claude-compatible provider
- * (anthropic/zai/deepseek);
- * throws for codex/gemini, whose CLIs do not expose the bidirectional stream-json
- * input mode this depends on.
+ * Start the provider-qualified Resident session. Claude-compatible providers
+ * retain the warm bidirectional stream transport; OpenAI uses the Codex JSONL
+ * exec/resume adapter while preserving this public factory for callers.
  */
 export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): ResidentSession {
   const workspace = opts.workspace ?? WORKSPACE;
@@ -355,6 +360,17 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
 
   const runner = getProviderRunner();
   const runnerBase = runner.buildRunCommand('', opts.model, opts.effort, opts.disallowedTools);
+  // Both provider transports expose the same project helpers. Seed their
+  // current task-scoped token before either subprocess can read the token file.
+  const tokenFileSeeded = !opts.foregroundLaunch
+    ? writeAgentTokenFile(getAgentToken())
+    : false;
+  if (runnerBase.outputMode === 'codex-jsonl' && !opts.foregroundLaunch) {
+    if (!tokenFileSeeded) {
+      throw new Error('Codex Resident requires a current task token file');
+    }
+    return startResidentCodexSession(opts, runner, runnerBase);
+  }
   const base = opts.foregroundLaunch
     ? {
       command: opts.foregroundLaunch.command,
@@ -365,7 +381,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     : runnerBase;
   if (base.outputMode !== 'claude-stream-json') {
     throw new Error(
-      `resident session requires a Claude-compatible provider (anthropic/zai/deepseek); got ${runner.provider}/${base.outputMode}`,
+      `resident session requires a qualified Claude or Codex provider; got ${runner.provider}/${base.outputMode}`,
     );
   }
   // Clone the one-shot args and append bidirectional streaming input. The one-shot
@@ -412,8 +428,6 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   // The normal Resident keeps an agent token file for its project helpers.
   // A foreground Call Resident has no helpers and must not create or inherit
   // that backend credential in its isolated environment.
-  if (!opts.foregroundLaunch) writeAgentTokenFile(getAgentToken());
-
   ensureResidentClaudeWorkspaceTrust(childEnv, workspace);
 
   const child = spawn(base.command, args, {
@@ -794,7 +808,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         if (t && ev.toolUseId) {
           const reply = t.pendingOperatorReplies.get(ev.toolUseId);
           t.pendingOperatorReplies.delete(ev.toolUseId);
-          if (!ev.isError && reply) {
+          if (reply && residentReplyAcknowledged(ev)) {
             t.sentOperatorMessage = true;
             t.operatorReply = reply;
           }

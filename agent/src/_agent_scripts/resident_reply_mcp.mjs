@@ -5,6 +5,8 @@
 // the operator message's handled state.
 
 import fs from 'node:fs';
+import { Buffer } from 'node:buffer';
+import process from 'node:process';
 import readline from 'node:readline';
 
 const MAX_REPLY_BYTES = 65_536;
@@ -115,6 +117,7 @@ function handleToolCall(id, params) {
             type: 'text',
             text: 'No active operator turn is armed. Nothing was delivered; wait for an operator message before using reply_to_operator.',
           }],
+          structuredContent: { accepted: false },
         },
       });
     }
@@ -127,7 +130,10 @@ function handleToolCall(id, params) {
     send({
       jsonrpc: '2.0',
       id,
-      result: { content: [{ type: 'text', text: 'Workday reply accepted for delivery.' }] },
+      result: {
+        content: [{ type: 'text', text: 'Workday reply accepted for delivery.' }],
+        structuredContent: { accepted: true },
+      },
     });
   } catch (error) {
     toolError(id, `reply_to_operator could not accept this reply: ${String(error)}`);

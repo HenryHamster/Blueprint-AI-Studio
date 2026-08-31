@@ -5,17 +5,17 @@ task executor. This guide covers enrolling a runner, persisting its credentials,
 and wiring it into systemd so it survives reboots and restarts automatically on
 crash.
 
-Agent-capable runners need Node.js 22+, Claude Code, and Codex CLI 0.144.1 or
+Agent-capable runners need Node.js 22+, Claude Code, and Codex CLI 0.150.1 or
 newer. Install the fleet-approved Codex build with optional native packages
 enabled (some npm configurations omit them):
 
 ```bash
-npm install -g --include=optional @openai/codex@0.144.1
+npm install -g --include=optional @openai/codex@0.150.1
 codex --version
 ```
 
 The version command is a quota-free startup smoke. It must print
-`codex-cli 0.144.1` (or a later compatible version); merely finding `codex` on
+`codex-cli 0.150.1` (or a later compatible version); merely finding `codex` on
 `PATH` is insufficient.
 
 For host/bwrap runners, that manual command is now a fallback rather than the
@@ -32,8 +32,8 @@ normal repair path. While the runner stays online, a background maintainer:
   retry backoff. Captured npm output is never written to runner logs, because
   registry configuration can contain credentials.
 
-Codex repair installs the reviewed exact `0.144.1` package and accepts compatible
-healthy versions `>=0.144.1`. Claude Code preserves the image policy of tracking
+Codex repair installs the reviewed exact `0.150.1` package and accepts compatible
+healthy versions `>=0.150.1`. Claude Code preserves the image policy of tracking
 the current npm `latest` release. Docker-only agent runners remain image-managed
 and never mutate host packages. Hybrid Docker+bwrap runners also maintain and
 probe host CLIs because write/heavy tasks still route through bwrap; their flat
@@ -328,7 +328,7 @@ compute-only runner (no agent source) stays quiet.
 
 ```text
   codex       : [MISSING] PATH shim found, but the native Codex package is missing
-                 -> Reinstall Codex with optional native packages: npm install -g --include=optional @openai/codex@0.144.1
+                 -> Reinstall Codex with optional native packages: npm install -g --include=optional @openai/codex@0.150.1
 ```
 
 Until that probe succeeds, the heartbeat advertises Codex as unhealthy and the

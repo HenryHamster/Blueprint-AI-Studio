@@ -17,6 +17,9 @@ vi.mock('fs', () => ({
     readFileSync: vi.fn(() => { throw new Error('ENOENT'); }),
     mkdirSync: vi.fn(),
     writeFileSync: vi.fn(),
+    mkdtempSync: vi.fn(() => '/tmp/blueprint-resident-codex-factory'),
+    chmodSync: vi.fn(),
+    rmSync: vi.fn(),
   },
   readFileSync: vi.fn(() => { throw new Error('ENOENT'); }),
   mkdirSync: vi.fn(),
@@ -86,12 +89,13 @@ import fs from 'fs';
 import { startResidentClaudeSession } from './resident-session.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import {
-  normalizeClaudeConfigContent, recordLlmTokens, recordProviderReportedUsage,
+  getAgentToken, normalizeClaudeConfigContent, recordLlmTokens, recordProviderReportedUsage,
   recordNumTurns,
 } from '../index.js';
+import { writeAgentTokenFile } from '../token-file.js';
 import { encodeUserTurnBlocks } from './resident-stream.js';
 import {
-  probeClaudeCapabilities, stripUnsupportedClaudeOptionalArgs,
+  getProviderRunner, probeClaudeCapabilities, stripUnsupportedClaudeOptionalArgs,
 } from './runners.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -119,6 +123,7 @@ function makeControllableChild() {
       destroyed: false,
       write: vi.fn((s: string) => { stdinWrites.push(s); return true; }),
       end: vi.fn(),
+      on: vi.fn(),
     },
     stdout: {
       on: vi.fn((event: string, cb: (d: Buffer) => void) => { if (event === 'data') dataCb = cb; }),
@@ -159,7 +164,14 @@ describe('startResidentClaudeSession', () => {
     ]));
     vi.mocked(registerChildPid).mockClear();
     vi.mocked(unregisterChildPid).mockClear();
-    vi.spyOn(process, 'kill').mockReturnValue(true); // never signal a real pid in tests
+    vi.mocked(getAgentToken).mockReset();
+    vi.mocked(getAgentToken).mockReturnValue('');
+    vi.mocked(writeAgentTokenFile).mockClear();
+    vi.mocked(writeAgentTokenFile).mockReturnValue(true);
+    vi.spyOn(process, 'kill').mockImplementation((_pid, signal) => {
+      if (signal === 0) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+      return true;
+    }); // never signal a real pid in tests
     vi.useFakeTimers();
   });
 
@@ -182,6 +194,65 @@ describe('startResidentClaudeSession', () => {
     expect(opts.detached).toBe(true);
     expect(registerChildPid).toHaveBeenCalledWith(4242);
     session.close();
+  });
+
+  it('selects the Codex Resident adapter for a qualified OpenAI runner', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    vi.mocked(getProviderRunner).mockReturnValueOnce({
+      provider: 'openai',
+      authMode: 'oauth',
+      displayName: 'OpenAI Codex',
+      buildRunCommand: vi.fn(() => ({
+        command: 'codex',
+        args: ['exec', '--skip-git-repo-check', '--json', '--dangerously-bypass-approvals-and-sandbox', '-m', 'gpt-5.6-sol'],
+        env: { CODEX_HOME: '/codex-home', ORCHESTRATOR_URL: 'http://blueprint-api:8000' },
+        outputMode: 'codex-jsonl',
+        timeoutMs: 900_000,
+        promptInput: 'stdin',
+        displayName: 'OpenAI Codex',
+      })),
+    } as never);
+    vi.mocked(getAgentToken).mockReturnValueOnce('fresh-codex-token');
+
+    const session = startResidentClaudeSession({
+      workspace: '/workspace',
+      disallowedTools: ['Write', 'Edit', 'NotebookEdit'],
+    });
+    const turn = session.sendTurn('hello Codex');
+    const [, args] = vi.mocked(spawn).mock.calls[0] as unknown as [string, string[]];
+    expect(args[0]).toBe('exec');
+    expect(args).toContain('--json');
+    expect(args).not.toContain('--input-format');
+    expect(args).toContain('default_permissions="resident-read-only"');
+    expect(writeAgentTokenFile).toHaveBeenCalledWith('fresh-codex-token');
+    expect(vi.mocked(writeAgentTokenFile).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(spawn).mock.invocationCallOrder[0]);
+    session.close();
+    await vi.advanceTimersByTimeAsync(14_000);
+    await expect(turn).resolves.toMatchObject({ processGone: true });
+  });
+
+  it('refuses a Codex Resident before spawn when the current task token file cannot be seeded', () => {
+    vi.mocked(getProviderRunner).mockReturnValueOnce({
+      provider: 'openai',
+      authMode: 'oauth',
+      displayName: 'OpenAI Codex',
+      buildRunCommand: vi.fn(() => ({
+        command: 'codex',
+        args: ['exec', '--json', '-m', 'gpt-5.6-sol'],
+        env: { CODEX_HOME: '/codex-home', ORCHESTRATOR_URL: 'http://blueprint-api:8000' },
+        outputMode: 'codex-jsonl',
+      })),
+    } as never);
+    vi.mocked(getAgentToken).mockReturnValueOnce('fresh-codex-token');
+    vi.mocked(writeAgentTokenFile).mockReturnValueOnce(false);
+
+    expect(() => startResidentClaudeSession({
+      workspace: '/workspace',
+      disallowedTools: ['Write', 'Edit', 'NotebookEdit'],
+    })).toThrow(/requires a current task token file/);
+    expect(spawn).not.toHaveBeenCalled();
   });
 
   it('materializes Claude workspace trust before spawning a Resident', () => {
@@ -871,15 +942,36 @@ describe('startResidentClaudeSession', () => {
       type: 'assistant',
       message: { content: [{ type: 'tool_use', id: 'toolu_reply', name: 'mcp__workday__reply_to_operator', input: { content: 'here you go' } }] },
     });
-    // The MCP tool result comes back without an error → confirmed staging.
+    // Only the exact MCP acceptance receipt confirms staging.
     ctl.pushLine({
       type: 'user',
-      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_reply', content: 'accepted', is_error: false }] },
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_reply', content: 'Workday reply accepted for delivery.', is_error: false }] },
     });
     ctl.pushLine({ type: 'result', result: 'done' });
     const r = await turn;
     expect(r.sentOperatorMessage).toBe(true);
     expect(r.operatorReply).toEqual({ type: 'NOTE', content: 'here you go' });
+    session.close();
+  });
+
+  it('does not count an unarmed native reply result as delivered', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({ replyTool: { mcpConfigPath: '/tmp/workday-mcp.json' } });
+    const turn = session.sendTurn('reply to operator');
+    ctl.pushLine({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_unarmed', name: 'mcp__workday__reply_to_operator', input: { content: 'not deliverable' } }] },
+    });
+    ctl.pushLine({
+      type: 'user',
+      message: { content: [{
+        type: 'tool_result', tool_use_id: 'toolu_unarmed',
+        content: 'No active operator turn is armed. Nothing was delivered.', is_error: false,
+      }] },
+    });
+    ctl.pushLine({ type: 'result', result: 'done' });
+    await expect(turn).resolves.toMatchObject({ sentOperatorMessage: false, operatorReply: null });
     session.close();
   });
 

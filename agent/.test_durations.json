@@ -1,351 +1,379 @@
 {
   "_meta": {
     "suite": "agent",
-    "generated": "2026-08-30T12:01:04.496Z",
+    "generated": "2026-08-31T02:47:01.590Z",
     "runs": 1,
     "flake_detection": false
   },
   "files": [
     {
       "file": "src/prompts/pr-helper.test.ts",
-      "duration_ms": 18543,
+      "duration_ms": 23989,
       "tests": 45,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/walkthrough-stack.test.ts",
-      "duration_ms": 15023,
+      "duration_ms": 15027,
       "tests": 14,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/bake-smoke-run.test.ts",
-      "duration_ms": 13918,
+      "duration_ms": 14006,
       "tests": 6,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/strategic-resident.test.ts",
-      "duration_ms": 5701,
-      "tests": 153,
+      "duration_ms": 5813,
+      "tests": 157,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/prompts/check-helper.test.ts",
+      "duration_ms": 5256,
+      "tests": 84,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/audits.test.ts",
-      "duration_ms": 5046,
+      "duration_ms": 5071,
       "tests": 92,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/review-fix.test.ts",
-      "duration_ms": 4154,
+      "duration_ms": 4140,
       "tests": 242,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/prompts/check-helper.test.ts",
-      "duration_ms": 4091,
-      "tests": 84,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/handlers/merge-grade.test.ts",
-      "duration_ms": 3514,
+      "duration_ms": 3518,
       "tests": 34,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/audit-challenge.test.ts",
-      "duration_ms": 2019,
+      "duration_ms": 2029,
       "tests": 32,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/providers/codex-rate-limit-reset.test.ts",
-      "duration_ms": 1622,
-      "tests": 21,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/handlers/strategic-helpers.test.ts",
-      "duration_ms": 1429,
+      "duration_ms": 1789,
       "tests": 118,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/providers/codex-rate-limit-reset.test.ts",
+      "duration_ms": 1628,
+      "tests": 21,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/prompts/code-change-helpers.test.ts",
-      "duration_ms": 1140,
+      "duration_ms": 1481,
       "tests": 99,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/prompts/terminal-checkpoint-helpers.test.ts",
-      "duration_ms": 1041,
+      "duration_ms": 1384,
       "tests": 12,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/strategic-resident-cold-fast.stream.test.ts",
-      "duration_ms": 944,
+      "duration_ms": 950,
       "tests": 22,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/handlers/strategic.test.ts",
-      "duration_ms": 704,
-      "tests": 89,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/prompt.guidance.test.ts",
-      "duration_ms": 647,
+      "duration_ms": 881,
       "tests": 179,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/handlers/strategic.test.ts",
+      "duration_ms": 782,
+      "tests": 89,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/index.watchdog.test.ts",
-      "duration_ms": 500,
+      "duration_ms": 599,
       "tests": 114,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/prompts/done-helper.test.ts",
-      "duration_ms": 460,
+      "duration_ms": 557,
       "tests": 28,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/prompts/code-change-helpers.blocked-receipt.test.ts",
-      "duration_ms": 449,
+      "duration_ms": 553,
       "tests": 2,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/index.pool-mode.test.ts",
-      "duration_ms": 329,
-      "tests": 75,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/prompts/task-type-focus.test.ts",
-      "duration_ms": 301,
+      "duration_ms": 461,
       "tests": 81,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/handlers/research-plan.test.ts",
-      "duration_ms": 294,
-      "tests": 396,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/mock-factory-export-coverage.test.ts",
-      "duration_ms": 260,
+      "duration_ms": 438,
       "tests": 13,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/viewport-snapshot-script.test.ts",
-      "duration_ms": 247,
-      "tests": 19,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/prompts/diagnostics-after-edit-hook.test.ts",
-      "duration_ms": 231,
-      "tests": 2,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/sr-pr-section.test.ts",
-      "duration_ms": 225,
-      "tests": 15,
+      "file": "src/index.pool-mode.test.ts",
+      "duration_ms": 376,
+      "tests": 75,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/resident-repo-freshness.test.ts",
-      "duration_ms": 223,
+      "duration_ms": 374,
       "tests": 4,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/handlers/research-plan.test.ts",
+      "duration_ms": 368,
+      "tests": 396,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/sr-pr-section.test.ts",
+      "duration_ms": 342,
+      "tests": 15,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/vitest.globalSetup.test.ts",
-      "duration_ms": 176,
+      "duration_ms": 335,
       "tests": 16,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/screenshots-pr-section.test.ts",
-      "duration_ms": 174,
-      "tests": 10,
+      "file": "src/prompts/diagnostics-after-edit-hook.test.ts",
+      "duration_ms": 318,
+      "tests": 2,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/viewport-snapshot-script.test.ts",
+      "duration_ms": 305,
+      "tests": 19,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/guard-suppressions-pr-section.test.ts",
-      "duration_ms": 170,
+      "duration_ms": 271,
       "tests": 11,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/index.llm-runner.test.ts",
-      "duration_ms": 145,
+      "duration_ms": 235,
       "tests": 95,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/providers/runners.test.ts",
-      "duration_ms": 123,
-      "tests": 54,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/index.provider-runner.test.ts",
-      "duration_ms": 117,
-      "tests": 134,
+      "file": "src/screenshots-pr-section.test.ts",
+      "duration_ms": 182,
+      "tests": 10,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/providers/call-resident-tool.test.ts",
-      "duration_ms": 104,
+      "duration_ms": 150,
       "tests": 2,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/index.provider-runner.test.ts",
+      "duration_ms": 147,
+      "tests": 134,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/providers/runners.test.ts",
+      "duration_ms": 144,
+      "tests": 54,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/handlers/standard.test.ts",
-      "duration_ms": 75,
+      "duration_ms": 90,
       "tests": 214,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/providers/resident-reply-tool.test.ts",
-      "duration_ms": 68,
+      "duration_ms": 84,
       "tests": 3,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/providers/resident-session.test.ts",
+      "duration_ms": 76,
+      "tests": 53,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/handlers/strategic-resident-lib.test.ts",
-      "duration_ms": 67,
+      "duration_ms": 70,
       "tests": 310,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/index.test.ts",
-      "duration_ms": 65,
+      "duration_ms": 70,
       "tests": 201,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/handlers/verify-tests.integration.test.ts",
-      "duration_ms": 60,
-      "tests": 1,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/index.utilities.test.ts",
-      "duration_ms": 59,
+      "duration_ms": 63,
       "tests": 131,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/providers/resident-session.test.ts",
-      "duration_ms": 56,
-      "tests": 50,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/utils/test-runners.test.ts",
-      "duration_ms": 49,
-      "tests": 430,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/handlers/specialized.test.ts",
-      "duration_ms": 47,
+      "duration_ms": 58,
       "tests": 146,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/handlers/verify-tests.integration.test.ts",
+      "duration_ms": 55,
+      "tests": 1,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/prompt.project-context.test.ts",
+      "duration_ms": 53,
+      "tests": 189,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/test-runners.test.ts",
+      "duration_ms": 51,
+      "tests": 430,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/handlers/verify-tests.test.ts",
-      "duration_ms": 44,
+      "duration_ms": 50,
       "tests": 62,
       "measured": true,
       "flaky": false
     },
     {
+      "file": "src/workspacePrep.test.ts",
+      "duration_ms": 49,
+      "tests": 74,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/handlers/artifacts-helper.test.ts",
-      "duration_ms": 38,
+      "duration_ms": 46,
       "tests": 6,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/prompt.test.ts",
-      "duration_ms": 36,
+      "duration_ms": 46,
       "tests": 209,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/prompt.project-context.test.ts",
-      "duration_ms": 35,
-      "tests": 189,
+      "file": "src/prompts/thinker.test.ts",
+      "duration_ms": 43,
+      "tests": 101,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/utils/test-fix-loop.test.ts",
-      "duration_ms": 35,
+      "duration_ms": 42,
       "tests": 62,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/strategic-sections.test.ts",
-      "duration_ms": 32,
+      "duration_ms": 38,
       "tests": 198,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/prompt-helper-refs.test.ts",
+      "duration_ms": 33,
+      "tests": 29,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/handlers/index.test.ts",
+      "duration_ms": 30,
+      "tests": 102,
       "measured": true,
       "flaky": false
     },
@@ -357,107 +385,135 @@
       "flaky": false
     },
     {
-      "file": "src/prompt-helper-refs.test.ts",
-      "duration_ms": 29,
-      "tests": 29,
+      "file": "src/handlers/conversation-message-streamer.test.ts",
+      "duration_ms": 26,
+      "tests": 6,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/handlers/index.test.ts",
-      "duration_ms": 24,
-      "tests": 102,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/artifact-consume.test.ts",
-      "duration_ms": 22,
-      "tests": 19,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/prompts/thinker.test.ts",
-      "duration_ms": 22,
-      "tests": 101,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/workspacePrep.test.ts",
-      "duration_ms": 22,
-      "tests": 74,
+      "file": "src/providers/resident-codex-session.test.ts",
+      "duration_ms": 26,
+      "tests": 18,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/design.test.ts",
-      "duration_ms": 21,
+      "duration_ms": 24,
       "tests": 36,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/moduleSize.contract.test.ts",
-      "duration_ms": 21,
-      "tests": 46,
+      "file": "src/handlers/strategic-cold-successor.test.ts",
+      "duration_ms": 24,
+      "tests": 23,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/handlers/artifact-consume.test.ts",
+      "duration_ms": 23,
+      "tests": 19,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/prompt.context.test.ts",
-      "duration_ms": 20,
+      "duration_ms": 22,
       "tests": 116,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/handlers/code-change.test.ts",
-      "duration_ms": 19,
-      "tests": 37,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/prompt.format.test.ts",
-      "duration_ms": 19,
-      "tests": 102,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/reset.test.ts",
-      "duration_ms": 18,
+      "duration_ms": 22,
       "tests": 32,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/walkthrough-e2e.test.ts",
-      "duration_ms": 17,
+      "duration_ms": 21,
       "tests": 30,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/handlers/strategic-cold-successor.test.ts",
-      "duration_ms": 15,
-      "tests": 23,
+      "file": "src/handlers/code-change.test.ts",
+      "duration_ms": 20,
+      "tests": 37,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/moduleSize.contract.test.ts",
+      "duration_ms": 20,
+      "tests": 46,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/prompt.format.test.ts",
+      "duration_ms": 20,
+      "tests": 102,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/handlers/web-research.test.ts",
+      "duration_ms": 16,
+      "tests": 28,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/prompts/context-prefix.test.ts",
-      "duration_ms": 15,
+      "duration_ms": 16,
       "tests": 73,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/call-speech/call-speech.test.ts",
+      "file": "src/prompts/compute-progress-contract.test.ts",
+      "duration_ms": 15,
+      "tests": 14,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/prompts/discovery.test.ts",
+      "duration_ms": 15,
+      "tests": 45,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/telemetry.test.ts",
+      "duration_ms": 15,
+      "tests": 74,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/provisioning.test.ts",
       "duration_ms": 14,
+      "tests": 40,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/call-speech/call-speech.test.ts",
+      "duration_ms": 13,
       "tests": 13,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/git-credential.test.ts",
+      "duration_ms": 13,
+      "tests": 11,
       "measured": true,
       "flaky": false
     },
@@ -469,37 +525,72 @@
       "flaky": false
     },
     {
-      "file": "src/handlers/memo.test.ts",
+      "file": "src/handlers/structured-output-repair.test.ts",
       "duration_ms": 13,
-      "tests": 40,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/web-research.test.ts",
-      "duration_ms": 12,
-      "tests": 28,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/utils/provisioning.test.ts",
-      "duration_ms": 12,
-      "tests": 40,
+      "tests": 32,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/handlers/audits-reopen.test.ts",
-      "duration_ms": 11,
+      "duration_ms": 12,
       "tests": 15,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/handlers/capability-proof-trial.test.ts",
+      "file": "src/handlers/criterion-named-test-trial.test.ts",
+      "duration_ms": 12,
+      "tests": 17,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/handlers/live-conversation-resident.test.ts",
+      "duration_ms": 12,
+      "tests": 13,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/prompts/review-prompt.test.ts",
+      "duration_ms": 12,
+      "tests": 42,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/prompts/self-review.test.ts",
+      "duration_ms": 12,
+      "tests": 76,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/providers/resident-stream.test.ts",
+      "duration_ms": 12,
+      "tests": 46,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/classifier-fixtures.test.ts",
+      "duration_ms": 12,
+      "tests": 6,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/handlers/memo.test.ts",
       "duration_ms": 11,
-      "tests": 27,
+      "tests": 40,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/handlers/strategic-ops-registry.test.ts",
+      "duration_ms": 11,
+      "tests": 13,
       "measured": true,
       "flaky": false
     },
@@ -511,135 +602,86 @@
       "flaky": false
     },
     {
-      "file": "src/media/livekit-call-media.test.ts",
-      "duration_ms": 11,
-      "tests": 13,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/prompts/discovery.test.ts",
-      "duration_ms": 11,
-      "tests": 45,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/telemetry.test.ts",
-      "duration_ms": 11,
-      "tests": 74,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/git-credential.test.ts",
-      "duration_ms": 10,
-      "tests": 11,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/criterion-named-test-trial.test.ts",
+      "file": "src/handlers/discovery-review.test.ts",
       "duration_ms": 10,
       "tests": 17,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/handlers/live-conversation-resident.test.ts",
+      "file": "src/handlers/verify-tests.gate-bound.test.ts",
       "duration_ms": 10,
-      "tests": 13,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/prompts/compute-progress-contract.test.ts",
-      "duration_ms": 10,
-      "tests": 14,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/strategic-ops-registry.test.ts",
-      "duration_ms": 9,
-      "tests": 13,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/structured-output-repair.test.ts",
-      "duration_ms": 9,
-      "tests": 32,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/token-file.test.ts",
-      "duration_ms": 9,
-      "tests": 25,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/utils/agent-token.test.ts",
-      "duration_ms": 9,
-      "tests": 21,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/conversation-message-streamer.test.ts",
-      "duration_ms": 8,
-      "tests": 6,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/verify-tests.setup-retry.test.ts",
-      "duration_ms": 8,
       "tests": 5,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/prompts/review-prompt.test.ts",
-      "duration_ms": 8,
-      "tests": 42,
+      "file": "src/media/livekit-call-media.test.ts",
+      "duration_ms": 10,
+      "tests": 13,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/prompts/self-review.test.ts",
-      "duration_ms": 8,
-      "tests": 76,
+      "file": "src/utils/agent-token.test.ts",
+      "duration_ms": 10,
+      "tests": 21,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/utils/viewport-shot-download.test.ts",
-      "duration_ms": 8,
-      "tests": 11,
+      "file": "src/build-config.test.ts",
+      "duration_ms": 9,
+      "tests": 46,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/handlers/discovery-review.test.ts",
-      "duration_ms": 7,
-      "tests": 17,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/prior-knowledge.test.ts",
-      "duration_ms": 7,
+      "file": "src/handlers/capability-proof-trial.test.ts",
+      "duration_ms": 9,
       "tests": 27,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/handlers/research-direction-context.test.ts",
-      "duration_ms": 7,
-      "tests": 36,
+      "file": "src/oauth-rotation.test.ts",
+      "duration_ms": 9,
+      "tests": 10,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/viewport-shot-download.test.ts",
+      "duration_ms": 9,
+      "tests": 11,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/handlers/compute-experiment.test.ts",
+      "duration_ms": 8,
+      "tests": 13,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/handlers/strategic-resident-prompt.test.ts",
+      "duration_ms": 8,
+      "tests": 3,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/token-file.test.ts",
+      "duration_ms": 8,
+      "tests": 25,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/utils/design-doc-presence.test.ts",
+      "duration_ms": 8,
+      "tests": 25,
       "measured": true,
       "flaky": false
     },
@@ -651,58 +693,51 @@
       "flaky": false
     },
     {
-      "file": "src/handlers/verify-tests.gate-bound.test.ts",
+      "file": "src/handlers/verify-tests.provision.test.ts",
+      "duration_ms": 7,
+      "tests": 4,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/handlers/verify-tests.setup-retry.test.ts",
       "duration_ms": 7,
       "tests": 5,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/oauth-rotation.test.ts",
-      "duration_ms": 7,
-      "tests": 10,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/providers/resident-stream.test.ts",
-      "duration_ms": 7,
-      "tests": 46,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/utils/design-doc-presence.test.ts",
-      "duration_ms": 7,
-      "tests": 25,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/verify-tests.provision.test.ts",
+      "file": "src/handlers/prior-knowledge.test.ts",
       "duration_ms": 6,
-      "tests": 4,
+      "tests": 27,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/providers/foreground-resident.test.ts",
+      "file": "src/handlers/verify-tests.setup-probe.test.ts",
       "duration_ms": 6,
-      "tests": 9,
+      "tests": 2,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/utils/classifier-fixtures.test.ts",
+      "file": "src/json-extract.test.ts",
       "duration_ms": 6,
-      "tests": 6,
+      "tests": 29,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/build-config.test.ts",
-      "duration_ms": 5,
-      "tests": 46,
+      "file": "src/prompts/check-helper.fixture-deps.test.ts",
+      "duration_ms": 6,
+      "tests": 5,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/prompts/project-context.test.ts",
+      "duration_ms": 6,
+      "tests": 23,
       "measured": true,
       "flaky": false
     },
@@ -714,23 +749,30 @@
       "flaky": false
     },
     {
-      "file": "src/handlers/compute-experiment.test.ts",
+      "file": "src/handlers/review-fix-migration.test.ts",
       "duration_ms": 5,
-      "tests": 13,
+      "tests": 20,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/prompts/check-helper.fixture-deps.test.ts",
+      "file": "src/handlers/strategic-context-envelope.test.ts",
       "duration_ms": 5,
-      "tests": 5,
+      "tests": 8,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/prompts/project-context.test.ts",
+      "file": "src/providers/foreground-resident.test.ts",
       "duration_ms": 5,
-      "tests": 23,
+      "tests": 9,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/taskCapabilities.test.ts",
+      "duration_ms": 5,
+      "tests": 10,
       "measured": true,
       "flaky": false
     },
@@ -742,23 +784,23 @@
       "flaky": false
     },
     {
+      "file": "src/handlers/research-direction-context.test.ts",
+      "duration_ms": 4,
+      "tests": 36,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/handlers/research-plan-contract.test.ts",
+      "duration_ms": 4,
+      "tests": 11,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/handlers/review-fix-history.test.ts",
       "duration_ms": 4,
       "tests": 21,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/review-fix-migration.test.ts",
-      "duration_ms": 4,
-      "tests": 20,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/strategic-context-envelope.test.ts",
-      "duration_ms": 4,
-      "tests": 8,
       "measured": true,
       "flaky": false
     },
@@ -770,16 +812,23 @@
       "flaky": false
     },
     {
-      "file": "src/json-extract.test.ts",
+      "file": "src/node-preflight.test.ts",
       "duration_ms": 4,
-      "tests": 29,
+      "tests": 19,
       "measured": true,
       "flaky": false
     },
     {
-      "file": "src/taskCapabilities.test.ts",
+      "file": "src/processTracking.test.ts",
       "duration_ms": 4,
-      "tests": 10,
+      "tests": 4,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/reset-invariant.test.ts",
+      "duration_ms": 4,
+      "tests": 9,
       "measured": true,
       "flaky": false
     },
@@ -798,6 +847,13 @@
       "flaky": false
     },
     {
+      "file": "src/handlers/strategic-resident-wake.test.ts",
+      "duration_ms": 3,
+      "tests": 9,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/handlers/structured-repair.test.ts",
       "duration_ms": 3,
       "tests": 3,
@@ -805,30 +861,9 @@
       "flaky": false
     },
     {
-      "file": "src/handlers/verify-tests.setup-probe.test.ts",
+      "file": "src/providers/usage.test.ts",
       "duration_ms": 3,
-      "tests": 2,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/node-preflight.test.ts",
-      "duration_ms": 3,
-      "tests": 19,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/processTracking.test.ts",
-      "duration_ms": 3,
-      "tests": 4,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/reset-invariant.test.ts",
-      "duration_ms": 3,
-      "tests": 9,
+      "tests": 10,
       "measured": true,
       "flaky": false
     },
@@ -840,43 +875,15 @@
       "flaky": false
     },
     {
-      "file": "src/handlers/research-plan-contract.test.ts",
-      "duration_ms": 2,
-      "tests": 11,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/strategic-resident-prompt.test.ts",
-      "duration_ms": 2,
-      "tests": 3,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/handlers/strategic-resident-wake.test.ts",
-      "duration_ms": 2,
-      "tests": 9,
-      "measured": true,
-      "flaky": false
-    },
-    {
-      "file": "src/providers/usage.test.ts",
-      "duration_ms": 2,
-      "tests": 10,
-      "measured": true,
-      "flaky": false
-    },
-    {
       "file": "src/utils/sanitize.test.ts",
-      "duration_ms": 2,
+      "duration_ms": 3,
       "tests": 3,
       "measured": true,
       "flaky": false
     },
     {
       "file": "src/workspaceDisk.test.ts",
-      "duration_ms": 2,
+      "duration_ms": 3,
       "tests": 6,
       "measured": true,
       "flaky": false

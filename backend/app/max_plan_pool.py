@@ -14,7 +14,7 @@ import logging
 import random
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Set
 
 from app.database import AsyncSessionLocal
@@ -478,13 +478,9 @@ def _filter_providers_by_cli(
         if required_cli is None:
             continue  # Unknown provider — can't determine requirement
         cli_entry = runner_available_clis.get(required_cli)
-        resident_blocked = (
-            require_resident_ready
-            and required_cli == "claude"
-            and (
-                not isinstance(cli_entry, dict)
-                or cli_entry.get("resident_ready") is not True
-            )
+        resident_blocked = require_resident_ready and (
+            not isinstance(cli_entry, dict)
+            or cli_entry.get("resident_ready") is not True
         )
         if (
             isinstance(cli_entry, dict)
@@ -3159,6 +3155,12 @@ _USAGE_METER_DISPLAY_STALE_SECONDS = 2700
 # the [0, 100] headroom scale, mirroring how sparse success-rate falls back to
 # 0.5. Keeps unprobed accounts from being either starved or unduly preferred.
 _USAGE_HEADROOM_NEUTRAL = 50.0
+# Resident turns are long-lived enough that a nearly exhausted account is not
+# a safe preferred route even when an administrator disables the ordinary
+# long-task gate with a 100% threshold. Exact pinned routes still reach the
+# later degraded-evidence pass; this ceiling only prevents a non-exact Resident
+# preference from outranking a materially healthier compatible provider.
+_RESIDENT_USAGE_DEGRADED_THRESHOLD_PCT = 90.0
 # Conservative default set of "long-running" task types the claim-time gate
 # applies to (kept in sync with runtime_config_state defaults). Used only as a
 # fallback when runtime_config omits the key.
@@ -3169,7 +3171,46 @@ _DEFAULT_LONG_RUNNING_TASK_TYPES: tuple[str, ...] = (
     "research",
     "plan",
     "security_audit",
+    "strategic_review",
 )
+
+# A fresh credential/quota failure from the provider's authenticated usage
+# endpoint is stronger evidence than the row's persisted enabled/runtime-ready
+# labels. Keep this deliberately narrow: transport/schema/endpoint failures do
+# not prove the inference credential is unusable, while authentication and
+# rate-limit responses do. The same short freshness window used by selection
+# snapshots bounds the quarantine; a successful probe clears it immediately.
+_USAGE_PROBE_ADMISSION_FAILURES = frozenset({"authentication", "rate_limited"})
+
+
+def _usage_probe_datetime(value: Any) -> datetime | None:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _recent_usage_probe_admission_failure(
+    acct: Dict[str, Any], now: datetime
+) -> str | None:
+    failure_kind = acct.get("usage_probe_failure_kind")
+    if failure_kind not in _USAGE_PROBE_ADMISSION_FAILURES:
+        return None
+    attempted_at = acct.get("usage_probe_attempt_at") or acct.get(
+        "usage_probe_failed_at"
+    )
+    attempted_at = _usage_probe_datetime(attempted_at)
+    if attempted_at is None:
+        return None
+    if (now - attempted_at).total_seconds() >= _USAGE_SNAPSHOT_TTL_SECONDS:
+        return None
+    return str(failure_kind)
 
 # Strong refs to in-flight probe tasks so fire-and-forget refreshes aren't
 # garbage-collected mid-flight. Entries are discarded on completion.
@@ -3259,6 +3300,11 @@ def _usage_headroom_rank(acct: Dict[str, Any], now: datetime) -> float:
     if not utils:
         return _USAGE_HEADROOM_NEUTRAL
     return 100.0 - max(utils)
+
+
+def _has_fresh_known_usage(acct: Dict[str, Any], now: datetime) -> bool:
+    snapshot = _cached_usage_snapshot(acct, now)
+    return snapshot is not None and snapshot.known
 
 
 async def _refresh_usage_snapshot(acct_id: str) -> None:
@@ -3573,6 +3619,41 @@ def _restore_usage_state(
         best_at, best_snap = max(candidates, key=lambda c: c[0])
         entry["usage_snapshot"] = best_snap
         entry["usage_snapshot_at"] = best_at
+    persisted_attempt_at, persisted_attempt_status = _usage_attempt_from_persisted(
+        persisted_raw
+    )
+    if persisted_attempt_at is not None:
+        parsed_attempt_at = _usage_probe_datetime(persisted_attempt_at)
+        if parsed_attempt_at is not None:
+            current_attempt_at = entry.get("usage_probe_attempt_at")
+            if (
+                not isinstance(current_attempt_at, datetime)
+                or parsed_attempt_at > current_attempt_at
+            ):
+                entry["usage_probe_attempt_at"] = parsed_attempt_at
+                if persisted_attempt_status == "known":
+                    entry.pop("usage_probe_failure_kind", None)
+                    entry.pop("usage_probe_failed_at", None)
+                elif (
+                    isinstance(persisted_attempt_status, str)
+                    and not (
+                        isinstance(entry.get("usage_snapshot_at"), datetime)
+                        and entry["usage_snapshot_at"] >= parsed_attempt_at
+                    )
+                ):
+                    entry["usage_probe_failure_kind"] = persisted_attempt_status
+                    entry["usage_probe_failed_at"] = parsed_attempt_at
+    # Older persisted schemas carried a last-good snapshot without explicit
+    # last_attempt_* fields.  A newer known snapshot is nevertheless positive
+    # credential evidence and must clear an older in-memory failure quarantine.
+    snapshot_at = _usage_probe_datetime(entry.get("usage_snapshot_at"))
+    failure_at = _usage_probe_datetime(
+        entry.get("usage_probe_attempt_at") or entry.get("usage_probe_failed_at")
+    )
+    if snapshot_at is not None and failure_at is not None and snapshot_at >= failure_at:
+        entry["usage_probe_attempt_at"] = snapshot_at
+        entry.pop("usage_probe_failure_kind", None)
+        entry.pop("usage_probe_failed_at", None)
 
 
 def _account_meter_eligible(acct: Dict[str, Any]) -> bool:
@@ -4500,6 +4581,9 @@ async def select_max_plan_account_balanced(
     runtime_config: Mapping[str, Any] | None = None,
     project_id: str | None = None,
     reject_reasons: List[str] | None = None,
+    allow_degraded_usage: bool = True,
+    allow_failed_usage_probe: bool = True,
+    require_fresh_known_usage: bool = False,
 ) -> tuple[Dict[str, Any], str, str | None] | None:
     """Balanced-mode selection: flatten all accounts across the given providers
     into one pool and pick the single best by (health_score, -active_tasks).
@@ -4606,24 +4690,59 @@ async def select_max_plan_account_balanced(
         gate_enabled, gate_threshold, gate_long_types = _usage_headroom_settings(
             runtime_config
         )
-        if gate_enabled:
+        resident_headroom = task_type == "strategic_review"
+        if resident_headroom:
+            gate_threshold = min(
+                gate_threshold, _RESIDENT_USAGE_DEGRADED_THRESHOLD_PCT
+            )
+        rank_by_headroom = gate_enabled or resident_headroom
+        if rank_by_headroom:
             for c in candidates_healthy:
                 _maybe_schedule_usage_refresh(c[0], now)
             for c in candidates_probing:
                 _maybe_schedule_usage_refresh(c[0], now)
-            if task_type in gate_long_types:
-                candidates_healthy = _apply_usage_gate(
-                    candidates_healthy,
-                    now=now,
-                    threshold_pct=gate_threshold,
-                    acct_getter=lambda c: c[0],
-                )
-                candidates_probing = _apply_usage_gate(
-                    candidates_probing,
-                    now=now,
-                    threshold_pct=gate_threshold,
-                    acct_getter=lambda c: c[0],
-                )
+
+        def _filter_resident_usage(
+            candidates: List[tuple[Dict[str, Any], str, str | None]],
+        ) -> List[tuple[Dict[str, Any], str, str | None]]:
+            retained: List[tuple[Dict[str, Any], str, str | None]] = []
+            for candidate in candidates:
+                acct, provider_name, _model = candidate
+                failure = _recent_usage_probe_admission_failure(acct, now)
+                if not allow_failed_usage_probe and failure is not None:
+                    _reject(acct, provider_name, f"recent usage probe {failure}")
+                    continue
+                if require_fresh_known_usage and not _has_fresh_known_usage(acct, now):
+                    _reject(acct, provider_name, "no fresh known usage snapshot")
+                    continue
+                if not allow_degraded_usage and _usage_gate_should_skip(
+                    acct, now, gate_threshold
+                ):
+                    _reject(
+                        acct,
+                        provider_name,
+                        f"fresh usage at or above {gate_threshold:g}%",
+                    )
+                    continue
+                retained.append(candidate)
+            return retained
+
+        if resident_headroom:
+            candidates_healthy = _filter_resident_usage(candidates_healthy)
+            candidates_probing = _filter_resident_usage(candidates_probing)
+        elif gate_enabled and task_type in gate_long_types:
+            candidates_healthy = _apply_usage_gate(
+                candidates_healthy,
+                now=now,
+                threshold_pct=gate_threshold,
+                acct_getter=lambda c: c[0],
+            )
+            candidates_probing = _apply_usage_gate(
+                candidates_probing,
+                now=now,
+                threshold_pct=gate_threshold,
+                acct_getter=lambda c: c[0],
+            )
 
         winner: tuple[Dict[str, Any], str, str | None] | None = None
         if candidates_healthy:
@@ -4663,15 +4782,18 @@ async def select_max_plan_account_balanced(
                             candidates_healthy = preferred
             winner = min(
                 candidates_healthy,
-                # Primary: fewest active_tasks. When usage-headroom is enabled,
-                # prefer more remaining headroom next (advisory; unknown ranks
-                # neutrally so unprobed accounts aren't starved). Then higher 7d
+                # Resident capacity evidence precedes load so a nearly exhausted
+                # account cannot outrank a materially healthier compatible one.
+                # Ordinary routes retain load-first behavior. Then higher 7d
                 # success rate (task-type-scoped when confident, aggregate
                 # fallback, None → 0.5 so sparse accounts aren't penalised), then
                 # faster avg duration (None → neutral 0). Tiebreak: by id.
                 key=lambda c: (
+                    -_usage_headroom_rank(c[0], now) if resident_headroom else 0.0,
                     c[0].get("active_tasks", 0),
-                    -_usage_headroom_rank(c[0], now) if gate_enabled else 0.0,
+                    -_usage_headroom_rank(c[0], now)
+                    if gate_enabled and not resident_headroom
+                    else 0.0,
                     -(_effective_success_rate(c[0], task_type, now) or 0.5),
                     _compute_avg_duration_24h(c[0], now) or 0.0,
                     c[0]["id"],
@@ -4711,6 +4833,9 @@ async def select_max_plan_account(
     runtime_config: Mapping[str, Any] | None = None,
     project_id: str | None = None,
     reject_reasons: List[str] | None = None,
+    allow_degraded_usage: bool = True,
+    allow_failed_usage_probe: bool = True,
+    require_fresh_known_usage: bool = False,
 ) -> Dict[str, Any] | None:
     """Select a Max plan account for a task. Two-tier circuit-breaker selection:
 
@@ -4802,24 +4927,54 @@ async def select_max_plan_account(
         gate_enabled, gate_threshold, gate_long_types = _usage_headroom_settings(
             runtime_config
         )
-        if gate_enabled:
+        resident_headroom = task_type == "strategic_review"
+        if resident_headroom:
+            gate_threshold = min(
+                gate_threshold, _RESIDENT_USAGE_DEGRADED_THRESHOLD_PCT
+            )
+        rank_by_headroom = gate_enabled or resident_headroom
+        if rank_by_headroom:
             for a in healthy:
                 _maybe_schedule_usage_refresh(a, now)
             for a in probing:
                 _maybe_schedule_usage_refresh(a, now)
-            if task_type in gate_long_types:
-                healthy = _apply_usage_gate(
-                    healthy,
-                    now=now,
-                    threshold_pct=gate_threshold,
-                    acct_getter=lambda a: a,
-                )
-                probing = _apply_usage_gate(
-                    probing,
-                    now=now,
-                    threshold_pct=gate_threshold,
-                    acct_getter=lambda a: a,
-                )
+
+        def _filter_resident_usage(
+            candidates: List[Dict[str, Any]],
+        ) -> List[Dict[str, Any]]:
+            retained: List[Dict[str, Any]] = []
+            for acct in candidates:
+                failure = _recent_usage_probe_admission_failure(acct, now)
+                if not allow_failed_usage_probe and failure is not None:
+                    _reject(acct, f"recent usage probe {failure}")
+                    continue
+                if require_fresh_known_usage and not _has_fresh_known_usage(acct, now):
+                    _reject(acct, "no fresh known usage snapshot")
+                    continue
+                if not allow_degraded_usage and _usage_gate_should_skip(
+                    acct, now, gate_threshold
+                ):
+                    _reject(acct, f"fresh usage at or above {gate_threshold:g}%")
+                    continue
+                retained.append(acct)
+            return retained
+
+        if resident_headroom:
+            healthy = _filter_resident_usage(healthy)
+            probing = _filter_resident_usage(probing)
+        elif gate_enabled and task_type in gate_long_types:
+            healthy = _apply_usage_gate(
+                healthy,
+                now=now,
+                threshold_pct=gate_threshold,
+                acct_getter=lambda a: a,
+            )
+            probing = _apply_usage_gate(
+                probing,
+                now=now,
+                threshold_pct=gate_threshold,
+                acct_getter=lambda a: a,
+            )
 
         if healthy:
             # Exclude decisively-negative-health-score accounts when alternatives exist.
@@ -4843,10 +4998,13 @@ async def select_max_plan_account(
             account = max(
                 healthy,
                 key=lambda a: (
+                    _usage_headroom_rank(a, now) if resident_headroom else 0.0,
                     _compute_health_score(a, now),
                     _effective_success_rate(a, task_type, now) or 0.0,
                     -(_compute_avg_duration_24h(a, now) or 0.0),
-                    _usage_headroom_rank(a, now) if gate_enabled else 0.0,
+                    _usage_headroom_rank(a, now)
+                    if gate_enabled and not resident_headroom
+                    else 0.0,
                     -a.get("active_tasks", 0),
                 ),
             )
@@ -4882,6 +5040,7 @@ async def select_llm_runtime_for_task(
     project_id: str | None = None,
     runner_available_clis: dict[str, dict] | None = None,
     failure_reasons: List[str] | None = None,
+    _strategic_usage_pass: str | None = None,
 ) -> LLMSelectionResult | None:
     """Resolve the (provider, model, account) runtime for a task.
 
@@ -4978,6 +5137,14 @@ async def select_llm_runtime_for_task(
         or infer_provider_for_model(explicit_model, runtime_config)
     )
     routing_task_type = _task_type(task)
+    strategic_usage_pass = (
+        _strategic_usage_pass or "fresh"
+        if routing_task_type == "strategic_review"
+        else "any"
+    )
+    allow_degraded_usage = strategic_usage_pass != "fresh"
+    allow_failed_usage_probe = strategic_usage_pass == "any"
+    require_fresh_known_usage = strategic_usage_pass == "fresh"
     capability = get_task_capability(routing_task_type)
     hard_allowed_providers = (
         capability.allowed_providers
@@ -5124,6 +5291,9 @@ async def select_llm_runtime_for_task(
                 runtime_config=runtime_config,
                 project_id=_resolved_project_id,
                 reject_reasons=sub_reasons,
+                allow_degraded_usage=allow_degraded_usage,
+                allow_failed_usage_probe=allow_failed_usage_probe,
+                require_fresh_known_usage=require_fresh_known_usage,
             )
             if not account:
                 _note_attempt(provider_name, model_name, sub_reasons)
@@ -5187,6 +5357,9 @@ async def select_llm_runtime_for_task(
                 runtime_config=runtime_config,
                 project_id=_resolved_project_id,
                 reject_reasons=balanced_sub,
+                allow_degraded_usage=allow_degraded_usage,
+                allow_failed_usage_probe=allow_failed_usage_probe,
+                require_fresh_known_usage=require_fresh_known_usage,
             )
             if balanced_result is None:
                 _note_attempt(
@@ -5250,6 +5423,9 @@ async def select_llm_runtime_for_task(
             runtime_config=runtime_config,
             project_id=_resolved_project_id,
             reject_reasons=sub_reasons,
+            allow_degraded_usage=allow_degraded_usage,
+            allow_failed_usage_probe=allow_failed_usage_probe,
+            require_fresh_known_usage=require_fresh_known_usage,
         )
         if not account:
             _note_attempt(provider_name, model, sub_reasons)
@@ -5294,6 +5470,9 @@ async def select_llm_runtime_for_task(
                 runtime_config=runtime_config,
                 project_id=_resolved_project_id,
                 reject_reasons=sub_reasons,
+                allow_degraded_usage=allow_degraded_usage,
+                allow_failed_usage_probe=allow_failed_usage_probe,
+                require_fresh_known_usage=require_fresh_known_usage,
             )
             if not account:
                 _note_attempt(provider_name, fallback, sub_reasons)
@@ -5324,6 +5503,27 @@ async def select_llm_runtime_for_task(
                         task, runtime_config, provider_name, fallback
                     ),
                 )
+
+    # Strategic Workday/Resident routes are long-lived and expensive. Replay
+    # this exact route plan under progressively weaker evidence policies rather
+    # than maintaining a second, drift-prone copy that omits model preferences,
+    # balanced selection, or preview fallback.
+    if routing_task_type == "strategic_review" and strategic_usage_pass != "any":
+        next_pass = (
+            "credential_healthy"
+            if strategic_usage_pass == "fresh"
+            else "any"
+        )
+        return await select_llm_runtime_for_task(
+            user_id=user_id,
+            task=task,
+            runtime_config=runtime_config,
+            blacklist=blacklist,
+            project_id=project_id,
+            runner_available_clis=runner_available_clis,
+            failure_reasons=failure_reasons,
+            _strategic_usage_pass=next_pass,
+        )
 
     if explicit_provider and explicit_model:
         _flush_reasons("no pool account (returning account-less explicit result)")
