@@ -58,8 +58,9 @@ def test_deploy_local_submits_directly_to_release_socket(monkeypatch):
     monkeypatch.setattr(
         blueprint,
         "_request_release_socket",
-        lambda digest, revision: socket_calls.append((digest, revision)) or True,
+        lambda *args, **kwargs: socket_calls.append((args, kwargs)) or True,
     )
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: _DEPLOY_REV)
     monkeypatch.setattr(
         blueprint.subprocess,
         "run",
@@ -69,7 +70,22 @@ def test_deploy_local_submits_directly_to_release_socket(monkeypatch):
     rc = blueprint.main(["deploy", "--local", "--host", "hamsterwheel", "--yes"])
 
     assert rc == 0
-    assert socket_calls == [("sha256:" + "0" * 64, _DEPLOY_REV)]
+    digest = "sha256:" + "0" * 64
+    operation_id = blueprint._manual_release_operation_id(
+        "proj-1",
+        digest,
+        _DEPLOY_REV,
+        {
+            "id": "uuid-promo",
+            "version_number": 7,
+            "status": "promoted",
+            "promoted_sha": "a" * 40,
+            "serving_status": "unconfirmed",
+        },
+    )
+    assert socket_calls == [((digest, _DEPLOY_REV, operation_id), {
+        "receipt_only": False,
+    })]
     receipts = [
         body for method, path, body in calls
         if method == "POST" and path.endswith("/activation-receipt")
@@ -92,7 +108,7 @@ def test_deploy_ambiguous_local_handoff_is_nonzero_and_never_retried(
     monkeypatch.setattr(
         blueprint,
         "_request_release_socket",
-        lambda digest, revision: socket_calls.append((digest, revision)) or False,
+        lambda *args, **kwargs: socket_calls.append((args, kwargs)) or False,
     )
 
     rc = blueprint.main(["deploy", "--local", "--host", "hamsterwheel", "--yes"])
@@ -106,6 +122,7 @@ def test_deploy_ambiguous_local_handoff_is_nonzero_and_never_retried(
     err = capsys.readouterr().err
     assert "acceptance is ambiguous" in err
     assert "do not retry activation" in err
+    assert f"blueprint deploy --receipt-only --sha {_DEPLOY_REV}" in err
 
 
 def test_receipt_query_transport_failure_preserves_started_fence(monkeypatch, tmp_path):
@@ -234,6 +251,20 @@ def test_raw_not_accepted_verdict_is_authoritative_no_claim():
         )
 
 
+def test_mismatched_root_receipt_fails_closed():
+    digest = "sha256:" + "7" * 64
+    revision = "8" * 40
+    operation_id = "9" * 64
+
+    with pytest.raises(blueprint.APIError, match="mismatched operation receipt"):
+        blueprint._parse_release_socket_response(
+            f"OK {'a' * 64} {digest} {revision} success",
+            digest,
+            revision,
+            operation_id,
+        )
+
+
 @pytest.mark.parametrize(("response", "connect_error", "expected"), [
     ("NOT_ACCEPTED {op} {digest} {revision}\n", False, 5),
     ("", True, 4),
@@ -322,6 +353,7 @@ def test_execute_deploy_derives_operation_from_explicit_project_id(monkeypatch):
         lambda *args, **kwargs: calls.append((args, kwargs)) or True,
     )
     monkeypatch.setattr(blueprint, "_post_activation_receipt", lambda *_args: None)
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: revision)
     args = SimpleNamespace(project_id="project-explicit", host="control-plane")
 
     blueprint._execute_deploy(args, revision, digest, approved, inplace=True)
@@ -330,3 +362,163 @@ def test_execute_deploy_derives_operation_from_explicit_project_id(monkeypatch):
     assert calls == [
         ((args, revision, digest), {"inplace": True, "operation_id": expected})
     ]
+
+
+def test_receipt_only_manual_binding_queries_exact_artifact_without_activation(
+    monkeypatch,
+):
+    revision = "3" * 40
+    digest = "sha256:" + "4" * 64
+    promoted = {
+        "version_number": 20,
+        "promoted_sha": "2" * 40,
+        "activation_requested_at": None,
+    }
+    manifest = {
+        "run": {"createdAt": "now", "databaseId": 2},
+        "digest": digest,
+        "revision": revision,
+    }
+    root_calls = []
+    receipts = []
+    monkeypatch.setattr(blueprint, "_fetch_deploy_manifest", lambda _sha: manifest)
+    monkeypatch.setattr(blueprint, "_resolve_deploy_binding", lambda *_args: promoted)
+    monkeypatch.setattr(blueprint, "_require_write_config", lambda _action: None)
+    monkeypatch.setattr(
+        blueprint,
+        "_execute_deploy_shim",
+        lambda *args, **kwargs: root_calls.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: revision)
+    monkeypatch.setattr(
+        blueprint,
+        "_post_activation_receipt",
+        lambda *args: receipts.append(args),
+    )
+    args = SimpleNamespace(
+        sha=revision,
+        host="control-plane",
+        dry_run=False,
+        receipt_only=True,
+        local=True,
+        yes=True,
+        force=False,
+        project_id="project-manual",
+    )
+
+    blueprint.cmd_deploy(args)
+
+    operation_id = blueprint._manual_release_operation_id(
+        "project-manual", digest, revision, promoted
+    )
+    assert root_calls == [((args, revision, digest), {
+        "inplace": True,
+        "operation_id": operation_id,
+        "receipt_only": True,
+    })]
+    assert all(call[1]["receipt_only"] is True for call in root_calls)
+    assert receipts == [(args, promoted, revision)]
+
+
+def test_manual_operation_identity_changes_after_serving_predecessor_advances():
+    revision = "3" * 40
+    digest = "sha256:" + "4" * 64
+    predecessor = {
+        "id": "version-20",
+        "served_sha": "2" * 40,
+        "served_at": "2026-08-30T00:00:00Z",
+    }
+    reconciled = {
+        **predecessor,
+        "served_sha": revision,
+        "served_at": "2026-08-31T00:00:00Z",
+    }
+
+    before = blueprint._manual_release_operation_id(
+        "project-manual", digest, revision, predecessor
+    )
+    after = blueprint._manual_release_operation_id(
+        "project-manual", digest, revision, reconciled
+    )
+
+    assert before != after
+
+
+def test_receipt_only_approved_binding_preserves_approval_operation_id(monkeypatch):
+    revision = "5" * 40
+    digest = "sha256:" + "6" * 64
+    promoted = {
+        "version_number": 21,
+        "promoted_sha": revision,
+        "activation_requested_at": "2026-08-31T01:02:03Z",
+    }
+    root_calls = []
+    monkeypatch.setattr(blueprint, "_fetch_deploy_manifest", lambda _sha: {
+        "run": {"createdAt": "now", "databaseId": 3},
+        "digest": digest,
+        "revision": revision,
+    })
+    monkeypatch.setattr(blueprint, "_resolve_deploy_binding", lambda *_args: promoted)
+    monkeypatch.setattr(blueprint, "_require_write_config", lambda _action: None)
+    monkeypatch.setattr(
+        blueprint,
+        "_execute_deploy_shim",
+        lambda *args, **kwargs: root_calls.append((args, kwargs)) or True,
+    )
+    args = SimpleNamespace(
+        sha=revision,
+        host="control-plane",
+        dry_run=False,
+        receipt_only=True,
+        local=False,
+        yes=True,
+        force=False,
+        project_id="project-approved",
+    )
+
+    blueprint.cmd_deploy(args)
+
+    expected = blueprint._activation_operation_id("project-approved", promoted)
+    assert root_calls == [((args, revision, digest), {
+        "inplace": False,
+        "operation_id": expected,
+        "receipt_only": True,
+    })]
+
+
+def test_local_success_receipt_requires_exact_served_sha_before_api_receipt(
+    monkeypatch,
+):
+    revision = "7" * 40
+    digest = "sha256:" + "8" * 64
+    promoted = {
+        "id": "version-22",
+        "version_number": 22,
+        "promoted_sha": revision,
+        "served_sha": "6" * 40,
+        "served_at": "2026-08-30T00:00:00Z",
+    }
+    root_calls = []
+    monkeypatch.setattr(
+        blueprint,
+        "_execute_deploy_shim",
+        lambda *args, **kwargs: root_calls.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: "9" * 40)
+    monkeypatch.setattr(
+        blueprint,
+        "_post_activation_receipt",
+        lambda *_args: pytest.fail("mismatched serving evidence must not be posted"),
+    )
+    args = SimpleNamespace(project_id="project-manual", host="control-plane")
+
+    with pytest.raises(blueprint.APIError, match="local served revision does not match"):
+        blueprint._execute_deploy(args, revision, digest, promoted, inplace=True)
+
+    expected = blueprint._manual_release_operation_id(
+        "project-manual", digest, revision, promoted
+    )
+    assert root_calls == [((args, revision, digest), {
+        "inplace": True,
+        "operation_id": expected,
+    })]
