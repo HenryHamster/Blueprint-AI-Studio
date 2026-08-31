@@ -83,7 +83,7 @@ class PrerequisiteTests(unittest.TestCase):
     def test_all_ok_when_node_new_enough_and_claude_present(self):
         with patch.object(br, "_node_major", return_value=22), \
              patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
-             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.144.1")):
+             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.150.1")):
             results = {p.name: p for p in br.check_prerequisites()}
         self.assertTrue(results["node"].ok)
         self.assertTrue(results["claude"].ok)
@@ -92,7 +92,7 @@ class PrerequisiteTests(unittest.TestCase):
     def test_node_too_old_flagged_with_actionable_fix(self):
         with patch.object(br, "_node_major", return_value=18), \
              patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
-             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.144.1")):
+             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.150.1")):
             results = {p.name: p for p in br.check_prerequisites()}
         self.assertFalse(results["node"].ok)
         self.assertIn("22", results["node"].fix)
@@ -100,7 +100,7 @@ class PrerequisiteTests(unittest.TestCase):
     def test_node_missing_flagged(self):
         with patch.object(br, "_node_major", return_value=None), \
              patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
-             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.144.1")):
+             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.150.1")):
             results = {p.name: p for p in br.check_prerequisites()}
         self.assertFalse(results["node"].ok)
         self.assertIn("nodejs.org", results["node"].fix)
@@ -108,7 +108,7 @@ class PrerequisiteTests(unittest.TestCase):
     def test_claude_missing_flagged_with_install_hint(self):
         with patch.object(br, "_node_major", return_value=22), \
              patch.object(br.shutil, "which", return_value=None), \
-             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.144.1")):
+             patch.object(br, "_codex_prerequisite", return_value=br.Prereq("codex", True, "0.150.1")):
             results = {p.name: p for p in br.check_prerequisites()}
         self.assertFalse(results["claude"].ok)
         self.assertIn("claude-code", results["claude"].fix)
@@ -134,10 +134,10 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("native Codex package is missing", result.detail)
         self.assertIn("--include=optional", result.fix)
-        self.assertIn("0.144.1", result.fix)
+        self.assertIn("0.150.1", result.fix)
 
-    def test_codex_below_gpt_5_6_minimum_is_rejected(self):
-        old = MagicMock(returncode=0, stdout="codex-cli 0.143.0\n", stderr="")
+    def test_codex_below_resident_minimum_is_rejected(self):
+        old = MagicMock(returncode=0, stdout="codex-cli 0.149.9\n", stderr="")
         with patch.object(br.shutil, "which", return_value="/usr/bin/codex"), \
              patch.object(br.subprocess, "run", return_value=old):
             result = br._codex_prerequisite()
@@ -145,7 +145,7 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertIn("older than required", result.detail)
 
     def test_codex_version_probe_is_quota_free_and_healthy(self):
-        current = MagicMock(returncode=0, stdout="codex-cli 0.144.1\n", stderr="")
+        current = MagicMock(returncode=0, stdout="codex-cli 0.150.1\n", stderr="")
         with patch.object(br.shutil, "which", return_value="/usr/bin/codex"), \
              patch.object(br.subprocess, "run", return_value=current) as run:
             result = br._codex_prerequisite()
@@ -155,6 +155,12 @@ class PrerequisiteTests(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=5,
+        )
+
+    def test_codex_reviewed_minimum_matches_repair_pin(self):
+        self.assertEqual(
+            ".".join(str(part) for part in br.MIN_CODEX_VERSION),
+            br.PINNED_CODEX_VERSION,
         )
 
 
@@ -249,7 +255,7 @@ class MainTests(unittest.TestCase):
              patch.object(br, "check_prerequisites", return_value=[
                  br.Prereq("node", True, "v22"),
                  br.Prereq("claude", False, "not found", "install claude"),
-                 br.Prereq("codex", True, "codex-cli 0.144.1"),
+                 br.Prereq("codex", True, "codex-cli 0.150.1"),
              ]), \
              patch.object(br, "run_local_runner", return_value=0) as run_mock:
             rc = br.main(["start", "--token", "tok"])

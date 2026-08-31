@@ -957,15 +957,15 @@ def test_packer_requires_codex_cli_with_gpt_5_6_picker():
         if "npm install -g" in line and "@openai/codex" in line
     )
     assert "--include=optional" in install
-    assert "@openai/codex@0.144.1" in install
+    assert "@openai/codex@0.150.1" in install
     gate = next(
         line.strip()
         for line in hcl.splitlines()
-        if "Codex CLI 0.144.1 required for GPT-5.6 models" in line
+        if "Codex CLI 0.150.1 required for Resident support" in line
     )
     assert gate.startswith('"codex_version=$(codex --version | awk')
     assert "awk '{print $NF}'" in gate
-    assert 'test \\"$codex_version\\" = 0.144.1' in gate
+    assert 'test \\"$codex_version\\" = 0.150.1' in gate
     assert "|| { echo" in gate
     assert "exit 1; }" in gate
 
@@ -1048,7 +1048,7 @@ def test_agent_dockerfile_pins_and_starts_codex_native_binary():
     if not _AGENT_DOCKERFILE.exists():
         pytest.skip("agent/Dockerfile not present (backend-only Docker run)")
     dockerfile = _AGENT_DOCKERFILE.read_text(encoding="utf-8")
-    assert "ARG CODEX_VERSION=0.144.1" in dockerfile
+    assert "ARG CODEX_VERSION=0.150.1" in dockerfile
     assert "npm install -g --include=optional" in dockerfile
     assert 'codex --version' in dockerfile
     assert 'test "${codex_version}" = "${CODEX_VERSION}"' in dockerfile

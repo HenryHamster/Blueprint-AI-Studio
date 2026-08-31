@@ -36,6 +36,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -726,7 +727,7 @@ def detect_gpus() -> tuple[tuple[int, ...], tuple[str, ...]]:
 
 # Known LLM CLI binaries the runner may advertise in the heartbeat.
 _LLM_CLI_NAMES: tuple[str, ...] = ("claude", "codex", "gemini")
-MIN_CODEX_CLI_VERSION: tuple[int, int, int] = (0, 144, 1)
+MIN_CODEX_CLI_VERSION: tuple[int, int, int] = (0, 150, 1)
 CLAUDE_RESIDENT_REQUIRED_FLAGS: frozenset[str] = frozenset(
     {
         "--input-format",
@@ -734,6 +735,17 @@ CLAUDE_RESIDENT_REQUIRED_FLAGS: frozenset[str] = frozenset(
         "--mcp-config",
         "--strict-mcp-config",
         "--allowedTools",
+    }
+)
+CODEX_RESIDENT_REQUIRED_FLAGS: frozenset[str] = frozenset(
+    {
+        "--config",
+        "--ignore-user-config",
+        "--image",
+        "--json",
+        "--model",
+        "--skip-git-repo-check",
+        "--strict-config",
     }
 )
 
@@ -749,6 +761,7 @@ def _with_claude_resident_capabilities(
         enriched.update(
             {
                 "resident_ready": False,
+                "resident_profile_ready": False,
                 "missing_resident_flags": sorted(CLAUDE_RESIDENT_REQUIRED_FLAGS),
                 "capability_probe_reason": failure_reason or "help_probe_failed",
             }
@@ -765,6 +778,224 @@ def _with_claude_resident_capabilities(
         }
     )
     return enriched
+
+
+def _with_codex_resident_capabilities(
+    info: dict,
+    exec_completed: subprocess.CompletedProcess | None,
+    resume_completed: subprocess.CompletedProcess | None,
+    profile_completed: subprocess.CompletedProcess | None,
+    *,
+    failure_reason: str | None = None,
+) -> dict:
+    """Qualify the process-per-turn Codex Resident JSONL/resume contract."""
+    enriched = dict(info)
+    if exec_completed is None or exec_completed.returncode != 0:
+        enriched.update(
+            {
+                "resident_ready": False,
+                "resident_profile_ready": False,
+                "missing_resident_flags": [
+                    f"exec:{flag}" for flag in sorted(CODEX_RESIDENT_REQUIRED_FLAGS)
+                ],
+                "capability_probe_reason": failure_reason or "exec_help_probe_failed",
+            }
+        )
+        return enriched
+    if resume_completed is None or resume_completed.returncode != 0:
+        enriched.update(
+            {
+                "resident_ready": False,
+                "resident_profile_ready": False,
+                "missing_resident_flags": [
+                    f"resume:{flag}"
+                    for flag in sorted(CODEX_RESIDENT_REQUIRED_FLAGS)
+                ],
+                "capability_probe_reason": failure_reason or "resume_help_probe_failed",
+            }
+        )
+        return enriched
+    if profile_completed is None or profile_completed.returncode != 0:
+        enriched.update(
+            {
+                "resident_ready": False,
+                "resident_profile_ready": False,
+                "missing_resident_flags": ["profile:strict-runtime-config"],
+                "capability_probe_reason": failure_reason or "profile_probe_failed",
+            }
+        )
+        return enriched
+    exec_output = "\n".join(
+        (exec_completed.stdout or "", exec_completed.stderr or "")
+    )
+    resume_output = "\n".join(
+        (resume_completed.stdout or "", resume_completed.stderr or "")
+    )
+    exec_flags = set(re.findall(r"--[0-9A-Za-z][0-9A-Za-z-]*", exec_output))
+    resume_flags = set(re.findall(r"--[0-9A-Za-z][0-9A-Za-z-]*", resume_output))
+    missing = [
+        *(
+            f"exec:{flag}"
+            for flag in sorted(CODEX_RESIDENT_REQUIRED_FLAGS - exec_flags)
+        ),
+        *(
+            f"resume:{flag}"
+            for flag in sorted(CODEX_RESIDENT_REQUIRED_FLAGS - resume_flags)
+        ),
+    ]
+    enriched.update(
+        {
+            "resident_ready": not missing,
+            "resident_profile_ready": True,
+            "missing_resident_flags": missing,
+            "capability_probe_reason": None if not missing else "missing_required_features",
+        }
+    )
+    return enriched
+
+
+def _with_resident_capabilities(
+    name: str,
+    info: dict,
+    completed: subprocess.CompletedProcess | None,
+    *,
+    resume_completed: subprocess.CompletedProcess | None = None,
+    profile_completed: subprocess.CompletedProcess | None = None,
+    failure_reason: str | None = None,
+) -> dict:
+    if name == "claude":
+        return _with_claude_resident_capabilities(
+            info, completed, failure_reason=failure_reason
+        )
+    if name == "codex":
+        return _with_codex_resident_capabilities(
+            info,
+            completed,
+            resume_completed,
+            profile_completed,
+            failure_reason=failure_reason,
+        )
+    return info
+
+
+def _codex_resident_help_args() -> tuple[list[str], list[str]]:
+    return ["exec", "--help"], ["exec", "resume", "--help"]
+
+
+def _codex_resident_profile_args() -> list[str]:
+    """Strict, quota-free parse probe for the Resident runtime contract."""
+    return [
+        "app-server",
+        "--strict-config",
+        "--listen",
+        "stdio://",
+        "-c",
+        'permissions.resident-read-only.extends=":read-only"',
+        "-c",
+        'permissions.resident-read-only.filesystem={"/tmp/blueprint-resident-profile-probe"="write","/tmp/blueprint-resident-codex-home"="deny"}',
+        "-c",
+        "permissions.resident-read-only.network.enabled=true",
+        "-c",
+        'permissions.resident-read-only.network.mode="limited"',
+        "-c",
+        'permissions.resident-read-only.network.domains={"blueprint-api"="allow"}',
+        "-c",
+        "features.network_proxy=true",
+        "-c",
+        'default_permissions="resident-read-only"',
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'web_search="disabled"',
+        "-c",
+        "tools.web_search=false",
+        "-c",
+        'shell_environment_policy.inherit="none"',
+        "-c",
+        "shell_environment_policy.ignore_default_excludes=false",
+        "-c",
+        'shell_environment_policy.set.HOME="/tmp/blueprint-resident-profile-probe"',
+        "-c",
+        "mcp_servers={}",
+        "-c",
+        'mcp_servers.workday.command="/bin/false"',
+        "-c",
+        "mcp_servers.workday.args=[]",
+        "-c",
+        'mcp_servers.workday.env.RESIDENT_REPLY_RECEIPT_PATH="/tmp/blueprint-resident-profile-probe/receipt.json"',
+        "-c",
+        "mcp_servers.workday.enabled=false",
+        "-c",
+        "mcp_servers.workday.required=true",
+        "-c",
+        'mcp_servers.workday.enabled_tools=["reply_to_operator"]',
+        "-c",
+        'mcp_servers.workday.default_tools_approval_mode="approve"',
+    ]
+
+
+def _probe_codex_resident_profile(
+    command_prefix: list[str],
+    *,
+    timeout: float,
+    env: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess | None, str | None]:
+    try:
+        completed = subprocess.run(
+            [*command_prefix, *_codex_resident_profile_args()],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "profile_probe_timeout"
+    except (OSError, subprocess.SubprocessError):
+        return None, "profile_probe_error"
+    if completed.returncode != 0:
+        return completed, "profile_probe_failed"
+    return completed, None
+
+
+def _probe_codex_resident_help(
+    command_prefix: list[str],
+    *,
+    timeout: float,
+    env: dict[str, str] | None = None,
+) -> tuple[
+    subprocess.CompletedProcess | None,
+    subprocess.CompletedProcess | None,
+    str | None,
+]:
+    exec_args, resume_args = _codex_resident_help_args()
+    try:
+        exec_completed = subprocess.run(
+            [*command_prefix, *exec_args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None, None, "exec_help_probe_timeout"
+    except (OSError, subprocess.SubprocessError):
+        return None, None, "exec_help_probe_error"
+    if exec_completed.returncode != 0:
+        return exec_completed, None, "exec_help_probe_failed"
+    try:
+        resume_completed = subprocess.run(
+            [*command_prefix, *resume_args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return exec_completed, None, "resume_help_probe_timeout"
+    except (OSError, subprocess.SubprocessError):
+        return exec_completed, None, "resume_help_probe_error"
+    return exec_completed, resume_completed, None
 
 
 def _llm_cli_probe_reason(name: str, output: str) -> str:
@@ -854,8 +1085,9 @@ def probe_llm_clis(*, env: dict[str, str] | None = None) -> dict[str, dict]:
         path = shutil.which(name, path=(env or {}).get("PATH")) if env else _which(name)
         if path is None:
             result[name] = _unavailable_llm_cli("not_found")
-            if name == "claude":
-                result[name] = _with_claude_resident_capabilities(
+            if name in ("claude", "codex"):
+                result[name] = _with_resident_capabilities(
+                    name,
                     result[name], None, failure_reason="not_found"
                 )
             continue
@@ -868,12 +1100,13 @@ def probe_llm_clis(*, env: dict[str, str] | None = None) -> dict[str, dict]:
                 env=env,
             )
             result[name] = _llm_cli_result(name, ver)
-            if name == "claude":
+            if name in ("claude", "codex"):
                 if result[name].get("healthy") is not True:
-                    result[name] = _with_claude_resident_capabilities(
+                    result[name] = _with_resident_capabilities(
+                        name,
                         result[name], None, failure_reason=result[name].get("reason")
                     )
-                else:
+                elif name == "claude":
                     try:
                         help_result = subprocess.run(
                             [path, "--help"],
@@ -882,31 +1115,67 @@ def probe_llm_clis(*, env: dict[str, str] | None = None) -> dict[str, dict]:
                             timeout=10,
                             env=env,
                         )
-                        result[name] = _with_claude_resident_capabilities(
+                        result[name] = _with_resident_capabilities(
+                            name,
                             result[name], help_result
                         )
                     except subprocess.TimeoutExpired:
-                        result[name] = _with_claude_resident_capabilities(
+                        result[name] = _with_resident_capabilities(
+                            name,
                             result[name], None, failure_reason="help_probe_timeout"
                         )
                     except (OSError, subprocess.SubprocessError):
-                        result[name] = _with_claude_resident_capabilities(
+                        result[name] = _with_resident_capabilities(
+                            name,
                             result[name], None, failure_reason="help_probe_error"
                         )
+                else:
+                    exec_help, resume_help, help_reason = (
+                        _probe_codex_resident_help([path], timeout=10, env=env)
+                    )
+                    profile_result = None
+                    profile_reason = None
+                    if (
+                        exec_help is not None
+                        and exec_help.returncode == 0
+                        and resume_help is not None
+                        and resume_help.returncode == 0
+                    ):
+                        with tempfile.TemporaryDirectory(
+                            prefix="blueprint-codex-profile-"
+                        ) as codex_home:
+                            profile_env = dict(os.environ if env is None else env)
+                            profile_env["CODEX_HOME"] = codex_home
+                            profile_env["HOME"] = codex_home
+                            profile_result, profile_reason = (
+                                _probe_codex_resident_profile(
+                                    [path], timeout=10, env=profile_env
+                                )
+                            )
+                    result[name] = _with_resident_capabilities(
+                        name,
+                        result[name],
+                        exec_help,
+                        resume_completed=resume_help,
+                        profile_completed=profile_result,
+                        failure_reason=help_reason or profile_reason,
+                    )
         except subprocess.TimeoutExpired:
             result[name] = _unavailable_llm_cli(
                 "version_probe_timeout", executable_found=True
             )
-            if name == "claude":
-                result[name] = _with_claude_resident_capabilities(
+            if name in ("claude", "codex"):
+                result[name] = _with_resident_capabilities(
+                    name,
                     result[name], None, failure_reason="version_probe_timeout"
                 )
         except (OSError, subprocess.SubprocessError):
             result[name] = _unavailable_llm_cli(
                 "version_probe_error", executable_found=True
             )
-            if name == "claude":
-                result[name] = _with_claude_resident_capabilities(
+            if name in ("claude", "codex"):
+                result[name] = _with_resident_capabilities(
+                    name,
                     result[name], None, failure_reason="version_probe_error"
                 )
     return result
@@ -962,12 +1231,13 @@ def probe_container_llm_clis(
                 result[name] = _unavailable_llm_cli("not_found")
             else:
                 result[name] = _llm_cli_result(name, completed)
-                if name == "claude":
+                if name in ("claude", "codex"):
                     if result[name].get("healthy") is not True:
-                        result[name] = _with_claude_resident_capabilities(
+                        result[name] = _with_resident_capabilities(
+                            name,
                             result[name], None, failure_reason=result[name].get("reason")
                         )
-                    else:
+                    elif name == "claude":
                         try:
                             help_result = subprocess.run(
                                 [
@@ -983,31 +1253,83 @@ def probe_container_llm_clis(
                                 text=True,
                                 timeout=20,
                             )
-                            result[name] = _with_claude_resident_capabilities(
+                            result[name] = _with_resident_capabilities(
+                                name,
                                 result[name], help_result
                             )
                         except subprocess.TimeoutExpired:
-                            result[name] = _with_claude_resident_capabilities(
+                            result[name] = _with_resident_capabilities(
+                                name,
                                 result[name], None,
                                 failure_reason="container_help_probe_timeout",
                             )
                         except (OSError, subprocess.SubprocessError):
-                            result[name] = _with_claude_resident_capabilities(
+                            result[name] = _with_resident_capabilities(
+                                name,
                                 result[name], None,
                                 failure_reason="container_help_probe_error",
                             )
+                    else:
+                        exec_help, resume_help, help_reason = (
+                            _probe_codex_resident_help(
+                                [
+                                    runtime,
+                                    "run",
+                                    "--rm",
+                                    "--entrypoint",
+                                    name,
+                                    image,
+                                ],
+                                timeout=20,
+                            )
+                        )
+                        profile_result = None
+                        profile_reason = None
+                        if (
+                            exec_help is not None
+                            and exec_help.returncode == 0
+                            and resume_help is not None
+                            and resume_help.returncode == 0
+                        ):
+                            profile_result, profile_reason = (
+                                _probe_codex_resident_profile(
+                                    [
+                                        runtime,
+                                        "run",
+                                        "--rm",
+                                        "--entrypoint",
+                                        name,
+                                        "--env",
+                                        "CODEX_HOME=/tmp/blueprint-resident-codex-home",
+                                        "--env",
+                                        "HOME=/tmp/blueprint-resident-codex-home",
+                                        image,
+                                    ],
+                                    timeout=20,
+                                )
+                            )
+                        result[name] = _with_resident_capabilities(
+                            name,
+                            result[name],
+                            exec_help,
+                            resume_completed=resume_help,
+                            profile_completed=profile_result,
+                            failure_reason=help_reason or profile_reason,
+                        )
         except subprocess.TimeoutExpired:
             result[name] = _unavailable_llm_cli(
                 "version_probe_timeout", executable_found=True
             )
-            if name == "claude":
-                result[name] = _with_claude_resident_capabilities(
+            if name in ("claude", "codex"):
+                result[name] = _with_resident_capabilities(
+                    name,
                     result[name], None, failure_reason="container_probe_timeout"
                 )
         except (OSError, subprocess.SubprocessError):
             result[name] = _unavailable_llm_cli("container_probe_error")
-            if name == "claude":
-                result[name] = _with_claude_resident_capabilities(
+            if name in ("claude", "codex"):
+                result[name] = _with_resident_capabilities(
+                    name,
                     result[name], None, failure_reason="container_probe_error"
                 )
     return result
@@ -2133,12 +2455,13 @@ def probe_agent_plan_llm_clis(plan: ExecutionPlan) -> dict[str, dict]:
     if plan.declined or plan.backend != BACKEND_BWRAP:
         return {
             name: (
-                _with_claude_resident_capabilities(
+                _with_resident_capabilities(
+                    name,
                     _unavailable_llm_cli(unavailable_reason),
                     None,
                     failure_reason=unavailable_reason,
                 )
-                if name == "claude"
+                if name in ("claude", "codex")
                 else _unavailable_llm_cli(unavailable_reason)
             )
             for name in _LLM_CLI_NAMES
@@ -2165,8 +2488,9 @@ def probe_agent_plan_llm_clis(plan: ExecutionPlan) -> dict[str, dict]:
             executable = located_lines[0] if located_lines else ""
             if located.returncode != 0 or not executable:
                 result[name] = _unavailable_llm_cli("not_found")
-                if name == "claude":
-                    result[name] = _with_claude_resident_capabilities(
+                if name in ("claude", "codex"):
+                    result[name] = _with_resident_capabilities(
+                        name,
                         result[name], None, failure_reason="not_found"
                     )
                 continue
@@ -2180,12 +2504,13 @@ def probe_agent_plan_llm_clis(plan: ExecutionPlan) -> dict[str, dict]:
             result[name] = _llm_cli_result(name, version)
             result[name]["boundary"] = "agent_bwrap"
             result[name]["executable"] = executable
-            if name == "claude":
+            if name in ("claude", "codex"):
                 if result[name].get("healthy") is not True:
-                    result[name] = _with_claude_resident_capabilities(
+                    result[name] = _with_resident_capabilities(
+                        name,
                         result[name], None, failure_reason=result[name].get("reason")
                     )
-                else:
+                elif name == "claude":
                     try:
                         help_result = subprocess.run(
                             [*prefix, executable, "--help"],
@@ -2194,31 +2519,71 @@ def probe_agent_plan_llm_clis(plan: ExecutionPlan) -> dict[str, dict]:
                             timeout=10,
                             env=plan.env,
                         )
-                        result[name] = _with_claude_resident_capabilities(
+                        result[name] = _with_resident_capabilities(
+                            name,
                             result[name], help_result
                         )
                     except subprocess.TimeoutExpired:
-                        result[name] = _with_claude_resident_capabilities(
+                        result[name] = _with_resident_capabilities(
+                            name,
                             result[name], None, failure_reason="help_probe_timeout"
                         )
                     except (OSError, subprocess.SubprocessError):
-                        result[name] = _with_claude_resident_capabilities(
+                        result[name] = _with_resident_capabilities(
+                            name,
                             result[name], None, failure_reason="help_probe_error"
                         )
+                else:
+                    exec_help, resume_help, help_reason = (
+                        _probe_codex_resident_help(
+                            [*prefix, executable],
+                            timeout=10,
+                            env=plan.env,
+                        )
+                    )
+                    profile_result = None
+                    profile_reason = None
+                    if (
+                        exec_help is not None
+                        and exec_help.returncode == 0
+                        and resume_help is not None
+                        and resume_help.returncode == 0
+                    ):
+                        profile_env = dict(plan.env)
+                        profile_env["CODEX_HOME"] = (
+                            "/tmp/blueprint-resident-codex-home"
+                        )
+                        profile_result, profile_reason = (
+                            _probe_codex_resident_profile(
+                                [*prefix, executable],
+                                timeout=10,
+                                env=profile_env,
+                            )
+                        )
+                    result[name] = _with_resident_capabilities(
+                        name,
+                        result[name],
+                        exec_help,
+                        resume_completed=resume_help,
+                        profile_completed=profile_result,
+                        failure_reason=help_reason or profile_reason,
+                    )
         except subprocess.TimeoutExpired:
             result[name] = _unavailable_llm_cli(
                 "version_probe_timeout", executable_found=True
             )
-            if name == "claude":
-                result[name] = _with_claude_resident_capabilities(
+            if name in ("claude", "codex"):
+                result[name] = _with_resident_capabilities(
+                    name,
                     result[name], None, failure_reason="version_probe_timeout"
                 )
         except (OSError, subprocess.SubprocessError):
             result[name] = _unavailable_llm_cli(
                 "version_probe_error", executable_found=True
             )
-            if name == "claude":
-                result[name] = _with_claude_resident_capabilities(
+            if name in ("claude", "codex"):
+                result[name] = _with_resident_capabilities(
+                    name,
                     result[name], None, failure_reason="version_probe_error"
                 )
     return result

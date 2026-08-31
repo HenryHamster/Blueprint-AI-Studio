@@ -506,6 +506,7 @@ function makeSession(
     sessionId: vi.fn(() => 'cli-sess'),
     isAlive: vi.fn(alive),
     exitCode: vi.fn(() => 0),
+    exitDiagnostic: vi.fn<() => string | null>(() => null),
     _emit: (ev: ResidentSessionEvent) => {
       if (progress && ['text', 'tool', 'error', 'activity'].includes(ev.kind)) {
         progress.lastActivityAtMs = Date.now();
@@ -9128,6 +9129,132 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1]
     ) as Record<string, unknown>;
     expect(terminal).toMatchObject({ status: 'COMPLETED' });
+  });
+
+  it('fails closed without replacement when the provider child cannot be killed', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'msg-provider-kill-failed',
+      content: 'This turn must not be replayed into a second child',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?') && !delivered) {
+        delivered = true;
+        return Promise.resolve({ messages: [operatorMessage] });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true, stop_requested: false });
+    const failedSession = makeSession(
+      () => Promise.resolve(turnResult({
+        providerFailed: true,
+        failureCategory: null,
+        failureDetail: 'Could not deliver SIGKILL to Codex child',
+        providerTerminalReason: 'kill_failed',
+        processGone: false,
+      })),
+      () => true,
+    );
+    failedSession.waitForIdle.mockReturnValue(new Promise<void>(() => {}));
+    failedSession.exitDiagnostic.mockReturnValue(
+      'active_child_pid=5100; provider_output_tail=kill_failed',
+    );
+    mockStartSession.mockReturnValue(failedSession);
+
+    const done = handleStrategicResident(
+      'task-provider-kill-failed',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-provider-kill-failed' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(15_001);
+    await done;
+
+    expect(mockStartSession).toHaveBeenCalledTimes(1);
+    expect(failedSession.close).toHaveBeenCalledTimes(1);
+    const failedReplyPaths = replyToolPaths.current;
+    if (failedReplyPaths === null) throw new Error('reply tool paths were not provisioned');
+    expect(fs.existsSync(path.dirname(failedReplyPaths.receiptPath))).toBe(true);
+    const terminal = (
+      vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1]
+    ) as Record<string, unknown>;
+    expect(terminal).toMatchObject({ status: 'FAILED' });
+    expect(terminal.logs).toContain('provider_process_uncontrolled');
+  });
+
+  it('stays silent after incarnation loss even when provider teardown cannot settle', async () => {
+    vi.useFakeTimers();
+    vi.mocked(persistAndPostStatus).mockClear();
+    mockApiGet.mockImplementation((url: string) => (
+      url.includes('/messages?')
+        ? Promise.resolve({ messages: [] })
+        : Promise.resolve(null)
+    ));
+    let heartbeatCount = 0;
+    mockApiPost.mockImplementation((url: string) => {
+      if (!url.includes('/heartbeat')) return Promise.resolve({});
+      heartbeatCount += 1;
+      return Promise.resolve(heartbeatCount === 1 ? {
+        authority_held: true,
+        resident_incarnation_held: true,
+        stop_requested: false,
+      } : {
+        authority_held: false,
+        resident_incarnation_held: false,
+        stop_requested: true,
+      });
+    });
+    const staleSession = makeSession(
+      () => Promise.resolve(turnResult()),
+      () => true,
+    );
+    staleSession.waitForIdle.mockReturnValue(new Promise<void>(() => {}));
+    staleSession.exitDiagnostic.mockReturnValue(
+      'active_child_pid=5101; provider_output_tail=kill_failed',
+    );
+    mockStartSession.mockReturnValue(staleSession);
+    const statusRef = { value: 'replacement remains active' };
+
+    const done = handleStrategicResident(
+      'task-incarnation-lost-uncontrolled-child',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_autonomous: false,
+        strategic_session_idle_tick_seconds: 1,
+        strategic_session_message_poll_seconds: 0.001,
+      },
+      { project_metadata: { project_id: 'proj-incarnation-lost' }, context: {} },
+      'ghtok', 'owner', 'repo', null, statusRef,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    for (let elapsedMs = 0; heartbeatCount < 2 && elapsedMs < 5_000; elapsedMs += 1_000) {
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(heartbeatCount).toBeGreaterThanOrEqual(2);
+    await vi.advanceTimersByTimeAsync(15_001);
+    await done;
+
+    expect(mockStartSession).toHaveBeenCalledTimes(1);
+    expect(staleSession.close).toHaveBeenCalledTimes(1);
+    const staleReplyPaths = replyToolPaths.current;
+    if (staleReplyPaths === null) throw new Error('reply tool paths were not provisioned');
+    expect(fs.existsSync(path.dirname(staleReplyPaths.receiptPath))).toBe(true);
+    expect(persistAndPostStatus).not.toHaveBeenCalled();
+    expect(statusRef.value).not.toBe('Resident strategic session ended');
+    expect(mockSendLog.mock.calls.some(([message]) =>
+      String(message).includes('provider child did not settle'))).toBe(false);
+    expect(mockSendLog.mock.calls.some(([message]) =>
+      String(message).includes('ended ('))).toBe(false);
   });
 
   it('re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply', async () => {
