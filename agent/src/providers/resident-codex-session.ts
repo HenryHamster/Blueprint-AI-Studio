@@ -74,7 +74,7 @@ const CODEX_RESIDENT_BOUNDARY = [
   'When a requested surface has no native Workday MCP contract, rely on the supplied canonical snapshot and report the limitation; never probe locally.',
   `Use ${RESIDENT_STRATEGIC_TOOL_NAME} for strategic mutations and pass exact JSON values directly.`,
   `Use ${RESIDENT_PROJECT_READ_TOOL_NAME} for bounded canonical precondition checks and readback.`,
-  `Use ${RESIDENT_REPLY_TOOL_NAME} only for the complete operator-facing reply.`,
+  `Every interactive operator turn must end by calling ${RESIDENT_REPLY_TOOL_NAME} exactly once with the complete operator-facing reply; ordinary assistant text is an undelivered transcript, never a substitute for that native call.`,
   'Reuse a stable idempotency_key only for a byte-identical strategic retry; after ambiguity, reconcile canonically before retrying.',
   'Native local writes are denied; trusted Workday MCP helpers alone use the private Resident scratch for bounded staging.',
 ].join(' ');
@@ -283,6 +283,12 @@ function codexMcpArgs(
       '-c', `mcp_servers.${serverKey}.enabled=true`,
       '-c', `mcp_servers.${serverKey}.required=true`,
       '-c', `mcp_servers.${serverKey}.enabled_tools=${tomlStringArray(enabledTools)}`,
+      // Codex models with native tool-search support otherwise defer every
+      // external MCP tool, so the Resident can see only tool_search and may
+      // finish with ordinary assistant text without ever seeing Workday.
+      // These exact allowlisted tools are the Resident's complete authority;
+      // keep them directly model-visible on both exec and exec resume turns.
+      '-c', `mcp_servers.${serverKey}.omit_tools_from=["deferred"]`,
       '-c', `mcp_servers.${serverKey}.default_tools_approval_mode=${tomlString('approve')}`,
     );
   }
