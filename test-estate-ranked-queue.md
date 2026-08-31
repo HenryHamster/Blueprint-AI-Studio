@@ -55,7 +55,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P2 | backend | `backend/testing/test_salvage_bundle_standalone.py` | 7,778 | 239 | critical (>5000 LOC) | 8.485s measured | — |
 | P2 | backend | `backend/testing/test_digest_metrics.py` | 8,216 | 251 | critical (>5000 LOC) | 8.434s measured | — |
 | P2 | backend | `backend/testing/test_agent_strategic_fetch.py` | 7,210 | 142 | critical (>5000 LOC) | 7.724s measured | protected; declared floor 142 |
-| P2 | agent | `agent/src/handlers/strategic-resident.test.ts` | 10,850 | 157 | critical (>5000 LOC) | 5.813s measured | protected; declared floor 157 |
+| P2 | agent | `agent/src/handlers/strategic-resident.test.ts` | 10,867 | 157 | critical (>5000 LOC) | 5.813s measured | protected; declared floor 157 |
 | P2 | backend | `backend/testing/test_release_qualifier__finalize_qualification_2.py` | 7,232 | 116 | critical (>5000 LOC) | 5.220s measured | — |
 | P2 | backend | `backend/testing/test_strategic_state.py` | 10,800 | 176 | critical (>5000 LOC) | 4.542s measured | protected; declared floor 176 |
 | P2 | backend | `backend/testing/test_release_qualifier__sweep_stuck_qualifications.py` | 7,351 | 149 | critical (>5000 LOC) | 3.776s measured | — |
@@ -771,7 +771,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_compute_secret_manifest.py` | 252 | 10 | under 1500 LOC | 0.086s measured | — |
 | G | admin-ui | `admin-ui/src/hooks/__tests__/useLogViewer.test.ts` | 513 | 8 | under 1500 LOC | 0.086s measured | — |
 | G | backend | `backend/testing/test_evidence_primitive.py` | 543 | 52 | under 1500 LOC | 0.086s measured | — |
-| G | agent | `agent/src/providers/resident-reply-tool.test.ts` | 120 | 3 | under 1500 LOC | 0.084s measured | — |
+| G | agent | `agent/src/providers/resident-reply-tool.test.ts` | 326 | 5 | under 1500 LOC | 0.084s measured | — |
 | G | admin-ui | `admin-ui/src/components/StrategicContextMap.test.tsx` | 140 | 5 | under 1500 LOC | 0.081s measured | — |
 | G | admin-ui | `admin-ui/src/components/EventVisibilityMenu.test.tsx` | 87 | 5 | under 1500 LOC | 0.081s measured | — |
 | G | admin-ui | `admin-ui/src/components/ScopeConversionRatesSection.test.tsx` | 377 | 26 | under 1500 LOC | 0.080s measured | — |
@@ -872,7 +872,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | admin-ui | `admin-ui/src/components/SearchFilterBar.test.tsx` | 23 | 1 | under 1500 LOC | 0.027s measured | — |
 | G | backend | `backend/testing/test_strategic_correctness_preflight.py` | 150 | 2 | under 1500 LOC | 0.027s measured | — |
 | G | backend | `backend/testing/test_local_app_release.py` | 134 | 3 | under 1500 LOC | 0.026s measured | — |
-| G | agent | `agent/src/providers/resident-codex-session.test.ts` | 617 | 18 | under 1500 LOC | 0.026s measured | protected; declared floor 18 |
+| G | agent | `agent/src/providers/resident-codex-session.test.ts` | 679 | 25 | under 1500 LOC | 0.026s measured | protected; declared floor 25 |
 | G | agent | `agent/src/handlers/conversation-message-streamer.test.ts` | 183 | 6 | under 1500 LOC | 0.026s measured | — |
 | G | admin-ui | `admin-ui/src/components/AnomalyThrottleBanner.test.tsx` | 54 | 3 | under 1500 LOC | 0.026s measured | — |
 | G | admin-ui | `admin-ui/src/utils/strategicWorkSessionMetrics.test.ts` | 40 | 2 | under 1500 LOC | 0.025s measured | — |
