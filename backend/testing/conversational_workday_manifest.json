@@ -497,13 +497,13 @@
         "startResidentCodexSession > revokes an accepted reply when the resumed process has a $label thread receipt [case 2]",
         "startResidentCodexSession > revokes an accepted reply after $label [case 1]",
         "startResidentCodexSession > revokes an accepted reply after $label [case 2]",
-        "startResidentCodexSession > requires exact successful command and MCP receipts before acknowledging authority",
+        "startResidentCodexSession > requires exact successful MCP receipts before acknowledging delivery",
         "startResidentCodexSession > rejects unsafe sandbox translations and requires the complete read-only contract",
         "startResidentCodexSession > bounds an interrupt through SIGKILL when the child emits no close event",
         "startResidentCodexSession > retains tracking and scratch after an undeliverable kill until late close",
         "startResidentCodexSession > settles child idle even when asynchronous scratch cleanup needs a retry"
       ],
-      "test_count": 18
+      "test_count": 25
     },
     {
       "path": "scripts/test_runner_isolation.py",
@@ -513,7 +513,7 @@
         "TestProbeLlmClis::test_agent_plan_probe_uses_exact_bwrap_boundary",
         "TestProbeLlmClis::test_agent_plan_probe_reports_sandbox_missing_resident_flag"
       ],
-      "test_count": 189
+      "test_count": 190
     },
     {
       "path": "scripts/test_local_runner.py",

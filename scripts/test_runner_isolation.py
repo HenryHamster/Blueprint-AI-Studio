@@ -2191,10 +2191,11 @@ class TestProbeLlmClis(unittest.TestCase):
         joined = " ".join(args)
         self.assertEqual(args[:4], ["app-server", "--strict-config", "--listen", "stdio://"])
         for required in (
-            "permissions.resident-read-only.extends",
-            "permissions.resident-read-only.filesystem",
-            "permissions.resident-read-only.network.domains",
-            "features.network_proxy=true",
+            "use_legacy_landlock",
+            "shell_tool",
+            "unified_exec",
+            "apply_patch_freeform",
+            'sandbox_mode="read-only"',
             'approval_policy="never"',
             'web_search="disabled"',
             "tools.web_search=false",
@@ -2205,13 +2206,36 @@ class TestProbeLlmClis(unittest.TestCase):
             "mcp_servers.workday.env.RESIDENT_REPLY_RECEIPT_PATH=",
             "mcp_servers.workday.enabled=false",
             "mcp_servers.workday.required=true",
-            'mcp_servers.workday.enabled_tools=["reply_to_operator"]',
+            'mcp_servers.workday.enabled_tools=["reply_to_operator","strategic_operation","project_read"]',
             'mcp_servers.workday.default_tools_approval_mode="approve"',
+            'mcp_servers.call.command="/bin/false"',
+            "mcp_servers.call.enabled=false",
+            "mcp_servers.call.required=true",
+            'mcp_servers.call.enabled_tools=["emit_call_packet"]',
+            'mcp_servers.call.default_tools_approval_mode="approve"',
         ):
             self.assertIn(required, joined)
         self.assertNotIn(" exec ", f" {joined} ")
         self.assertNotIn("--model", args)
-        self.assertFalse(any("API_KEY" in arg or "auth" in arg.lower() for arg in args))
+        for feature in iso.CODEX_RESIDENT_DISABLED_FEATURES:
+            self.assertIn(feature, args)
+        self.assertFalse(any("API_KEY" in arg or "TOKEN=" in arg for arg in args))
+        self.assertNotIn("permissions.resident-read-only", joined)
+        self.assertNotIn("default_permissions", joined)
+        self.assertNotIn("network_proxy", joined)
+
+    def test_codex_landlock_probe_executes_read_only_write_canary(self):
+        args = iso._codex_resident_landlock_args()
+        joined = " ".join(args)
+        self.assertEqual(args[:5], [
+            "sandbox", "-C", iso.CODEX_RESIDENT_PROFILE_HOME, "-P", ":read-only",
+        ])
+        self.assertIn("use_legacy_landlock", args)
+        self.assertIn(iso.CODEX_RESIDENT_PROFILE_HOME, args)
+        self.assertIn(iso.CODEX_RESIDENT_PROFILE_DENIED, args)
+        self.assertIn("write-denied", joined)
+        self.assertNotIn("--model", args)
+        self.assertFalse(any("TOKEN" in arg or "API_KEY" in arg for arg in args))
 
     def test_codex_profile_failure_preserves_ordinary_health_but_blocks_resident(self):
         flags = "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
@@ -2306,7 +2330,7 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertEqual(result["claude"]["executable"], "/sandbox/bin/claude")
         self.assertTrue(result["codex"]["resident_ready"])
         self.assertTrue(result["codex"]["resident_profile_ready"])
-        self.assertEqual(run.call_count, 10)
+        self.assertEqual(run.call_count, 11)
         profile_calls = [
             call for call in run.call_args_list if "app-server" in call.args[0]
         ]
@@ -2314,17 +2338,30 @@ class TestProbeLlmClis(unittest.TestCase):
         profile_argv = profile_calls[0].args[0]
         profile_separator = profile_argv.index("--")
         self.assertEqual(
-            profile_argv[profile_separator - 2 : profile_separator],
-            ["--dir", iso.CODEX_RESIDENT_PROFILE_HOME],
+            profile_argv[profile_separator - 4 : profile_separator],
+            [
+                "--dir", iso.CODEX_RESIDENT_PROFILE_HOME,
+                "--dir", iso.CODEX_RESIDENT_PROFILE_DENIED,
+            ],
         )
+        runtime_calls = [
+            call for call in run.call_args_list
+            if "sandbox" in call.args[0] and "use_legacy_landlock" in call.args[0]
+        ]
+        self.assertEqual(len(runtime_calls), 1)
         for call in run.call_args_list:
-            if "app-server" in call.args[0]:
+            if "app-server" in call.args[0] or call in runtime_calls:
                 self.assertEqual(call.args[0][:3], plan.argv[:3])
                 self.assertEqual(call.kwargs["env"]["PATH"], plan.env["PATH"])
                 self.assertEqual(
                     call.kwargs["env"]["CODEX_HOME"],
                     iso.CODEX_RESIDENT_PROFILE_HOME,
                 )
+                self.assertEqual(
+                    call.kwargs["env"]["TMPDIR"],
+                    iso.CODEX_RESIDENT_PROFILE_HOME,
+                )
+                self.assertNotIn("AGENT_TOKEN_FILE", call.kwargs["env"])
                 self.assertEqual(
                     call.kwargs["env"]["HOME"], iso.CODEX_RESIDENT_PROFILE_HOME
                 )
@@ -2382,9 +2419,9 @@ class TestProbeLlmClis(unittest.TestCase):
             ) as run,
         ):
             iso.probe_llm_clis(env=safe_env)
-        self.assertEqual(run.call_count, 7)
+        self.assertEqual(run.call_count, 8)
         for call in run.call_args_list:
-            if "app-server" in call.args[0]:
+            if "app-server" in call.args[0] or "sandbox" in call.args[0]:
                 self.assertEqual(call.kwargs["env"]["PATH"], safe_env["PATH"])
                 self.assertNotEqual(call.kwargs["env"]["HOME"], safe_env["HOME"])
                 self.assertEqual(
@@ -2517,7 +2554,7 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertTrue(result["codex"]["resident_ready"])
         self.assertTrue(result["codex"]["resident_profile_ready"])
         self.assertTrue(result["claude"]["resident_ready"])
-        self.assertEqual(run.call_count, 7)
+        self.assertEqual(run.call_count, 8)
         profile_calls = [
             call.args[0] for call in run.call_args_list if "app-server" in call.args[0]
         ]
@@ -2531,7 +2568,7 @@ class TestProbeLlmClis(unittest.TestCase):
         for call in run.call_args_list:
             self.assertEqual(call.args[0][0:2], ["docker", "run"])
             self.assertIn("agent:test", call.args[0])
-            if "app-server" not in call.args[0]:
+            if "app-server" not in call.args[0] and "sandbox" not in call.args[0]:
                 self.assertNotIn("--env", call.args[0])
 
     def test_container_probe_broken_codex_is_ineligible_despite_host(self):

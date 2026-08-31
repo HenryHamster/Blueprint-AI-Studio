@@ -20,7 +20,7 @@ import {
   buildContextPrefix, configureResidentAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, writeSkillHelpers,
 } from '../prompt.js';
-import { writeStrategicHelpers } from './strategic-helpers.js';
+import { STRATEGIC_FETCH_VERBS, writeStrategicHelpers } from './strategic-helpers.js';
 import { writeArtifactsHelper, COMPUTE_ARTIFACT_GUIDANCE } from './artifacts-helper.js';
 import { provisionAmbientHelpers } from '../providers/runners.js';
 import {
@@ -31,8 +31,10 @@ import {
   type ResidentSession, type ResidentSessionEvent, type ResidentTurnResult,
 } from '../providers/resident-session.js';
 import {
-  provisionResidentReplyTool, RESIDENT_REPLY_TOOL_NAME,
+  provisionResidentReplyTool, RESIDENT_PROJECT_READ_TOOL_NAME,
+  RESIDENT_REPLY_TOOL_NAME, RESIDENT_STRATEGIC_TOOL_NAME,
 } from '../providers/resident-reply-tool.js';
+import { agentTokenFilePath } from '../token-file.js';
 import {
   buildDirSummaryText,
   buildOpenMessagesText,
@@ -1559,6 +1561,18 @@ export async function handleStrategicResident(
   let residentReplyTool = provisionResidentReplyTool(WORKSPACE, {
     receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
     stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+    strategic: {
+      helperPath: path.join(WORKSPACE, 'strategic'),
+      readHelperPath: path.join(WORKSPACE, 'fetch'),
+      readVerbs: STRATEGIC_FETCH_VERBS,
+      orchestratorUrl: process.env.ORCHESTRATOR_URL || 'http://localhost:8080',
+      agentTokenFile: agentTokenFilePath(),
+      incarnationId: residentProcessIncarnation,
+      replyKeyPath: RESIDENT_REPLY_KEY_PATH,
+      replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
+      stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+      privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
+    },
   });
   let residentCallMcpConfigPath = mergeCallMcpConfigs(
     WORKSPACE, residentReplyTool.configPath, workdayCallTool.configPath,
@@ -1582,7 +1596,12 @@ export async function handleStrategicResident(
       toolName: RESIDENT_REPLY_TOOL_NAME,
       // Workday can produce a typed private packet, but cannot reply publicly
       // through it. The existing native reply is fenced by backend call state.
-      allowedTools: [RESIDENT_REPLY_TOOL_NAME, 'mcp__call__emit_call_packet'],
+      allowedTools: [
+        RESIDENT_REPLY_TOOL_NAME,
+        RESIDENT_STRATEGIC_TOOL_NAME,
+        RESIDENT_PROJECT_READ_TOOL_NAME,
+        'mcp__call__emit_call_packet',
+      ],
     },
   });
 
@@ -5854,6 +5873,18 @@ export async function handleStrategicResident(
           residentReplyTool = provisionResidentReplyTool(WORKSPACE, {
             receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
             stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+            strategic: {
+              helperPath: path.join(WORKSPACE, 'strategic'),
+              readHelperPath: path.join(WORKSPACE, 'fetch'),
+              readVerbs: STRATEGIC_FETCH_VERBS,
+              orchestratorUrl: process.env.ORCHESTRATOR_URL || 'http://localhost:8080',
+              agentTokenFile: agentTokenFilePath(),
+              incarnationId: residentProcessIncarnation,
+              replyKeyPath: RESIDENT_REPLY_KEY_PATH,
+              replyReceiptPath: RESIDENT_REPLY_RECEIPT_PATH,
+              stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
+              privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
+            },
           });
           workdayCallTool = provisionCallResidentTool(WORKSPACE, 'workday', {
             stageDir: workdayCallStageDir,
@@ -5867,6 +5898,14 @@ export async function handleStrategicResident(
           // The live subprocess is still attached to the deleted inode.
           invalidateSessionEvents();
           session.close();
+          if (!(await waitForResidentSessionIdle(session))) {
+            stopReason = 'workspace_recovery_provider_uncontrolled';
+            sendLog(
+              ws,
+              '[resident] FATAL: old provider did not settle before workspace recovery restart\n',
+            );
+            break;
+          }
           const recoverySession = startResidentClaudeSession({
             ...residentSessionOptions(),
           });

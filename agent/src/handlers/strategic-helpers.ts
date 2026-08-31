@@ -273,6 +273,18 @@ _private_turn_provenance() {
 }
 
 _operation_uuid() {
+  if [ -n "\${BLUEPRINT_STRATEGIC_OPERATION_ID:-}" ]; then
+    if command -v "$NODE_BIN" >/dev/null 2>&1; then
+      "$NODE_BIN" -e 'const v=process.argv[1]; if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v)) process.exit(2); process.stdout.write(v)' "$BLUEPRINT_STRATEGIC_OPERATION_ID"
+      return $?
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+      python3 -c 'import sys,uuid; value=sys.argv[1]; parsed=uuid.UUID(value); parsed.version in range(1,6) or sys.exit(2); sys.stdout.write(str(parsed))' "$BLUEPRINT_STRATEGIC_OPERATION_ID"
+      return $?
+    fi
+    echo "[ERROR] no operation UUID validator available" >&2
+    return 1
+  fi
   if command -v "$NODE_BIN" >/dev/null 2>&1; then
     "$NODE_BIN" -e 'process.stdout.write(require("crypto").randomUUID())'
     return $?
@@ -292,7 +304,8 @@ else
 fi
 
 _call() {
-  local attempt=0 saw_auth=0 max=3 delay http_code body dump response private_turn_json workday_operation_id
+  local attempt=0 saw_auth=0 max="\${BLUEPRINT_STRATEGIC_MAX_ATTEMPTS:-3}" delay http_code body dump response private_turn_json workday_operation_id
+  case "$max" in 2|3) ;; *) max=3 ;; esac
   workday_operation_id=$(_operation_uuid) || return 1
   while [ $attempt -lt $max ]; do
     # Re-read the live token each attempt so a token that rotated between tries
