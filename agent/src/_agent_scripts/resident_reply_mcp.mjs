@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import readline from 'node:readline';
+import { clearTimeout, setTimeout } from 'node:timers';
 
 const MAX_REPLY_BYTES = 65_536;
 const MAX_STRATEGIC_INPUT_BYTES = 100 * 1024;
@@ -28,6 +29,26 @@ const projectReadHelperPath = process.env.RESIDENT_PROJECT_READ_HELPER_PATH || '
 const projectReadsPath = process.env.RESIDENT_PROJECT_READS_PATH || '';
 let cachedStrategicOps;
 let cachedProjectReads;
+const activeHelperChildren = new Set();
+
+function signalActiveHelperGroups(signal) {
+  for (const child of activeHelperChildren) {
+    if (!child.pid) continue;
+    try {
+      process.kill(-child.pid, signal);
+    } catch {
+      try { child.kill(signal); } catch { /* close/error owns final cleanup */ }
+    }
+  }
+}
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    signalActiveHelperGroups('SIGTERM');
+    signalActiveHelperGroups('SIGKILL');
+    setTimeout(() => process.exit(signal === 'SIGINT' ? 130 : 143), 250).unref();
+  });
+}
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -309,6 +330,7 @@ function runHelper(executable, args, operationId) {
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    activeHelperChildren.add(child);
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
     let overflow = false;
@@ -348,12 +370,14 @@ function runHelper(executable, args, operationId) {
     child.on('error', (error) => {
       if (settled) return;
       settled = true;
+      activeHelperChildren.delete(child);
       clearTimeout(timer);
       resolve({ ok: false, detail: `helper launch failed: ${String(error)}` });
     });
     child.on('close', (code, signal) => {
       if (settled) return;
       settled = true;
+      activeHelperChildren.delete(child);
       clearTimeout(timer);
       const detail = stderr.toString('utf8').slice(-4_096).trim();
       resolve({

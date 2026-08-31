@@ -29,6 +29,7 @@ is pending an operator install of bubblewrap.
 
 from __future__ import annotations
 
+import json
 import os
 import posixpath
 import re
@@ -729,14 +730,7 @@ def detect_gpus() -> tuple[tuple[int, ...], tuple[str, ...]]:
 _LLM_CLI_NAMES: tuple[str, ...] = ("claude", "codex", "gemini")
 MIN_CODEX_CLI_VERSION: tuple[int, int, int] = (0, 150, 1)
 CODEX_RESIDENT_PROFILE_HOME = "/tmp/blueprint-resident-codex-home"
-CODEX_RESIDENT_PROFILE_DENIED = "/tmp/blueprint-resident-profile-denied"
-CODEX_RESIDENT_DISABLED_FEATURES: tuple[str, ...] = (
-    "shell_tool", "unified_exec", "apply_patch_freeform", "apps",
-    "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use",
-    "goals", "hooks", "image_generation", "in_app_browser", "multi_agent", "plugins",
-    "remote_plugin", "skill_mcp_dependency_install", "skill_search", "tool_suggest", "view_image", "auth_elicitation",
-    "tool_call_mcp_elicitation", "code_mode", "code_mode_host",
-)
+CODEX_RESIDENT_PREFLIGHT_CONTAINER = "/opt/agent/src/_agent_scripts/resident_landlock_preflight.py"
 CLAUDE_RESIDENT_REQUIRED_FLAGS: frozenset[str] = frozenset(
     {
         "--input-format",
@@ -824,7 +818,11 @@ def _with_codex_resident_capabilities(
             }
         )
         return enriched
-    if profile_completed is None or profile_completed.returncode != 0:
+    if (
+        profile_completed is None
+        or profile_completed.returncode != 0
+        or failure_reason is not None
+    ):
         enriched.update(
             {
                 "resident_ready": False,
@@ -891,64 +889,38 @@ def _codex_resident_help_args() -> tuple[list[str], list[str]]:
     return ["exec", "--help"], ["exec", "resume", "--help"]
 
 
-def _codex_resident_profile_args() -> list[str]:
-    """Strict, quota-free parse probe for the Resident runtime contract."""
-    config = (
-        'sandbox_mode="read-only"', 'approval_policy="never"',
-        'web_search="disabled"', "tools.web_search=false",
-        'shell_environment_policy.inherit="none"',
-        "shell_environment_policy.ignore_default_excludes=false",
-        f'shell_environment_policy.set.HOME="{CODEX_RESIDENT_PROFILE_HOME}"',
-        "mcp_servers={}", 'mcp_servers.workday.command="/bin/false"', "mcp_servers.workday.args=[]",
-        f'mcp_servers.workday.env.RESIDENT_REPLY_RECEIPT_PATH="{CODEX_RESIDENT_PROFILE_HOME}/receipt.json"',
-        "mcp_servers.workday.enabled=false", "mcp_servers.workday.required=true",
-        'mcp_servers.workday.enabled_tools=["reply_to_operator","strategic_operation","project_read"]',
-        'mcp_servers.workday.default_tools_approval_mode="approve"',
-        'mcp_servers.call.command="/bin/false"', "mcp_servers.call.args=[]", "mcp_servers.call.enabled=false", "mcp_servers.call.required=true",
-        'mcp_servers.call.enabled_tools=["emit_call_packet"]', 'mcp_servers.call.default_tools_approval_mode="approve"',
-    )
-    return [
-        "app-server", "--strict-config", "--listen", "stdio://",
-        "--enable", "use_legacy_landlock",
-        *[
-            arg for feature in CODEX_RESIDENT_DISABLED_FEATURES
-            for arg in ("--disable", feature)
-        ],
-        *[arg for value in config for arg in ("-c", value)],
-    ]
-def _codex_resident_landlock_args() -> list[str]:
-    """Execute a quota-free write-boundary canary in the legacy sandbox."""
-    return ["sandbox", "-C", CODEX_RESIDENT_PROFILE_HOME, "-P", ":read-only",
-        "--enable", "use_legacy_landlock", "--", "/bin/sh", "-c",
-        ('set -eu; umask 077; test -d "$1"; test -d "$2"; test -w "$2"; '
-         'if /usr/bin/touch "$1/write-denied" 2>/dev/null; then rm -f "$1/write-denied"; exit 73; fi; '
-         'if /usr/bin/touch "$2/write-denied" 2>/dev/null; then rm -f "$2/write-denied"; exit 74; fi'),
-        "resident-landlock-probe", CODEX_RESIDENT_PROFILE_HOME,
-        CODEX_RESIDENT_PROFILE_DENIED,
-    ]
 def _probe_codex_resident_profile(
-    command_prefix: list[str],
+    command: list[str],
     *,
     timeout: float,
     env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess | None, str | None]:
-    completed = None
-    probes = (
-        (_codex_resident_profile_args(), "profile_probe", "failed"),
-        (_codex_resident_landlock_args(), "runtime_enforcement", "unavailable"),
-    )
-    for args, reason, failure in probes:
-        try:
-            completed = subprocess.run(
-                [*command_prefix, *args], stdin=subprocess.DEVNULL,
-                capture_output=True, text=True, timeout=timeout, env=env,
-            )
-        except subprocess.TimeoutExpired:
-            return None, f"{reason}_timeout"
-        except (OSError, subprocess.SubprocessError):
-            return None, f"{reason}_error"
-        if completed.returncode != 0:
-            return completed, f"{reason}_{failure}"
+    try:
+        completed = subprocess.run(
+            command, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, timeout=timeout, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "resident_landlock_preflight_timeout"
+    except (OSError, subprocess.SubprocessError):
+        return None, "resident_landlock_preflight_error"
+    if completed.returncode != 0:
+        return completed, "resident_landlock_preflight_failed"
+    try:
+        marker = json.loads((completed.stdout or "").strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        return completed, "resident_landlock_marker_invalid"
+    expected = {
+        "filesystem": True, "mcp": True, "codex_config": True,
+        "broker_transport": True, "credential_isolated": True,
+        "three_tool_mcp": True, "codex_proxy_config": True,
+        "broker_teardown": True,
+        "nested_namespace": False,
+    }
+    if marker.get("kind") != "blueprint.resident_landlock_preflight.v1" or any(
+        marker.get(key) != value for key, value in expected.items()
+    ) or not isinstance(marker.get("abi"), int) or not 5 <= marker["abi"] <= 8:
+        return completed, "resident_landlock_marker_invalid"
     return completed, None
 
 
@@ -1141,9 +1113,16 @@ def probe_llm_clis(*, env: dict[str, str] | None = None) -> dict[str, dict]:
                             profile_env = dict(os.environ if env is None else env)
                             profile_env["CODEX_HOME"] = codex_home
                             profile_env["HOME"] = codex_home
+                            preflight = os.path.join(
+                                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "agent", "src", "_agent_scripts", "resident_landlock_preflight.py",
+                            )
                             profile_result, profile_reason = (
                                 _probe_codex_resident_profile(
-                                    [path], timeout=10, env=profile_env
+                                    [sys.executable, "-I", preflight,
+                                     "--runtime-root", codex_home,
+                                     "--codex", path, "--timeout", "12"],
+                                    timeout=15, env=profile_env
                                 )
                             )
                     result[name] = _with_resident_capabilities(
@@ -1292,18 +1271,19 @@ def probe_container_llm_clis(
                                         "run",
                                         "--rm",
                                         "--entrypoint",
-                                        name,
+                                        "python3",
                                         "--env",
                                         f"CODEX_HOME={CODEX_RESIDENT_PROFILE_HOME}",
                                         "--env",
                                         f"HOME={CODEX_RESIDENT_PROFILE_HOME}",
                                         "--tmpfs",
                                         CODEX_RESIDENT_PROFILE_HOME,
-                                        "--tmpfs",
-                                        CODEX_RESIDENT_PROFILE_DENIED,
                                         image,
+                                        "-I", CODEX_RESIDENT_PREFLIGHT_CONTAINER,
+                                        "--runtime-root", f"{CODEX_RESIDENT_PROFILE_HOME}/preflight",
+                                        "--codex", name, "--timeout", "12",
                                     ],
-                                    timeout=20,
+                                    timeout=25,
                                 )
                             )
                         result[name] = _with_resident_capabilities(
@@ -2555,19 +2535,27 @@ def probe_agent_plan_llm_clis(plan: ExecutionPlan) -> dict[str, dict]:
                         profile_env["CODEX_HOME"] = CODEX_RESIDENT_PROFILE_HOME
                         profile_env["HOME"] = CODEX_RESIDENT_PROFILE_HOME
                         profile_env["TMPDIR"] = CODEX_RESIDENT_PROFILE_HOME
-                        profile_prefix = [
+                        agent_entry = plan.argv[-1]
+                        agent_root = os.path.dirname(os.path.dirname(agent_entry))
+                        preflight = os.path.join(
+                            agent_root, "src", "_agent_scripts",
+                            "resident_landlock_preflight.py",
+                        )
+                        profile_command = [
                             *prefix[:-1],
                             "--dir",
                             CODEX_RESIDENT_PROFILE_HOME,
-                            "--dir",
-                            CODEX_RESIDENT_PROFILE_DENIED,
                             "--",
-                            executable,
+                            "/usr/bin/python3", "-I", preflight,
+                            "--runtime-root", CODEX_RESIDENT_PROFILE_HOME,
+                            "--codex", executable,
+                            "--repository-root", SANDBOX_WORKSPACE,
+                            "--timeout", "12",
                         ]
                         profile_result, profile_reason = (
                             _probe_codex_resident_profile(
-                                profile_prefix,
-                                timeout=10,
+                                profile_command,
+                                timeout=15,
                                 env=profile_env,
                             )
                         )
