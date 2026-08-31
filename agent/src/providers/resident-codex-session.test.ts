@@ -241,6 +241,9 @@ describe('startResidentCodexSession', () => {
       && arg.includes('replaces ./strategic help/schema')
       && arg.includes('set-running-update sends data')
       && arg.includes('ordinary assistant text is an undelivered transcript')
+      && arg.includes('Never call list_mcp_resources')
+      && arg.includes('resources/list')
+      && arg.includes('or any MCP discovery path')
     ))).toBe(true);
     expect(firstArgs).not.toContain('resume');
     expect(firstArgs.at(-1)).toBe('-');
@@ -986,6 +989,59 @@ describe('startResidentCodexSession', () => {
       expect(session.isAlive()).toBe(false);
     },
   );
+
+  it('fails closed on Codex MCP resource discovery with a bounded tool identity', async () => {
+    const mcpConfig = path.join(tempDir, 'resident-resource-discovery-mcp.json');
+    fs.writeFileSync(mcpConfig, JSON.stringify({
+      mcpServers: {
+        workday: { command: process.execPath, args: [trustedMcpScript('reply.mjs')] },
+      },
+    }));
+    const session = startResidentCodexSession({
+      ...readOnly,
+      workspace: tempDir, ...directIsolation(),
+      replyTool: {
+        mcpConfigPath: mcpConfig,
+        allowedTools: [
+          'mcp__workday__reply_to_operator',
+          'mcp__workday__strategic_operation',
+          'mcp__workday__project_read',
+        ],
+      },
+    }, runner, base);
+    const turn = session.sendTurn('use only the direct Workday tools');
+    await waitForChildCount(children, 1);
+    const codexArgs = vi.mocked(spawn).mock.calls[0][1] as string[];
+    expect(codexArgs).toContain(
+      'mcp_servers.workday.enabled_tools=["reply_to_operator","strategic_operation","project_read"]',
+    );
+    expect(codexArgs).toContain('mcp_servers.workday.omit_tools_from=["deferred"]');
+    expect(codexArgs.some((arg) => arg.includes('enabled_tools') && arg.includes('resource'))).toBe(false);
+    children[0].line({ type: 'thread.started', thread_id: 'thread-resource-discovery' });
+    children[0].line({ type: 'item.started', item: {
+      id: 'forbidden-resource-discovery',
+      type: 'mcp_tool_call',
+      server: 'mcp__workday',
+      tool: 'list_mcp_resources',
+      arguments: { server: 'mcp__workday' },
+      status: 'in_progress',
+    } });
+    children[0].close(130, 'SIGINT');
+
+    const result = await turn;
+    expect(result).toMatchObject({
+      providerFailed: true,
+      providerTerminalReason: 'unexpected_mcp_tool',
+      processGone: true,
+      sentOperatorMessage: false,
+      appliedStrategicOp: false,
+      failureDetail: 'Codex attempted a non-allowlisted MCP tool '
+        + '(server="mcp__workday", tool="list_mcp_resources")',
+    });
+    expect(result.failureDetail?.length).toBeLessThan(300);
+    expect(killSpy).toHaveBeenCalledWith(-5100, 'SIGINT');
+    expect(session.isAlive()).toBe(false);
+  });
 
   it('fails closed when the process exits without turn.completed', async () => {
     const session = startResidentCodexSession({ ...readOnly, workspace: tempDir, ...directIsolation() }, runner, base);

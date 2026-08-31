@@ -75,6 +75,7 @@ const CODEX_RESIDENT_BOUNDARY = [
   `Use ${RESIDENT_STRATEGIC_TOOL_NAME} for strategic mutations and pass exact JSON values directly.`,
   `Use ${RESIDENT_PROJECT_READ_TOOL_NAME} for bounded canonical precondition checks and readback.`,
   `Every interactive operator turn must end by calling ${RESIDENT_REPLY_TOOL_NAME} exactly once with the complete operator-facing reply; ordinary assistant text is an undelivered transcript, never a substitute for that native call.`,
+  `The only permitted MCP calls are ${RESIDENT_REPLY_TOOL_NAME}, ${RESIDENT_STRATEGIC_TOOL_NAME}, and ${RESIDENT_PROJECT_READ_TOOL_NAME}; they are already directly available. Never call list_mcp_resources, list_mcp_resource_templates, read_mcp_resource, tools/list, resources/list, resources/templates/list, resources/read, or any MCP discovery path.`,
   'Reuse a stable idempotency_key only for a byte-identical strategic retry; after ambiguity, reconcile canonically before retrying.',
   'Native local writes are denied; trusted Workday MCP helpers alone use the private Resident scratch for bounded staging.',
 ].join(' ');
@@ -421,6 +422,13 @@ function mcpReplyAccepted(result: unknown): boolean {
 
 function boundedTail(current: string, addition: string, max = 16_000): string {
   return (current + addition).slice(-max);
+}
+
+function boundedMcpIdentity(server: string, tool: string): string {
+  const bounded = (value: string): string => (
+    value ? JSON.stringify(sanitize(value).slice(0, 80)) : '"<missing>"'
+  );
+  return `server=${bounded(server)}, tool=${bounded(tool)}`;
 }
 
 function contentPrompt(
@@ -1164,7 +1172,9 @@ export function startResidentCodexSession(
         markFailure(
           turn,
           unexpectedMcp ? 'unexpected_mcp_tool' : 'unexpected_local_tool',
-          unexpectedMcp ? 'Codex attempted a non-allowlisted MCP tool' : 'Codex attempted a forbidden local tool',
+          unexpectedMcp
+            ? `Codex attempted a non-allowlisted MCP tool (${boundedMcpIdentity(mcpServer, mcpTool)})`
+            : 'Codex attempted a forbidden local tool',
         );
       }
       turn.sentOperatorMessage = false;

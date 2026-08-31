@@ -512,21 +512,22 @@
         "startResidentCodexSession > retains tracking and scratch after an undeliverable kill until late close",
         "startResidentCodexSession > settles child idle even when asynchronous scratch cleanup needs a retry"
       ],
-      "test_count": 31
+      "test_count": 32
     },
     {
       "path": "scripts/test_resident_landlock_preflight.py",
-      "reason": "Protects the quota-free production-shaped Codex exec/resume preflight: six-request Responses continuations covering project_read followed by an accepted native reply_to_operator on each turn, exact Workday MCP JSONL dispatch receipts, terminal authority, and fail-closed denial of native or unknown local tools.",
+      "reason": "Protects the quota-free production-shaped Codex greeting/resume preflight: a tool-free greeting establishes continuity before a long private packet performs three reads, two receipt-bound strategic operations, and one accepted native reply through exactly three direct Workday tools, while resource/server discovery and forbidden local tool calls fail closed.",
       "test_ids": [
-        "TestResidentLandlockPreflight::test_loopback_fixture_serves_project_read_then_native_reply_for_exec_and_resume",
-        "TestResidentLandlockPreflight::test_project_read_keeps_exact_mcp_bounds_before_codex_projection",
-        "TestResidentLandlockPreflight::test_responses_roundtrip_accepts_codex_0150_bounded_schema_projection",
-        "TestResidentLandlockPreflight::test_responses_schema_mismatch_diagnostic_is_useful_and_bounded",
-        "TestResidentLandlockPreflight::test_jsonl_transport_diagnostics_do_not_replace_terminal_authority",
-        "TestResidentLandlockPreflight::test_jsonl_preflight_rejects_missing_mcp_dispatch",
-        "TestResidentLandlockPreflight::test_jsonl_preflight_rejects_forbidden_local_items"
+        "TestResidentLandlockPreflight::test_loopback_fixture_serves_greeting_then_long_private_packet",
+        "TestResidentLandlockPreflight::test_direct_tool_contract_and_long_packet_are_exact",
+        "TestResidentLandlockPreflight::test_responses_roundtrip_preserves_greeting_and_private_tool_sequence",
+        "TestResidentLandlockPreflight::test_responses_reject_discovery_or_bounded_schema_drift",
+        "TestResidentLandlockPreflight::test_jsonl_private_packet_requires_all_native_receipts",
+        "TestResidentLandlockPreflight::test_jsonl_preflight_rejects_missing_rejected_or_substituted_reply",
+        "TestResidentLandlockPreflight::test_jsonl_greeting_is_tool_free_and_local_tools_fail_closed",
+        "TestResidentLandlockPreflight::test_broker_trace_rejects_resource_or_server_discovery"
       ],
-      "test_count": 7
+      "test_count": 8
     },
     {
       "path": "scripts/test_runner_isolation.py",
