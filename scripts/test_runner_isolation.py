@@ -2303,13 +2303,14 @@ class TestProbeLlmClis(unittest.TestCase):
             stop = threading.Event()
             errors = []
             metrics = {"connections": 0, "active": 0}
+            protocol_trace = []
             broker = threading.Thread(
                 target=module.serve_broker,
                 args=(
                     socket_path,
                     [sys.executable, "-u", "-c", "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())"],
                     {"PATH": os.environ.get("PATH", "")},
-                    ready, stop, errors, metrics,
+                    ready, stop, errors, metrics, protocol_trace,
                 ),
             )
             broker.start()
@@ -2324,6 +2325,7 @@ class TestProbeLlmClis(unittest.TestCase):
             self.assertFalse(broker.is_alive())
             self.assertEqual(errors, [])
             self.assertEqual(metrics, {"connections": 1, "active": 0})
+            self.assertEqual(len(protocol_trace), 1)
             self.assertFalse(socket_path.exists())
 
     def test_preflight_restricted_child_failure_precedes_broker_teardown_receipt(self):
