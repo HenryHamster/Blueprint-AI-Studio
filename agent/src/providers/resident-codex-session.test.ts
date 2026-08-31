@@ -140,35 +140,41 @@ describe('startResidentCodexSession', () => {
     expect(firstArgs.slice(0, 2)).toEqual(['exec', '--skip-git-repo-check']);
     expect(firstArgs).toContain('--ignore-user-config');
     expect(firstArgs).toContain('--strict-config');
-    expect(firstArgs).toContain('default_permissions="resident-read-only"');
+    expect(firstArgs).toContain('read-only');
+    expect(firstArgs).toContain('use_legacy_landlock');
+    expect(firstArgs).toContain('shell_tool');
+    expect(firstArgs).toContain('unified_exec');
+    expect(firstArgs).toContain('apply_patch_freeform');
     expect(firstArgs).toContain('approval_policy="never"');
-    expect(firstArgs).toContain('permissions.resident-read-only.extends=":read-only"');
-    expect(firstArgs).toContain('permissions.resident-read-only.network.domains={"blueprint-api"="allow"}');
-    expect(firstArgs).toContain('features.network_proxy=true');
+    expect(firstArgs.some((arg) => arg.startsWith('sandbox_workspace_write.'))).toBe(false);
+    expect(firstArgs.some((arg) => arg.startsWith('permissions.resident-read-only.'))).toBe(false);
+    expect(firstArgs).not.toContain('default_permissions="resident-read-only"');
+    expect(firstArgs).not.toContain('features.network_proxy=true');
     expect(firstArgs).toContain('web_search="disabled"');
     expect(firstArgs).toContain('tools.web_search=false');
     expect(firstArgs).toContain('shell_environment_policy.inherit="none"');
-    const firstSpawnOptions = vi.mocked(spawn).mock.calls[0][2] as { env: Record<string, string> };
+    const firstSpawnOptions = vi.mocked(spawn).mock.calls[0][2] as {
+      cwd: string; env: Record<string, string>;
+    };
     const scratchDir = firstSpawnOptions.env.TMPDIR;
     expect(scratchDir).toMatch(/blueprint-resident-codex-/);
     expect(fs.statSync(scratchDir).mode & 0o777).toBe(0o700);
-    expect(firstArgs).toContain(
-      `permissions.resident-read-only.filesystem={${JSON.stringify(scratchDir)}="write","/codex-home"="deny"}`,
-    );
+    expect(firstSpawnOptions.cwd).toBe(scratchDir);
     expect(firstArgs).toContain(`shell_environment_policy.set.TMPDIR=${JSON.stringify(scratchDir)}`);
-    expect(firstArgs).toContain('shell_environment_policy.set.AGENT_TOKEN_FILE="/run/blueprint/agent-token.jwt"');
+    expect(firstSpawnOptions.env.AGENT_TOKEN_FILE).toBeUndefined();
+    expect(firstSpawnOptions.env.ORCHESTRATOR_URL).toBeUndefined();
     expect(firstSpawnOptions.env.AGENT_API_TOKEN).toBeUndefined();
     expect(firstSpawnOptions.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(firstSpawnOptions.env.DEEPSEEK_API_KEY).toBeUndefined();
     expect(firstSpawnOptions.env.OPENAI_API_KEY).toBeUndefined();
     expect(firstSpawnOptions.env.CODEX_API_KEY).toBeUndefined();
     expect(firstArgs).not.toContain('--dangerously-bypass-approvals-and-sandbox');
-    expect(firstArgs).not.toContain('-s');
+    expect(firstArgs).toContain('-s');
     expect(firstArgs).not.toContain('danger-full-access');
     expect(firstArgs.some((arg) => (
       arg.startsWith('developer_instructions=')
       && arg.includes('canonical Resident identity')
-      && arg.includes('write only below $TMPDIR')
+      && arg.includes('without native shell')
     ))).toBe(true);
     expect(firstArgs).not.toContain('resume');
     expect(firstArgs.at(-1)).toBe('-');
@@ -185,7 +191,7 @@ describe('startResidentCodexSession', () => {
     expect(secondArgs.slice(-2)).toEqual(['thread-exact-1', '-']);
     expect(secondArgs).not.toContain('--last');
     expect(secondArgs).not.toContain('--ephemeral');
-    expect(secondArgs).toContain('default_permissions="resident-read-only"');
+    expect(secondArgs).toContain('use_legacy_landlock');
     expect(secondArgs).not.toContain('--dangerously-bypass-approvals-and-sandbox');
     expect(children[1].stdin.end).toHaveBeenCalledWith('second prompt');
     children[1].line({ type: 'thread.started', thread_id: 'thread-exact-1' });
@@ -286,14 +292,6 @@ describe('startResidentCodexSession', () => {
     const turn = session.sendTurn('reply before terminal failure');
     children[0].line({ type: 'thread.started', thread_id: 'thread-terminal-failure' });
     children[0].line({ type: 'item.started', item: {
-      id: 'cmd-terminal', type: 'command_execution',
-      command: './strategic set-memory --json exact', status: 'in_progress',
-    } });
-    children[0].line({ type: 'item.completed', item: {
-      id: 'cmd-terminal', type: 'command_execution', status: 'completed', exit_code: 0,
-      aggregated_output: '{"status":"ok","applied":true}',
-    } });
-    children[0].line({ type: 'item.started', item: {
       id: 'mcp-terminal', type: 'mcp_tool_call', server: 'workday', tool: 'reply_to_operator',
       arguments: { content: 'must remain uncommitted', message_type: 'NOTE' },
     } });
@@ -313,14 +311,14 @@ describe('startResidentCodexSession', () => {
       providerFailed: true,
       providerTerminalReason: reason,
       processGone: true,
-      appliedStrategicOp: true,
+      appliedStrategicOp: false,
       sentOperatorMessage: false,
       operatorReply: null,
     });
     expect(session.isAlive()).toBe(false);
   });
 
-  it('requires exact successful command and MCP receipts before acknowledging authority', async () => {
+  it('requires exact successful MCP receipts before acknowledging delivery', async () => {
     const mcpConfig = path.join(tempDir, 'resident-mcp.json');
     fs.writeFileSync(mcpConfig, JSON.stringify({
       mcpServers: {
@@ -332,12 +330,16 @@ describe('startResidentCodexSession', () => {
             RESIDENT_STAGED_REPLY_PATH: '/workspace/staged.json',
           },
         },
+        call: { command: process.execPath, args: ['/workspace/call.mjs'] },
       },
     }));
     const session = startResidentCodexSession({
       ...readOnly,
       workspace: tempDir,
-      replyTool: { mcpConfigPath: mcpConfig },
+      replyTool: {
+        mcpConfigPath: mcpConfig,
+        allowedTools: ['mcp__workday__reply_to_operator', 'mcp__call__emit_call_packet'],
+      },
     }, runner, base);
     const turn = session.sendTurn('mutate and reply');
     const args = vi.mocked(spawn).mock.calls[0][1] as string[];
@@ -353,18 +355,12 @@ describe('startResidentCodexSession', () => {
     );
     expect(args).toContain('mcp_servers.workday.enabled=true');
     expect(args).toContain('mcp_servers.workday.enabled_tools=["reply_to_operator"]');
+    expect(args).toContain('mcp_servers.call.required=true');
+    expect(args).toContain('mcp_servers.call.enabled_tools=["emit_call_packet"]');
     expect(args).toContain('mcp_servers.workday.default_tools_approval_mode="approve"');
     expect(args).toContain('mcp_servers.workday.enabled_tools=["reply_to_operator"]');
 
     children[0].line({ type: 'thread.started', thread_id: 'thread-tools' });
-    children[0].line({ type: 'item.started', item: {
-      id: 'cmd-1', type: 'command_execution',
-      command: './strategic set-memory --json exact', status: 'in_progress',
-    } });
-    children[0].line({ type: 'item.completed', item: {
-      id: 'cmd-1', type: 'command_execution', status: 'completed', exit_code: 0,
-      aggregated_output: '{"status":"ok","applied":true}',
-    } });
     children[0].line({ type: 'item.started', item: {
       id: 'mcp-1', type: 'mcp_tool_call', server: 'workday', tool: 'reply_to_operator',
       arguments: { content: 'operator answer', message_type: 'NOTE' }, status: 'in_progress',
@@ -381,11 +377,54 @@ describe('startResidentCodexSession', () => {
     children[0].close();
 
     await expect(turn).resolves.toMatchObject({
-      appliedStrategicOp: true,
+      appliedStrategicOp: false,
       sentOperatorMessage: true,
       operatorReply: { type: 'NOTE', content: 'operator answer' },
-      toolCallCount: 2,
+      toolCallCount: 1,
     });
+    session.close();
+  });
+
+  it.each([
+    { commitAcknowledged: false, expectedApplied: false },
+    { commitAcknowledged: true, expectedApplied: true },
+  ])('requires an exact committed strategic result (ack=$commitAcknowledged)', async ({
+    commitAcknowledged, expectedApplied,
+  }) => {
+    const mcpConfig = path.join(tempDir, `resident-strategic-${String(commitAcknowledged)}.json`);
+    fs.writeFileSync(mcpConfig, JSON.stringify({
+      mcpServers: {
+        workday: { command: process.execPath, args: ['/workspace/workday.mjs'] },
+      },
+    }));
+    const session = startResidentCodexSession({
+      ...readOnly,
+      workspace: tempDir,
+      replyTool: {
+        mcpConfigPath: mcpConfig,
+        allowedTools: ['mcp__workday__strategic_operation'],
+      },
+    }, runner, base);
+    const turn = session.sendTurn('apply one bounded mutation');
+    children[0].line({ type: 'thread.started', thread_id: `thread-strategic-${String(commitAcknowledged)}` });
+    children[0].line({ type: 'item.started', item: {
+      id: 'mcp-strategic', type: 'mcp_tool_call', server: 'workday', tool: 'strategic_operation',
+      arguments: { operation: 'set-running-update', data: { markdown: 'exact' }, idempotency_key: 'exact-key' },
+    } });
+    children[0].line({ type: 'item.completed', item: {
+      id: 'mcp-strategic', type: 'mcp_tool_call', server: 'workday', tool: 'strategic_operation',
+      status: 'completed', error: null,
+      result: {
+        structured_content: {
+          outcome: 'applied', applied: true, commit_acknowledged: commitAcknowledged,
+          receipt_confirmed: true,
+        },
+      },
+    } });
+    children[0].line({ type: 'turn.completed' });
+    children[0].close();
+
+    await expect(turn).resolves.toMatchObject({ appliedStrategicOp: expectedApplied });
     session.close();
   });
 
@@ -418,6 +457,29 @@ describe('startResidentCodexSession', () => {
     await expect(turn).resolves.toMatchObject({ sentOperatorMessage: false, operatorReply: null });
     session.close();
   });
+
+  it.each(['command_execution', 'file_change', 'web_search', 'todo_list', 'computer_use'])(
+    'fails closed on forbidden local item %s',
+    async (itemType) => {
+      const session = startResidentCodexSession({ ...readOnly, workspace: tempDir }, runner, base);
+      const turn = session.sendTurn('do not use local tools');
+      children[0].line({ type: 'thread.started', thread_id: `thread-forbidden-${itemType}` });
+      children[0].line({ type: 'item.started', item: {
+        id: `forbidden-${itemType}`, type: itemType, status: 'in_progress',
+      } });
+      children[0].close(130, 'SIGINT');
+
+      await expect(turn).resolves.toMatchObject({
+        providerFailed: true,
+        providerTerminalReason: 'unexpected_local_tool',
+        processGone: true,
+        sentOperatorMessage: false,
+        appliedStrategicOp: false,
+      });
+      expect(killSpy).toHaveBeenCalledWith(-5100, 'SIGINT');
+      expect(session.isAlive()).toBe(false);
+    },
+  );
 
   it('fails closed when the process exits without turn.completed', async () => {
     const session = startResidentCodexSession({ ...readOnly, workspace: tempDir }, runner, base);

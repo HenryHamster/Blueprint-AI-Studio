@@ -4,15 +4,18 @@ import os from 'os';
 import path from 'path';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import {
-  WORKSPACE, recordLlmCallStart, recordLlmTokens,
+  recordLlmCallStart, recordLlmTokens,
   recordNumTurns, recordProviderReportedUsage, sanitize,
 } from '../index.js';
 import {
   DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS,
   PROCESS_KILL_GRACE_MS,
 } from '../constants.js';
-import { isStrategicMutation } from './resident-stream.js';
-import { RESIDENT_REPLY_TOOL_NAME } from './resident-reply-tool.js';
+import {
+  RESIDENT_PROJECT_READ_TOOL_NAME,
+  RESIDENT_REPLY_TOOL_NAME,
+  RESIDENT_STRATEGIC_TOOL_NAME,
+} from './resident-reply-tool.js';
 import { matchesAuthFailure, matchesRateLimit } from './runners.js';
 import type { ProviderRunner, RunnerCommand } from './runners.js';
 import type {
@@ -33,30 +36,42 @@ const SAFE_MCP_ENV_KEYS = new Set([
   'CALL_RESIDENT_ROLE',
   'CALL_LOCAL_STAGE_DIR',
   'CALL_TURN_RECEIPT_PATH',
+  'RESIDENT_STRATEGIC_HELPER_PATH',
+  'RESIDENT_STRATEGIC_OPS_PATH',
+  'RESIDENT_PROJECT_READ_HELPER_PATH',
+  'RESIDENT_PROJECT_READS_PATH',
+  'RESIDENT_STRATEGIC_PATH',
+  'RESIDENT_STRATEGIC_LANG',
+  'RESIDENT_STRATEGIC_TERM',
+  'ORCHESTRATOR_URL',
+  'AGENT_TOKEN_FILE',
+  'BLUEPRINT_RESIDENT_INCARNATION_ID',
+  'BLUEPRINT_RESIDENT_REPLY_KEY_PATH',
+  'BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH',
+  'BLUEPRINT_RESIDENT_STAGED_REPLY_PATH',
+  'BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH',
 ]);
 const CODEX_PROCESS_ENV_KEYS = new Set([
   'HOME', 'PATH', 'LANG', 'TERM',
-  'ORCHESTRATOR_URL', 'TASK_ID', 'AGENT_TOKEN_FILE',
-  'BLUEPRINT_RESIDENT_INCARNATION_ID',
-  'BLUEPRINT_RESIDENT_REPLY_KEY_PATH',
-  'BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH',
-  'BLUEPRINT_RESIDENT_STAGED_REPLY_PATH',
-  'BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH',
-]);
-const RESIDENT_SHELL_ENV_KEYS = new Set([
-  'PATH', 'LANG', 'TERM', 'ORCHESTRATOR_URL', 'TASK_ID', 'AGENT_TOKEN_FILE',
-  'BLUEPRINT_RESIDENT_INCARNATION_ID',
-  'BLUEPRINT_RESIDENT_REPLY_KEY_PATH',
-  'BLUEPRINT_RESIDENT_REPLY_RECEIPT_PATH',
-  'BLUEPRINT_RESIDENT_STAGED_REPLY_PATH',
-  'BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH',
 ]);
 const CODEX_RESIDENT_BOUNDARY = [
-  'Codex Resident commands run inside an enforced read-only, no-approval sandbox.',
-  'Do not attempt filesystem writes or approval escalation.',
-  'For required temporary files, write only below $TMPDIR; never write to /tmp directly.',
-  'Repository synchronization is coordinator-owned; do not run git fetch or change refs.',
+  'Codex Resident runs without native shell, repository, Git, or local file tools.',
+  'Do not invoke ./strategic, ./fetch, ./design-doc, ./messages, apply_patch, or any command path.',
+  `Use ${RESIDENT_STRATEGIC_TOOL_NAME} for strategic mutations and pass exact JSON values directly.`,
+  `Use ${RESIDENT_PROJECT_READ_TOOL_NAME} for bounded canonical precondition checks and readback.`,
+  `Use ${RESIDENT_REPLY_TOOL_NAME} only for the complete operator-facing reply.`,
+  'Reuse a stable idempotency_key only for a byte-identical strategic retry; after ambiguity, reconcile canonically before retrying.',
+  'Native local writes are denied; trusted Workday MCP helpers alone use the private Resident scratch for bounded staging.',
 ].join(' ');
+
+const FORCED_DISABLED_FEATURES = [
+  'shell_tool', 'unified_exec', 'apply_patch_freeform', 'apps', 'browser_use', 'browser_use_external',
+  'browser_use_full_cdp_access', 'computer_use', 'goals', 'hooks',
+  'image_generation', 'in_app_browser', 'multi_agent', 'plugins',
+  'remote_plugin', 'skill_mcp_dependency_install', 'skill_search',
+  'tool_suggest', 'view_image', 'auth_elicitation',
+  'tool_call_mcp_elicitation', 'code_mode', 'code_mode_host',
+] as const;
 
 interface CodexTurn {
   resolve: (result: ResidentTurnResult) => void;
@@ -106,10 +121,6 @@ function tomlString(value: string): string {
 
 function tomlStringArray(values: readonly string[]): string {
   return `[${values.map(tomlString).join(',')}]`;
-}
-
-function tomlStringMap(entries: ReadonlyArray<readonly [string, string]>): string {
-  return `{${entries.map(([key, value]) => `${tomlString(key)}=${tomlString(value)}`).join(',')}}`;
 }
 
 function safeConfigKey(value: string, label: string): string {
@@ -190,7 +201,6 @@ function normalizeCommonArgs(
   base: RunnerCommand,
   opts: ResidentSessionOptions,
   scratchDir: string,
-  childEnv: NodeJS.ProcessEnv,
 ): string[] {
   if (base.args[0] !== 'exec') throw new Error('Codex Resident runner must start with codex exec');
   const valueFlags = new Set(['-c', '--config', '-m', '--model', '--enable', '--disable', '--thread-source']);
@@ -211,6 +221,24 @@ function normalizeCommonArgs(
     if (valueFlags.has(arg)) {
       const value = base.args.at(index + 1);
       if (value === undefined || value.startsWith('-')) throw new Error(`Codex Resident flag ${arg} is missing a value`);
+      if (arg === '--enable' || arg === '--disable') {
+        if (value === 'use_legacy_landlock' || FORCED_DISABLED_FEATURES.some((feature) => feature === value)) {
+          index += 1;
+          continue;
+        }
+      }
+      if (arg === '-c' || arg === '--config') {
+        const key = value.split('=', 1)[0];
+        if (
+          key === 'sandbox_mode' || key === 'approval_policy'
+          || key === 'default_permissions' || key.startsWith('permissions.')
+          || key.startsWith('sandbox_workspace_write.')
+          || key === 'features.use_legacy_landlock'
+          || FORCED_DISABLED_FEATURES.some((feature) => key === `features.${feature}`)
+        ) {
+          throw new Error(`Codex Resident runner cannot override protected config ${key}`);
+        }
+      }
       common.push(arg, value);
       index += 1;
     } else if (arg === '--dangerously-bypass-approvals-and-sandbox') {
@@ -228,37 +256,15 @@ function normalizeCommonArgs(
   if (!common.includes('--ignore-user-config')) common.push('--ignore-user-config');
   if (!common.includes('--strict-config')) common.push('--strict-config');
   common.push(...codexMcpArgs(opts));
-  const orchestratorUrl = base.env.ORCHESTRATOR_URL;
-  let orchestratorHost = '';
-  try {
-    const parsed = new URL(orchestratorUrl);
-    if (
-      !['http:', 'https:'].includes(parsed.protocol)
-      || parsed.username || parsed.password
-      || !parsed.hostname
-      || parsed.hostname.includes('*')
-      || !/^[A-Za-z0-9.:-]+$/.test(parsed.hostname)
-    ) {
-      throw new Error('unsupported control-plane URL');
-    }
-    orchestratorHost = parsed.hostname;
-  } catch {
-    throw new Error('Codex Resident requires an exact HTTP(S) control-plane host');
-  }
   // Append these last so provider translation cannot broaden the Resident.
-  // The named profile inherits a read-only filesystem and permits command
-  // network traffic only to this task's exact Blueprint control-plane host.
-  const filesystemRules: Array<readonly [string, string]> = [[scratchDir, 'write']];
-  const codexHome = childEnv.CODEX_HOME;
-  if (codexHome) filesystemRules.push([codexHome, 'deny']);
+  // Legacy Landlock is deliberately used inside the runner's existing bwrap
+  // boundary: the modern bwrap implementation cannot create a nested user
+  // namespace there. Legacy Landlock accepts the built-in read-only profile;
+  // trusted MCP helpers run separately with only their fixed typed surface.
   common.push(
-    '-c', 'permissions.resident-read-only.extends=":read-only"',
-    '-c', `permissions.resident-read-only.filesystem=${tomlStringMap(filesystemRules)}`,
-    '-c', 'permissions.resident-read-only.network.enabled=true',
-    '-c', 'permissions.resident-read-only.network.mode="limited"',
-    '-c', `permissions.resident-read-only.network.domains=${tomlStringMap([[orchestratorHost, 'allow']])}`,
-    '-c', 'features.network_proxy=true',
-    '-c', 'default_permissions="resident-read-only"',
+    '-s', 'read-only',
+    '--enable', 'use_legacy_landlock',
+    ...FORCED_DISABLED_FEATURES.flatMap((feature) => ['--disable', feature]),
     '-c', 'approval_policy="never"',
     '-c', 'web_search="disabled"',
     '-c', 'tools.web_search=false',
@@ -266,16 +272,7 @@ function normalizeCommonArgs(
     '-c', 'shell_environment_policy.ignore_default_excludes=false',
     '-c', `shell_environment_policy.set.HOME=${tomlString(scratchDir)}`,
   );
-  for (const [envName, envValue] of Object.entries(childEnv)) {
-    if (
-      typeof envValue === 'string'
-      && (envName === 'TMPDIR' || RESIDENT_SHELL_ENV_KEYS.has(envName))
-    ) {
-      common.push(
-        '-c', `shell_environment_policy.set.${safeConfigKey(envName, 'shell environment key')}=${tomlString(envValue)}`,
-      );
-    }
-  }
+  common.push('-c', `shell_environment_policy.set.TMPDIR=${tomlString(scratchDir)}`);
   const developerInstructions = [opts.appendSystemPrompt, CODEX_RESIDENT_BOUNDARY]
     .filter((value): value is string => Boolean(value))
     .join('\n\n');
@@ -296,14 +293,15 @@ function operatorReply(input: unknown): ResidentOperatorReply | null {
   return { content, type };
 }
 
-function strategicAcknowledged(output: unknown): boolean {
-  if (typeof output !== 'string') return false;
-  let parsed: unknown;
-  try { parsed = JSON.parse(output.trim()); } catch { return false; }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
-  const receipt = parsed as Record<string, unknown>;
-  if (receipt.applied === false || receipt.status === 'refused' || receipt.http_status === 409) return false;
-  return receipt.applied === true || receipt.status === 'ok';
+function mcpStrategicAcknowledged(result: unknown): boolean {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
+  const raw = result as Record<string, unknown>;
+  const structured = raw.structured_content ?? raw.structuredContent;
+  if (!structured || typeof structured !== 'object' || Array.isArray(structured)) return false;
+  const receipt = structured as Record<string, unknown>;
+  return receipt.outcome === 'applied'
+    && receipt.applied === true
+    && receipt.commit_acknowledged === true;
 }
 
 function mcpReplyAccepted(result: unknown): boolean {
@@ -377,7 +375,9 @@ export function startResidentCodexSession(
   if ([...REQUIRED_READ_ONLY_TOOLS].some((tool) => !disallowed.has(tool))) {
     throw new Error('Codex Resident requires the complete read-only tool boundary');
   }
-  const workspace = opts.workspace ?? WORKSPACE;
+  const allowedMcpTools = new Set(
+    (opts.replyTool?.allowedTools ?? [opts.replyTool?.toolName ?? RESIDENT_REPLY_TOOL_NAME]),
+  );
   const turnTimeoutMs = opts.turnTimeoutMs ?? DEFAULT_TURN_STALL_MS;
   const hardTurnTimeoutMs = opts.hardTurnTimeoutMs
     ?? Math.max(DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS, turnTimeoutMs + FORCE_SETTLE_MS);
@@ -397,7 +397,7 @@ export function startResidentCodexSession(
   }
   let commonArgs: string[];
   try {
-    commonArgs = normalizeCommonArgs(runnerBase, opts, scratchDir, childEnv);
+    commonArgs = normalizeCommonArgs(runnerBase, opts, scratchDir);
   } catch (error) {
     fs.rmSync(scratchDir, { recursive: true, force: true });
     throw error;
@@ -654,6 +654,28 @@ export function startResidentCodexSession(
       return;
     }
     const mcpTool = typeof item.tool === 'string' ? item.tool : '';
+    const mcpServer = typeof item.server === 'string' ? item.server : '';
+    const fullMcpTool = mcpServer && mcpTool ? `mcp__${mcpServer}__${mcpTool}` : '';
+    const unexpectedLocal = itemType === 'command_execution'
+      || itemType === 'file_change'
+      || itemType === 'web_search'
+      || itemType === 'todo_list';
+    const unexpectedMcp = itemType === 'mcp_tool_call' && !allowedMcpTools.has(fullMcpTool);
+    const unknownItem = !['mcp_tool_call', 'reasoning', 'agent_message'].includes(itemType);
+    if (unexpectedLocal || unexpectedMcp || unknownItem) {
+      if (!turn.providerFailed) {
+        markFailure(
+          turn,
+          unexpectedMcp ? 'unexpected_mcp_tool' : 'unexpected_local_tool',
+          unexpectedMcp ? 'Codex attempted a non-allowlisted MCP tool' : 'Codex attempted a forbidden local tool',
+        );
+      }
+      turn.sentOperatorMessage = false;
+      turn.operatorReply = null;
+      alive = false;
+      beginTermination(turn, 'SIGINT');
+      return;
+    }
     const toolName = itemType === 'command_execution' ? 'Bash'
       : itemType === 'file_change' ? 'apply_patch'
         : itemType === 'mcp_tool_call' ? `MCP:${mcpTool}`
@@ -673,15 +695,15 @@ export function startResidentCodexSession(
       const activityKind = itemType === 'command_execution' ? 'command'
         : itemType === 'file_change' ? 'file' : 'tool';
       emit({ kind: 'tool', toolName, activity: { kind: activityKind, text: toolName } });
-      if (itemType === 'command_execution' && typeof item.command === 'string' && isStrategicMutation(item.command)) {
-        turn.pendingStrategic.add(id);
-      }
-      if (itemType === 'mcp_tool_call') {
+      if (itemType === 'mcp_tool_call' && started) {
         const server = item.server;
         const tool = item.tool;
         if (server === 'workday' && tool === 'reply_to_operator') {
           const reply = operatorReply(item.arguments);
           if (reply) turn.pendingReplies.set(id, reply);
+        }
+        if (server === 'workday' && tool === 'strategic_operation') {
+          turn.pendingStrategic.add(id);
         }
       }
     }
@@ -693,7 +715,12 @@ export function startResidentCodexSession(
     const succeeded = status === 'completed' && (itemType !== 'command_execution' || exitCode === 0);
     trace(turn, 'tool_result', toolName, !succeeded);
     emit({ kind: 'activity', activity: { kind: 'tool_result', text: `${toolName}: ${status || 'completed'}` } });
-    if (turn.pendingStrategic.delete(id) && succeeded && strategicAcknowledged(item.aggregated_output)) {
+    if (
+      turn.pendingStrategic.delete(id)
+      && succeeded
+      && item.error == null
+      && mcpStrategicAcknowledged(item.result)
+    ) {
       turn.appliedStrategicOp = true;
     }
     const reply = turn.pendingReplies.get(id);
@@ -783,7 +810,7 @@ export function startResidentCodexSession(
       ? ['exec', 'resume', ...commonArgs, ...turnImages.flatMap((image) => ['-i', image]), sessionIdValue as string, '-']
       : ['exec', ...commonArgs, ...turnImages.flatMap((image) => ['-i', image]), '-'];
     const child = spawn(runnerBase.command, args, {
-      cwd: workspace,
+      cwd: scratchDir,
       env: childEnv,
       detached: true,
       stdio: ['pipe', 'pipe', 'pipe'],

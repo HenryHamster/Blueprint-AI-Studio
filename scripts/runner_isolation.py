@@ -729,6 +729,14 @@ def detect_gpus() -> tuple[tuple[int, ...], tuple[str, ...]]:
 _LLM_CLI_NAMES: tuple[str, ...] = ("claude", "codex", "gemini")
 MIN_CODEX_CLI_VERSION: tuple[int, int, int] = (0, 150, 1)
 CODEX_RESIDENT_PROFILE_HOME = "/tmp/blueprint-resident-codex-home"
+CODEX_RESIDENT_PROFILE_DENIED = "/tmp/blueprint-resident-profile-denied"
+CODEX_RESIDENT_DISABLED_FEATURES: tuple[str, ...] = (
+    "shell_tool", "unified_exec", "apply_patch_freeform", "apps",
+    "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use",
+    "goals", "hooks", "image_generation", "in_app_browser", "multi_agent", "plugins",
+    "remote_plugin", "skill_mcp_dependency_install", "skill_search", "tool_suggest", "view_image", "auth_elicitation",
+    "tool_call_mcp_elicitation", "code_mode", "code_mode_host",
+)
 CLAUDE_RESIDENT_REQUIRED_FLAGS: frozenset[str] = frozenset(
     {
         "--input-format",
@@ -885,77 +893,62 @@ def _codex_resident_help_args() -> tuple[list[str], list[str]]:
 
 def _codex_resident_profile_args() -> list[str]:
     """Strict, quota-free parse probe for the Resident runtime contract."""
-    return [
-        "app-server",
-        "--strict-config",
-        "--listen",
-        "stdio://",
-        "-c",
-        'permissions.resident-read-only.extends=":read-only"',
-        "-c",
-        f'permissions.resident-read-only.filesystem={{"/tmp/blueprint-resident-profile-probe"="write","{CODEX_RESIDENT_PROFILE_HOME}"="deny"}}',
-        "-c",
-        "permissions.resident-read-only.network.enabled=true",
-        "-c",
-        'permissions.resident-read-only.network.mode="limited"',
-        "-c",
-        'permissions.resident-read-only.network.domains={"blueprint-api"="allow"}',
-        "-c",
-        "features.network_proxy=true",
-        "-c",
-        'default_permissions="resident-read-only"',
-        "-c",
-        'approval_policy="never"',
-        "-c",
-        'web_search="disabled"',
-        "-c",
-        "tools.web_search=false",
-        "-c",
+    config = (
+        'sandbox_mode="read-only"', 'approval_policy="never"',
+        'web_search="disabled"', "tools.web_search=false",
         'shell_environment_policy.inherit="none"',
-        "-c",
         "shell_environment_policy.ignore_default_excludes=false",
-        "-c",
-        'shell_environment_policy.set.HOME="/tmp/blueprint-resident-profile-probe"',
-        "-c",
-        "mcp_servers={}",
-        "-c",
-        'mcp_servers.workday.command="/bin/false"',
-        "-c",
-        "mcp_servers.workday.args=[]",
-        "-c",
-        'mcp_servers.workday.env.RESIDENT_REPLY_RECEIPT_PATH="/tmp/blueprint-resident-profile-probe/receipt.json"',
-        "-c",
-        "mcp_servers.workday.enabled=false",
-        "-c",
-        "mcp_servers.workday.required=true",
-        "-c",
-        'mcp_servers.workday.enabled_tools=["reply_to_operator"]',
-        "-c",
+        f'shell_environment_policy.set.HOME="{CODEX_RESIDENT_PROFILE_HOME}"',
+        "mcp_servers={}", 'mcp_servers.workday.command="/bin/false"', "mcp_servers.workday.args=[]",
+        f'mcp_servers.workday.env.RESIDENT_REPLY_RECEIPT_PATH="{CODEX_RESIDENT_PROFILE_HOME}/receipt.json"',
+        "mcp_servers.workday.enabled=false", "mcp_servers.workday.required=true",
+        'mcp_servers.workday.enabled_tools=["reply_to_operator","strategic_operation","project_read"]',
         'mcp_servers.workday.default_tools_approval_mode="approve"',
+        'mcp_servers.call.command="/bin/false"', "mcp_servers.call.args=[]", "mcp_servers.call.enabled=false", "mcp_servers.call.required=true",
+        'mcp_servers.call.enabled_tools=["emit_call_packet"]', 'mcp_servers.call.default_tools_approval_mode="approve"',
+    )
+    return [
+        "app-server", "--strict-config", "--listen", "stdio://",
+        "--enable", "use_legacy_landlock",
+        *[
+            arg for feature in CODEX_RESIDENT_DISABLED_FEATURES
+            for arg in ("--disable", feature)
+        ],
+        *[arg for value in config for arg in ("-c", value)],
     ]
-
-
+def _codex_resident_landlock_args() -> list[str]:
+    """Execute a quota-free write-boundary canary in the legacy sandbox."""
+    return ["sandbox", "-C", CODEX_RESIDENT_PROFILE_HOME, "-P", ":read-only",
+        "--enable", "use_legacy_landlock", "--", "/bin/sh", "-c",
+        ('set -eu; umask 077; test -d "$1"; test -d "$2"; test -w "$2"; '
+         'if /usr/bin/touch "$1/write-denied" 2>/dev/null; then rm -f "$1/write-denied"; exit 73; fi; '
+         'if /usr/bin/touch "$2/write-denied" 2>/dev/null; then rm -f "$2/write-denied"; exit 74; fi'),
+        "resident-landlock-probe", CODEX_RESIDENT_PROFILE_HOME,
+        CODEX_RESIDENT_PROFILE_DENIED,
+    ]
 def _probe_codex_resident_profile(
     command_prefix: list[str],
     *,
     timeout: float,
     env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess | None, str | None]:
-    try:
-        completed = subprocess.run(
-            [*command_prefix, *_codex_resident_profile_args()],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return None, "profile_probe_timeout"
-    except (OSError, subprocess.SubprocessError):
-        return None, "profile_probe_error"
-    if completed.returncode != 0:
-        return completed, "profile_probe_failed"
+    completed = None
+    probes = (
+        (_codex_resident_profile_args(), "profile_probe", "failed"),
+        (_codex_resident_landlock_args(), "runtime_enforcement", "unavailable"),
+    )
+    for args, reason, failure in probes:
+        try:
+            completed = subprocess.run(
+                [*command_prefix, *args], stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=timeout, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return None, f"{reason}_timeout"
+        except (OSError, subprocess.SubprocessError):
+            return None, f"{reason}_error"
+        if completed.returncode != 0:
+            return completed, f"{reason}_{failure}"
     return completed, None
 
 
@@ -1306,6 +1299,8 @@ def probe_container_llm_clis(
                                         f"HOME={CODEX_RESIDENT_PROFILE_HOME}",
                                         "--tmpfs",
                                         CODEX_RESIDENT_PROFILE_HOME,
+                                        "--tmpfs",
+                                        CODEX_RESIDENT_PROFILE_DENIED,
                                         image,
                                     ],
                                     timeout=20,
@@ -2552,13 +2547,20 @@ def probe_agent_plan_llm_clis(plan: ExecutionPlan) -> dict[str, dict]:
                         and resume_help is not None
                         and resume_help.returncode == 0
                     ):
-                        profile_env = dict(plan.env)
+                        profile_env = {
+                            key: value
+                            for key, value in plan.env.items()
+                            if key in {"PATH", "LANG", "LC_ALL", "TERM"}
+                        }
                         profile_env["CODEX_HOME"] = CODEX_RESIDENT_PROFILE_HOME
                         profile_env["HOME"] = CODEX_RESIDENT_PROFILE_HOME
+                        profile_env["TMPDIR"] = CODEX_RESIDENT_PROFILE_HOME
                         profile_prefix = [
                             *prefix[:-1],
                             "--dir",
                             CODEX_RESIDENT_PROFILE_HOME,
+                            "--dir",
+                            CODEX_RESIDENT_PROFILE_DENIED,
                             "--",
                             executable,
                         ]

@@ -120,6 +120,8 @@ vi.mock('../providers/resident-session.js', () => ({
 }));
 vi.mock('../providers/resident-reply-tool.js', () => ({
   RESIDENT_REPLY_TOOL_NAME: 'mcp__workday__reply_to_operator',
+  RESIDENT_STRATEGIC_TOOL_NAME: 'mcp__workday__strategic_operation',
+  RESIDENT_PROJECT_READ_TOOL_NAME: 'mcp__workday__project_read',
   provisionResidentReplyTool: mockProvisionResidentReplyTool,
 }));
 // Existing Workday tests stub only the native reply MCP path.  The new
@@ -7140,6 +7142,7 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(mockStartSession).toHaveBeenCalledTimes(2);
     // old subprocess was closed before the new one was started
     expect(session1.close).toHaveBeenCalled();
+    expect(session1.waitForIdle).toHaveBeenCalled();
     // recovery session received the prime (compaction checkpoint)
     expect(session2.sendTurn).toHaveBeenCalledTimes(1);
     // helpers were re-provisioned into the recreated checkout (startup + recovery = 2 calls each)
@@ -7147,6 +7150,20 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(mockWriteStrategicHelpers.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(mockWriteArtifactsHelper.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(mockProvisionAmbientHelpers.mock.calls.length).toBeGreaterThanOrEqual(2);
+    const provisionCalls = mockProvisionResidentReplyTool.mock.calls;
+    expect(provisionCalls.length).toBeGreaterThanOrEqual(2);
+    const startupConfig = provisionCalls[provisionCalls.length - 2]?.[1] as {
+      strategic?: Record<string, unknown>;
+    };
+    const recoveryConfig = provisionCalls[provisionCalls.length - 1]?.[1] as {
+      strategic?: Record<string, unknown>;
+    };
+    expect(recoveryConfig.strategic).toEqual(startupConfig.strategic);
+    expect(recoveryConfig.strategic).toMatchObject({
+      helperPath: '/tmp/strategic',
+      readHelperPath: '/tmp/fetch',
+      readVerbs: [],
+    });
   });
 
   it('stops gracefully when the workspace-recovery prime returns processGone', async () => {
