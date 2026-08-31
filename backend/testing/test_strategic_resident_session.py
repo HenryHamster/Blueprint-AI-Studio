@@ -30,7 +30,9 @@ from app.conversation_coordinator import (
     claim_next_workday_consultation_packet,
     claim_operator_messages,
     complete_claimed_public_turn,
+    reset_conversation_claim_for_session_handoff,
 )
+from app.failure_classification import RESIDENT_REPLY_PROTOCOL_FAILURE
 from app.models import (
     LocalRunner,
     MessageHandlingState,
@@ -65,6 +67,7 @@ from app.strategic_resident_session import (
     OPERATOR_DECISION_ABSENT_NOTIFIED_KEY,
     OPERATOR_DECISION_CAPTURE_MIN_SAMPLE,
     RESIDENT_SESSION_KEY,
+    RESIDENT_SESSION_REASON_KEY,
     RESIDENT_TASK_PRIORITY,
     STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
     _OPERATOR_DECISION_SUMMARY_STALE_SECONDS,
@@ -74,6 +77,7 @@ from app.strategic_resident_session import (
     legacy_resident_worker_incarnation,
     new_session_id,
     read_resident_session,
+    reconcile_terminal_resident_worker,
     resident_call_is_active,
     resident_call_snapshot,
     resident_typed_fast_snapshot,
@@ -484,6 +488,181 @@ def _test_session_factory(session):
         class_=AsyncSession,
         expire_on_commit=False,
     )
+
+
+def _conversation_claim_snapshot(message: ProjectMessage) -> tuple:
+    return (
+        message.handling_state,
+        message.handled_by_task_id,
+        message.conversation_claim_id,
+        message.conversation_claim_generation,
+        message.conversation_claim_incarnation,
+        message.conversation_claim_expires_at,
+        message.conversation_claim_attempt,
+        message.resident_session_id,
+        dict(message.context or {}),
+    )
+
+
+async def _make_reply_protocol_failure_with_claim(db_session):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    await persist_strategic_workbench_update(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        {"interaction_mode": "continuous"},
+        sync_local_continuation_marker=False,
+        arm_interaction_mode=False,
+    )
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    task = await db_session.get(Task, uuid.UUID(started["task_id"]))
+    message = ProjectMessage(
+        project_id=project.id,
+        sequence=501,
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="Preserve this exact admitted operator turn.",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+        resident_session_id=started["session_id"],
+    )
+    db_session.add(message)
+    await db_session.commit()
+    incarnation = legacy_resident_worker_incarnation(
+        task.id, started["worker_generation"]
+    )
+    claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id=started["session_id"],
+        task_id=task.id,
+        worker_generation=started["worker_generation"],
+        incarnation_id=incarnation,
+        message_ids=[message.id],
+        lease_seconds=300,
+        canonical_conversation_only=True,
+    )
+    assert claim is not None
+    task.status = TaskStatus.FAILED
+    task.context = {
+        **(task.context or {}),
+        "failure_category": RESIDENT_REPLY_PROTOCOL_FAILURE,
+        "failure_class": "STALE_CACHE_MUST_NOT_WIN",
+    }
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+    await db_session.refresh(message)
+    return project, task, message, started
+
+
+@pytest.mark.asyncio
+async def test_terminal_reconciler_requires_explicit_recovery_after_reply_protocol_failure(
+    db_session, mocker
+):
+    project, task, message, _ = await _make_reply_protocol_failure_with_claim(
+        db_session
+    )
+    claim_before = _conversation_claim_snapshot(message)
+    start = mocker.patch(
+        "app.strategic_resident_session.start_resident_session",
+        new_callable=mocker.AsyncMock,
+    )
+
+    assert await reconcile_terminal_resident_worker(
+        task.id, session_factory=_test_session_factory(db_session)
+    ) is True
+    start.assert_not_awaited()
+    await db_session.refresh(project)
+    await db_session.refresh(message)
+    blob = project.vision[RESIDENT_SESSION_KEY]
+    assert (blob["status"], blob["worker_state"], blob["stop_requested"]) == (
+        "ended", "recovery_required", False
+    )
+    assert project.vision[RESIDENT_SESSION_REASON_KEY]["reason"].startswith(
+        "reply_protocol_failed:"
+    )
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in project.vision
+    assert _conversation_claim_snapshot(message) == claim_before
+
+
+@pytest.mark.asyncio
+async def test_reply_protocol_terminal_does_not_override_chat_mode(
+    db_session, mocker
+):
+    project, task, _, _ = await _make_reply_protocol_failure_with_claim(db_session)
+    await persist_strategic_workbench_update(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        {"interaction_mode": "chat"},
+        sync_local_continuation_marker=False,
+        arm_interaction_mode=False,
+    )
+    start = mocker.patch(
+        "app.strategic_resident_session.start_resident_session",
+        new_callable=mocker.AsyncMock,
+    )
+
+    assert await reconcile_terminal_resident_worker(
+        task.id, session_factory=_test_session_factory(db_session)
+    ) is False
+    start.assert_not_awaited()
+    await db_session.refresh(project)
+    assert project.vision[RESIDENT_SESSION_KEY]["status"] == "active"
+    assert RESIDENT_SESSION_REASON_KEY not in project.vision
+
+
+@pytest.mark.asyncio
+async def test_reply_protocol_recovery_fences_auto_ensure_until_claim_release(
+    db_session,
+):
+    project, task, message, started = await _make_reply_protocol_failure_with_claim(
+        db_session
+    )
+    claim_before = _conversation_claim_snapshot(message)
+
+    with pytest.raises(RuntimeError, match="explicit operator Start"):
+        await start_resident_session(
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            expected_interaction_mode="continuous",
+        )
+    await db_session.refresh(project)
+    await db_session.refresh(message)
+    assert project.vision[RESIDENT_SESSION_KEY]["worker_state"] == "recovery_required"
+    assert _conversation_claim_snapshot(message) == claim_before
+
+    with pytest.raises(HTTPException) as blocked:
+        await start_resident_session(
+            db_session, project, operator_user_id=TEST_USER_ID
+        )
+    assert blocked.value.status_code == 409
+    await db_session.refresh(message)
+    assert _conversation_claim_snapshot(message) == claim_before
+
+    reset_conversation_claim_for_session_handoff(message)
+    message.handling_state = MessageHandlingState.PENDING
+    message.handled_by_task_id = None
+    db_session.add(message)
+    await db_session.commit()
+    await db_session.refresh(project)
+    recovered = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert recovered["session_id"] != started["session_id"]
+    assert recovered["task_id"] != str(task.id)
+    await db_session.refresh(message)
+    assert message.handling_state == MessageHandlingState.PENDING
+    assert message.conversation_claim_id is None
+    assert message.resident_session_id == recovered["session_id"]
 
 
 @pytest.mark.asyncio

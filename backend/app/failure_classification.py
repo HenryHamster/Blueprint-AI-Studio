@@ -494,13 +494,25 @@ UNPLACEABLE_EXECUTION_SITE = "UNPLACEABLE_EXECUTION_SITE"
 # apiece, and all four died ``[CODE_ERROR] Retries exhausted (3/3)``.
 MALFORMED_TASK_PAYLOAD = "MALFORMED_TASK_PAYLOAD"
 
-# Failure classes that a retry can never clear because the cause is a permanent
-# property of the task ROW, not of the attempt.  The agent-status retry gate
-# refuses to re-queue these: the task lands terminal on first detection with a
-# reason instead of burning the whole budget on identical deaths.
+# A Resident consumed the exact admitted operator turn plus its one bounded
+# same-thread delivery correction, but neither produced an authenticated
+# ``reply_to_operator`` receipt. Re-running the entire task would re-admit the
+# same durable operator input, so this is terminal on first report. Recovery is
+# explicit after the canonical conversation-claim release, never an automatic
+# task retry. Kept outside ``INFRA_CLASSES`` so the generic resurrection sweep
+# cannot replay it, but inside the analytics superset because this is a
+# platform delivery-protocol defect rather than agent-authored work failure.
+RESIDENT_REPLY_PROTOCOL_FAILURE = "RESIDENT_REPLY_PROTOCOL_FAILURE"
+
+# Failure classes that a retry can never safely clear because the cause is a
+# permanent task-row property or a replay-unsafe protocol contract. The
+# agent-status retry gate refuses to re-queue these: the task lands terminal on
+# first detection with a truthful reason instead of burning identical VMs or
+# replaying already-admitted durable input.
 NON_RETRYABLE_PLATFORM_CLASSES: frozenset[str] = frozenset(
     {
         MALFORMED_TASK_PAYLOAD,
+        RESIDENT_REPLY_PROTOCOL_FAILURE,
     }
 )
 
@@ -1201,6 +1213,7 @@ INFRA_ANALYTICS_CLASSES: frozenset[str] = INFRA_CLASSES | {
     # OUT of INFRA_CLASSES for the same resurrection reason as the entry above.
     ROLLUP_DELIVERABLE_DROPPED,
     MALFORMED_TASK_PAYLOAD,
+    RESIDENT_REPLY_PROTOCOL_FAILURE,
 }
 
 # ── Infra-resurrection eligibility: ONE predicate, two call sites ────────────
@@ -1340,6 +1353,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     UNPLACEABLE_EXECUTION_SITE,
     ROLLUP_DELIVERABLE_DROPPED,
     MALFORMED_TASK_PAYLOAD,
+    RESIDENT_REPLY_PROTOCOL_FAILURE,
 )
 
 
@@ -1406,9 +1420,10 @@ def classify_failure_taxonomy(task: "Task") -> str:
     # condition, not a code defect — keep it in the infra analytics bucket.
     if base == UNPLACEABLE_EXECUTION_SITE:
         return TAXONOMY_INFRA_RELATED
-    # MALFORMED_TASK_PAYLOAD is likewise outside INFRA_CLASSES (terminal, never
-    # resurrected) but is a spawner/platform defect, not agent-written code.
-    if base == MALFORMED_TASK_PAYLOAD:
+    # These non-retryable protocol/platform classes stay outside INFRA_CLASSES
+    # (so the resurrection sweep cannot replay them) but are platform defects,
+    # not agent-written code.
+    if base in {MALFORMED_TASK_PAYLOAD, RESIDENT_REPLY_PROTOCOL_FAILURE}:
         return TAXONOMY_INFRA_RELATED
     # Migration errors are code defects (the schema is wrong / migration missing),
     # not review-quality or scope issues — route to code_defect bucket directly.
@@ -1648,6 +1663,7 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # this class from the payload itself, because the agent reports only
     # ``fatal`` when its handler rejects a missing required field.
     "malformed_task_payload": MALFORMED_TASK_PAYLOAD,
+    "resident_reply_protocol_failed": RESIDENT_REPLY_PROTOCOL_FAILURE,
 }
 
 
@@ -3299,7 +3315,11 @@ def _classify_failure_class(
                 if any(kw in combined for kw in _VIEWPORT_PATTERNS):
                     return VIEWPORT_REGRESSION
             return mapped
-        if agent_category in INFRA_CLASSES or agent_category == CODE_ERROR:
+        if (
+            agent_category in INFRA_CLASSES
+            or agent_category in NON_RETRYABLE_PLATFORM_CLASSES
+            or agent_category == CODE_ERROR
+        ):
             return agent_category
         # Orchestrator-internal: task auto-failed after too many retry_after cycles
         # because all accounts were rate-limited. Root cause is RATE_LIMIT.

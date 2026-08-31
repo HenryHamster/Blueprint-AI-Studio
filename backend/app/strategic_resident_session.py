@@ -48,7 +48,11 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal, get_session
-from app.failure_classification import ADMIN_CANCEL
+from app.failure_classification import (
+    ADMIN_CANCEL,
+    RESIDENT_REPLY_PROTOCOL_FAILURE,
+    resolved_failure_class,
+)
 from app.knowledge_query import build_strategic_memory_index
 from app.livekit_tokens import (
     LiveKitConfigurationError,
@@ -162,6 +166,7 @@ RESIDENT_SESSION_REASON_KEY = "_resident_strategic_session_reason"
 # mode itself is the on-switch, so there is no global disabled-state reason.
 RESIDENT_SESSION_REASON_NO_RUNNER = "no_runner"
 RESIDENT_SESSION_REASON_START_FAILED_PREFIX = "start_failed"
+RESIDENT_SESSION_REASON_REPLY_PROTOCOL_FAILED = "reply_protocol_failed"
 # Transient block: a batch strategic cycle is already in flight (IN_PROGRESS /
 # EVALUATING) — no adoptable task exists and the spawn guard refuses to create a
 # duplicate. The blocking cycle completes on its own; the strategic_completion
@@ -2820,6 +2825,94 @@ def _task_matches_resident_identity(
     )
 
 
+def _apply_reply_protocol_recovery_hold(
+    vision: dict[str, Any],
+    task: Task | None,
+    *,
+    expected_identity: tuple[str, str, int],
+    now_iso: str,
+) -> bool:
+    """Materialize one exact no-replay terminal while Project→Task locks are held."""
+    current = read_resident_session(vision)
+    session_id, expected_task_id, generation = expected_identity
+    current_identity = (
+        str(current.get("session_id")) if isinstance(current, dict) else "",
+        str(current.get("task_id")) if isinstance(current, dict) else "",
+        int(current.get("worker_generation") or 1) if isinstance(current, dict) else 0,
+    )
+    if (
+        not resident_session_is_active(current)
+        or current_identity != expected_identity
+        or task is None
+        or str(task.id) != expected_task_id
+        or task.status not in _TERMINAL_TASK_STATUSES
+        or not _task_matches_resident_identity(
+            task, session_id=session_id, worker_generation=generation
+        )
+        or resolved_failure_class(task).strip().upper()
+        != RESIDENT_REPLY_PROTOCOL_FAILURE
+    ):
+        return False
+    ended = dict(current)
+    ended.update({
+        "status": STATUS_ENDED,
+        "stop_requested": False,
+        "worker_state": "recovery_required",
+        "updated_at": now_iso,
+        "ended_at": now_iso,
+        "activity": {
+            "phase": "ended",
+            "phase_started_at": now_iso,
+            "last_action": (
+                "Authenticated operator reply delivery failed; explicit recovery required"
+            ),
+            "next_review_at": None,
+        },
+    })
+    vision.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
+    vision[RESIDENT_SESSION_KEY] = ended
+    vision[RESIDENT_SESSION_REASON_KEY] = {
+        "reason": (
+            f"{RESIDENT_SESSION_REASON_REPLY_PROTOCOL_FAILED}: bounded same-thread "
+            "delivery correction exhausted; await canonical claim release before "
+            "explicit recovery"
+        ),
+        "recorded_at": now_iso,
+    }
+    return True
+
+
+async def _reply_protocol_recovery_start_mode(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    predecessor_session_id: str,
+    expected_interaction_mode: str | None,
+) -> str | None:
+    if expected_interaction_mode is not None:
+        return "reply_recovery_required"
+    claimed_predecessor = await session.scalar(
+        select(ProjectMessage.id)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.resident_session_id == predecessor_session_id,
+            ProjectMessage.from_type == "user",
+            ProjectMessage.surface == MessageSurface.CONVERSATION,
+            ProjectMessage.status == "open",
+            or_(
+                ProjectMessage.handling_state == MessageHandlingState.CLAIMED,
+                ProjectMessage.handled_by_task_id.is_not(None),
+                ProjectMessage.conversation_claim_id.is_not(None),
+                ProjectMessage.conversation_claim_generation.is_not(None),
+                ProjectMessage.conversation_claim_incarnation.is_not(None),
+                ProjectMessage.conversation_claim_expires_at.is_not(None),
+            ),
+        )
+        .with_for_update()
+        .limit(1)
+    )
+    return "reply_recovery_claim_held" if claimed_predecessor is not None else None
+
+
 def resident_worker_is_healthy(
     blob: dict[str, Any] | None,
     task: Task | None,
@@ -4076,6 +4169,11 @@ async def start_resident_session(
         reject_active_cold_successor(locked_project.vision)
         vision = dict(locked_project.vision or {})
         fresh = read_resident_session(vision)
+        reply_recovery_hold = bool(
+            isinstance(fresh, dict)
+            and fresh.get("status") == STATUS_ENDED
+            and fresh.get("worker_state") == "recovery_required"
+        )
         if locked_project.archived:
             decision["mode"] = "project_archived"
         elif (
@@ -4107,6 +4205,57 @@ async def start_resident_session(
             )
             if workbench.get("interaction_mode") != expected_interaction_mode:
                 decision["mode"] = "ensure_mode_changed"
+        if decision["mode"] is None and reply_recovery_hold:
+            decision["mode"] = await _reply_protocol_recovery_start_mode(
+                session,
+                project.id,
+                str(fresh.get("session_id") or ""),
+                expected_interaction_mode,
+            )
+        if (
+            decision["mode"] is None
+            and resident_session_is_active(fresh)
+            and fresh.get("task_id")
+        ):
+            # The task terminal commit and its post-commit reconciler are two
+            # separate durable gates. Close that interval under the canonical
+            # Project→Task locks so an ensure cannot supersede the exact task or
+            # reset its still-held operator claim before recovery is materialized.
+            try:
+                recovery_task_id = uuid.UUID(str(fresh.get("task_id")))
+                recovery_generation = int(fresh.get("worker_generation") or 1)
+            except (TypeError, ValueError):
+                recovery_task_id = None
+                recovery_generation = 0
+            if recovery_task_id is not None:
+                recovery_identity = (
+                    str(fresh.get("session_id")),
+                    str(recovery_task_id),
+                    recovery_generation,
+                )
+                async with task_lock(
+                    session, recovery_task_id, skip_locked=False
+                ) as recovery_task:
+                    reply_recovery_hold = _apply_reply_protocol_recovery_hold(
+                        vision,
+                        recovery_task,
+                        expected_identity=recovery_identity,
+                        now_iso=now_iso,
+                    )
+                if reply_recovery_hold:
+                    fresh = read_resident_session(vision)
+                    await with_vision_locked(
+                        session,
+                        project.id,
+                        lambda current_vision: _replace_vision(current_vision, vision),
+                        _locked_project=locked_project,
+                    )
+                    decision["mode"] = await _reply_protocol_recovery_start_mode(
+                        session,
+                        project.id,
+                        recovery_identity[0],
+                        expected_interaction_mode,
+                    )
         if (
             decision["mode"] is None
             and expected_recovery_identity is not None
@@ -4250,6 +4399,8 @@ async def start_resident_session(
             "existing",
             "recovery_superseded",
             "ensure_mode_changed",
+            "reply_recovery_required",
+            "reply_recovery_claim_held",
             "runner_mismatch",
             "project_archived",
             "project_paused",
@@ -4398,6 +4549,18 @@ async def start_resident_session(
     if decision["mode"] == "ensure_mode_changed":
         raise _ResidentEnsureModeChanged(
             "Interaction mode changed before resident ensure committed"
+        )
+    if decision["mode"] == "reply_recovery_required":
+        raise _ResidentEnsureModeChanged(
+            "Resident reply recovery requires an explicit operator Start"
+        )
+    if decision["mode"] == "reply_recovery_claim_held":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Resident reply recovery is waiting for the prior canonical "
+                "conversation claim to be released"
+            ),
         )
     if decision["mode"] == "recovery_superseded":
         raise _ResidentRecoverySuperseded(
@@ -5828,6 +5991,37 @@ async def reconcile_terminal_resident_worker(
             )
             if workbench.get("interaction_mode") != "continuous":
                 return False
+            task_failure_class = resolved_failure_class(task).strip().upper()
+            if task_failure_class == RESIDENT_REPLY_PROTOCOL_FAILURE:
+                handled = False
+                async with project_lock(session, project_id, skip_locked=False) as locked:
+                    if locked is None:
+                        return False
+                    vision = dict(locked.vision or {})
+                    async with task_lock(session, task_uuid, skip_locked=False) as locked_task:
+                        handled = _apply_reply_protocol_recovery_hold(
+                            vision,
+                            locked_task,
+                            expected_identity=expected_identity,
+                            now_iso=_utcnow().isoformat(),
+                        )
+                        if not handled:
+                            return False
+                    await with_vision_locked(
+                        session,
+                        project_id,
+                        lambda current_vision: _replace_vision(current_vision, vision),
+                        _locked_project=locked,
+                    )
+                if handled:
+                    await session.commit()
+                    logger.warning(
+                        "[RESIDENT_SESSION] terminal worker %s requires explicit "
+                        "reply-protocol recovery for project %s; automatic restart suppressed",
+                        task_uuid,
+                        project_id,
+                    )
+                return handled
             runner_id = str(blob.get("runner_id") or "") or None
             await start_resident_session(
                 session,

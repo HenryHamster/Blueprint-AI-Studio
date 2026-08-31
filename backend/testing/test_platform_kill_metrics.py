@@ -22,6 +22,7 @@ from app.failure_classification import (
     CODE_ERROR,
     EXTERNAL_API,
     PROVISION_FAILURE,
+    RESIDENT_REPLY_PROTOCOL_FAILURE,
     SCOPE_EMPTY,
     UNPLACEABLE_EXECUTION_SITE,
 )
@@ -134,7 +135,8 @@ class TestClassifyTerminalTask:
     @pytest.mark.parametrize(
         "cls",
         [PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API, AGENT_STALLED,
-         APPROVED_CAP_PR_CLOSED, UNPLACEABLE_EXECUTION_SITE],
+         APPROVED_CAP_PR_CLOSED, UNPLACEABLE_EXECUTION_SITE,
+         RESIDENT_REPLY_PROTOCOL_FAILURE],
     )
     def test_platform_classes_count_as_kills_with_a_reason(self, cls):
         v = classify_terminal_task(_task({"failure_category": cls}))

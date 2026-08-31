@@ -45,6 +45,7 @@ from app.strategic_resident_session import (
     RESIDENT_SESSION_KEY,
     RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
     RESIDENT_SESSION_REASON_KEY,
+    RESIDENT_SESSION_REASON_REPLY_PROTOCOL_FAILED,
     _enqueue_resident_activation_turn,
     authoritative_resident_session_snapshot,
     reconcile_terminal_resident_worker,
@@ -69,6 +70,35 @@ def test_workday_availability_does_not_consult_removed_global_gate():
         eligible_live_runner_count=1,
         runner_options=[],
     ) == {"available": True, "state": "ready", "reason": None}
+
+
+def test_reply_protocol_recovery_hold_is_never_reported_ready():
+    reason = (
+        f"{RESIDENT_SESSION_REASON_REPLY_PROTOCOL_FAILED}: "
+        "bounded correction exhausted"
+    )
+    project = Project(
+        name="Workday recovery hold",
+        user_id="operator",
+        vision={
+            RESIDENT_SESSION_KEY: {
+                "session_id": str(uuid.uuid4()),
+                "status": "ended",
+                "stop_requested": False,
+                "worker_state": "recovery_required",
+            },
+            RESIDENT_SESSION_REASON_KEY: {
+                "reason": reason,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            },
+        },
+    )
+
+    assert _resident_session_availability(
+        project,
+        eligible_live_runner_count=1,
+        runner_options=[{"id": str(uuid.uuid4()), "online": True, "eligible": True}],
+    ) == {"available": True, "state": "recovery_required", "reason": reason}
 
 
 def test_operator_context_cannot_spoof_hidden_workday_activation_marker():

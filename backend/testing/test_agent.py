@@ -16187,6 +16187,88 @@ async def test_branchless_fix_payload_is_platform_terminal_not_a_retried_code_er
 
 
 @pytest.mark.asyncio
+async def test_resident_reply_protocol_failure_is_terminal_without_backend_retry(
+    client: AsyncClient, db_session, mocker
+):
+    """A failed authenticated reply correction must never replay operator input."""
+    from app.failure_classification import RESIDENT_REPLY_PROTOCOL_FAILURE
+    from app.routers.agent import _terminated_task_ids
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="Resident Reply Protocol",
+        user_id="test-user-resident-reply-protocol",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "runner:resident-reply-protocol"
+    resident_session_id = "resident-reply-protocol-session"
+    task = Task(
+        project_id=project.id,
+        title="Strategic review: reply protocol",
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        created_by="ORCHESTRATOR",
+        context={
+            "_resident_session": True,
+            "_resident_infrastructure": True,
+            "strategic_session_id": resident_session_id,
+            "_resident_worker_generation": 1,
+        },
+    )
+    project.vision = {RESIDENT_SESSION_KEY: {
+        "status": "active", "stop_requested": False,
+        "session_id": resident_session_id, "task_id": str(task.id),
+        "worker_generation": 1,
+    }}
+    db_session.add(project)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    _terminated_task_ids.pop(task_id, None)
+    token = create_agent_token(task_id, vm_id)
+    response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": task_id,
+            "status": "FAILED",
+            "failure_category": "resident_reply_protocol_failed",
+            "logs": (
+                "Resident strategic session ended "
+                "(operator_reply_protocol_failed)."
+            ),
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] != "retrying"
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.FAILED
+    assert task.context["failure_category"] == RESIDENT_REPLY_PROTOCOL_FAILURE
+    assert task.context["failure_class"] == RESIDENT_REPLY_PROTOCOL_FAILURE
+    assert task.attempt_count == 0
+    message = task.latest_status_message or ""
+    assert "not retried" in message.lower()
+    assert "replay" in message.lower()
+    assert "retries exhausted" not in message.lower()
+
+    _terminated_task_ids.pop(task_id, None)
+
+
+@pytest.mark.asyncio
 async def test_postgres_runtime_sentinel_learns_verification_and_declines_runner(
     client: AsyncClient, db_session, mocker
 ):

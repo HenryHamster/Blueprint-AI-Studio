@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import socket
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from typing import NoReturn
 import uuid
 
 
@@ -73,7 +75,7 @@ def start_responses_fixture() -> tuple[ThreadingHTTPServer, threading.Thread, li
         protocol_version = "HTTP/1.1"
 
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
-            if self.path != "/v1/responses" or len(requests) >= 2:
+            if self.path != "/v1/responses" or len(requests) >= 4:
                 self.send_error(404)
                 return
             try:
@@ -86,16 +88,28 @@ def start_responses_fixture() -> tuple[ThreadingHTTPServer, threading.Thread, li
                 self.send_error(400)
                 return
             requests.append(payload)
-            response_id = f"resp_blueprint_preflight_{len(requests)}"
-            item_id = f"msg_blueprint_preflight_{len(requests)}"
+            request_number = len(requests)
+            response_id = f"resp_blueprint_preflight_{request_number}"
             model = str(payload.get("model") or "blueprint-preflight")
-            output = [{
-                "id": item_id, "type": "message", "status": "completed",
-                "role": "assistant", "content": [{
-                    "type": "output_text", "text": "Blueprint preflight turn complete.",
-                    "annotations": [],
-                }],
-            }]
+            logical_turn = (request_number + 1) // 2
+            if request_number % 2 == 1:
+                output = [{
+                    "id": f"fc_blueprint_preflight_{logical_turn}",
+                    "type": "function_call", "status": "completed",
+                    "call_id": f"call_blueprint_preflight_{logical_turn}",
+                    "namespace": "mcp__workday", "name": "project_read",
+                    "arguments": '{"resource":"running-update"}',
+                }]
+            else:
+                output = [{
+                    "id": f"msg_blueprint_preflight_{logical_turn}",
+                    "type": "message", "status": "completed",
+                    "role": "assistant", "content": [{
+                        "type": "output_text",
+                        "text": "Blueprint preflight MCP turn complete.",
+                        "annotations": [],
+                    }],
+                }]
             response = {
                 "id": response_id, "object": "response", "created_at": int(time.time()),
                 "status": "completed", "error": None, "incomplete_details": None,
@@ -108,14 +122,21 @@ def start_responses_fixture() -> tuple[ThreadingHTTPServer, threading.Thread, li
                     "total_tokens": 2,
                 },
             }
-            events = [
-                {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}},
-                {"type": "response.output_item.added", "response_id": response_id,
-                 "output_index": 0, "item": {**output[0], "status": "in_progress", "content": []}},
+            events = [{
+                "type": "response.created",
+                "response": {**response, "status": "in_progress", "output": []},
+            }]
+            if output[0]["type"] == "message":
+                events.append({
+                    "type": "response.output_item.added", "response_id": response_id,
+                    "output_index": 0,
+                    "item": {**output[0], "status": "in_progress", "content": []},
+                })
+            events.extend([
                 {"type": "response.output_item.done", "response_id": response_id,
                  "output_index": 0, "item": output[0]},
                 {"type": "response.completed", "response": response},
-            ]
+            ])
             body = "".join(f"data: {json.dumps(event, separators=(',', ':'))}\n\n" for event in events)
             body += "data: [DONE]\n\n"
             encoded = body.encode()
@@ -136,7 +157,97 @@ def start_responses_fixture() -> tuple[ThreadingHTTPServer, threading.Thread, li
     return server, thread, requests
 
 
-def run_codex_turn(command: list[str], prompt: str, timeout: float) -> tuple[str, str]:
+def validate_responses_mcp_roundtrips(requests: list[dict]) -> None:
+    if len(requests) != 4:
+        abort(f"Codex loopback provider received {len(requests)} requests, expected four")
+    expected_child = {
+        "type": "function",
+        "name": "project_read",
+        "description": (
+            "Read one bounded canonical Blueprint project resource for "
+            "preconditions and post-mutation verification."
+        ),
+        "strict": False,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "resource": {"type": "string", "enum": ["running-update"]},
+                "id": {"type": "string", "minLength": 1, "maxLength": 200},
+            },
+            "required": ["resource"],
+            "additionalProperties": False,
+        },
+    }
+    expected_output_prefix = re.compile(
+        r'^Wall time: [0-9]+\.[0-9]{4} seconds\nOutput:\n'
+    )
+    for logical_turn, offset in enumerate((0, 2), start=1):
+        initial = requests[offset]
+        continuation = requests[offset + 1]
+        namespace_tools = [
+            tool for tool in initial.get("tools", [])
+            if isinstance(tool, dict)
+            and tool.get("type") == "namespace"
+            and tool.get("name") == "mcp__workday"
+        ]
+        if len(namespace_tools) != 1:
+            abort(f"Codex turn {logical_turn} omitted the exact Workday namespace")
+        namespace = namespace_tools[0]
+        if not isinstance(namespace.get("description"), str):
+            abort(f"Codex turn {logical_turn} Workday namespace has no description")
+        children = namespace.get("tools")
+        if not isinstance(children, list) or expected_child not in children:
+            abort(f"Codex turn {logical_turn} exposed the wrong project_read schema")
+        child_names = [
+            child.get("name") for child in children if isinstance(child, dict)
+        ]
+        if (
+            len(child_names) != len(children)
+            or len(set(child_names)) != len(child_names)
+            or set(child_names)
+            != {"reply_to_operator", "strategic_operation", "project_read"}
+        ):
+            abort(f"Codex turn {logical_turn} exposed an unbounded Workday namespace")
+
+        continuation_items = continuation.get("input")
+        if not isinstance(continuation_items, list):
+            abort(f"Codex turn {logical_turn} continuation input is not structured")
+        expected_call_id = f"call_blueprint_preflight_{logical_turn}"
+        calls = [
+            (index, item) for index, item in enumerate(continuation_items)
+            if isinstance(item, dict)
+            and item.get("type") == "function_call"
+            and item.get("call_id") == expected_call_id
+        ]
+        outputs = [
+            (index, item) for index, item in enumerate(continuation_items)
+            if isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and item.get("call_id") == expected_call_id
+        ]
+        if len(calls) != 1 or len(outputs) != 1 or calls[0][0] >= outputs[0][0]:
+            abort(f"Codex turn {logical_turn} did not round-trip one MCP result")
+        call, output = calls[0][1], outputs[0][1]
+        if any((
+            call.get("id") != f"fc_blueprint_preflight_{logical_turn}",
+            call.get("namespace") != "mcp__workday",
+            call.get("name") != "project_read",
+            call.get("arguments") != '{"resource":"running-update"}',
+        )):
+            abort(f"Codex turn {logical_turn} changed the namespaced function call")
+        raw_output = output.get("output")
+        if not isinstance(raw_output, str):
+            abort(f"Codex turn {logical_turn} returned an invalid MCP output receipt")
+        prefix = expected_output_prefix.match(raw_output)
+        try:
+            structured_output = json.loads(raw_output[prefix.end():]) if prefix else None
+        except json.JSONDecodeError:
+            structured_output = None
+        if structured_output != {"resource": "running-update", "bytes": 40}:
+            abort(f"Codex turn {logical_turn} returned an invalid MCP output receipt")
+
+
+def run_codex_turn(command: list[str], prompt: str, timeout: float) -> tuple[str, str, bool]:
     try:
         result = subprocess.run(
             command, input=prompt, capture_output=True, text=True, timeout=timeout,
@@ -168,13 +279,66 @@ def run_codex_turn(command: list[str], prompt: str, timeout: float) -> tuple[str
         abort("Codex exec did not emit one terminal completion")
     if any(event.get("type") == "turn.failed" for event in events):
         abort("Codex exec emitted a failed terminal")
-    if any(item in {"command_execution", "file_change", "web_search", "todo_list", "computer_use"}
+    if any(item not in {"reasoning", "agent_message", "mcp_tool_call", "error"}
            for item in item_types):
         abort("Codex preflight attempted a forbidden local tool")
+    mcp_started = [
+        (index, event["item"]) for index, event in enumerate(events)
+        if event.get("type") == "item.started"
+        and isinstance(event.get("item"), dict)
+        and event["item"].get("type") == "mcp_tool_call"
+    ]
+    mcp_completed = [
+        (index, event["item"]) for index, event in enumerate(events)
+        if event.get("type") == "item.completed"
+        and isinstance(event.get("item"), dict)
+        and event["item"].get("type") == "mcp_tool_call"
+    ]
+    if len(mcp_started) != 1 or len(mcp_completed) != 1:
+        abort("Codex exec did not emit one exact MCP dispatch receipt")
+    started_index, started = mcp_started[0]
+    completed_index, completed = mcp_completed[0]
+    thread_index = next(
+        index for index, event in enumerate(events)
+        if event.get("type") == "thread.started"
+    )
+    terminal_index = next(
+        index for index, event in enumerate(events)
+        if event.get("type") == "turn.completed"
+    )
+    dispatch_id = started.get("id")
+    if (
+        not isinstance(dispatch_id, str)
+        or not dispatch_id
+        or dispatch_id != completed.get("id")
+        or not (thread_index < started_index < completed_index < terminal_index)
+        or started.get("server") != "workday"
+        or started.get("tool") != "project_read"
+        or started.get("arguments") != {"resource": "running-update"}
+        or completed.get("server") != "workday"
+        or completed.get("tool") != "project_read"
+        or completed.get("status") != "completed"
+        or completed.get("error") is not None
+    ):
+        abort("Codex exec emitted the wrong MCP dispatch identity or terminal")
+    result_payload = completed.get("result")
+    if not isinstance(result_payload, dict):
+        abort("Codex exec MCP receipt omitted its structured result")
+    content = result_payload.get("content")
+    if (
+        content != [{
+            "type": "text",
+            "text": '{"markdown": "preflight running update"}',
+        }]
+        or result_payload.get("is_error") is True
+        or result_payload.get("structured_content")
+        != {"resource": "running-update", "bytes": 40}
+    ):
+        abort("Codex exec MCP receipt did not preserve the project_read result")
     unsafe_stderr = ("unshare", "namespace", "failed to setup sandbox", "resident_landlock:")
     if any(marker in result.stderr.lower() for marker in unsafe_stderr):
         abort(f"Codex exec attempted nested sandboxing: {result.stderr[-500:]}")
-    return thread_ids[0], result.stderr
+    return thread_ids[0], result.stderr, True
 
 
 def serve_broker(
@@ -431,6 +595,7 @@ def run_restricted_child(options: argparse.Namespace) -> int:
     codex_exec_turn = False
     codex_resume_turn = False
     exact_thread_identity = False
+    codex_mcp_dispatch = False
     if options.codex:
         responses, responses_thread, response_requests = start_responses_fixture()
         provider_url = f"http://127.0.0.1:{responses.server_port}/v1"
@@ -462,19 +627,27 @@ def run_restricted_child(options: argparse.Namespace) -> int:
             "-c", "shell_environment_policy.ignore_default_excludes=false",
             "-c", f"shell_environment_policy.set.HOME={json.dumps(str(scratch))}",
             "-c", f"shell_environment_policy.set.TMPDIR={json.dumps(str(scratch))}",
-            "-c", 'developer_instructions="Use no local tools. Return the requested preflight text only."',
+            "-c", (
+                'developer_instructions="Use no filesystem or shell tools. '
+                'Call workday.project_read exactly once for running-update, '
+                'then return the requested preflight text."'
+            ),
         ]
         try:
             codex = os.path.realpath(options.codex)
-            thread_id, _ = run_codex_turn(
-                [codex, "exec", *common, "-"], "Return the bounded preflight text.", 10,
+            thread_id, _, exec_mcp = run_codex_turn(
+                [codex, "exec", *common, "-"],
+                "Read running-update once, then return the bounded preflight text.",
+                10,
             )
             codex_exec_turn = True
-            resumed_id, _ = run_codex_turn(
+            resumed_id, _, resume_mcp = run_codex_turn(
                 [codex, "exec", "resume", *common, thread_id, "-"],
-                "Return the bounded resume preflight text.", 10,
+                "Read running-update once, then return the bounded resume preflight text.",
+                10,
             )
             codex_resume_turn = True
+            codex_mcp_dispatch = exec_mcp and resume_mcp
             exact_thread_identity = resumed_id == thread_id
             if not exact_thread_identity:
                 abort("Codex resume changed the exact thread identity")
@@ -482,15 +655,9 @@ def run_restricted_child(options: argparse.Namespace) -> int:
             responses.shutdown()
             responses.server_close()
             responses_thread.join(timeout=1)
-        if responses_thread.is_alive() or len(response_requests) != 2:
-            abort("Codex loopback provider did not receive two bounded turns")
-        for request in response_requests:
-            tool_names = [
-                str(tool.get("name") or tool.get("function", {}).get("name") or "")
-                for tool in request.get("tools", []) if isinstance(tool, dict)
-            ]
-            if "mcp__workday" not in tool_names:
-                abort(f"Codex exec omitted required MCP tools: {tool_names}")
+        if responses_thread.is_alive():
+            abort("Codex loopback provider did not stop")
+        validate_responses_mcp_roundtrips(response_requests)
 
     abi = int(os.environ["BLUEPRINT_RESIDENT_LANDLOCK"].rsplit("abi", 1)[1])
     print(json.dumps({
@@ -508,6 +675,7 @@ def run_restricted_child(options: argparse.Namespace) -> int:
         "thread_identity": exact_thread_identity,
         "jsonl_terminal": codex_exec_turn and codex_resume_turn,
         "loopback_provider": codex_exec_turn and codex_resume_turn,
+        "codex_mcp_dispatch": codex_mcp_dispatch,
         "nested_namespace": False,
     }, separators=(",", ":")))
     return 0

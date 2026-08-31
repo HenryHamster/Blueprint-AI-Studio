@@ -91,6 +91,18 @@ describe('StrategicSessionControl keeps status readout in the utility bar', () =
     expect(screen.getByTitle('Stop Workday session before restarting')).toBeInTheDocument();
     expect(screen.queryByTitle('Start Workday session')).not.toBeInTheDocument();
   });
+
+  test('offers explicit Start for a terminal reply-recovery hold', () => {
+    const onStartSession = vi.fn();
+    render(<StrategicSessionControl currentMode="continuous" sessionActive={false}
+      sessionState="recovery_required" onStartSession={onStartSession} onStopSession={vi.fn()} />);
+
+    const start = screen.getByTitle('Start Workday session');
+    expect(start).toBeInTheDocument();
+    expect(screen.queryByTitle(/Stop Workday session/)).not.toBeInTheDocument();
+    fireEvent.click(start);
+    expect(onStartSession).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('StrategicSessionControl click-to-talk affordance', () => {

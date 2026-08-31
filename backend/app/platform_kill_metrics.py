@@ -132,6 +132,7 @@ from app.failure_classification import (
     RATE_LIMIT,
     REASSIGNED,
     REPO_UNINITIALIZED,
+    RESIDENT_REPLY_PROTOCOL_FAILURE,
     ROLLUP_DELIVERABLE_DROPPED,
     SCOPE_EMPTY,
     SCOPE_OVERFLOW,
@@ -190,6 +191,10 @@ PLATFORM_KILL_CLASSES: Dict[str, str] = {
     MALFORMED_TASK_PAYLOAD: (
         "the spawner wrote a payload the handler cannot run; the task was "
         "unrunnable by construction"
+    ),
+    RESIDENT_REPLY_PROTOCOL_FAILURE: (
+        "the Resident exhausted its one authority-fenced same-thread delivery "
+        "correction without an authenticated operator reply receipt"
     ),
     BRANCH_GONE: (
         "the branch vanished before the clone — a repository-state race"

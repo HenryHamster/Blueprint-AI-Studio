@@ -248,6 +248,14 @@ export function useStrategicSession({
     if (strategicSessionActive && residentStrategicSession?.worker_state === 'retry_wait') return;
     const workerState = residentStrategicSession?.worker_state?.trim().toLowerCase() ?? null;
     const lifecycleState = strategicSessionState?.trim().toLowerCase() ?? null;
+    const lifecycleReason = strategicSessionReason?.trim().toLowerCase() ?? null;
+    // This exact terminal is replay-unsafe: automatic ensure would re-admit the
+    // same durable operator row. Only the explicit operator Start action may
+    // cross this boundary after the canonical claim has been released.
+    if (
+      workerState === 'recovery_required'
+      || lifecycleReason?.startsWith('reply_protocol_failed')
+    ) return;
     const workerTimestamp = parseTimestamp(
       residentStrategicSession?.started_at
       ?? null,
@@ -296,6 +304,13 @@ export function useStrategicSession({
           }).catch(() => undefined);
         }
         const response = await request;
+        const returnedSession = response.session;
+        const returnedWorker = returnedSession?.worker_state?.trim().toLowerCase();
+        if (returnedWorker === 'recovery_required') {
+          strategicWorkdayEnsuredKeysRef.current.add(ensureKey);
+          if (hasCurrentOperateAccess(projectId)) void refreshStrategicReadModel();
+          return;
+        }
         if (response.ensure_outcome === 'mode_changed') {
           if (cancelled || !hasCurrentOperateAccess(projectId)) return;
           const retryDelayMs = Math.min(250 * (2 ** retryAttempt), 10_000);
@@ -308,8 +323,6 @@ export function useStrategicSession({
           return;
         }
         if (cancelled || !hasCurrentOperateAccess(projectId)) return;
-        const returnedSession = response.session;
-        const returnedWorker = returnedSession?.worker_state?.trim().toLowerCase();
         const returnedStatus = returnedSession?.status?.trim().toLowerCase();
         const returnedSessionId = returnedSession?.session_id?.trim();
         const returnedStartedAtValue = returnedSession?.started_at?.trim();
@@ -371,6 +384,7 @@ export function useStrategicSession({
     residentStrategicSession?.status,
     residentStrategicSession?.started_at,
     strategicSessionState,
+    strategicSessionReason,
     strategicSessionSelectedRunnerId,
     refreshStrategicReadModel,
     strategicWorkdayRecoveryTick,
