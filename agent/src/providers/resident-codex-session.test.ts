@@ -240,6 +240,7 @@ describe('startResidentCodexSession', () => {
       && arg.includes('mcp__workday__strategic_operation')
       && arg.includes('replaces ./strategic help/schema')
       && arg.includes('set-running-update sends data')
+      && arg.includes('ordinary assistant text is an undelivered transcript')
     ))).toBe(true);
     expect(firstArgs).not.toContain('resume');
     expect(firstArgs.at(-1)).toBe('-');
@@ -285,6 +286,8 @@ describe('startResidentCodexSession', () => {
 
     const first = session.sendTurn('first turn may omit its native reply');
     await waitForChildCount(children, 1);
+    const firstArgs = vi.mocked(spawn).mock.calls[0][1] as string[];
+    expect(firstArgs).toContain('mcp_servers.workday.omit_tools_from=["deferred"]');
     const firstChild = requiredLatestChild(children);
     firstChild.line({ type: 'thread.started', thread_id: 'thread-corrective-reply' });
     firstChild.line({
@@ -308,6 +311,7 @@ describe('startResidentCodexSession', () => {
     await waitForChildCount(children, 2);
     const secondArgs = vi.mocked(spawn).mock.calls[1][1] as string[];
     expect(secondArgs.slice(-2)).toEqual(['thread-corrective-reply', '-']);
+    expect(secondArgs).toContain('mcp_servers.workday.omit_tools_from=["deferred"]');
     expect(children[1].stdin.end).toHaveBeenCalledWith('deliver only the correction reply');
     const secondChild = requiredLatestChild(children);
     secondChild.line({ type: 'thread.started', thread_id: 'thread-corrective-reply' });
@@ -554,8 +558,10 @@ describe('startResidentCodexSession', () => {
     expect(args.join(' ')).not.toContain('/workspace/staged.json');
     expect(args).toContain('mcp_servers.workday.enabled=true');
     expect(args).toContain('mcp_servers.workday.enabled_tools=["reply_to_operator"]');
+    expect(args).toContain('mcp_servers.workday.omit_tools_from=["deferred"]');
     expect(args).toContain('mcp_servers.call.required=true');
     expect(args).toContain('mcp_servers.call.enabled_tools=["emit_call_packet"]');
+    expect(args).toContain('mcp_servers.call.omit_tools_from=["deferred"]');
     expect(args).toContain('mcp_servers.workday.default_tools_approval_mode="approve"');
     expect(args).toContain('mcp_servers.workday.enabled_tools=["reply_to_operator"]');
 
