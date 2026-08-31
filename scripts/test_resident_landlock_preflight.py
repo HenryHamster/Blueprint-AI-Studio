@@ -1,7 +1,9 @@
 """Focused regressions for the quota-free real-Codex Resident preflight."""
 
 import copy
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -58,7 +60,23 @@ class TestResidentLandlockPreflight(unittest.TestCase):
         self.assertIn('"type":"function_call"', response_bodies[2])
         self.assertIn('"type":"message"', response_bodies[3])
 
-    def test_responses_roundtrip_requires_namespaced_schema_and_exact_mcp_output(self):
+    def test_project_read_keeps_exact_mcp_bounds_before_codex_projection(self):
+        self.assertEqual(
+            PREFLIGHT.PROJECT_READ_DESCRIPTION,
+            "Read one bounded canonical Blueprint project resource for "
+            "preconditions and post-mutation verification.",
+        )
+        self.assertEqual(PREFLIGHT.PROJECT_READ_MCP_INPUT_SCHEMA, {
+            "type": "object",
+            "properties": {
+                "resource": {"type": "string", "enum": ["running-update"]},
+                "id": {"type": "string", "minLength": 1, "maxLength": 200},
+            },
+            "required": ["resource"],
+            "additionalProperties": False,
+        })
+
+    def test_responses_roundtrip_accepts_codex_0150_bounded_schema_projection(self):
         project_read = {
             "type": "function",
             "name": "project_read",
@@ -71,7 +89,10 @@ class TestResidentLandlockPreflight(unittest.TestCase):
                 "type": "object",
                 "properties": {
                     "resource": {"type": "string", "enum": ["running-update"]},
-                    "id": {"type": "string", "minLength": 1, "maxLength": 200},
+                    # codex-cli 0.150.1 projects MCP tools into a Responses
+                    # namespace after dropping string-length annotations. The
+                    # direct MCP discovery contract above remains exact.
+                    "id": {"type": "string"},
                 },
                 "required": ["resource"],
                 "additionalProperties": False,
@@ -111,16 +132,67 @@ class TestResidentLandlockPreflight(unittest.TestCase):
         bad_packets = []
         missing_namespace = copy.deepcopy(requests)
         missing_namespace[1]["input"][0].pop("namespace")
-        bad_packets.append(missing_namespace)
+        bad_packets.append((missing_namespace, "changed the namespaced function call"))
+        unbounded_resource = copy.deepcopy(requests)
+        del unbounded_resource[0]["tools"][0]["tools"][2]["parameters"][
+            "properties"
+        ]["resource"]["enum"]
+        bad_packets.append((unbounded_resource, "wrong project_read schema"))
+        permissive_arguments = copy.deepcopy(requests)
+        permissive_arguments[0]["tools"][0]["tools"][2]["parameters"][
+            "additionalProperties"
+        ] = True
+        bad_packets.append((permissive_arguments, "wrong project_read schema"))
         extra_child = copy.deepcopy(requests)
         extra_child[0]["tools"][0]["tools"].append(
             {"type": "function", "name": "unexpected_tool"}
         )
-        bad_packets.append(extra_child)
-        for packet in bad_packets:
-            with self.assertRaises(SystemExit) as raised:
+        bad_packets.append((extra_child, "unbounded Workday namespace"))
+        for packet, diagnostic in bad_packets:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), self.assertRaises(
+                SystemExit
+            ) as raised:
                 PREFLIGHT.validate_responses_mcp_roundtrips(packet)
             self.assertEqual(raised.exception.code, 126)
+            self.assertIn(diagnostic, stderr.getvalue())
+
+    def test_responses_schema_mismatch_diagnostic_is_useful_and_bounded(self):
+        project_read = {
+            "type": "function",
+            "name": "project_read",
+            "description": "x" * 5000,
+            "strict": False,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "resource": {"type": "string", "enum": ["running-update"]},
+                    "id": {"type": "string"},
+                },
+                "required": ["resource"],
+                "additionalProperties": False,
+            },
+        }
+        initial = {"tools": [{
+            "type": "namespace", "name": "mcp__workday",
+            "description": "Workday", "tools": [
+                {"type": "function", "name": "reply_to_operator"},
+                {"type": "function", "name": "strategic_operation"},
+                project_read,
+            ],
+        }]}
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(
+            SystemExit
+        ) as raised:
+            PREFLIGHT.validate_responses_mcp_roundtrips([initial, {}, initial, {}])
+        self.assertEqual(raised.exception.code, 126)
+        diagnostic = stderr.getvalue()
+        self.assertIn("wrong project_read schema", diagnostic)
+        self.assertIn("expected=", diagnostic)
+        self.assertIn("actual=", diagnostic)
+        self.assertIn("[truncated", diagnostic)
+        self.assertLess(len(diagnostic), 2500)
 
     def test_jsonl_transport_diagnostics_do_not_replace_terminal_authority(self):
         stdout = "\n".join(json.dumps(event) for event in (
