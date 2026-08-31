@@ -32,10 +32,13 @@ def clean_runtime_pool():
     _account_by_id.update(orig_by_id)
 
 
-def _task(*, context=None):
+def _task(*, context=None, resident: bool = True):
+    task_context = dict(context or {})
+    if resident:
+        task_context["_resident_session"] = True
     return SimpleNamespace(
         payloads=[{"type": "strategic_review", "quality_tier": "opus"}],
-        context=context or {},
+        context=task_context,
     )
 
 
@@ -122,7 +125,7 @@ async def test_strategic_runtime_global_usage_precedence_prefers_fresh_known(
     assert result is not None
     assert (result.provider, result.model, result.account_id) == (
         "openai",
-        "gpt-5.6-sol",
+        "gpt-5.5",
         "codex-18",
     )
     assert healthy_codex["active_tasks"] == 1
@@ -350,3 +353,28 @@ async def test_strategic_usage_precedence_does_not_widen_exact_route(
     )
     assert exact_codex["active_tasks"] == 1
     assert alternate_claude["active_tasks"] == 0
+
+
+@pytest.mark.asyncio
+async def test_openai_compatibility_override_is_resident_only(clean_runtime_pool):
+    now = _utcnow()
+    codex = _runtime_account("codex-ordinary-review", "openai")
+    codex.update(
+        usage_snapshot=_known_usage(18.0, now), usage_snapshot_at=now
+    )
+    _register(codex)
+    config = _config()
+    config["task_type_provider_preference"]["strategic_review"] = ["openai"]
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=_task(resident=False),
+        runtime_config=config,
+    )
+
+    assert result is not None
+    assert (result.provider, result.model, result.account_id) == (
+        "openai",
+        "gpt-5.6-sol",
+        "codex-ordinary-review",
+    )
