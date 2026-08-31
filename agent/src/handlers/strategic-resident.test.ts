@@ -5365,6 +5365,9 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
 
     expect(workday.sendTurn).toHaveBeenCalledTimes(1);
     expect(sentPrompts[0]).toContain('private, durable typed-Fast consultation');
+    expect(sentPrompts[0]).toContain(
+      'request-qualification is available in this receipt-bound private turn',
+    );
     expect(sentPrompts[0]).toContain('Inspect the repository without blocking Fast.');
     expect(sentPrompts[0]).not.toContain('# Resident session state —');
     expect(capabilityRevokedAtTurnStart).toBe(true);

@@ -19,7 +19,7 @@ def main() -> int:
         payload = json.loads(sys.argv[3])
         print(json.dumps({"status": "ok", "applied": True, "payload": payload}))
         return 0
-    if not sys.argv[1:] or sys.argv[1] != "running_update":
+    if not sys.argv[1:] or sys.argv[1] != "running-update":
         raise SystemExit("invalid project-read helper arguments")
     print(json.dumps({"markdown": "preflight running update"}))
     return 0

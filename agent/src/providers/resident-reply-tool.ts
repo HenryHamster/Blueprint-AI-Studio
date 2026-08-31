@@ -64,6 +64,8 @@ export function provisionResidentReplyTool(
         backend_op: entry.op,
         required: input.required ?? [],
         fields: input.fields ?? [],
+        requirements: input.requirements ?? [],
+        ...(input.example ? { example: input.example } : {}),
       }];
       }));
     fs.writeFileSync(opsPath, JSON.stringify(contracts), { encoding: 'utf8', mode: 0o600 });

@@ -198,10 +198,68 @@ describe('Resident Workday reply MCP tool', () => {
       expect((responses[0].result as { tools: Array<{ name: string }> }).tools.map(({ name }) => name))
         .toEqual(['reply_to_operator', 'strategic_operation', 'project_read']);
       const strategicDefinition = (responses[0].result as {
-        tools: Array<{ name: string; inputSchema: { properties: { operation: { enum: string[] } } } }>;
+        tools: Array<{ name: string; inputSchema: { properties: {
+          operation: { enum: string[] }; data: { description: string };
+        } } }>;
       }).tools.find(({ name }) => name === 'strategic_operation');
       expect(strategicDefinition?.inputSchema.properties.operation.enum).not.toContain('create-message');
       expect(strategicDefinition?.inputSchema.properties.operation.enum).not.toContain('resolve-message');
+      const contractMarker = 'contract-json=';
+      const contractDescription = strategicDefinition?.inputSchema.properties.data.description ?? '';
+      const contractOffset = contractDescription.indexOf(contractMarker);
+      expect(contractOffset).toBeGreaterThanOrEqual(0);
+      const advertisedContracts = JSON.parse(contractDescription.slice(contractOffset + contractMarker.length)) as Record<
+        string, { required: string[]; fields: string[]; requirements: string[]; example: Record<string, unknown> }
+      >;
+      expect(advertisedContracts).toMatchObject({
+        'spawn-task': {
+          required: ['type', 'title'],
+          fields: expect.arrayContaining(['prompt', 'direction_id', 'criterion_ids', 'depends_on']),
+          requirements: expect.arrayContaining([
+            expect.stringContaining('prompt must be a non-empty string'),
+            expect.stringContaining('criteria inherited from direction_id'),
+            expect.stringContaining('test_path'),
+          ]),
+          example: {
+            acceptance_evidence: {
+              kind: 'named_test',
+              test_path: expect.any(String),
+            },
+          },
+        },
+        'set-running-update': { required: ['markdown'], fields: ['markdown'] },
+        'set-memory': {
+          required: [],
+          fields: expect.arrayContaining(['body']),
+          requirements: expect.arrayContaining([expect.stringContaining('body or note')]),
+        },
+        'set-acceptance-criteria': {
+          required: [],
+          fields: ['criteria', 'retract'],
+          requirements: expect.arrayContaining([
+            expect.stringContaining('direction_keys'),
+            expect.stringContaining('expected_text'),
+            expect.stringContaining('operator_authored_commits'),
+            expect.stringContaining('must omit direction_keys'),
+          ]),
+          example: {
+            criteria: [{
+              text: expect.any(String),
+              evidence_contract: {
+                type: 'operator_authored_commits',
+                predicate: { max_count: 0 },
+              },
+            }],
+          },
+        },
+        'request-qualification': {
+          required: [],
+          fields: ['reason', 'probes'],
+          requirements: expect.arrayContaining([expect.stringContaining('omit probes')]),
+          example: { reason: expect.any(String) },
+        },
+      });
+      expect(advertisedContracts['request-qualification'].example).not.toHaveProperty('probes');
       const strategic = (responses[1].result as {
         structuredContent: { applied: boolean; commit_acknowledged: boolean; receipt_confirmed: boolean; operation_fingerprint: string; response: {
           args: string[]; env: Record<string, string>; leaked: string[];

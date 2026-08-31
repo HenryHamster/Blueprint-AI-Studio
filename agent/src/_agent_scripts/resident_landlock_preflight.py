@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
-import select
 import shutil
 import signal
 import socket
@@ -22,6 +22,14 @@ import uuid
 MARKER_KIND = "blueprint.resident_landlock_preflight.v1"
 SYSTEM_READONLY_ROOTS = (
     "/usr", "/usr/local", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/etc",
+)
+CODEX_DISABLED_FEATURES = (
+    "shell_tool", "unified_exec", "apply_patch_freeform", "apps", "browser_use",
+    "browser_use_external", "browser_use_full_cdp_access", "computer_use", "goals",
+    "hooks", "image_generation", "in_app_browser", "multi_agent", "plugins",
+    "remote_plugin", "skill_mcp_dependency_install", "skill_search", "tool_suggest",
+    "view_image", "auth_elicitation", "tool_call_mcp_elicitation", "code_mode",
+    "code_mode_host",
 )
 
 
@@ -56,6 +64,117 @@ def stop_process_group(process: subprocess.Popen, grace: float = 0.5) -> None:
     except ProcessLookupError:
         pass
     process.wait(timeout=2)
+
+
+def start_responses_fixture() -> tuple[ThreadingHTTPServer, threading.Thread, list[dict]]:
+    requests: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            if self.path != "/v1/responses" or len(requests) >= 2:
+                self.send_error(404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length))
+            except (ValueError, json.JSONDecodeError):
+                self.send_error(400)
+                return
+            if not isinstance(payload, dict) or payload.get("stream") is not True:
+                self.send_error(400)
+                return
+            requests.append(payload)
+            response_id = f"resp_blueprint_preflight_{len(requests)}"
+            item_id = f"msg_blueprint_preflight_{len(requests)}"
+            model = str(payload.get("model") or "blueprint-preflight")
+            output = [{
+                "id": item_id, "type": "message", "status": "completed",
+                "role": "assistant", "content": [{
+                    "type": "output_text", "text": "Blueprint preflight turn complete.",
+                    "annotations": [],
+                }],
+            }]
+            response = {
+                "id": response_id, "object": "response", "created_at": int(time.time()),
+                "status": "completed", "error": None, "incomplete_details": None,
+                "instructions": None, "model": model, "output": output,
+                "parallel_tool_calls": False, "temperature": None,
+                "tool_choice": "auto", "tools": [], "top_p": None,
+                "usage": {
+                    "input_tokens": 1, "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": 2,
+                },
+            }
+            events = [
+                {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}},
+                {"type": "response.output_item.added", "response_id": response_id,
+                 "output_index": 0, "item": {**output[0], "status": "in_progress", "content": []}},
+                {"type": "response.output_item.done", "response_id": response_id,
+                 "output_index": 0, "item": output[0]},
+                {"type": "response.completed", "response": response},
+            ]
+            body = "".join(f"data: {json.dumps(event, separators=(',', ':'))}\n\n" for event in events)
+            body += "data: [DONE]\n\n"
+            encoded = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(encoded)
+            self.close_connection = True
+
+        def log_message(self, _format: str, *_args) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, requests
+
+
+def run_codex_turn(command: list[str], prompt: str, timeout: float) -> tuple[str, str]:
+    try:
+        result = subprocess.run(
+            command, input=prompt, capture_output=True, text=True, timeout=timeout,
+            env={
+                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "HOME": os.environ["HOME"], "TMPDIR": os.environ["TMPDIR"],
+                "CODEX_HOME": os.environ["CODEX_HOME"],
+                "BLUEPRINT_CODEX_PREFLIGHT_TOKEN": "quota-free-loopback-sentinel",
+            },
+        )
+    except subprocess.TimeoutExpired as error:
+        stderr = (error.stderr or b"") if isinstance(error.stderr, bytes) else (error.stderr or "")
+        abort(f"Codex exec exceeded its bounded timeout: {str(stderr)[-500:]}")
+    if result.returncode != 0:
+        abort(f"Codex exec failed rc={result.returncode}: {result.stderr[-500:]}")
+    try:
+        events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    except json.JSONDecodeError:
+        abort("Codex exec emitted invalid JSONL")
+    thread_ids = [event.get("thread_id") for event in events if event.get("type") == "thread.started"]
+    item_types = [
+        event.get("item", {}).get("type") for event in events
+        if event.get("type") in {"item.started", "item.updated", "item.completed"}
+        and isinstance(event.get("item"), dict)
+    ]
+    if len(thread_ids) != 1 or not isinstance(thread_ids[0], str) or not thread_ids[0]:
+        abort("Codex exec did not emit one exact thread receipt")
+    if sum(event.get("type") == "turn.completed" for event in events) != 1:
+        abort("Codex exec did not emit one terminal completion")
+    if any(event.get("type") == "turn.failed" for event in events):
+        abort("Codex exec emitted a failed terminal")
+    if any(item in {"command_execution", "file_change", "web_search", "todo_list", "computer_use"}
+           for item in item_types):
+        abort("Codex preflight attempted a forbidden local tool")
+    unsafe_stderr = ("unshare", "namespace", "failed to setup sandbox", "resident_landlock:")
+    if any(marker in result.stderr.lower() for marker in unsafe_stderr):
+        abort(f"Codex exec attempted nested sandboxing: {result.stderr[-500:]}")
+    return thread_ids[0], result.stderr
 
 
 def serve_broker(
@@ -216,7 +335,7 @@ def run_restricted_child(options: argparse.Namespace) -> int:
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
-            "name": "project_read", "arguments": {"resource": "running_update"},
+            "name": "project_read", "arguments": {"resource": "running-update"},
         }},
         {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
             "name": "strategic_operation", "arguments": {
@@ -258,9 +377,34 @@ def run_restricted_child(options: argparse.Namespace) -> int:
         "reply_to_operator", "strategic_operation", "project_read",
     ]:
         abort("MCP three-tool contract was not exposed")
+    strategic_tool = next(
+        (tool for tool in tools if tool.get("name") == "strategic_operation"),
+        None,
+    )
+    contract_marker = "contract-json="
+    contract_description = (
+        strategic_tool.get("inputSchema", {})
+        .get("properties", {})
+        .get("data", {})
+        .get("description", "")
+    ) if isinstance(strategic_tool, dict) else ""
+    try:
+        contract_offset = contract_description.index(contract_marker)
+        advertised_contracts = json.loads(
+            contract_description[contract_offset + len(contract_marker):]
+        )
+    except (ValueError, TypeError, json.JSONDecodeError):
+        abort("MCP strategic discovery contract is invalid")
+    if advertised_contracts.get("set-running-update") != {
+        "required": ["markdown"],
+        "fields": ["markdown"],
+        "requirements": ["markdown must be a string."],
+        "example": {"markdown": "# Current status\n..."},
+    }:
+        abort("MCP strategic discovery contract is incomplete")
     expected_project = json.dumps({"markdown": "preflight running update"})
     if (
-        project_read.get("resource") != "running_update"
+        project_read.get("resource") != "running-update"
         or project_read.get("bytes") != len(expected_project.encode())
         or project_text != expected_project
     ):
@@ -284,14 +428,29 @@ def run_restricted_child(options: argparse.Namespace) -> int:
     if "credential sentinel" in mcp.stdout or "credential sentinel" in mcp.stderr:
         abort("MCP broker exposed credential bytes to the restricted child")
 
-    codex_started = False
+    codex_exec_turn = False
+    codex_resume_turn = False
+    exact_thread_identity = False
     if options.codex:
-        command = [
-            os.path.realpath(options.codex),
-            "app-server", "--strict-config", "--listen", "stdio://",
+        responses, responses_thread, response_requests = start_responses_fixture()
+        provider_url = f"http://127.0.0.1:{responses.server_port}/v1"
+        common = [
+            "--json", "--skip-git-repo-check", "--ignore-user-config", "--strict-config",
+            "--dangerously-bypass-approvals-and-sandbox",
+            *(part for feature in CODEX_DISABLED_FEATURES for part in ("--disable", feature)),
+            "-m", "blueprint-preflight",
             "-c", 'approval_policy="never"',
             "-c", 'web_search="disabled"',
             "-c", "tools.web_search=false",
+            "-c", 'model_provider="blueprint_preflight"',
+            "-c", 'model_providers.blueprint_preflight.name="Blueprint preflight"',
+            "-c", f"model_providers.blueprint_preflight.base_url={json.dumps(provider_url)}",
+            "-c", 'model_providers.blueprint_preflight.env_key="BLUEPRINT_CODEX_PREFLIGHT_TOKEN"',
+            "-c", 'model_providers.blueprint_preflight.wire_api="responses"',
+            "-c", "model_providers.blueprint_preflight.requires_openai_auth=false",
+            "-c", "model_providers.blueprint_preflight.supports_websockets=false",
+            "-c", "model_providers.blueprint_preflight.request_max_retries=0",
+            "-c", "model_providers.blueprint_preflight.stream_max_retries=0",
             "-c", "mcp_servers={}",
             "-c", f"mcp_servers.workday.command={json.dumps(node)}",
             "-c", "mcp_servers.workday.args=" + json.dumps([str(socket_client), str(socket_path)], separators=(",", ":")),
@@ -299,56 +458,39 @@ def run_restricted_child(options: argparse.Namespace) -> int:
             "-c", "mcp_servers.workday.required=true",
             "-c", 'mcp_servers.workday.enabled_tools=["reply_to_operator","strategic_operation","project_read"]',
             "-c", 'mcp_servers.workday.default_tools_approval_mode="approve"',
+            "-c", 'shell_environment_policy.inherit="none"',
+            "-c", "shell_environment_policy.ignore_default_excludes=false",
+            "-c", f"shell_environment_policy.set.HOME={json.dumps(str(scratch))}",
+            "-c", f"shell_environment_policy.set.TMPDIR={json.dumps(str(scratch))}",
+            "-c", 'developer_instructions="Use no local tools. Return the requested preflight text only."',
         ]
-        child = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-            env={
-                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-                "HOME": str(scratch),
-                "TMPDIR": str(scratch),
-                "CODEX_HOME": str(scratch / "codex-home"),
-            },
-        )
         try:
-            child.stdin.write(json.dumps({
-                "method": "initialize", "id": 1,
-                "params": {
-                    "clientInfo": {
-                        "name": "blueprint_agent", "title": "Blueprint Agent", "version": "2.0.0",
-                    },
-                    "capabilities": {"experimentalApi": True},
-                },
-            }) + "\n")
-            child.stdin.write(json.dumps({"method": "initialized", "params": {}}) + "\n")
-            child.stdin.flush()
-            deadline = time.monotonic() + 3
-            initialized = False
-            while time.monotonic() < deadline:
-                readable, _, _ = select.select([child.stdout], [], [], deadline - time.monotonic())
-                if not readable:
-                    break
-                line = child.stdout.readline()
-                if not line:
-                    break
-                message = json.loads(line)
-                if message.get("id") == 1:
-                    if message.get("error") is not None or "result" not in message:
-                        abort("Codex app-server initialize returned an error")
-                    initialized = True
-                    break
-            if not initialized:
-                abort("Codex app-server did not complete initialization")
+            codex = os.path.realpath(options.codex)
+            thread_id, _ = run_codex_turn(
+                [codex, "exec", *common, "-"], "Return the bounded preflight text.", 10,
+            )
+            codex_exec_turn = True
+            resumed_id, _ = run_codex_turn(
+                [codex, "exec", "resume", *common, thread_id, "-"],
+                "Return the bounded resume preflight text.", 10,
+            )
+            codex_resume_turn = True
+            exact_thread_identity = resumed_id == thread_id
+            if not exact_thread_identity:
+                abort("Codex resume changed the exact thread identity")
         finally:
-            stop_process_group(child)
-            child.stdin.close()
-            child.stdout.close()
-            child.stderr.close()
-        codex_started = True
+            responses.shutdown()
+            responses.server_close()
+            responses_thread.join(timeout=1)
+        if responses_thread.is_alive() or len(response_requests) != 2:
+            abort("Codex loopback provider did not receive two bounded turns")
+        for request in response_requests:
+            tool_names = [
+                str(tool.get("name") or tool.get("function", {}).get("name") or "")
+                for tool in request.get("tools", []) if isinstance(tool, dict)
+            ]
+            if "mcp__workday" not in tool_names:
+                abort(f"Codex exec omitted required MCP tools: {tool_names}")
 
     abi = int(os.environ["BLUEPRINT_RESIDENT_LANDLOCK"].rsplit("abi", 1)[1])
     print(json.dumps({
@@ -356,11 +498,16 @@ def run_restricted_child(options: argparse.Namespace) -> int:
         "abi": abi,
         "filesystem": True,
         "mcp": True,
-        "codex_config": codex_started,
+        "codex_config": codex_exec_turn,
         "broker_transport": True,
         "credential_isolated": True,
         "three_tool_mcp": True,
-        "codex_proxy_config": codex_started,
+        "codex_proxy_config": codex_exec_turn,
+        "codex_exec_turn": codex_exec_turn,
+        "codex_resume_turn": codex_resume_turn,
+        "thread_identity": exact_thread_identity,
+        "jsonl_terminal": codex_exec_turn and codex_resume_turn,
+        "loopback_provider": codex_exec_turn and codex_resume_turn,
         "nested_namespace": False,
     }, separators=(",", ":")))
     return 0
@@ -406,13 +553,15 @@ def controller(options: argparse.Namespace) -> int:
     strategic_ops = authority_state / "strategic-ops.json"
     strategic_ops.write_text(json.dumps({
         "set-running-update": {
-            "backend_op": "set-running-update",
+            "backend_op": "set_running_update",
             "required": ["markdown"],
             "fields": ["markdown"],
+            "requirements": ["markdown must be a string."],
+            "example": {"markdown": "# Current status\n..."},
         },
     }), encoding="utf-8")
     project_reads = authority_state / "project-reads.json"
-    project_reads.write_text(json.dumps(["running_update"]), encoding="utf-8")
+    project_reads.write_text(json.dumps(["running-update"]), encoding="utf-8")
     private_marker = authority_state / "private-turn.json"
     private_marker.write_text(json.dumps({
         "kind": "typed-consultation",
@@ -540,9 +689,9 @@ def controller(options: argparse.Namespace) -> int:
     if result.returncode != 0:
         sys.stderr.write(result.stderr[-2000:])
         return result.returncode
-    # app-server parses the exact proxy config during initialize but opens MCP
-    # lazily on a model turn; the quota-free direct client owns this connection.
-    if broker_metrics != {"connections": 1, "active": 0}:
+    # One direct tool-contract client plus each real Codex exec process must
+    # initialize the required MCP server, and every connection must drain.
+    if broker_metrics != {"connections": 3, "active": 0}:
         abort(f"private MCP broker teardown receipt is invalid: {broker_metrics}")
     staged_reply = json.loads(staged.read_text(encoding="utf-8"))
     if staged_reply != {

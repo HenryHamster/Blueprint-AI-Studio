@@ -158,6 +158,17 @@ function replyToolDefinition() {
 }
 
 function strategicToolDefinition(ops) {
+  const contracts = Object.fromEntries(Object.entries(ops).map(([operation, contract]) => [
+    operation,
+    {
+      required: Array.isArray(contract.required) ? contract.required : [],
+      fields: Array.isArray(contract.fields) ? contract.fields : [],
+      requirements: Array.isArray(contract.requirements) ? contract.requirements : [],
+      example: contract.example && typeof contract.example === 'object' && !Array.isArray(contract.example)
+        ? contract.example
+        : {},
+    },
+  ]));
   return {
     name: STRATEGIC_TOOL,
     description: 'Apply one exact Blueprint strategic operation. Use a stable idempotency_key and retry only byte-identical ambiguous calls.',
@@ -165,7 +176,10 @@ function strategicToolDefinition(ops) {
       type: 'object',
       properties: {
         operation: { type: 'string', enum: Object.keys(ops) },
-        data: { type: 'object', description: 'The canonical JSON body for the selected operation.' },
+        data: {
+          type: 'object',
+          description: `Canonical JSON discovery contracts by operation. required lists unconditional required top-level fields; fields lists MCP-supported top-level fields; requirements lists conditional or nested rules; example is a valid data object. contract-json=${JSON.stringify(contracts)}`,
+        },
         idempotency_key: { type: 'string', minLength: 1, maxLength: 128 },
       },
       required: ['operation', 'data', 'idempotency_key'],
