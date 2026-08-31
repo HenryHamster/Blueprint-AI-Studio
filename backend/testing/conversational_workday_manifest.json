@@ -516,9 +516,9 @@
     },
     {
       "path": "scripts/test_resident_landlock_preflight.py",
-      "reason": "Protects the quota-free production-shaped Codex exec/resume preflight: four-request Responses namespace/function-call continuations, exact successful Workday MCP JSONL dispatch receipts, terminal authority, and fail-closed denial of native or unknown local tools.",
+      "reason": "Protects the quota-free production-shaped Codex exec/resume preflight: six-request Responses continuations covering project_read followed by an accepted native reply_to_operator on each turn, exact Workday MCP JSONL dispatch receipts, terminal authority, and fail-closed denial of native or unknown local tools.",
       "test_ids": [
-        "TestResidentLandlockPreflight::test_loopback_responses_fixture_serves_two_tool_call_continuation_pairs",
+        "TestResidentLandlockPreflight::test_loopback_fixture_serves_project_read_then_native_reply_for_exec_and_resume",
         "TestResidentLandlockPreflight::test_project_read_keeps_exact_mcp_bounds_before_codex_projection",
         "TestResidentLandlockPreflight::test_responses_roundtrip_accepts_codex_0150_bounded_schema_projection",
         "TestResidentLandlockPreflight::test_responses_schema_mismatch_diagnostic_is_useful_and_bounded",
