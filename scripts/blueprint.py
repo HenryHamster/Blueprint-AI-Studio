@@ -11834,7 +11834,7 @@ def _execute_deploy(
     *,
     inplace: bool = False,
 ) -> None:
-    """Execute the shim, then post the receipt as a distinct stage."""
+    """Execute the shim, then preserve or post the compatible receipt stage."""
     project_id = get_project_id(getattr(args, "project_id", None))
     operation_id = _deploy_operation_id(
         project_id, promoted, digest=digest, revision=revision
@@ -11862,7 +11862,7 @@ def _execute_deploy(
     if inplace:
         _require_local_served_revision(revision)
     print("Release activated. Runners self-update on their next heartbeat.")
-    _post_activation_receipt(args, promoted, revision)
+    _post_compatible_activation_receipt(args, promoted, revision)
 
 
 def _read_live_approved_activation(args: argparse.Namespace) -> dict | None:
@@ -12776,6 +12776,31 @@ def _post_activation_receipt(
         print(f"  Receipt:   recorded for v{promoted.get('version_number')}")
 
 
+def _post_compatible_activation_receipt(
+    args: argparse.Namespace,
+    promoted: dict | None,
+    revision: str,
+) -> bool:
+    """Preserve an older immutable manual receipt for a build-ahead deploy."""
+    served_sha = None if promoted is None else promoted.get("served_sha")
+    if (
+        promoted is not None
+        and not promoted.get("activation_requested_at")
+        and isinstance(served_sha, str)
+        and _DEPLOY_REVISION_RE.fullmatch(served_sha)
+        and served_sha != revision
+    ):
+        print(
+            f"WARNING: v{promoted.get('version_number')} immutable historical "
+            f"receipt remains unchanged at {served_sha}; exact build-ahead "
+            f"revision {revision} is deployed. No version receipt was posted.",
+            file=sys.stderr,
+        )
+        return False
+    _post_activation_receipt(args, promoted, revision)
+    return True
+
+
 def cmd_deploy(args: argparse.Namespace) -> None:
     """Activate the newest CI-built main release on the local control plane.
 
@@ -12828,7 +12853,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             raise APIError("exact root activation receipt was not observed")
         if args.local:
             _require_local_served_revision(revision)
-        _post_activation_receipt(args, promoted, revision)
+        _post_compatible_activation_receipt(args, promoted, revision)
         print(f"  Root receipt: success ({operation_id})")
         return
     if not args.yes:
