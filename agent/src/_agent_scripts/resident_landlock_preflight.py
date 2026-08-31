@@ -22,6 +22,19 @@ import uuid
 
 
 MARKER_KIND = "blueprint.resident_landlock_preflight.v1"
+PROJECT_READ_DESCRIPTION = (
+    "Read one bounded canonical Blueprint project resource for "
+    "preconditions and post-mutation verification."
+)
+PROJECT_READ_MCP_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "resource": {"type": "string", "enum": ["running-update"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 200},
+    },
+    "required": ["resource"],
+    "additionalProperties": False,
+}
 SYSTEM_READONLY_ROOTS = (
     "/usr", "/usr/local", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/etc",
 )
@@ -38,6 +51,14 @@ CODEX_DISABLED_FEATURES = (
 def abort(reason: str) -> "NoReturn":
     print(f"resident_landlock_preflight: {reason}", file=sys.stderr)
     raise SystemExit(126)
+
+
+def bounded_json(value: object, limit: int = 1200) -> str:
+    """Render non-secret protocol shapes without flooding runner diagnostics."""
+    rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if len(rendered) <= limit:
+        return rendered
+    return f"{rendered[:limit]}...[truncated {len(rendered) - limit} chars]"
 
 
 def expect_denied(action, label: str) -> None:
@@ -163,16 +184,17 @@ def validate_responses_mcp_roundtrips(requests: list[dict]) -> None:
     expected_child = {
         "type": "function",
         "name": "project_read",
-        "description": (
-            "Read one bounded canonical Blueprint project resource for "
-            "preconditions and post-mutation verification."
-        ),
+        "description": PROJECT_READ_DESCRIPTION,
         "strict": False,
+        # Codex's Responses namespace projection preserves the accepted field
+        # names and resource enum, but deliberately removes minLength and
+        # maxLength. The direct MCP discovery check below separately proves
+        # that the upstream server still advertises the bounded id contract.
         "parameters": {
             "type": "object",
             "properties": {
                 "resource": {"type": "string", "enum": ["running-update"]},
-                "id": {"type": "string", "minLength": 1, "maxLength": 200},
+                "id": {"type": "string"},
             },
             "required": ["resource"],
             "additionalProperties": False,
@@ -197,7 +219,15 @@ def validate_responses_mcp_roundtrips(requests: list[dict]) -> None:
             abort(f"Codex turn {logical_turn} Workday namespace has no description")
         children = namespace.get("tools")
         if not isinstance(children, list) or expected_child not in children:
-            abort(f"Codex turn {logical_turn} exposed the wrong project_read schema")
+            actual_children = [
+                child for child in children or []
+                if isinstance(child, dict) and child.get("name") == "project_read"
+            ] if isinstance(children, list) else children
+            abort(
+                f"Codex turn {logical_turn} exposed the wrong project_read schema; "
+                f"expected={bounded_json(expected_child)} "
+                f"actual={bounded_json(actual_children)}"
+            )
         child_names = [
             child.get("name") for child in children if isinstance(child, dict)
         ]
@@ -545,6 +575,21 @@ def run_restricted_child(options: argparse.Namespace) -> int:
         (tool for tool in tools if tool.get("name") == "strategic_operation"),
         None,
     )
+    project_read_tool = next(
+        (tool for tool in tools if tool.get("name") == "project_read"),
+        None,
+    )
+    expected_project_read_tool = {
+        "name": "project_read",
+        "description": PROJECT_READ_DESCRIPTION,
+        "inputSchema": PROJECT_READ_MCP_INPUT_SCHEMA,
+    }
+    if project_read_tool != expected_project_read_tool:
+        abort(
+            "MCP project_read discovery schema is incomplete; "
+            f"expected={bounded_json(expected_project_read_tool)} "
+            f"actual={bounded_json(project_read_tool)}"
+        )
     contract_marker = "contract-json="
     contract_description = (
         strategic_tool.get("inputSchema", {})
