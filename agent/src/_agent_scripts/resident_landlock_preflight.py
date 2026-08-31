@@ -20,6 +20,9 @@ import uuid
 
 
 MARKER_KIND = "blueprint.resident_landlock_preflight.v1"
+SYSTEM_READONLY_ROOTS = (
+    "/usr", "/usr/local", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/etc",
+)
 
 
 def abort(reason: str) -> "NoReturn":
@@ -453,7 +456,7 @@ def controller(options: argparse.Namespace) -> int:
         abort("private MCP broker failed to become ready")
     readonly = [
         path for path in (
-            "/usr", "/usr/local", "/etc", str(source_dir), str(mcp_dir),
+            *SYSTEM_READONLY_ROOTS, str(source_dir), str(mcp_dir),
             str(socket_root),
             os.path.realpath(node),
         )
@@ -534,13 +537,13 @@ def controller(options: argparse.Namespace) -> int:
     shutil.rmtree(socket_root, ignore_errors=True)
     if broker_errors:
         abort(broker_errors[-1])
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr[-2000:])
+        return result.returncode
     # app-server parses the exact proxy config during initialize but opens MCP
     # lazily on a model turn; the quota-free direct client owns this connection.
     if broker_metrics != {"connections": 1, "active": 0}:
         abort(f"private MCP broker teardown receipt is invalid: {broker_metrics}")
-    if result.returncode != 0:
-        sys.stderr.write(result.stderr[-2000:])
-        return result.returncode
     staged_reply = json.loads(staged.read_text(encoding="utf-8"))
     if staged_reply != {
         "type": "NOTE",

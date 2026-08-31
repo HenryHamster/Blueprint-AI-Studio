@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -1019,10 +1020,22 @@ class TestLlmCliBackendProbe(unittest.TestCase):
             env={"PATH": "/sandbox/bin", "HOME": "/home"},
         )
         boundary_health = _healthy_llm_clis()
+        observed_sentinel = None
+
+        def plan_with_sentinel(**kwargs):
+            nonlocal observed_sentinel
+            observed_sentinel = os.path.join(
+                kwargs["workspace_host"],
+                local_runner._RESIDENT_CAPABILITY_WORKSPACE_SENTINEL,
+            )
+            self.assertTrue(os.path.isfile(observed_sentinel))
+            self.assertEqual(stat.S_IMODE(os.stat(observed_sentinel).st_mode), 0o600)
+            return planned
+
         with tempfile.TemporaryDirectory() as workspace_root, patch.object(
             local_runner, "_agent_binary_checkout_sha", return_value="a" * 40
         ), patch.object(
-            iso, "plan_agent_execution", return_value=planned
+            iso, "plan_agent_execution", side_effect=plan_with_sentinel
         ) as planner, patch.object(
             iso, "probe_agent_plan_llm_clis", return_value=boundary_health
         ) as boundary_probe, patch.object(
@@ -1040,6 +1053,7 @@ class TestLlmCliBackendProbe(unittest.TestCase):
         self.assertIs(result, boundary_health)
         self.assertEqual(planner.call_args.kwargs["task_type"], "strategic_review")
         self.assertEqual(planner.call_args.kwargs["agent_image"], None)
+        self.assertIsNotNone(observed_sentinel)
         boundary_probe.assert_called_once_with(planned)
         host_probe.assert_not_called()
 
@@ -11225,6 +11239,52 @@ class TestProviderCredentials(unittest.TestCase):
         self.assertNotIn("NONE", creds_line)
         self.assertIn("present", creds_line)
         self.assertTrue(result["setup_ok"])
+
+    def test_preflight_fails_closed_on_installed_unready_codex_profile(self):
+        caps = _bounded_bwrap_caps()
+        gpu_state = {"allowed": [], "in_use": set(), "per_job": 1}
+        llm_clis = _healthy_llm_clis()
+        llm_clis["codex"].update({
+            "resident_ready": False,
+            "resident_profile_ready": False,
+            "capability_probe_reason": "resident_landlock_preflight_failed",
+            "capability_probe_detail": (
+                "resident_landlock_preflight: repository root has no regular sentinel file"
+            ),
+        })
+        posted = {}
+
+        def fake_post(url, token, body, **kwargs):
+            posted.update(body)
+            return 200, {"ok": True}
+
+        output = io.StringIO()
+        with patch.dict(os.environ, _env(), clear=True), patch.object(
+            local_runner, "_post", fake_post
+        ), patch.object(
+            local_runner, "_detect_gpu",
+            return_value={"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+        ), patch.object(
+            local_runner, "_workspace_writable", return_value=True
+        ), patch.object(
+            local_runner, "_hostname", return_value="test-box"
+        ), patch.object(
+            local_runner, "_runner_version", return_value="v1-test"
+        ), contextlib.redirect_stdout(output):
+            result = local_runner._preflight(
+                "https://api.example.com", "tok-abcdefgh-1234",
+                agent_binary=["node", "/agent/dist/index.js"],
+                caps=caps, gpu_state=gpu_state,
+                max_concurrent=2, max_concurrent_compute=2,
+                llm_clis=llm_clis,
+            )
+
+        self.assertFalse(result["resident_profile_ok"])
+        self.assertFalse(result["setup_ok"])
+        self.assertIs(posted["llm_clis"], llm_clis)
+        self.assertIn(
+            "repository root has no regular sentinel file", output.getvalue()
+        )
 
 
 # ── Agent deps bootstrap (blueprint-runner install) ──────────────────────────

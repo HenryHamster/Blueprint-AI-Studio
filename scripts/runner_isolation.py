@@ -831,6 +831,14 @@ def _with_codex_resident_capabilities(
                 "capability_probe_reason": failure_reason or "profile_probe_failed",
             }
         )
+        if profile_completed is not None:
+            for raw_line in reversed((profile_completed.stderr or "").splitlines()):
+                detail = raw_line.strip()
+                if detail.startswith((
+                    "resident_landlock_preflight:", "resident_landlock:"
+                )):
+                    enriched["capability_probe_detail"] = detail[:512]
+                    break
         return enriched
     exec_output = "\n".join(
         (exec_completed.stdout or "", exec_completed.stderr or "")

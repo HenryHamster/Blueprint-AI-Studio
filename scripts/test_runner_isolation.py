@@ -8,6 +8,7 @@ install of bubblewrap.
 """
 
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -2214,6 +2215,8 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertIn("resident_mcp_socket_client.mjs", source)
         self.assertIn("mcp_servers.workday.default_tools_approval_mode", source)
         self.assertIn('"app-server", "--strict-config"', source)
+        for loader_root in ("/bin", "/sbin", "/lib", "/lib64", "/lib32"):
+            self.assertIn(f'"{loader_root}"', source)
         self.assertNotIn("use_legacy_landlock", source)
         self.assertNotIn('"sandbox"', source)
         self.assertNotIn("--model", source)
@@ -2310,12 +2313,44 @@ class TestProbeLlmClis(unittest.TestCase):
             self.assertEqual(metrics, {"connections": 1, "active": 0})
             self.assertFalse(socket_path.exists())
 
+    def test_preflight_restricted_child_failure_precedes_broker_teardown_receipt(self):
+        source = (
+            Path(__file__).parents[1]
+            / "agent/src/_agent_scripts/resident_landlock_preflight.py"
+        )
+        spec = importlib.util.spec_from_file_location("resident_landlock_preflight", source)
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        child_error = "resident_landlock: restricted command exec failed: errno=13\n"
+        failed_child = subprocess.CompletedProcess(
+            ["resident_landlock_exec.py"], 13, "", child_error,
+        )
+        def ready_without_connection(socket_path, _upstream, _env, ready, *_rest):
+            socket_path.touch(mode=0o600)
+            ready.set()
+
+        with tempfile.TemporaryDirectory(prefix="blueprint-landlock-controller-") as root:
+            options = mock.Mock(
+                runtime_root=str(Path(root) / "runtime"),
+                repository_root="",
+                codex="",
+                timeout=1.0,
+            )
+            with mock.patch.object(module.shutil, "which", return_value=sys.executable):
+                with mock.patch.object(module, "serve_broker", side_effect=ready_without_connection):
+                    with mock.patch.object(module.subprocess, "run", return_value=failed_child):
+                        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                            self.assertEqual(module.controller(options), 13)
+        self.assertEqual(stderr.getvalue(), child_error)
+        self.assertNotIn("private MCP broker teardown receipt is invalid", stderr.getvalue())
+
     def test_codex_profile_failure_preserves_ordinary_health_but_blocks_resident(self):
         flags = "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
         help_result = subprocess.CompletedProcess(["codex"], 0, flags, "")
         profile_result = subprocess.CompletedProcess(
             ["codex"], 2, "",
-            "unknown field mcp_servers.workday.default_tools_approval_mode",
+            "resident_landlock: restricted command exec failed: errno=13\n",
         )
         result = iso._with_codex_resident_capabilities(
             {"present": True, "healthy": True},
@@ -2331,6 +2366,10 @@ class TestProbeLlmClis(unittest.TestCase):
             result["missing_resident_flags"], ["profile:strict-runtime-config"]
         )
         self.assertEqual(result["capability_probe_reason"], "profile_probe_failed")
+        self.assertEqual(
+            result["capability_probe_detail"],
+            "resident_landlock: restricted command exec failed: errno=13",
+        )
 
     def test_codex_profile_success_is_distinct_from_missing_resume_flag(self):
         all_flags = "--config --ignore-user-config --image --json --model --skip-git-repo-check --strict-config"
