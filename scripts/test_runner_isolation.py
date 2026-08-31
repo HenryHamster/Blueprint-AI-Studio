@@ -2156,6 +2156,9 @@ class TestProbeLlmClis(unittest.TestCase):
         "filesystem": True, "mcp": True, "codex_config": True,
         "broker_transport": True, "credential_isolated": True,
         "three_tool_mcp": True, "codex_proxy_config": True,
+        "codex_exec_turn": True, "codex_resume_turn": True,
+        "thread_identity": True, "jsonl_terminal": True,
+        "loopback_provider": True,
         "broker_teardown": True,
         "nested_namespace": False,
     })
@@ -2214,7 +2217,8 @@ class TestProbeLlmClis(unittest.TestCase):
         self.assertIn("MCP tool contract was not completed", source)
         self.assertIn("resident_mcp_socket_client.mjs", source)
         self.assertIn("mcp_servers.workday.default_tools_approval_mode", source)
-        self.assertIn('"app-server", "--strict-config"', source)
+        self.assertIn('[codex, "exec", *common, "-"]', source)
+        self.assertIn('[codex, "exec", "resume", *common, thread_id, "-"]', source)
         for loader_root in ("/bin", "/sbin", "/lib", "/lib64", "/lib32"):
             self.assertIn(f'"{loader_root}"', source)
         self.assertNotIn("use_legacy_landlock", source)
@@ -2227,6 +2231,9 @@ class TestProbeLlmClis(unittest.TestCase):
             "filesystem": True, "mcp": True, "codex_config": True,
             "broker_transport": True, "credential_isolated": True,
             "three_tool_mcp": True, "codex_proxy_config": True,
+            "codex_exec_turn": True, "codex_resume_turn": True,
+            "thread_identity": True, "jsonl_terminal": True,
+            "loopback_provider": True,
             "broker_teardown": True,
             "nested_namespace": False,
         }
@@ -2242,6 +2249,9 @@ class TestProbeLlmClis(unittest.TestCase):
             "filesystem": True, "mcp": True, "codex_config": False,
             "broker_transport": True, "credential_isolated": True,
             "three_tool_mcp": True, "codex_proxy_config": False,
+            "codex_exec_turn": False, "codex_resume_turn": False,
+            "thread_identity": False, "jsonl_terminal": False,
+            "loopback_provider": False,
             "broker_teardown": True,
             "nested_namespace": False,
         }
@@ -2257,6 +2267,9 @@ class TestProbeLlmClis(unittest.TestCase):
             "filesystem": True, "mcp": True, "codex_config": True,
             "broker_transport": True, "credential_isolated": True,
             "three_tool_mcp": True, "codex_proxy_config": True,
+            "codex_exec_turn": True, "codex_resume_turn": True,
+            "thread_identity": True, "jsonl_terminal": True,
+            "loopback_provider": True,
             "broker_teardown": True,
             "nested_namespace": False,
         }

@@ -922,6 +922,9 @@ def _probe_codex_resident_profile(
         "filesystem": True, "mcp": True, "codex_config": True,
         "broker_transport": True, "credential_isolated": True,
         "three_tool_mcp": True, "codex_proxy_config": True,
+        "codex_exec_turn": True, "codex_resume_turn": True,
+        "thread_identity": True, "jsonl_terminal": True,
+        "loopback_provider": True,
         "broker_teardown": True,
         "nested_namespace": False,
     }
@@ -1129,8 +1132,8 @@ def probe_llm_clis(*, env: dict[str, str] | None = None) -> dict[str, dict]:
                                 _probe_codex_resident_profile(
                                     [sys.executable, "-I", preflight,
                                      "--runtime-root", codex_home,
-                                     "--codex", path, "--timeout", "12"],
-                                    timeout=15, env=profile_env
+                                     "--codex", path, "--timeout", "24"],
+                                    timeout=30, env=profile_env
                                 )
                             )
                     result[name] = _with_resident_capabilities(
@@ -1289,9 +1292,9 @@ def probe_container_llm_clis(
                                         image,
                                         "-I", CODEX_RESIDENT_PREFLIGHT_CONTAINER,
                                         "--runtime-root", f"{CODEX_RESIDENT_PROFILE_HOME}/preflight",
-                                        "--codex", name, "--timeout", "12",
+                                        "--codex", name, "--timeout", "24",
                                     ],
-                                    timeout=25,
+                                    timeout=35,
                                 )
                             )
                         result[name] = _with_resident_capabilities(
@@ -2558,12 +2561,12 @@ def probe_agent_plan_llm_clis(plan: ExecutionPlan) -> dict[str, dict]:
                             "--runtime-root", CODEX_RESIDENT_PROFILE_HOME,
                             "--codex", executable,
                             "--repository-root", SANDBOX_WORKSPACE,
-                            "--timeout", "12",
+                            "--timeout", "24",
                         ]
                         profile_result, profile_reason = (
                             _probe_codex_resident_profile(
                                 profile_command,
-                                timeout=15,
+                                timeout=30,
                                 env=profile_env,
                             )
                         )

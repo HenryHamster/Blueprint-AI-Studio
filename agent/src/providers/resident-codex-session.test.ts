@@ -235,6 +235,9 @@ describe('startResidentCodexSession', () => {
       arg.startsWith('developer_instructions=')
       && arg.includes('canonical Resident identity')
       && arg.includes('without native shell')
+      && arg.includes('Claude-only legacy vocabulary')
+      && arg.includes('mcp__workday__project_read')
+      && arg.includes('mcp__workday__strategic_operation')
     ))).toBe(true);
     expect(firstArgs).not.toContain('resume');
     expect(firstArgs.at(-1)).toBe('-');
@@ -325,23 +328,8 @@ describe('startResidentCodexSession', () => {
     expect(session.isAlive()).toBe(false);
   });
 
-  it.each([
-    {
-      label: 'turn.failed',
-      terminal: { type: 'turn.failed', error: { message: 'provider rejected turn' } },
-      trailingCompleted: false,
-      reason: 'turn_failed',
-    },
-    {
-      label: 'top-level error followed by completion',
-      terminal: { type: 'error', message: 'provider stream failed' },
-      trailingCompleted: true,
-      reason: 'provider_error',
-    },
-  ])('revokes an accepted reply after $label', async ({
-    terminal, trailingCompleted, reason,
-  }) => {
-    const mcpConfig = path.join(tempDir, `resident-terminal-${reason}-mcp.json`);
+  it('revokes an accepted reply after turn.failed', async () => {
+    const mcpConfig = path.join(tempDir, 'resident-terminal-turn-failed-mcp.json');
     fs.writeFileSync(mcpConfig, JSON.stringify({
       mcpServers: {
         workday: { command: process.execPath, args: [trustedMcpScript('reply.mjs')] },
@@ -367,17 +355,88 @@ describe('startResidentCodexSession', () => {
         structured_content: { accepted: true },
       },
     } });
-    children[0].line(terminal);
-    if (trailingCompleted) children[0].line({ type: 'turn.completed' });
+    children[0].line({ type: 'turn.failed', error: { message: 'provider rejected turn' } });
     children[0].close();
 
     await expect(turn).resolves.toMatchObject({
       providerFailed: true,
-      providerTerminalReason: reason,
+      providerTerminalReason: 'turn_failed',
       processGone: true,
       appliedStrategicOp: false,
       sentOperatorMessage: false,
       operatorReply: null,
+    });
+    expect(session.isAlive()).toBe(false);
+  });
+
+  it('retains reply authority when transport diagnostics recover before turn.completed', async () => {
+    const mcpConfig = path.join(tempDir, 'resident-recovered-transport-mcp.json');
+    fs.writeFileSync(mcpConfig, JSON.stringify({
+      mcpServers: {
+        workday: { command: process.execPath, args: [trustedMcpScript('reply.mjs')] },
+      },
+    }));
+    const events: Array<{ kind: string; text?: string }> = [];
+    const session = startResidentCodexSession({
+      ...readOnly,
+      workspace: tempDir, ...directIsolation(),
+      replyTool: { mcpConfigPath: mcpConfig },
+    }, runner, base);
+    session.onEvent((event) => events.push(event));
+    const turn = session.sendTurn('reply after recovered transport fallback');
+    await waitForChildCount(children, 1);
+    children[0].line({ type: 'thread.started', thread_id: 'thread-recovered-transport' });
+    children[0].line({ type: 'error', message: 'Reconnecting... 1/5' });
+    children[0].line({ type: 'item.completed', item: {
+      id: 'transport-fallback', type: 'error',
+      message: 'Falling back from WebSockets to HTTPS transport',
+    } });
+    children[0].line({ type: 'item.started', item: {
+      id: 'mcp-recovered', type: 'mcp_tool_call', server: 'workday', tool: 'reply_to_operator',
+      arguments: { content: 'delivered after recovery', message_type: 'NOTE' },
+    } });
+    children[0].line({ type: 'item.completed', item: {
+      id: 'mcp-recovered', type: 'mcp_tool_call', server: 'workday', tool: 'reply_to_operator',
+      status: 'completed', error: null,
+      result: {
+        content: [{ type: 'text', text: 'Workday reply accepted for delivery.' }],
+        structured_content: { accepted: true },
+      },
+    } });
+    children[0].line({ type: 'turn.completed' });
+    children[0].close();
+
+    await expect(turn).resolves.toMatchObject({
+      providerFailed: false,
+      providerTerminalReason: 'completed',
+      processGone: false,
+      sentOperatorMessage: true,
+      operatorReply: { content: 'delivered after recovery', type: 'NOTE' },
+    });
+    expect(events).toContainEqual({ kind: 'error', text: 'Reconnecting... 1/5' });
+    expect(events).toContainEqual({
+      kind: 'error', text: 'Falling back from WebSockets to HTTPS transport',
+    });
+    expect(session.isAlive()).toBe(true);
+    session.close();
+  });
+
+  it('fails with retained transport evidence when diagnostics are not followed by turn.completed', async () => {
+    const session = startResidentCodexSession({ ...readOnly, workspace: tempDir, ...directIsolation() }, runner, base);
+    const turn = session.sendTurn('incomplete after transport fallback');
+    children[0].line({ type: 'thread.started', thread_id: 'thread-incomplete-transport' });
+    children[0].line({ type: 'error', message: 'Reconnecting... 5/5' });
+    children[0].line({ type: 'item.completed', item: {
+      id: 'transport-fallback-failed', type: 'error', message: 'HTTPS fallback exhausted',
+    } });
+    children[0].close(0);
+
+    await expect(turn).resolves.toMatchObject({
+      providerFailed: true,
+      providerTerminalReason: 'missing_turn_completed',
+      processGone: true,
+      failureDetail: expect.stringContaining('HTTPS fallback exhausted'),
+      providerOutputTail: expect.stringContaining('HTTPS fallback exhausted'),
     });
     expect(session.isAlive()).toBe(false);
   });

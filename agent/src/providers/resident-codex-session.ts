@@ -68,6 +68,9 @@ const CODEX_PROCESS_ENV_KEYS = new Set([
 const CODEX_RESIDENT_BOUNDARY = [
   'Codex Resident runs without native shell, repository, Git, or local file tools.',
   'Do not invoke ./strategic, ./fetch, ./design-doc, ./messages, apply_patch, or any command path.',
+  'Treat every shell, file, Git, repository, and ./helper instruction elsewhere as Claude-only legacy vocabulary; it never authorizes a local tool.',
+  `Translate supported ./fetch intent to ${RESIDENT_PROJECT_READ_TOOL_NAME} and supported ./strategic intent to ${RESIDENT_STRATEGIC_TOOL_NAME} using exact JSON and receipt semantics.`,
+  'When a requested surface has no native Workday MCP contract, rely on the supplied canonical snapshot and report the limitation; never probe locally.',
   `Use ${RESIDENT_STRATEGIC_TOOL_NAME} for strategic mutations and pass exact JSON values directly.`,
   `Use ${RESIDENT_PROJECT_READ_TOOL_NAME} for bounded canonical precondition checks and readback.`,
   `Use ${RESIDENT_REPLY_TOOL_NAME} only for the complete operator-facing reply.`,
@@ -965,6 +968,12 @@ export function startResidentCodexSession(
     terminalFailure = turn.failureCategory;
     trace(turn, 'error', reason, true);
   };
+  const recordProviderDiagnostic = (turn: CodexTurn, reason: string, detail: string): void => {
+    const clean = sanitize(detail).slice(-2_000) || reason;
+    failureTail = boundedTail(failureTail, `\n${clean}`);
+    trace(turn, 'error', reason, true);
+    emit({ kind: 'error', text: clean });
+  };
   const settleGoneAfterOAuth = (turn: CodexTurn): void => {
     if (active !== turn || finalizingClosedChild === turn) return;
     activeChild = null;
@@ -1119,6 +1128,21 @@ export function startResidentCodexSession(
       emit({ kind: 'text', text: item.text });
       return;
     }
+    if (itemType === 'error') {
+      if (completed) {
+        const envelope = item.error;
+        const envelopeMessage = envelope && typeof envelope === 'object' && !Array.isArray(envelope)
+          ? (envelope as Record<string, unknown>).message
+          : null;
+        const message = typeof item.message === 'string' && item.message
+          ? item.message
+          : typeof envelopeMessage === 'string' && envelopeMessage
+            ? envelopeMessage
+            : 'Codex provider diagnostic';
+        recordProviderDiagnostic(turn, 'item_error', message);
+      }
+      return;
+    }
     const mcpTool = typeof item.tool === 'string' ? item.tool : '';
     const mcpServer = typeof item.server === 'string' ? item.server : '';
     const fullMcpTool = mcpServer && mcpTool ? `mcp__${mcpServer}__${mcpTool}` : '';
@@ -1147,10 +1171,7 @@ export function startResidentCodexSession(
         : itemType === 'mcp_tool_call' ? `MCP:${mcpTool}`
           : itemType === 'web_search' ? 'WebSearch'
             : itemType === 'todo_list' ? 'TodoWrite' : null;
-    if (!toolName) {
-      if (itemType === 'error') trace(turn, 'error', 'item_error', true);
-      return;
-    }
+    if (!toolName) return;
     const firstObservation = !turn.seenTools.has(id);
     if ((started || (completed && firstObservation)) && firstObservation) {
       turn.seenTools.add(id);
@@ -1265,8 +1286,7 @@ export function startResidentCodexSession(
       const message = typeof event.message === 'string' && event.message
         ? event.message
         : 'Codex provider error';
-      markFailure(turn, 'provider_error', message);
-      emit({ kind: 'error', text: message });
+      recordProviderDiagnostic(turn, 'provider_error', message);
     }
   };
 
@@ -1358,7 +1378,11 @@ export function startResidentCodexSession(
           : !validThread ? 'missing_thread_id'
           : !turn.terminalCompleted ? 'missing_turn_completed'
             : !cleanExit ? 'process_exit' : 'terminal_failure';
-        markFailure(turn, reason, stderr || `Codex exited code=${String(code)} signal=${String(signal)}`);
+        markFailure(
+          turn,
+          reason,
+          failureTail.trim() || stderr || `Codex exited code=${String(code)} signal=${String(signal)}`,
+        );
       }
       if (turn.interrupted || !success) {
         // A reply receipt from a process whose thread identity or terminal
