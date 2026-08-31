@@ -373,9 +373,10 @@
       "path": "admin-ui/src/components/StrategicSessionControl.test.tsx",
       "reason": "Covers the StrategicSessionControl component \u2014 the operator UI for the conversational Workday session lifecycle. Restored in #16075; guard ensures this test file is not silently deleted again.",
       "test_ids": [
+        "StrategicSessionControl keeps status readout in the utility bar > offers explicit Start for a terminal reply-recovery hold",
         "StrategicSessionControl walkthrough selector contract > root element carries data-testid=\"strategic-session-control\""
       ],
-      "test_count": 22
+      "test_count": 23
     },
     {
       "path": "admin-ui/src/components/StrategicSessionControl.viewport.test.tsx",
@@ -397,6 +398,8 @@
         "useStrategicSession liveness fallback > retries a 200 response with %s instead of completing the ensure epoch [case 1]",
         "useStrategicSession liveness fallback > does not duplicate an in-flight ensure when the read-model wrapper changes",
         "useStrategicSession liveness fallback > treats retry_wait as healthy dormant state and does not restart it on reload",
+        "useStrategicSession liveness fallback > holds reply-protocol recovery for explicit Start without auto-ensure or timer retry",
+        "useStrategicSession liveness fallback > does not timer-retry an in-flight ensure that observes reply recovery",
         "useStrategicSession liveness fallback > does not let a retained retry_wait field suppress restart of an ended session",
         "useStrategicSession liveness fallback > ensures a stale non-retry worker so the backend can replace it",
         "useStrategicSession liveness fallback > re-ensures a terminal worker generation on the same page exactly once",
@@ -406,7 +409,7 @@
         "useStrategicSession liveness fallback > keeps an explicitly stopped Workday stopped until the operator explicitly starts it",
         "useStrategicSession liveness fallback > allows Workday auto-ensure again after leaving and explicitly re-entering continuous mode"
       ],
-      "test_count": 26
+      "test_count": 28
     },
     {
       "path": "admin-ui/src/utils/strategicSessionLive.test.ts",
@@ -492,6 +495,7 @@
       "path": "agent/src/providers/resident-codex-session.test.ts",
       "reason": "Protects the OpenAI Codex Resident process-per-turn adapter: direct-Landlock isolation, credential-free MCP broker transport, exact thread resume identity, receipt-bound acknowledgements, bounded child termination, and cleanup/idle liveness.",
       "test_ids": [
+        "startResidentCodexSession > attributes only the corrective resumed turn native reply after a prior omission",
         "startResidentCodexSession > uses exact thread identity for a second exec resume turn",
         "startResidentCodexSession > fences OAuth persistence before settlement and adopts the authoritative CAS winner",
         "startResidentCodexSession > retains private OAuth state when authoritative persistence fails",
@@ -508,17 +512,19 @@
         "startResidentCodexSession > retains tracking and scratch after an undeliverable kill until late close",
         "startResidentCodexSession > settles child idle even when asynchronous scratch cleanup needs a retry"
       ],
-      "test_count": 30
+      "test_count": 31
     },
     {
       "path": "scripts/test_resident_landlock_preflight.py",
-      "reason": "Protects the quota-free production-shaped Codex exec/resume preflight, including exact JSONL terminal authority and denial of native local tools.",
+      "reason": "Protects the quota-free production-shaped Codex exec/resume preflight: four-request Responses namespace/function-call continuations, exact successful Workday MCP JSONL dispatch receipts, terminal authority, and fail-closed denial of native or unknown local tools.",
       "test_ids": [
-        "TestResidentLandlockPreflight::test_loopback_responses_fixture_serves_exactly_two_streamed_turns",
+        "TestResidentLandlockPreflight::test_loopback_responses_fixture_serves_two_tool_call_continuation_pairs",
+        "TestResidentLandlockPreflight::test_responses_roundtrip_requires_namespaced_schema_and_exact_mcp_output",
         "TestResidentLandlockPreflight::test_jsonl_transport_diagnostics_do_not_replace_terminal_authority",
+        "TestResidentLandlockPreflight::test_jsonl_preflight_rejects_missing_mcp_dispatch",
         "TestResidentLandlockPreflight::test_jsonl_preflight_rejects_forbidden_local_items"
       ],
-      "test_count": 3
+      "test_count": 5
     },
     {
       "path": "scripts/test_runner_isolation.py",
@@ -579,6 +585,7 @@
       "reason": "Primary protection for conversational Workday seams \u2014 invariant tests covering session availability, arming suppression, retry/refresh binding, operator-send serialization, mutation fencing, terminal reconciliation, and work-session arming. Its complete test list is machine-enforced by the manifest-driven completeness guard; silently deleting or emptying this file would remove all invariant coverage without tripping any existing guard.",
       "test_ids": [
         "test_workday_availability_does_not_consult_removed_global_gate",
+        "test_reply_protocol_recovery_hold_is_never_reported_ready",
         "test_workday_activation_enqueues_one_canonical_fast_turn_per_session",
         "test_real_operator_input_supersedes_unclaimed_activation_before_poll",
         "test_workday_activation_enqueue_failure_does_not_fail_started_session",
@@ -619,7 +626,7 @@
         "test_unworked_continuation_still_lapses_and_releases_the_local_pin",
         "test_fence_renewal_is_paced_at_the_call_site_not_only_in_the_helper"
       ],
-      "test_count": 40
+      "test_count": 41
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",
@@ -719,13 +726,16 @@
         "test_explicit_runner_change_rejects_active_session",
         "test_explicit_runner_replaces_a_genuinely_stale_active_worker",
         "test_terminal_worker_restart_preserves_checkpoint_and_single_generation",
+        "test_terminal_reconciler_requires_explicit_recovery_after_reply_protocol_failure",
+        "test_reply_protocol_terminal_does_not_override_chat_mode",
+        "test_reply_protocol_recovery_fences_auto_ensure_until_claim_release",
         "test_first_agent_heartbeat_reanchors_born_stale_session",
         "test_post_claim_quiet_heartbeat_renews_continuous_liveness",
         "test_autonomous_turn_survives_operator_silence_with_exact_heartbeat",
         "test_autonomous_turn_flag_cannot_rescue_committed_chat_mode",
         "test_autonomous_working_turn_renews_freshness_without_mutation"
       ],
-      "test_count": 98
+      "test_count": 101
     },
     {
       "path": "agent/src/workspacePrep.test.ts",
@@ -813,11 +823,13 @@
         "handleStrategicResident - failed-turn recovery > preserves conversation_claim_lost as the terminal replacement cause",
         "handleStrategicResident - failed-turn recovery > preserves private provider state when credential recovery forbids cleanup",
         "handleStrategicResident - failed-turn recovery > re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply",
-        "handleStrategicResident - failed-turn recovery > replaces the worker after the native reply protocol fails twice",
+        "handleStrategicResident - failed-turn recovery > uses one same-session corrective turn and persists exactly one reply without re-admitting input",
+        "handleStrategicResident - failed-turn recovery > fails closed after one same-session corrective omission without re-admitting input",
+        "handleStrategicResident - failed-turn recovery > does not dispatch a corrective turn without fresh exact-claim authority",
+        "handleStrategicResident - failed-turn recovery > never corrects or replays after an ambiguous strategic tool turn",
         "handleStrategicResident - failed-turn recovery > restarts after prompt SIGINT process exit and answers the queued operator message",
         "handleStrategicResident - failed-turn recovery > retries a failed initial heartbeat before polling or starting provider work",
         "handleStrategicResident - failed-turn recovery > retries a generic provider error in place and re-delivers the operator turn",
-        "handleStrategicResident - failed-turn recovery > retries a missing native reply in place instead of failing and resetting the task",
         "handleStrategicResident - failed-turn recovery > retries the same required ArtifactRef message after a whole-download %s timeout without model/reply/handled side effects [case 1]",
         "handleStrategicResident - failed-turn recovery > retries the same required ArtifactRef message after a whole-download %s timeout without model/reply/handled side effects [case 2]",
         "handleStrategicResident - failed-turn recovery > revalidates an authority proof that ages out during workspace preparation",
@@ -945,7 +957,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 159
+      "test_count": 161
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
@@ -1299,6 +1311,7 @@
         "resolveTerminalStatus > FAILED (claude_code_failed) on a loop error",
         "resolveTerminalStatus > FAILED (claude_code_failed) on a non-zero or signal-killed process exit",
         "resolveTerminalStatus > FAILED (consultation_abandoned) when a consultation-abandon interrupt killed the whole process",
+        "resolveTerminalStatus > FAILED with a non-retryable protocol category after the bounded reply correction is exhausted",
         "resolveTerminalStatus > FAILED (timeout) on a hard timeout / stalled session",
         "resolveTerminalStatus > legitimate paths are unaffected: operator stop / mode change / normal end stay clean",
         "resolveTerminalStatus > preserves provider rate-limit classification for orchestrator retry",
@@ -1332,7 +1345,7 @@
         "shouldRunAutonomousTurn (state-gated pacing) > runs the first-ever turn immediately, independent of exploration cadence",
         "shouldRunAutonomousTurn (state-gated pacing) > shouldRunAutonomousTurn does not fire on the loop's own applied ops"
       ],
-      "test_count": 310
+      "test_count": 311
     },
     {
       "path": "admin-ui/src/hooks/useStrategicLiveness.test.tsx",

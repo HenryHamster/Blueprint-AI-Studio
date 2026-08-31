@@ -153,6 +153,11 @@
       "why": "conversational_workday_manifest.json's PROTECT list names this exact file. Same scoping rationale as scripts/test_runner_isolation.py above."
     },
     {
+      "glob": "scripts/test_resident_landlock_preflight.py",
+      "sentinels": ["backend/testing/test_conversational_workday_protection.py"],
+      "why": "conversational_workday_manifest.json protects this exact production-shaped Resident preflight. Match the two sibling protected runner scripts so its count and test-id manifest is selected on the introducing PR."
+    },
+    {
       "glob": "backend/app/**/*.py",
       "sentinels": ["backend/testing/test_module_size_live_tree.py"],
       "why": "SIZE-GUARDRAIL LEFT SHIFT. The module-size guardrail (module_size_limits.json caps + the 1500-line uncapped coverage threshold) was enforced against the LIVE TREE only by test_invariants.py, which runs in the ci.yml backend matrix -- and ci.yml's pull_request trigger is `branches: [main]`, so an automain PR never runs it. The only workflow an automain PR does get is guard-data.yml, whose Derived-artifacts job replaces the standalone roster wholesale via BLUEPRINT_STATIC_GUARD_SELECTORS (no size scan in that list) and whose Impacted-backend-tests job runs only what this manifest selects. Before this entry NO glob mapped a governed source surface to any live-tree size scan, so a size breach first turned red on the automain->main promotion PR -- the worst place for it, since a red promotion PR usually CLOSES and deletes its release branch. Proven live, not theoretical: PR #17966 took backend/testing/test_impacted_tests.py from 1431 to 1522 lines past the uncapped threshold and merged into automain green. backend/app is the 'backend' section's source root, so any change here can breach a cap. The sentinel imports check_size_limits, not the modules it scans, so the dotted-import reverse-dep scan can never select it for an arbitrary app file."

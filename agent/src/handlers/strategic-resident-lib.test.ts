@@ -474,6 +474,13 @@ describe('resolveTerminalStatus', () => {
       .toEqual({ status: 'FAILED', failureCategory: 'consultation_abandoned' });
   });
 
+  it('FAILED with a non-retryable protocol category after the bounded reply correction is exhausted', () => {
+    expect(resolveTerminalStatus('operator_reply_protocol_failed', 0))
+      .toEqual({ status: 'FAILED', failureCategory: 'resident_reply_protocol_failed' });
+    expect(resolveTerminalStatus('operator_reply_protocol_failed', 1, 'dead_auth'))
+      .toEqual({ status: 'FAILED', failureCategory: 'resident_reply_protocol_failed' });
+  });
+
   it('still honors a provider failure category over a consultation-abandon exit', () => {
     expect(resolveTerminalStatus('consultation_abandoned_process_exit', 1, 'rate_limited'))
       .toEqual({ status: 'FAILED', failureCategory: 'rate_limited' });

@@ -24,6 +24,7 @@ from app.strategic_constants import STATUS_LATEST_MESSAGE_MAX
 from app.strategic_resident_session import (
     RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
     RESIDENT_SESSION_REASON_RUNNER_OFFLINE,
+    RESIDENT_SESSION_REASON_REPLY_PROTOCOL_FAILED,
     RESIDENT_SESSION_REASON_START_FAILED_PREFIX,
     read_resident_session_blocked_reason,
     resident_session_snapshot,
@@ -616,6 +617,10 @@ def _resident_session_availability(
         and not snapshot.get("stop_requested")
     )
     recorded_reason = read_resident_session_blocked_reason(project.vision)
+    recorded_reply_recovery = bool(
+        recorded_reason
+        and recorded_reason.startswith(RESIDENT_SESSION_REASON_REPLY_PROTOCOL_FAILED)
+    )
     recorded_start_failed = bool(
         recorded_reason
         and recorded_reason.startswith(RESIDENT_SESSION_REASON_START_FAILED_PREFIX)
@@ -625,7 +630,10 @@ def _resident_session_availability(
     )
 
     reason: str | None = None
-    if recorded_start_failed:
+    if recorded_reply_recovery:
+        state = "recovery_required"
+        reason = recorded_reason
+    elif recorded_start_failed:
         state = "error"
         reason = recorded_reason
     elif active:

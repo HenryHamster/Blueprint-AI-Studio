@@ -4487,3 +4487,37 @@ class TestMalformedTaskPayloadClassification:
         from app.failure_classification import MALFORMED_TASK_PAYLOAD
 
         assert MALFORMED_TASK_PAYLOAD in _FAILURE_CLASS_LABELS
+
+
+class TestResidentReplyProtocolFailureClassification:
+    def test_registered_non_retryable_platform_terminal(self):
+        from app.failure_classification import (
+            INFRA_ANALYTICS_CLASSES,
+            INFRA_CLASSES,
+            NON_RETRYABLE_PLATFORM_CLASSES,
+            RESIDENT_REPLY_PROTOCOL_FAILURE,
+        )
+
+        assert RESIDENT_REPLY_PROTOCOL_FAILURE in ALL_FAILURE_CLASSES
+        assert RESIDENT_REPLY_PROTOCOL_FAILURE in NON_RETRYABLE_PLATFORM_CLASSES
+        assert RESIDENT_REPLY_PROTOCOL_FAILURE in INFRA_ANALYTICS_CLASSES
+        assert RESIDENT_REPLY_PROTOCOL_FAILURE not in INFRA_CLASSES
+
+    def test_agent_label_round_trips_and_taxonomy_is_platform(self):
+        from app.failure_classification import RESIDENT_REPLY_PROTOCOL_FAILURE
+
+        task = _task(ctx={"failure_category": RESIDENT_REPLY_PROTOCOL_FAILURE})
+        assert (
+            normalize_agent_failure_category(
+                "resident_reply_protocol_failed", task
+            )
+            == RESIDENT_REPLY_PROTOCOL_FAILURE
+        )
+        assert classify_failure(task) == RESIDENT_REPLY_PROTOCOL_FAILURE
+        assert classify_failure_taxonomy(task) == TAXONOMY_INFRA_RELATED
+
+    def test_operator_label_is_registered(self):
+        from app.digest_metrics import _FAILURE_CLASS_LABELS
+        from app.failure_classification import RESIDENT_REPLY_PROTOCOL_FAILURE
+
+        assert RESIDENT_REPLY_PROTOCOL_FAILURE in _FAILURE_CLASS_LABELS

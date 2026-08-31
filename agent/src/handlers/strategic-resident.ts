@@ -132,9 +132,46 @@ const MAX_CONSECUTIVE_STALLS = 3;
 // provider outage still surfaces with evidence instead of looping forever.
 const MAX_CONSECUTIVE_GENERIC_PROVIDER_FAILURES = 2;
 // One same-generation retry distinguishes a transient native reply-tool miss
-// from a broken delivery channel. A second miss replaces the worker instead of
-// silently retrying the operator's message forever.
+// from a broken delivery channel. A second miss ends the worker behind an
+// explicit-recovery hold instead of silently retrying operator input forever.
 const MAX_CONSECUTIVE_OPERATOR_REPLY_PROTOCOL_FAILURES = 2;
+const OPERATOR_REPLY_PROTOCOL_REPAIR_HARD_TIMEOUT_MS = 60_000;
+const OPERATOR_REPLY_PROTOCOL_REPAIR_PROMPT = [
+  '[WORKDAY DELIVERY RECOVERY — SAME CLAIMED OPERATOR TURN]',
+  'Your preceding assistant text was not delivered because this turn recorded no confirmed native Workday reply call.',
+  'Continue this exact claimed turn on the same thread; do not restart the analysis or answer with ordinary assistant text.',
+  'Re-read the original operator request already present in this thread. Do not repeat completed tool work; satisfy only any still-missing native project_read or strategic_operation precondition it explicitly requires.',
+  `Then call ${RESIDENT_REPLY_TOOL_NAME} exactly once with the complete operator-facing answer.`,
+  'The existing claim, receipt, covered message ids, and idempotency key remain authoritative. Do not create or replay an operator message.',
+  'If the requested work cannot be completed, deliver that bounded blocker through reply_to_operator instead of returning normal assistant text.',
+].join('\n');
+const OPERATOR_REPLY_PROTOCOL_READ_COMPLETE_REPAIR_PROMPT = [
+  '[WORKDAY DELIVERY RECOVERY — PROJECT READ ALREADY COMPLETE]',
+  'Your preceding assistant text was not delivered because this exact claimed turn recorded no confirmed native Workday reply call.',
+  'The required project_read completed successfully on this same thread. Do not call project_read again.',
+  'Do not call strategic_operation, Bash, or any other tool and do not repeat the original analysis.',
+  `Call ${RESIDENT_REPLY_TOOL_NAME} exactly once with the complete operator-facing answer already established by this thread.`,
+  'The existing claim, receipt, covered message ids, and idempotency key remain authoritative. Do not create or replay an operator message.',
+].join('\n');
+
+function replyRepairPriorWorkIsSafe(result: ResidentTurnResult): boolean {
+  const trace = result.trace ?? [];
+  const tools = trace.filter(event => event.kind === 'tool');
+  if (result.toolCallCount === 0) {
+    return !result.sawToolUse && tools.length === 0;
+  }
+  const allowedReadLabels = new Set([
+    RESIDENT_PROJECT_READ_TOOL_NAME,
+    'MCP:project_read',
+  ]);
+  const results = trace.filter(event => event.kind === 'tool_result');
+  return result.sawToolUse
+    && result.traceTruncated !== true
+    && tools.length === result.toolCallCount
+    && tools.every(event => typeof event.label === 'string' && allowedReadLabels.has(event.label))
+    && results.length === result.toolCallCount
+    && results.every(event => event.isError !== true);
+}
 // session.interrupt() on a typed Workday consultation abandon kills the whole
 // Claude Code child, not just the turn. One consecutive exit is recovered in
 // place from checkpoint; a second in a row means recovery is not holding, so
@@ -1833,6 +1870,8 @@ export async function handleStrategicResident(
     privateTurn = false,
     directExecution = false,
     stallTimeoutOverrideMs?: number,
+    recordLatency = true,
+    hardTimeoutOverrideMs?: number,
   ): Promise<ResidentTurnResult> => {
     const repoPrefix = repoSnapshot
       ? `${formatResidentRepoSnapshot(repoSnapshot)}\n\n---\n\n`
@@ -1900,21 +1939,25 @@ export async function handleStrategicResident(
         // same bounded allowance as autonomous Workday; every other foreground
         // turn is fenced at the responsive operator deadline.
         ...(operator ? {
-          hardTimeoutMs: directExecution
-            ? directExecutionHardTimeoutMs
-            : operatorHardTimeoutMs,
+          hardTimeoutMs: hardTimeoutOverrideMs ?? (
+            directExecution
+              ? directExecutionHardTimeoutMs
+              : operatorHardTimeoutMs
+          ),
         } : {}),
       });
-      recordResidentTurnLatency({
-        kind: operator ? 'operator' : 'autonomous',
-        turnMs: r.turnMs,
-        ttftMs: r.ttftMs,
-        interrupted: r.interrupted,
-        toolCallCount: r.toolCallCount,
-        toolCallDurationMs: r.totalToolCallDurationMs,
-        meanInterTokenMs: r.meanInterTokenMs,
-        pickupLagMs: pickupLagMs ?? null,
-      });
+      if (recordLatency) {
+        recordResidentTurnLatency({
+          kind: operator ? 'operator' : 'autonomous',
+          turnMs: r.turnMs,
+          ttftMs: r.ttftMs,
+          interrupted: r.interrupted,
+          toolCallCount: r.toolCallCount,
+          toolCallDurationMs: r.totalToolCallDurationMs,
+          meanInterTokenMs: r.meanInterTokenMs,
+          pickupLagMs: pickupLagMs ?? null,
+        });
+      }
       return r;
     } finally {
       if (slowResponseTimer) clearTimeout(slowResponseTimer);
@@ -2631,9 +2674,13 @@ export async function handleStrategicResident(
   const retryOperatorReplyInPlace = async (
     reason: string,
     detail: string,
+    repairExhausted = false,
   ): Promise<'stop' | 'continue'> => {
     rollbackPendingOperatorAdmission();
     operatorReplyProtocolFailures += 1;
+    if (repairExhausted) {
+      operatorReplyProtocolFailures = MAX_CONSECUTIVE_OPERATOR_REPLY_PROTOCOL_FAILURES;
+    }
     try {
       removeResidentReplyArtifactsAtPaths(
         RESIDENT_REPLY_KEY_PATH,
@@ -2650,12 +2697,13 @@ export async function handleStrategicResident(
       stopReason = 'operator_reply_protocol_failed';
       setResidentActivity(
         'waiting',
-        'Reply channel failed repeatedly; replacing the Resident worker',
+        'Reply channel failed; explicit recovery required after claim release',
       );
       sendLog(
         ws,
         `[resident] FATAL: ${detail}; native reply delivery failed `
-          + `${operatorReplyProtocolFailures} consecutive times; replacing worker\n`,
+          + `${operatorReplyProtocolFailures} times; ending Resident behind the `
+          + `canonical-claim recovery hold\n`,
       );
       return 'stop';
     }
@@ -5573,6 +5621,8 @@ export async function handleStrategicResident(
 
     let ackTimer: ReturnType<typeof setTimeout> | null = null;
     let r: ResidentTurnResult;
+    const operatorAttempts: ResidentTurnResult[] = [];
+    let replyRepairDispatched = false;
     let cleanupError: unknown = null;
     let replyReceiptInstalled = false;
     try {
@@ -5657,6 +5707,8 @@ export async function handleStrategicResident(
         repoSnapshot,
         false,
         directExecution,
+        undefined,
+        false,
       );
       const watch = await watchOperatorTurn(
         turnPromise,
@@ -5672,7 +5724,7 @@ export async function handleStrategicResident(
           invalidateSessionEvents();
           session.close();
         }
-        await turnPromise;
+        operatorAttempts.push(await turnPromise);
         if (
           stopReason !== 'conversation_claim_lost'
           && stopReason !== 'resident_incarnation_lost'
@@ -5682,7 +5734,111 @@ export async function handleStrategicResident(
         return 'stop';
       }
       r = await turnPromise;
+      operatorAttempts.push(r);
+      if (
+        !r.sentOperatorMessage
+        && r.operatorReply === null
+        && !r.appliedStrategicOp
+        && replyRepairPriorWorkIsSafe(r)
+        && !r.providerFailed
+        && !r.interrupted
+        && !r.timedOut
+        && !r.hardTimedOut
+        && !r.processGone
+        && session.isAlive()
+        && !fs.existsSync(RESIDENT_STAGED_REPLY_PATH)
+      ) {
+        const resultText = r.resultText || r.accumulatedTurnText;
+        const repairAuthority = await livenessHeartbeat();
+        const exactClaimStillHeld = (
+          repairAuthority?.conversation_claim_held === true
+          && repairAuthority.resident_incarnation_held !== false
+          && repairAuthority.authority_held !== false
+          && repairAuthority.stop_requested !== true
+          && residentIncarnationHeld
+          && authorityHeld
+          && activeConversationClaimId !== null
+          && [...activeConversationClaimMessageIds].sort().join('\n')
+            === [...coveredMessageIds].sort().join('\n')
+        );
+        if (!exactClaimStillHeld) {
+          sendLog(
+            ws,
+            '[resident] native reply omitted on a clean replay-safe turn, but the '
+              + 'exact conversation claim/Resident authority could not be renewed; '
+              + 'refusing corrective dispatch and full-input replay\n',
+          );
+        } else {
+          replyRepairDispatched = true;
+          sendLog(
+            ws,
+            '[resident] native reply omitted on a clean replay-safe turn; '
+              + `issuing one same-thread delivery correction `
+              + `(assistant_text_bytes=${Buffer.byteLength(resultText, 'utf8')}, `
+              + `assistant_text_sha256=${createHash('sha256').update(resultText).digest('hex')}, `
+              + `trace=${JSON.stringify((r.trace ?? []).slice(-16))})\n`,
+          );
+          const repairPromise = runTurn(
+            r.toolCallCount === 0
+              ? OPERATOR_REPLY_PROTOCOL_REPAIR_PROMPT
+              : OPERATOR_REPLY_PROTOCOL_READ_COMPLETE_REPAIR_PROMPT,
+            true,
+            null,
+            undefined,
+            false,
+            directExecution,
+            undefined,
+            false,
+            OPERATOR_REPLY_PROTOCOL_REPAIR_HARD_TIMEOUT_MS,
+          );
+          const repairWatch = await watchOperatorTurn(
+            repairPromise,
+            handlePureFastMessagesDuringWorkday,
+          );
+          if (repairWatch === 'stop') {
+            session.interrupt();
+            const settledBeforeDeadline = await Promise.race([
+              repairPromise.then(() => true),
+              new Promise<boolean>((resolve) => setTimeout(() => { resolve(false); }, OPERATOR_PREEMPT_DEADLINE_MS)),
+            ]);
+            if (!settledBeforeDeadline) {
+              invalidateSessionEvents();
+              session.close();
+            }
+            operatorAttempts.push(await repairPromise);
+            if (
+              stopReason !== 'conversation_claim_lost'
+              && stopReason !== 'resident_incarnation_lost'
+            ) {
+              stopReason = 'operator_turn_interrupted';
+            }
+            return 'stop';
+          }
+          r = await repairPromise;
+          operatorAttempts.push(r);
+        }
+      }
     } finally {
+      if (operatorAttempts.length > 0) {
+        const firstAttempt = operatorAttempts[0];
+        const finalAttempt = operatorAttempts[operatorAttempts.length - 1];
+        recordResidentTurnLatency({
+          kind: 'operator',
+          turnMs: operatorAttempts.reduce((total, attempt) => total + attempt.turnMs, 0),
+          ttftMs: firstAttempt.ttftMs,
+          interrupted: operatorAttempts.some((attempt) => attempt.interrupted),
+          toolCallCount: operatorAttempts.reduce(
+            (total, attempt) => total + attempt.toolCallCount,
+            0,
+          ),
+          toolCallDurationMs: operatorAttempts.reduce(
+            (total, attempt) => total + attempt.totalToolCallDurationMs,
+            0,
+          ),
+          meanInterTokenMs: finalAttempt.meanInterTokenMs,
+          pickupLagMs,
+        });
+      }
       if (ackTimer !== null) clearTimeout(ackTimer);
       if (replyReceiptInstalled) {
         try {
@@ -5695,6 +5851,29 @@ export async function handleStrategicResident(
           sendLog(ws, `[resident] reply receipt cleanup failed; stopping after this turn: ${String(e)}\n`);
         }
       }
+    }
+    if (
+      replyRepairDispatched
+      && (
+        r.providerFailed
+        || r.failureCategory !== null
+        || r.interrupted
+        || r.timedOut
+        || r.hardTimedOut
+        || r.processGone
+        || r.providerTerminalReason === 'kill_failed'
+        || r.providerTerminalReason === 'resident_landlock_failed'
+        || r.providerTerminalReason === 'oauth_rotation_failed'
+      )
+    ) {
+      const text = r.resultText || r.accumulatedTurnText;
+      return retryOperatorReplyInPlace(
+        'operator reply correction did not settle cleanly',
+        `bounded same-thread correction failed without replay `
+          + `(provider_terminal_reason=${r.providerTerminalReason ?? 'none'}, `
+          + `assistant_text_sha256=${createHash('sha256').update(text).digest('hex')})`,
+        true,
+      );
     }
     if (providerTurnFailed(r)) return 'stop';
     if (recoverableProviderInterruption(r)) {
@@ -5713,13 +5892,31 @@ export async function handleStrategicResident(
       return retryOperatorReplyInPlace(
         'operator reply staging validation failure',
         `staged reply validation failed: ${String(e)}`,
+        true,
       );
     }
     const operatorReply = r.operatorReply;
     if (!r.sentOperatorMessage || stagedReply === null || operatorReply === null) {
+      const diagnostics = operatorAttempts.map((attempt, index) => {
+        const text = attempt.resultText || attempt.accumulatedTurnText;
+        return {
+          attempt: index + 1,
+          sent_operator_message: attempt.sentOperatorMessage,
+          saw_tool_use: attempt.sawToolUse,
+          tool_call_count: attempt.toolCallCount,
+          provider_terminal_reason: attempt.providerTerminalReason ?? null,
+          provider_output_tail: attempt.providerOutputTail?.slice(-500) ?? null,
+          assistant_text_bytes: Buffer.byteLength(text, 'utf8'),
+          assistant_text_sha256: createHash('sha256').update(text).digest('hex'),
+          assistant_text_tail: sanitize(text).slice(-500),
+          trace: (attempt.trace ?? []).slice(-16),
+          trace_truncated: attempt.traceTruncated ?? false,
+        };
+      });
       return retryOperatorReplyInPlace(
         'operator reply tool missing',
-        'no confirmed native reply_to_operator call',
+        `no confirmed native reply_to_operator call; diagnostics=${JSON.stringify(diagnostics)}`,
+        true,
       );
     }
     // The MCP server's staging file proves receipt ownership, while the
@@ -5730,6 +5927,7 @@ export async function handleStrategicResident(
       return retryOperatorReplyInPlace(
         'operator reply staging mismatch',
         'staged reply no longer matches accepted native tool arguments',
+        true,
       );
     }
     // Capture any operator-settled correction BEFORE the sole reply write. The
