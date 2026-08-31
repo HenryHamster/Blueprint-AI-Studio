@@ -365,59 +365,53 @@ def test_execute_deploy_derives_operation_from_explicit_project_id(monkeypatch):
 
 
 def test_receipt_only_manual_binding_queries_exact_artifact_without_activation(
-    monkeypatch,
+    monkeypatch, capsys,
 ):
     revision = "3" * 40
-    digest = "sha256:" + "4" * 64
+    digest = "sha256:" + "0" * 64
     promoted = {
+        "id": "version-20",
         "version_number": 20,
+        "status": "promoted",
         "promoted_sha": "2" * 40,
+        "served_sha": "2" * 40,
+        "served_at": "2026-08-30T00:00:00Z",
         "activation_requested_at": None,
     }
-    manifest = {
-        "run": {"createdAt": "now", "databaseId": 2},
-        "digest": digest,
-        "revision": revision,
-    }
+    api_calls = []
+    _deploy_env(
+        monkeypatch,
+        _deploy_api_fake(api_calls, promoted=promoted),
+        revision=revision,
+    )
     root_calls = []
-    receipts = []
-    monkeypatch.setattr(blueprint, "_fetch_deploy_manifest", lambda _sha: manifest)
-    monkeypatch.setattr(blueprint, "_resolve_deploy_binding", lambda *_args: promoted)
-    monkeypatch.setattr(blueprint, "_require_write_config", lambda _action: None)
     monkeypatch.setattr(
         blueprint,
-        "_execute_deploy_shim",
+        "_request_release_socket",
         lambda *args, **kwargs: root_calls.append((args, kwargs)) or True,
     )
     monkeypatch.setattr(blueprint, "_local_served_sha", lambda: revision)
-    monkeypatch.setattr(
-        blueprint,
-        "_post_activation_receipt",
-        lambda *args: receipts.append(args),
-    )
-    args = SimpleNamespace(
-        sha=revision,
-        host="control-plane",
-        dry_run=False,
-        receipt_only=True,
-        local=True,
-        yes=True,
-        force=False,
-        project_id="project-manual",
-    )
 
-    blueprint.cmd_deploy(args)
+    rc = blueprint.main([
+        "deploy", "--local", "--receipt-only", "--sha", revision,
+    ])
 
     operation_id = blueprint._manual_release_operation_id(
-        "project-manual", digest, revision, promoted
+        "proj-1", digest, revision, promoted
     )
-    assert root_calls == [((args, revision, digest), {
-        "inplace": True,
-        "operation_id": operation_id,
+    assert rc == 0
+    assert root_calls == [((digest, revision, operation_id), {
         "receipt_only": True,
     })]
     assert all(call[1]["receipt_only"] is True for call in root_calls)
-    assert receipts == [(args, promoted, revision)]
+    assert not any(
+        method == "POST" and path.endswith("/activation-receipt")
+        for method, path, _body in api_calls
+    )
+    err = capsys.readouterr().err
+    assert "v20 immutable historical receipt remains unchanged" in err
+    assert "No version receipt was posted" in err
+    assert "re-run deploy" not in err
 
 
 def test_manual_operation_identity_changes_after_serving_predecessor_advances():
@@ -452,6 +446,8 @@ def test_remote_receipt_only_preserves_approval_id_and_posts_without_loopback(
     promoted = {
         "version_number": 21,
         "promoted_sha": revision,
+        "served_sha": "4" * 40,
+        "served_at": "2026-08-30T00:00:00Z",
         "activation_requested_at": "2026-08-31T01:02:03Z",
     }
     root_calls = []
@@ -497,6 +493,66 @@ def test_remote_receipt_only_preserves_approval_id_and_posts_without_loopback(
         "operation_id": expected,
         "receipt_only": True,
     })]
+    assert receipts == [(args, promoted, revision)]
+
+
+def test_direct_remote_build_ahead_success_preserves_historical_receipt(
+    monkeypatch, capsys,
+):
+    revision = "7" * 40
+    digest = "sha256:" + "8" * 64
+    promoted = {
+        "id": "version-22",
+        "version_number": 22,
+        "promoted_sha": "6" * 40,
+        "served_sha": "6" * 40,
+        "served_at": "2026-08-30T00:00:00Z",
+    }
+    root_calls = []
+    monkeypatch.setattr(
+        blueprint,
+        "_execute_deploy_shim",
+        lambda *args, **kwargs: root_calls.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "_post_activation_receipt",
+        lambda *_args: pytest.fail("historical receipt must remain immutable"),
+    )
+    args = SimpleNamespace(project_id="project-manual", host="control-plane")
+
+    blueprint._execute_deploy(args, revision, digest, promoted, inplace=False)
+
+    expected = blueprint._manual_release_operation_id(
+        "project-manual", digest, revision, promoted
+    )
+    assert root_calls == [((args, revision, digest), {
+        "inplace": False,
+        "operation_id": expected,
+    })]
+    err = capsys.readouterr().err
+    assert "immutable historical receipt remains unchanged" in err
+    assert "No version receipt was posted" in err
+
+
+def test_manual_same_sha_still_posts_one_version_receipt(monkeypatch):
+    revision = "7" * 40
+    promoted = {
+        "version_number": 23,
+        "promoted_sha": revision,
+        "served_sha": revision,
+    }
+    receipts = []
+    monkeypatch.setattr(
+        blueprint,
+        "_post_activation_receipt",
+        lambda *args: receipts.append(args),
+    )
+    args = SimpleNamespace(project_id="project-manual", host="control-plane")
+
+    assert blueprint._post_compatible_activation_receipt(
+        args, promoted, revision
+    ) is True
     assert receipts == [(args, promoted, revision)]
 
 
