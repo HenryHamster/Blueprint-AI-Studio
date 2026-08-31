@@ -1831,6 +1831,13 @@ export function resolveTerminalStatus(
   providerFailureCategory: 'rate_limited' | 'dead_auth' | null = null,
 ): TerminalStatusDecision {
   if (CLEAN_STOP_REASONS.has(stopReason)) return { status: 'COMPLETED' };
+  if (stopReason === 'operator_reply_protocol_failed') {
+    // This task already consumed one bounded same-thread delivery correction.
+    // Its replay fence outranks any provider classification retained by the
+    // child: re-queueing the whole task would re-admit the same durable operator
+    // message. Explicit recovery remains possible after canonical claim release.
+    return { status: 'FAILED', failureCategory: 'resident_reply_protocol_failed' };
+  }
   if (providerFailureCategory) return { status: 'FAILED', failureCategory: providerFailureCategory };
   if (stopReason === 'consultation_abandoned_process_exit') {
     // The CLI child died (SIGINT-on-abandon exits the whole process, not just

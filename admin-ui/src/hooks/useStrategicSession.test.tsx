@@ -668,6 +668,51 @@ describe('useStrategicSession liveness fallback', () => {
     await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(1));
   });
 
+  it('holds reply-protocol recovery for explicit Start without auto-ensure or timer retry', async () => {
+    const liveness = makeLiveness();
+    liveness.resident_session = {
+      ...liveness.resident_session,
+      status: 'ended',
+      ended_at: new Date().toISOString(),
+      worker_state: 'recovery_required',
+      stop_requested: false,
+    };
+    liveness.resident_session_availability = {
+      available: true,
+      state: 'recovery_required',
+      reason: 'reply_protocol_failed: bounded correction exhausted',
+    };
+    renderHook(() =>
+      useStrategicSession({
+        selectedProjectId: 'proj-1',
+        addToast: vi.fn(),
+        strategicReadModel: makeReadModel(null),
+        strategicLiveness: liveness,
+      }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+    });
+    expect(startStrategicSession).not.toHaveBeenCalled();
+  });
+
+  it('does not timer-retry an in-flight ensure that observes reply recovery', async () => {
+    vi.mocked(startStrategicSession).mockResolvedValue({
+      ensure_outcome: 'mode_changed',
+      session: { status: 'ended', worker_state: 'recovery_required' },
+    });
+    renderHook(() => useStrategicSession({
+      selectedProjectId: 'proj-1', addToast: vi.fn(),
+      strategicReadModel: makeReadModel(null), strategicLiveness: makeLiveness(),
+    }));
+
+    await waitFor(() => expect(startStrategicSession).toHaveBeenCalledTimes(1));
+    await act(async () => { await vi.advanceTimersByTimeAsync(10 * 60_000); });
+    expect(startStrategicSession).toHaveBeenCalledTimes(1);
+  });
+
   it('ensures a stale non-retry worker so the backend can replace it', async () => {
     const liveness = makeLiveness();
     liveness.resident_session = {

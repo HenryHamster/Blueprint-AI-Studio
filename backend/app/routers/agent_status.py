@@ -3825,6 +3825,7 @@ async def update_agent_status(
         # masks a real defect.
         from app.failure_classification import (
             REASSIGNED,
+            RESIDENT_REPLY_PROTOCOL_FAILURE,
             SCOPE_EMPTY,
             NON_RETRYABLE_PLATFORM_CLASSES,
             malformed_task_payload_reason,
@@ -4147,16 +4148,28 @@ async def update_agent_status(
                     # exhausted (n/3)" would be a lie that reads as an agent
                     # that kept trying and kept failing. State the actual
                     # cause, and name the surface that owns the fix.
-                    _payload_reason = malformed_task_payload_reason(task)
-                    task.latest_status_message = (
-                        f"[{failure_class}] Not retried: the failure is a permanent "
-                        "property of this task's payload, so every attempt would "
-                        "die identically. "
-                        + (f"{_payload_reason}. " if _payload_reason else "")
-                        + "Fix the spawner that created this task; requeueing it "
-                        "unchanged cannot succeed. "
-                        + existing_msg[:200]
-                    ).strip()
+                    if failure_class == RESIDENT_REPLY_PROTOCOL_FAILURE:
+                        task.latest_status_message = (
+                            f"[{failure_class}] Not retried: this Resident already "
+                            "consumed the admitted operator turn and its one bounded "
+                            "same-thread delivery correction without an authenticated "
+                            "reply receipt. A blind task retry would replay the same "
+                            "durable operator input. Repair the reply protocol, wait for "
+                            "the canonical claim release, then use the supported explicit "
+                            "recovery path. "
+                            + existing_msg[:200]
+                        ).strip()
+                    else:
+                        _payload_reason = malformed_task_payload_reason(task)
+                        task.latest_status_message = (
+                            f"[{failure_class}] Not retried: the failure is a permanent "
+                            "property of this task's payload, so every attempt would "
+                            "die identically. "
+                            + (f"{_payload_reason}. " if _payload_reason else "")
+                            + "Fix the spawner that created this task; requeueing it "
+                            "unchanged cannot succeed. "
+                            + existing_msg[:200]
+                        ).strip()
                     session.add(task)
                 elif "retries exhausted" not in existing_msg:
                     task.latest_status_message = (

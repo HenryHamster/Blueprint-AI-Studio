@@ -270,6 +270,80 @@ describe('startResidentCodexSession', () => {
     expect(fs.existsSync(scratchDir)).toBe(false);
   });
 
+  it('attributes only the corrective resumed turn native reply after a prior omission', async () => {
+    const mcpConfig = path.join(tempDir, 'resident-corrective-reply-mcp.json');
+    fs.writeFileSync(mcpConfig, JSON.stringify({
+      mcpServers: {
+        workday: { command: process.execPath, args: [trustedMcpScript('corrective-reply.mjs')] },
+      },
+    }));
+    const session = startResidentCodexSession({
+      ...readOnly,
+      workspace: tempDir, ...directIsolation(),
+      replyTool: { mcpConfigPath: mcpConfig },
+    }, runner, base);
+
+    const first = session.sendTurn('first turn may omit its native reply');
+    await waitForChildCount(children, 1);
+    const firstChild = requiredLatestChild(children);
+    firstChild.line({ type: 'thread.started', thread_id: 'thread-corrective-reply' });
+    firstChild.line({
+      type: 'item.completed',
+      item: { id: 'msg-first', type: 'agent_message', text: 'undelivered ordinary text' },
+    });
+    firstChild.line({ type: 'turn.completed' });
+    firstChild.close();
+    const firstResult = await first;
+    expect(firstResult).toMatchObject({
+      providerFailed: false,
+      providerTerminalReason: 'completed',
+      processGone: false,
+      sentOperatorMessage: false,
+      operatorReply: null,
+      sawToolUse: false,
+      toolCallCount: 0,
+    });
+
+    const second = session.sendTurn('deliver only the correction reply');
+    await waitForChildCount(children, 2);
+    const secondArgs = vi.mocked(spawn).mock.calls[1][1] as string[];
+    expect(secondArgs.slice(-2)).toEqual(['thread-corrective-reply', '-']);
+    expect(children[1].stdin.end).toHaveBeenCalledWith('deliver only the correction reply');
+    const secondChild = requiredLatestChild(children);
+    secondChild.line({ type: 'thread.started', thread_id: 'thread-corrective-reply' });
+    secondChild.line({ type: 'item.started', item: {
+      id: 'mcp-correction', type: 'mcp_tool_call', server: 'workday',
+      tool: 'reply_to_operator',
+      arguments: { content: 'corrective reply', message_type: 'NOTE' },
+      status: 'in_progress',
+    } });
+    secondChild.line({ type: 'item.completed', item: {
+      id: 'mcp-correction', type: 'mcp_tool_call', server: 'workday',
+      tool: 'reply_to_operator', status: 'completed', error: null,
+      result: {
+        content: [{ type: 'text', text: 'Workday reply accepted for delivery.' }],
+        structured_content: { accepted: true },
+      },
+    } });
+    secondChild.line({ type: 'turn.completed' });
+    secondChild.close();
+    const secondResult = await second;
+
+    expect(secondResult).toMatchObject({
+      providerFailed: false,
+      providerTerminalReason: 'completed',
+      processGone: false,
+      sentOperatorMessage: true,
+      operatorReply: { type: 'NOTE', content: 'corrective reply' },
+      sawToolUse: true,
+      toolCallCount: 1,
+    });
+    expect(firstResult.sentOperatorMessage).toBe(false);
+    expect(firstResult.operatorReply).toBeNull();
+    expect(session.sessionId()).toBe('thread-corrective-reply');
+    session.close();
+  });
+
   it.each([
     { label: 'missing', resumedThreadId: null, reason: 'missing_thread_id' },
     { label: 'mismatched', resumedThreadId: 'thread-other', reason: 'thread_id_mismatch' },

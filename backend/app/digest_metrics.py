@@ -126,6 +126,7 @@ from app.failure_classification import (
     BLOCKED_PRECONDITION,
     BRANCH_GONE,
     REPO_UNINITIALIZED,
+    RESIDENT_REPLY_PROTOCOL_FAILURE,
     CODE_ERROR,
     DEAD_AUTH,
     EXTERNAL_API,
@@ -188,6 +189,9 @@ _FAILURE_CLASS_LABELS = {
         "child PR's work"
     ),
     MALFORMED_TASK_PAYLOAD: "Malformed payload — spawner omitted a field the runner requires",
+    RESIDENT_REPLY_PROTOCOL_FAILURE: (
+        "Resident reply protocol — bounded authenticated delivery correction failed"
+    ),
 }
 
 _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5

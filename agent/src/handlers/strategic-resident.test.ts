@@ -10167,6 +10167,9 @@ describe('handleStrategicResident - failed-turn recovery', () => {
 
   it('extends a legacy claim after backend upgrade when a retry batch grows', async () => {
     vi.useFakeTimers();
+    vi.mocked(fs.existsSync).mockImplementation((candidate) => (
+      String(candidate) !== replyToolPaths.current?.stagedReplyPath
+    ));
     const firstMessage = {
       id: 'msg-legacy-first',
       content: 'first message',
@@ -10251,7 +10254,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       () => {
         replacementTurns += 1;
         return Promise.resolve(replacementTurns === 1
-          ? turnResult({ sentOperatorMessage: false })
+          ? turnResult({ sentOperatorMessage: false, sawToolUse: false })
           : turnResult({
             sentOperatorMessage: true,
             resultText: 'covered both messages after retry',
@@ -10699,8 +10702,12 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(posts.some((post) => Array.isArray(post.handled_message_ids))).toBe(false);
     expect(session.close).toHaveBeenCalled();
   });
-  it('retries a missing native reply in place instead of failing and resetting the task', async () => {
+  it('uses one same-session corrective turn and persists exactly one reply without re-admitting input', async () => {
     vi.useFakeTimers();
+    vi.mocked(recordResidentTurnLatency).mockClear();
+    vi.mocked(fs.existsSync).mockImplementation((candidate) => (
+      String(candidate) !== replyToolPaths.current?.stagedReplyPath
+    ));
     const operatorMessage = {
       id: 'msg-inline-only',
       content: 'Please answer in Workday.',
@@ -10710,41 +10717,75 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     let persisted = false;
     mockApiGet.mockImplementation((url: string) => {
       if (url.includes('/messages?')) {
-        return Promise.resolve({ messages: persisted ? [] : [operatorMessage] });
+        return Promise.resolve({
+          messages: persisted ? [] : [operatorMessage],
+          claim_required: true,
+        });
       }
       return Promise.resolve(null);
     });
     const posts: Array<Record<string, unknown>> = [];
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (body) posts.push(body);
+      if (url.includes('/messages/claim')) {
+        return Promise.resolve({
+          claim_id: 'claim-inline-only',
+          message_ids: [operatorMessage.id],
+          incarnation_supported: true,
+          incarnation_id: 'claim-incarnation-inline-only',
+        });
+      }
       if (body?.op === 'create_message') {
         persisted = true;
         return Promise.resolve({});
       }
       if (url.includes('/heartbeat')) {
-        return Promise.resolve({ authority_held: true, stop_requested: persisted });
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+          conversation_claim_held: true,
+          stop_requested: persisted,
+        });
       }
       return Promise.resolve({});
     });
-    const missingReplySession = makeSession(
-      () => Promise.resolve(turnResult({
-        resultText: 'This inline final must not be delivered.',
-        accumulatedTurnText: 'This inline final must not be delivered.',
-        sentOperatorMessage: false,
-      })),
+    let providerTurn = 0;
+    const sameSession = makeSession(
+      (text) => {
+        providerTurn += 1;
+        if (providerTurn === 1) {
+          return Promise.resolve(turnResult({
+            resultText: 'This inline final must not be delivered.',
+            accumulatedTurnText: 'This inline final must not be delivered.',
+            sawToolUse: true,
+            toolCallCount: 1,
+            totalToolCallDurationMs: 3,
+            turnMs: 7,
+            trace: [
+              { elapsedMs: 1, kind: 'tool', label: 'MCP:project_read' },
+              { elapsedMs: 2, kind: 'tool_result', label: 'MCP:project_read', isError: false },
+              { elapsedMs: 7, kind: 'result', label: 'completed' },
+            ],
+            traceTruncated: false,
+            sentOperatorMessage: false,
+          }));
+        }
+        expect(JSON.stringify(text)).toContain('PROJECT READ ALREADY COMPLETE');
+        expect(JSON.stringify(text)).toContain('Do not call project_read again');
+        expect(JSON.stringify(text)).not.toContain(operatorMessage.content);
+        return Promise.resolve(turnResult({
+          resultText: 'Delivered through the native reply tool.',
+          accumulatedTurnText: 'Delivered through the native reply tool.',
+          sawToolUse: true,
+          toolCallCount: 1,
+          totalToolCallDurationMs: 5,
+          turnMs: 11,
+          sentOperatorMessage: true,
+        }));
+      },
       () => true,
     );
-    const retrySession = makeSession(
-      () => Promise.resolve(turnResult({
-        resultText: 'Delivered through the native reply tool.',
-        accumulatedTurnText: 'Delivered through the native reply tool.',
-        sentOperatorMessage: true,
-      })),
-      () => true,
-    );
-    mockStartSession
-      .mockReturnValueOnce(missingReplySession)
-      .mockReturnValue(retrySession);
+    mockStartSession.mockReturnValue(sameSession);
 
     const run = handleStrategicResident(
       'task-inline-only',
@@ -10756,8 +10797,24 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     await run;
 
     expect(posts.filter(post => post.op === 'create_message')).toHaveLength(1);
-    expect(missingReplySession.close).toHaveBeenCalled();
-    expect(retrySession.sendTurn).toHaveBeenCalledTimes(1);
+    expect(mockStartSession).toHaveBeenCalledTimes(1);
+    expect(sameSession.sendTurn).toHaveBeenCalledTimes(2);
+    expect(sameSession.sendTurn).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      expect.objectContaining({ hardTimeoutMs: 60_000 }),
+    );
+    expect(sameSession.close).toHaveBeenCalledTimes(1);
+    expect(mockApiPost.mock.calls.filter(([url]) =>
+      String(url).includes('/messages/claim'))).toHaveLength(1);
+    const operatorLatency = vi.mocked(recordResidentTurnLatency).mock.calls
+      .map((call) => call[0])
+      .filter((sample) => sample.kind === 'operator');
+    expect(operatorLatency).toContainEqual(expect.objectContaining({
+      turnMs: 18,
+      toolCallCount: 2,
+      toolCallDurationMs: 8,
+    }));
     // This suite deliberately exercises failing paths before this case.  Scope
     // the assertion to this task so an earlier test's expected terminal cannot
     // make a retry regression look flaky.
@@ -10766,8 +10823,11 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     ))).toBe(false);
   });
 
-  it('replaces the worker after the native reply protocol fails twice', async () => {
+  it('fails closed after one same-session corrective omission without re-admitting input', async () => {
     vi.useFakeTimers();
+    vi.mocked(fs.existsSync).mockImplementation((candidate) => (
+      String(candidate) !== replyToolPaths.current?.stagedReplyPath
+    ));
     const operatorMessage = {
       id: 'msg-reply-protocol-broken',
       content: 'Do not retry this forever.',
@@ -10776,33 +10836,44 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     };
     mockApiGet.mockImplementation((url: string) => {
       if (url.includes('/messages?')) {
-        return Promise.resolve({ messages: [operatorMessage] });
+        return Promise.resolve({ messages: [operatorMessage], claim_required: true });
       }
       return Promise.resolve(null);
     });
-    mockApiPost.mockResolvedValue({
-      authority_held: true,
-      stop_requested: false,
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/messages/claim')) {
+        return Promise.resolve({
+          claim_id: 'claim-reply-protocol-broken',
+          message_ids: [operatorMessage.id],
+          incarnation_supported: true,
+          incarnation_id: 'claim-incarnation-reply-protocol-broken',
+        });
+      }
+      return Promise.resolve({
+        authority_held: true,
+        resident_incarnation_held: true,
+        conversation_claim_held: true,
+        stop_requested: false,
+      });
     });
-    const firstBrokenSession = makeSession(
-      () => Promise.resolve(turnResult({
-        resultText: 'inline output is not delivery',
-        accumulatedTurnText: 'inline output is not delivery',
-        sentOperatorMessage: false,
-      })),
+    let providerTurn = 0;
+    const brokenSession = makeSession(
+      () => {
+        providerTurn += 1;
+        const text = providerTurn === 1
+          ? 'inline output is not delivery'
+          : 'still missing the native reply';
+        return Promise.resolve(turnResult({
+          resultText: text,
+          accumulatedTurnText: text,
+          sawToolUse: false,
+          sentOperatorMessage: false,
+        }));
+      },
       () => true,
     );
-    const secondBrokenSession = makeSession(
-      () => Promise.resolve(turnResult({
-        resultText: 'still missing the native reply',
-        accumulatedTurnText: 'still missing the native reply',
-        sentOperatorMessage: false,
-      })),
-      () => true,
-    );
-    mockStartSession
-      .mockReturnValueOnce(firstBrokenSession)
-      .mockReturnValueOnce(secondBrokenSession);
+    Object.assign(brokenSession, { failureCategory: vi.fn(() => 'dead_auth') });
+    mockStartSession.mockReturnValue(brokenSession);
 
     const run = handleStrategicResident(
       'task-reply-protocol-broken',
@@ -10820,15 +10891,149 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     await vi.advanceTimersByTimeAsync(2_000);
     await run;
 
-    expect(mockStartSession).toHaveBeenCalledTimes(2);
-    expect(firstBrokenSession.close).toHaveBeenCalled();
-    expect(secondBrokenSession.sendTurn).toHaveBeenCalledTimes(1);
+    expect(mockStartSession).toHaveBeenCalledTimes(1);
+    expect(brokenSession.sendTurn).toHaveBeenCalledTimes(2);
+    expect(brokenSession.sendTurn).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      expect.objectContaining({ hardTimeoutMs: 60_000 }),
+    );
+    expect(brokenSession.close).toHaveBeenCalledTimes(1);
+    expect(mockApiPost.mock.calls.filter(([url]) =>
+      String(url).includes('/messages/claim'))).toHaveLength(1);
     expect(mockApiPost.mock.calls.filter(([, body]) =>
       body?.op === 'create_message')).toHaveLength(0);
     expect(vi.mocked(persistAndPostStatus).mock.calls.some(([taskId, payload]) => (
       taskId === 'task-reply-protocol-broken'
       && payload.status === 'FAILED'
+      && payload.failure_category === 'resident_reply_protocol_failed'
       && String(payload.logs).includes('operator_reply_protocol_failed')
+    ))).toBe(true);
+  });
+
+  it('does not dispatch a corrective turn without fresh exact-claim authority', async () => {
+    vi.useFakeTimers();
+    vi.mocked(fs.existsSync).mockImplementation((candidate) => (
+      String(candidate) !== replyToolPaths.current?.stagedReplyPath
+    ));
+    const operatorMessage = {
+      id: 'msg-repair-claim-lost',
+      content: 'Do not answer after losing this claim.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    mockApiGet.mockImplementation((url: string) => Promise.resolve(
+      url.includes('/messages?')
+        ? { messages: [operatorMessage], claim_required: true }
+        : null,
+    ));
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/messages/claim')) {
+        return Promise.resolve({
+          claim_id: 'claim-repair-lost',
+          message_ids: [operatorMessage.id],
+          incarnation_supported: true,
+        });
+      }
+      return Promise.resolve({
+        authority_held: true,
+        resident_incarnation_held: true,
+        conversation_claim_held: false,
+        stop_requested: false,
+      });
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'undelivered text',
+        accumulatedTurnText: 'undelivered text',
+        sawToolUse: false,
+        sentOperatorMessage: false,
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    const run = handleStrategicResident(
+      'task-repair-claim-lost',
+      { project_name: 'P', open_messages: [], strategic_session_operator_ack_threshold_seconds: 0 },
+      { project_metadata: { project_id: 'proj-repair-claim-lost' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await run;
+
+    expect(session.sendTurn).toHaveBeenCalledTimes(1);
+    expect(mockApiPost.mock.calls.filter(([url]) =>
+      String(url).includes('/messages/claim'))).toHaveLength(1);
+    expect(vi.mocked(persistAndPostStatus).mock.calls.some(([taskId, payload]) => (
+      taskId === 'task-repair-claim-lost'
+      && payload.status === 'FAILED'
+      && payload.failure_category === 'resident_reply_protocol_failed'
+    ))).toBe(true);
+  });
+
+  it('never corrects or replays after an ambiguous strategic tool turn', async () => {
+    vi.useFakeTimers();
+    vi.mocked(fs.existsSync).mockImplementation((candidate) => (
+      String(candidate) !== replyToolPaths.current?.stagedReplyPath
+    ));
+    const operatorMessage = {
+      id: 'msg-ambiguous-strategic',
+      content: 'Apply a strategic update once.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    mockApiGet.mockImplementation((url: string) => Promise.resolve(
+      url.includes('/messages?')
+        ? { messages: [operatorMessage], claim_required: true }
+        : null,
+    ));
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/messages/claim')) {
+        return Promise.resolve({
+          claim_id: 'claim-ambiguous-strategic',
+          message_ids: [operatorMessage.id],
+          incarnation_supported: true,
+        });
+      }
+      return Promise.resolve({
+        authority_held: true,
+        resident_incarnation_held: true,
+        conversation_claim_held: true,
+        stop_requested: false,
+      });
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'mutation result was ambiguous',
+        accumulatedTurnText: 'mutation result was ambiguous',
+        appliedStrategicOp: false,
+        sawToolUse: true,
+        toolCallCount: 1,
+        trace: [
+          { elapsedMs: 1, kind: 'tool', label: 'MCP:strategic_operation' },
+          { elapsedMs: 2, kind: 'tool_result', label: 'MCP:strategic_operation', isError: true },
+        ],
+        sentOperatorMessage: false,
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    const run = handleStrategicResident(
+      'task-ambiguous-strategic',
+      { project_name: 'P', open_messages: [], strategic_session_operator_ack_threshold_seconds: 0 },
+      { project_metadata: { project_id: 'proj-ambiguous-strategic' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await run;
+
+    expect(session.sendTurn).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(persistAndPostStatus).mock.calls.some(([taskId, payload]) => (
+      taskId === 'task-ambiguous-strategic'
+      && payload.status === 'FAILED'
+      && payload.failure_category === 'resident_reply_protocol_failed'
     ))).toBe(true);
   });
 
