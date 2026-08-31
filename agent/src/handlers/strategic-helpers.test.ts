@@ -155,7 +155,8 @@ curl() {
     expect(request.data).not.toHaveProperty('packet_id');
     expect(request.data).not.toHaveProperty('workday_claim_id');
     expect(request.data).not.toHaveProperty('workday_operation_id');
-    expect(() => execFileSync(
+    fs.rmSync(attemptPath, { force: true });
+    execFileSync(
       bashExecutable,
       [
         bashPath(path.join(testWorkspace, 'strategic')),
@@ -174,8 +175,27 @@ curl() {
           PATH: executionPath,
         },
       },
-    )).toThrow();
-    expect(fs.readFileSync(capturedPath, 'utf8').trim().split('\n')).toHaveLength(2);
+    );
+    const qualificationRequests = fs.readFileSync(capturedPath, 'utf8')
+      .trim()
+      .split('\n')
+      .slice(2)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(qualificationRequests).toHaveLength(2);
+    const qualificationRequest = qualificationRequests[1];
+    expect(qualificationRequest).toMatchObject({
+      op: 'request_qualification',
+      resident_incarnation_id: incarnation,
+      packet_id: packetId,
+      workday_claim_id: workdayClaimId,
+      data: { reason: 'ready' },
+    });
+    expect(qualificationRequest.workday_operation_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(qualificationRequests[0]?.workday_operation_id).toBe(
+      qualificationRequest.workday_operation_id,
+    );
   }, 15_000);
 
   it('injects exact autonomous-turn provenance and rejects every unleased report', () => {
@@ -1321,9 +1341,9 @@ curl() {
       bashExecutable,
       [
         bashPath(path.join(ws, 'strategic')),
-        'set-problem-model',
+        'request-qualification',
         '--json',
-        JSON.stringify({ problem_model: 'python-private-turn' }),
+        JSON.stringify({ reason: 'python-private-turn' }),
       ],
       {
         cwd: ws,
@@ -1345,6 +1365,7 @@ curl() {
     );
     expect(requests).toHaveLength(2);
     expect(requests[0]).toMatchObject({
+      op: 'request_qualification',
       resident_incarnation_id: incarnation,
       packet_id: packetId,
       workday_claim_id: claimId,
@@ -1354,7 +1375,7 @@ curl() {
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
     expect(requests[1]?.workday_operation_id).toBe(requests[0]?.workday_operation_id);
-    expect(requests[0]?.data).toEqual({ problem_model: 'python-private-turn' });
+    expect(requests[0]?.data).toEqual({ reason: 'python-private-turn' });
   }, 15_000);
 
   it('rejects malformed JSON with the existing message + exit 2 via python3 when node is absent', () => {
