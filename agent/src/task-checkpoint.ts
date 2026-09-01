@@ -288,6 +288,16 @@ export async function prepareTaskWorkBranch(
       // outside both shallow boundaries; without this the squash below fails
       // with "unrelated histories" on a clean tree and rethrows forever.
       ensureCheckpointMergeBase(git, baseBranch, workBranch, ws, sendLog);
+      // The deepening helper may have to refetch this branch. Re-bind that local
+      // remote-tracking ref to the exact checkpoint tip already parsed above
+      // before allowing any squash merge from it.
+      const restoreTip = git(['rev-parse', `origin/${workBranch}`]).trim();
+      if (restoreTip !== fetchedSha) {
+        throw new Error(
+          `Checkpoint branch ${workBranch} advanced while deepening its history; ` +
+          'refusing to restore an unverified tip.',
+        );
+      }
       try {
         git(['merge', '--squash', '--no-commit', `origin/${workBranch}`]);
         sendLog(

@@ -1133,6 +1133,54 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
   });
 
+  it('refuses a checkpoint branch that advances during the deepening refetch', async () => {
+    const checkpointHead = 'd'.repeat(40);
+    const advancedHead = 'e'.repeat(40);
+    const checkpointMessage = buildTaskCheckpointCommitMessage(taskId, baseCommit);
+    let deepened = false;
+    let branchRefetchCount = 0;
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `${checkpointHead}\trefs/heads/${workBranch}`;
+      if (args[0] === 'show') return checkpointMessage;
+      if (args[0] === 'rev-parse' && args[1] === `origin/${workBranch}`) {
+        return branchRefetchCount >= 2 ? advancedHead : checkpointHead;
+      }
+      if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return 'true';
+      if (args[0] === 'merge-base') {
+        if (!deepened) throw new Error('fatal: no merge base found');
+        return 'a'.repeat(40);
+      }
+      if (args[0] === 'fetch' && args.includes('--unshallow')) {
+        deepened = true;
+        return '';
+      }
+      if (args[0] === 'fetch' && args.includes(`+refs/heads/${workBranch}:refs/remotes/origin/${workBranch}`)) {
+        // The first fetch materializes A; the deepening helper's second fetch
+        // observes competing B.
+        branchRefetchCount += 1;
+        return '';
+      }
+      return '';
+    });
+
+    await expect(prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+      },
+      {
+        git: gitOps,
+        listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([]),
+        sendLog: vi.fn(),
+      },
+    )).rejects.toThrow(/advanced while deepening its history/);
+
+    expect(gitOps.mock.calls.some(([args]) => args[0] === 'merge')).toBe(false);
+    expect(gitOps).not.toHaveBeenCalledWith([
+      'config', 'blueprint.taskRemoteLeaseSha', expect.any(String),
+    ]);
+  });
+
   it('does not deepen when the checkpoint merge base is already reachable', async () => {
     const checkpointMessage = buildTaskCheckpointCommitMessage(taskId, baseCommit);
     const gitOps = vi.fn((args: string[]): string => {
