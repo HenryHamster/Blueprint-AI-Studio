@@ -59,7 +59,7 @@ describePosix('writePrHelper', () => {
     args: string[],
     setup: (dir: string, realFs: typeof import('node:fs')) => void,
     envOverrides: NodeJS.ProcessEnv = {},
-  ): Promise<{ status: number; stdout: string; stderr: string; checkArgs?: string }> => {
+  ): Promise<{ status: number; stdout: string; stderr: string; checkArgs?: string; preparedLease?: string }> => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
     const realOs = await vi.importActual<typeof import('node:os')>('node:os');
@@ -119,7 +119,13 @@ exec "$(dirname "$0")/git.fixture" "$@"
         } catch {
           // File may not exist
         }
-        return { status: 0, stdout, stderr: '', checkArgs };
+        let preparedLease: string | undefined;
+        try {
+          preparedLease = realFs.readFileSync(realPath.join(dir, 'prepared-lease'), 'utf8');
+        } catch {
+          // Only in-place retry fixtures create this file.
+        }
+        return { status: 0, stdout, stderr: '', checkArgs, preparedLease };
       } catch (err: unknown) {
         const e = err as { status?: number; stdout?: string; stderr?: string };
         return { status: e.status ?? -1, stdout: e.stdout ?? '', stderr: e.stderr ?? '' };
@@ -143,6 +149,8 @@ exec "$(dirname "$0")/git.fixture" "$@"
     realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
 STATE="${dir}/ls-remote-count"
 case "$*" in
+  *"config --get blueprint.taskRemoteLeaseSha"*) [ -f "${dir}/prepared-lease" ] && cat "${dir}/prepared-lease"; exit 0 ;;
+  *"config blueprint.taskRemoteLeaseSha "*) printf '%s' "$3" > "${dir}/prepared-lease"; exit 0 ;;
   *"rev-parse --verify origin/main"*) exit 0 ;;
   *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
   *"status --porcelain"*) exit 0 ;;
@@ -423,6 +431,36 @@ exit 0
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('remote branch advanced to a competing SHA');
     expect(result.stderr).toContain(competingSha);
+  });
+
+  it('anchors an in-place PR retry to the exact head observed before the model turn', async () => {
+    const preparedSha = 'a'.repeat(40);
+    const advancedSha = 'c'.repeat(40);
+    const localSha = 'b'.repeat(40);
+    const script = writeScript({ taskId: 'task-prepared-race', workBranch: 'blueprint/task-prepared-race', baseBranch: 'main', owner: 'acme', repo: 'repo', testsOnMainBranch: false });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      setupPushRace(dir, realFs, 'task-prepared-race', advancedSha, advancedSha, localSha);
+      realFs.writeFileSync(`${dir}/prepared-lease`, preparedSha);
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('task branch advanced after retry checkout');
+    expect(result.stderr).toContain(preparedSha);
+    expect(result.stderr).toContain(advancedSha);
+  });
+
+  it('advances the prepared retry lease after an exactly reconciled push', async () => {
+    const preparedSha = 'a'.repeat(40);
+    const localSha = 'b'.repeat(40);
+    const script = writeScript({ taskId: 'task-prepared-success', workBranch: 'blueprint/task-prepared-success', baseBranch: 'main', owner: 'acme', repo: 'repo', testsOnMainBranch: false });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      setupPushRace(dir, realFs, 'task-prepared-success', preparedSha, localSha, localSha);
+      realFs.writeFileSync(`${dir}/prepared-lease`, preparedSha);
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('exact remote ref equals local HEAD');
+    expect(result.preparedLease).toBe(localSha);
   });
 
   /** Overwrite setupPushRace's git so the second ls-remote reports a checkpoint tip. */
@@ -2413,6 +2451,9 @@ describe('writePrHelper — run_pr_gate timeout-absent fallback (static)', () =>
     expect(script).toContain(
       '_PR_LEASE="--force-with-lease=$_PR_REMOTE_REF:$_PR_EXPECTED_REMOTE_SHA"',
     );
+    expect(script).toContain('git config --get blueprint.taskRemoteLeaseSha');
+    expect(script).toContain('task branch advanced after retry checkout');
+    expect(script).toContain('git config blueprint.taskRemoteLeaseSha "$_PR_PUSH_SHA"');
     expect(script).toContain('git push "$_PR_LEASE" origin "HEAD:$_PR_REMOTE_REF"');
     expect(script).toContain('if [ "$_PR_OBSERVED_REMOTE_SHA" != "$_PR_EXPECTED_REMOTE_SHA" ]; then');
     expect(script).not.toContain('stale lease, fetching + retrying');

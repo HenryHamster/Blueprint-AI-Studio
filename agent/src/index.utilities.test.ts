@@ -104,6 +104,7 @@ import {
   _setWarmStartForTesting,
   setCurrentPromptFingerprint,
   getCurrentPromptFingerprint,
+  listOpenPullRequestsForBranch,
   _crashReportForTesting,
   _resetCredentialStateForTesting,
   refreshRuntimeState,
@@ -805,6 +806,71 @@ describe('github/token fetch: infra category and long timeout', () => {
     // TypeScript ensures this is a valid FailureCategory member at compile time.
     const category: FailureCategory = wrapped.failureCategory;
     expect(typeof category).toBe('string');
+  });
+});
+
+describe('open PR branch authority read', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('returns the exact head/base identities needed for in-place task retry', async () => {
+    const headSha = '4'.repeat(40);
+    const payload = [{
+      number: 42,
+      html_url: 'https://github.com/owner/repo/pull/42',
+      head: { ref: 'blueprint/task-123', sha: headSha, repo: { full_name: 'owner/repo' } },
+      base: { ref: 'main' },
+    }];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue(payload),
+    }));
+
+    await expect(listOpenPullRequestsForBranch(
+      'token', 'owner', 'repo', 'blueprint/task-123',
+    )).resolves.toEqual(payload);
+  });
+
+  it('fails closed when GitHub cannot authoritatively report open PRs', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: vi.fn(),
+    }));
+
+    await expect(listOpenPullRequestsForBranch(
+      'token', 'owner', 'repo', 'blueprint/task-123',
+    )).rejects.toThrow(/refusing stale-branch cleanup without an authoritative PR read/);
+  });
+
+  it('fails closed on a malformed successful PR response', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ number: 42 }),
+    }));
+
+    await expect(listOpenPullRequestsForBranch(
+      'token', 'owner', 'repo', 'blueprint/task-123',
+    )).rejects.toThrow(/non-array response/);
+  });
+
+  it.each([
+    [{ html_url: 'https://github.com/owner/repo/pull/42' }],
+    [{ number: 42, html_url: 'not-a-github-pr-url' }],
+    [{ number: 42, html_url: 'https://github.com/owner/repo/pull/42', head: { ref: 'branch' } }],
+  ])('fails closed on a malformed PR entry %#', async (payload) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue([payload]),
+    }));
+
+    await expect(listOpenPullRequestsForBranch(
+      'token', 'owner', 'repo', 'blueprint/task-123',
+    )).rejects.toThrow(/malformed PR entry/);
   });
 });
 

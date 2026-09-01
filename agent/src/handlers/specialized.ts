@@ -29,7 +29,7 @@ import {
   setCurrentPromptFingerprint, listOpenPullRequestsForBranch, deriveTaskBranch, matchesRateLimit,
   resolveBaseBranch, resolveTaskBranchNamespace,
 } from '../index.js';
-import { prepareTaskWorkBranch } from '../task-checkpoint.js';
+import { prepareTaskWorkBranch, taskOwnedOpenPullRequest } from '../task-checkpoint.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
@@ -209,7 +209,10 @@ export async function handleMigrate(
 
   const workBranch = deriveTaskBranch('migrate', taskId, resolveTaskBranchNamespace(task));
   await prepareTaskWorkBranch(
-    { owner, repo, ghToken, baseBranch, workBranch, taskId, ws },
+    {
+      owner, repo, ghToken, baseBranch, workBranch, taskId, ws,
+      ownedOpenPullRequest: taskOwnedOpenPullRequest(payload),
+    },
     { git, listOpenPullRequestsForBranch, sendLog },
   );
 

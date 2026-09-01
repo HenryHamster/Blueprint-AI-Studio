@@ -834,6 +834,34 @@ if [ "$_PR_EXPECTED_QUERY_STATUS" -ne 0 ]; then
   exit 1
 fi
 _PR_EXPECTED_REMOTE_SHA=$(printf '%s\n' "$_PR_EXPECTED_QUERY" | awk 'NR == 1 {print $1}')
+# An in-place retry of an existing PR records the exact head it checked out in
+# local git config.  Do not let this later read silently walk the lease forward
+# to a branch update that happened during the model/tool turn.
+_PR_PREPARED_REMOTE_SHA=$(git config --get blueprint.taskRemoteLeaseSha 2>/dev/null || true)
+if [ -n "$_PR_PREPARED_REMOTE_SHA" ]; then
+  if ! printf '%s' "$_PR_PREPARED_REMOTE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+    echo "[pr] prepared remote lease is malformed; refusing publication" >&2
+    exit 1
+  fi
+  if [ "$_PR_EXPECTED_REMOTE_SHA" != "$_PR_PREPARED_REMOTE_SHA" ]; then
+    # If a prior invocation pushed this exact local HEAD but failed before
+    # advancing the local lease record, remote==local is an exact reconciliation
+    # predicate.  Any other advance belongs to an ambiguous competing writer.
+    if [ "$_PR_EXPECTED_REMOTE_SHA" = "$_PR_PUSH_SHA" ]; then
+      echo "[pr] exact remote ref already equals local HEAD; reconciling the prepared retry lease."
+      git config blueprint.taskRemoteLeaseSha "$_PR_PUSH_SHA" || {
+        echo "[pr] cannot persist the reconciled retry lease" >&2
+        exit 1
+      }
+      _PR_PREPARED_REMOTE_SHA="$_PR_PUSH_SHA"
+    else
+      echo "[pr] task branch advanced after retry checkout; refusing to overwrite it." >&2
+      echo "[pr] prepared: $_PR_PREPARED_REMOTE_SHA" >&2
+      echo "[pr] observed: \${_PR_EXPECTED_REMOTE_SHA:-<absent>}" >&2
+      exit 1
+    fi
+  fi
+fi
 _PR_LEASE="--force-with-lease=$_PR_REMOTE_REF:$_PR_EXPECTED_REMOTE_SHA"
 PUSH_OK=0
 for attempt in 1 2 3; do
@@ -884,6 +912,12 @@ done
 if [ "$PUSH_OK" = "0" ]; then
   echo "[pr] push failed after 3 attempts" >&2
   exit 1
+fi
+if [ -n "$_PR_PREPARED_REMOTE_SHA" ]; then
+  git config blueprint.taskRemoteLeaseSha "$_PR_PUSH_SHA" || {
+    echo "[pr] push completed but the local retry lease could not be advanced; refusing further publication" >&2
+    exit 1
+  }
 fi
 
 # 5. Create or update PR via orchestrator-mediated endpoint.
