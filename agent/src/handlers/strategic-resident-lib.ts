@@ -138,6 +138,11 @@ export interface ResidentActivityUpdate {
 
 export interface SessionHeartbeatResponse {
   authority_held?: boolean;
+  /** Canonical project-wide autonomy fence. False keeps the Resident's public
+   *  operator conversation alive while mechanically disabling private
+   *  autonomous project turns. Absent on an older backend preserves the last
+   *  known/bootstrap value. */
+  project_autonomous_enabled?: boolean;
   leased_until?: string;
   stop_requested?: boolean;
   status?: string;
