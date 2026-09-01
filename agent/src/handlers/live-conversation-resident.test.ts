@@ -65,7 +65,7 @@ describe('live conversation coordinator', () => {
       expect(callLeaseIsPubliclyActive(parsed)).toBe(false);
       const coordinator = new CallCoordinatorState();
       coordinator.updateLease(parsed);
-      expect(() => coordinator.beginPublicTurn('message-1')).toThrow('no active call lease');
+      expect(() => coordinator.beginPublicTurn(['message-1'], 42)).toThrow('no active call lease');
     } finally {
       vi.useRealTimers();
     }
@@ -95,7 +95,7 @@ describe('live conversation coordinator', () => {
   it('drops an old Fast completion after a lease revision changes and retains only heard playout', () => {
     const coordinator = new CallCoordinatorState();
     coordinator.updateLease(parseCallLeaseProjection(lease));
-    const receipt = coordinator.beginPublicTurn('message-1');
+    const receipt = coordinator.beginPublicTurn(['message-1'], 42);
     expect(coordinator.interruptPlayback('The con')).toBe(1);
     expect(coordinator.playbackState()).toEqual({ revision: 1, heardPrefix: 'The con' });
     coordinator.updateLease(parseCallLeaseProjection({ ...lease, input_revision: 8 }));
@@ -148,7 +148,7 @@ describe('live conversation coordinator', () => {
     try {
       const coordinator = new CallCoordinatorState();
       coordinator.updateLease(parseCallLeaseProjection(lease));
-      const receipt = coordinator.beginPublicTurn('message-1');
+      const receipt = coordinator.beginPublicTurn(['message-1'], 42);
       let turn = await controller.dispatch(receipt, 'hello');
       expect(turn.result.processGone).toBe(true);
       controller.replaceAfterCrash();
@@ -211,10 +211,10 @@ describe('live conversation coordinator', () => {
     try {
       const coordinator = new CallCoordinatorState();
       coordinator.updateLease(parseCallLeaseProjection(lease));
-      const turnA = coordinator.beginPublicTurn('message-a');
+      const turnA = coordinator.beginPublicTurn(['message-a'], 41);
       const resultA = await controller.dispatch(turnA, 'turn A');
       expect(resultA.completion).toBeNull();
-      const turnB = coordinator.beginPublicTurn('message-b');
+      const turnB = coordinator.beginPublicTurn(['message-b'], 42);
       const resultB = await controller.dispatch(turnB, 'turn B');
       expect(resultB.completion?.spoken_text).toBe('Current B completion.');
       expect(launches).toHaveLength(2);
@@ -242,7 +242,7 @@ describe('live conversation coordinator', () => {
     });
     const coordinator = new CallCoordinatorState();
     coordinator.updateLease(parseCallLeaseProjection(lease));
-    await expect(controller.dispatch(coordinator.beginPublicTurn('message-1'), 'hello'))
+    await expect(controller.dispatch(coordinator.beginPublicTurn(['message-1'], 42), 'hello'))
       .rejects.toThrow('not qualification-approved');
     controller.close();
     fs.rmSync(runtime, { recursive: true, force: true });

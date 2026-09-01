@@ -239,6 +239,13 @@ async def _begin(
     task: Task,
     payload: Any,
 ) -> dict[str, Any]:
+    # ``project`` is the canonical row already held FOR UPDATE by the agent
+    # operation handler.  The Resident activity blob is heartbeat-lagged, so
+    # it may still say ``active`` after the operator disables project autonomy.
+    # Fail closed on the canonical switch before inspecting or mutating any
+    # autonomous-turn lease state.
+    if project.autonomous_enabled is not True:
+        raise _conflict("Project autonomy is disabled")
     resident, session_id, generation, incarnation = _request_identity(
         project, task, payload
     )

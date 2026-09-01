@@ -13,6 +13,8 @@ export type CallResidentToolRole = 'fast' | 'typed' | 'workday';
 export interface CallResidentToolPaths {
   stageDir: string;
   receiptPath?: string;
+  /** Host-owned marker; Workday packet emission is valid only for active-call turns. */
+  privateTurnMarkerPath?: string;
 }
 
 export interface ProvisionedCallResidentTool {
@@ -32,6 +34,9 @@ export function provisionCallResidentTool(
 ): ProvisionedCallResidentTool {
   if ((role === 'fast' || role === 'typed') && !paths.receiptPath) {
     throw new Error('Fast foreground tool requires a turn receipt path');
+  }
+  if (role === 'workday' && !paths.privateTurnMarkerPath) {
+    throw new Error('Workday packet emitter requires a private turn marker path');
   }
   fs.mkdirSync(paths.stageDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(paths.stageDir, 0o700);
@@ -53,6 +58,9 @@ export function provisionCallResidentTool(
           CALL_RESIDENT_ROLE: role,
           CALL_LOCAL_STAGE_DIR: paths.stageDir,
           ...(paths.receiptPath ? { CALL_TURN_RECEIPT_PATH: paths.receiptPath } : {}),
+          ...(paths.privateTurnMarkerPath ? {
+            BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH: paths.privateTurnMarkerPath,
+          } : {}),
         },
       },
     },

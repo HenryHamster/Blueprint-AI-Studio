@@ -821,6 +821,74 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(statusAtLoopEntry).toBe('Resident ready — waiting for operator input');
   });
 
+  it('serves queued operator work but never runs an autonomous turn when canonical project autonomy is off', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'msg-project-autonomy-off',
+      content: 'Answer this queued operator request without advancing the project.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?')) return Promise.resolve(null);
+      if (delivered) return Promise.resolve({ messages: [] });
+      delivered = true;
+      return Promise.resolve({ messages: [operatorMessage] });
+    });
+    let heartbeatCount = 0;
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (!url.includes('/strategic-session/heartbeat')) return Promise.resolve({});
+      heartbeatCount += 1;
+      if (body?.activity) heartbeatBodies.push(body);
+      return Promise.resolve({
+        authority_held: true,
+        resident_incarnation_held: true,
+        project_autonomous_enabled: false,
+        stop_requested: heartbeatCount >= 6,
+      });
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        sentOperatorMessage: true,
+        resultText: 'Operator request answered.',
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    const done = handleStrategicResident(
+      'resident-project-autonomy-off',
+      {
+        project_name: 'P',
+        open_messages: [],
+        // Prove the live canonical heartbeat wins over a stale-true bootstrap.
+        project_autonomous_enabled: true,
+        strategic_session_autonomous: true,
+        strategic_session_idle_tick_seconds: 1,
+        strategic_session_message_poll_seconds: 0.001,
+        typed_fast_enabled: false,
+      },
+      { project_metadata: { project_id: 'project-autonomy-off' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+    await vi.advanceTimersByTimeAsync(10_000);
+    await done;
+
+    expect(session.sendTurn).toHaveBeenCalledTimes(1);
+    expect(session.sendTurn.mock.calls[0]?.[0]).toEqual(
+      expect.stringContaining(operatorMessage.content),
+    );
+    expect(heartbeatBodies.length).toBeGreaterThan(0);
+    expect(heartbeatBodies.every((body) => body.autonomous_turn === false)).toBe(true);
+    expect(heartbeatBodies.every((body) => (
+      (body.activity as Record<string, unknown> | undefined)?.autonomy_state === 'paused'
+      && (body.activity as Record<string, unknown> | undefined)?.autonomy_reason_code
+        === 'chat_or_disabled'
+    ))).toBe(true);
+  });
+
   it('publishes a bounded active-to-authority-paused follow-up heartbeat', async () => {
     const operatorMessage = {
       id: 'msg-autonomy-active-to-paused',
@@ -3525,9 +3593,12 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       ...qualifiedPayload(),
       strategic_session_message_poll_seconds: 0.001,
     });
+    const consultationSettled = (): boolean => (
+      consultationAcknowledged && olderContinuationCompleted
+    );
     for (
       let i = 0;
-      i < 50 && !(consultationAcknowledged && olderContinuationCompleted);
+      i < 50 && !consultationSettled();
       i += 1
     ) {
       await vi.advanceTimersByTimeAsync(100);
@@ -4898,23 +4969,19 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await activeDone;
 
     expect(messagePolls).toBeGreaterThan(0);
-    expect(staleReleaseBodies).toEqual([
-      expect.objectContaining({
-        task_id: staleTaskId,
-        continuation_claim_id: 'stale-continuation-claim',
-        incarnation_id: expect.any(String),
-      }),
-    ]);
+    expect(staleReleaseBodies).toHaveLength(1);
+    expect(staleReleaseBodies[0]).toMatchObject({
+      task_id: staleTaskId,
+      continuation_claim_id: 'stale-continuation-claim',
+    });
+    expect(staleReleaseBodies[0]?.incarnation_id).toEqual(expect.any(String));
     expect(mockSendLog.mock.calls.some(([, text]) => (
       String(text).includes('typed continuation release deferred')
       && String(text).includes('(401)')
     ))).toBe(true);
-    expect(activeClaimBodies).toEqual([
-      expect.objectContaining({
-        task_id: activeTaskId,
-        incarnation_id: expect.any(String),
-      }),
-    ]);
+    expect(activeClaimBodies).toHaveLength(1);
+    expect(activeClaimBodies[0]).toMatchObject({ task_id: activeTaskId });
+    expect(activeClaimBodies[0]?.incarnation_id).toEqual(expect.any(String));
     expect(activeClaimBodies[0]?.incarnation_id)
       .not.toBe(staleReleaseBodies[0]?.incarnation_id);
     expect(activeAckBodies).toEqual([
@@ -7032,6 +7099,15 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
               packet_id: '00000000-0000-0000-0000-000000000952',
               workday_claim_id: '00000000-0000-0000-0000-000000000953',
             } : {}),
+            ...(kind === 'active-call' ? {
+              project_id: '00000000-0000-0000-0000-000000000954',
+              call_session_id: '00000000-0000-0000-0000-000000000955',
+              call_generation: 7,
+              request_id: '00000000-0000-0000-0000-000000000956',
+              originating_user_turn_ids: ['00000000-0000-0000-0000-000000000957'],
+              input_revision: 11,
+              context_sequence: 23,
+            } : {}),
           });
           await new Promise<void>((resolve) => { release = resolve; });
           expect(fs.lstatSync(markerPath).isFile()).toBe(true);
@@ -7039,6 +7115,16 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
         kind === 'typed-consultation' ? {
           packetId: '00000000-0000-0000-0000-000000000952',
           workdayClaimId: '00000000-0000-0000-0000-000000000953',
+        } : undefined,
+        undefined,
+        kind === 'active-call' ? {
+          project_id: '00000000-0000-0000-0000-000000000954',
+          call_session_id: '00000000-0000-0000-0000-000000000955',
+          call_generation: 7,
+          request_id: '00000000-0000-0000-0000-000000000956',
+          originating_user_turn_ids: ['00000000-0000-0000-0000-000000000957'],
+          input_revision: 11,
+          context_sequence: 23,
         } : undefined,
       );
 
@@ -11194,7 +11280,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     );
     expect(sameSession.close).toHaveBeenCalledTimes(1);
     expect(mockApiPost.mock.calls.filter(([url]) =>
-      String(url).includes('/messages/claim'))).toHaveLength(1);
+      url.includes('/messages/claim'))).toHaveLength(1);
     const operatorLatency = vi.mocked(recordResidentTurnLatency).mock.calls
       .map((call) => call[0])
       .filter((sample) => sample.kind === 'operator');
@@ -11288,7 +11374,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     );
     expect(brokenSession.close).toHaveBeenCalledTimes(1);
     expect(mockApiPost.mock.calls.filter(([url]) =>
-      String(url).includes('/messages/claim'))).toHaveLength(1);
+      url.includes('/messages/claim'))).toHaveLength(1);
     expect(mockApiPost.mock.calls.filter(([, body]) =>
       body?.op === 'create_message')).toHaveLength(0);
     expect(vi.mocked(persistAndPostStatus).mock.calls.some(([taskId, payload]) => (
@@ -11355,7 +11441,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
 
     expect(session.sendTurn).toHaveBeenCalledTimes(1);
     expect(mockApiPost.mock.calls.filter(([url]) =>
-      String(url).includes('/messages/claim'))).toHaveLength(1);
+      url.includes('/messages/claim'))).toHaveLength(1);
     expect(vi.mocked(persistAndPostStatus).mock.calls.some(([taskId, payload]) => (
       taskId === 'task-repair-claim-lost'
       && payload.status === 'FAILED'

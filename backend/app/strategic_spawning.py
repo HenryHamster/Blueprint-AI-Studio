@@ -2204,6 +2204,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "typed_fast_models": {"priority": "critical", "exempt": True},
     "typed_fast_effort": {"priority": "critical"},
     "typed_fast_qualification": {"priority": "critical"},
+    # Canonical project-wide autonomy fence for a Resident task. Continuous
+    # Workday may keep serving operator conversation while this is false, but
+    # its private autonomous loop must remain mechanically disabled. This tiny
+    # server-owned scalar must never be trimmed from the bootstrap payload.
+    "project_autonomous_enabled": {"priority": "critical"},
     # Small authoritative decision contract. The live policy is critical so a
     # stale qualification threshold can never outlive the runtime truth under
     # payload pressure; the launch-time snapshot is separately labeled.
@@ -6070,6 +6075,7 @@ async def _spawn_strategic_review(
     strategy_only = cycle_id is None
     _project_id = project.id
     _project_name = project.name
+    _project_autonomous_enabled = bool(project.autonomous_enabled)
     _base_vision: dict = {}
     _base_problem_model: dict = {}
     _base_running_update: str = ""
@@ -6394,6 +6400,13 @@ async def _spawn_strategic_review(
                     # the same format as spawned agents.
                     "strategic_memory_notes": await build_strategic_memory_index(session, project.id),
                     **(extra_payload or {}),
+                    # Server-authoritative and intentionally AFTER extra_payload:
+                    # a caller cannot re-enable private autonomous project work
+                    # while the canonical Project fence is disabled. Continuous
+                    # Workday remains available for operator conversation.
+                    "project_autonomous_enabled": bool(
+                        _project_autonomous_enabled
+                    ),
                     # Server-authoritative and intentionally AFTER extra_payload:
                     # a caller-supplied payload must not advance the bootstrap
                     # cursor past an older open operator row omitted by packing.
