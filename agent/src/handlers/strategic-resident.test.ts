@@ -11297,6 +11297,109 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     ))).toBe(false);
   });
 
+  it('recovers an authenticated reply after a private-only packet tool is rejected on the public turn', async () => {
+    vi.useFakeTimers();
+    vi.mocked(fs.existsSync).mockImplementation((candidate) => (
+      String(candidate) !== replyToolPaths.current?.stagedReplyPath
+    ));
+    const operatorMessage = {
+      id: 'msg-rejected-private-tool',
+      content: 'Use the private consultation path and acknowledge the result.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let persisted = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        return Promise.resolve({
+          messages: persisted ? [] : [operatorMessage],
+          claim_required: true,
+        });
+      }
+      return Promise.resolve(null);
+    });
+    const posts: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (body) posts.push(body);
+      if (url.includes('/messages/claim')) {
+        return Promise.resolve({
+          claim_id: 'claim-rejected-private-tool',
+          message_ids: [operatorMessage.id],
+          incarnation_supported: true,
+          incarnation_id: 'claim-incarnation-rejected-private-tool',
+        });
+      }
+      if (body?.op === 'create_message') {
+        persisted = true;
+        return Promise.resolve({});
+      }
+      if (url.includes('/heartbeat')) {
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+          conversation_claim_held: true,
+          stop_requested: persisted,
+        });
+      }
+      return Promise.resolve({});
+    });
+    let providerTurn = 0;
+    const sameSession = makeSession(
+      (text) => {
+        providerTurn += 1;
+        if (providerTurn === 1) {
+          return Promise.resolve(turnResult({
+            resultText: 'No private call authority marker exists.',
+            accumulatedTurnText: 'No private call authority marker exists.',
+            sawToolUse: true,
+            toolCallCount: 1,
+            trace: [
+              { elapsedMs: 1, kind: 'tool', label: 'mcp__call__emit_call_packet' },
+              { elapsedMs: 2, kind: 'tool_result', label: 'tool_result', isError: true },
+              { elapsedMs: 3, kind: 'result', label: 'completed', isError: false },
+            ],
+            traceTruncated: false,
+            sentOperatorMessage: false,
+          }));
+        }
+        const repair = JSON.stringify(text);
+        expect(repair).toContain('PRIVATE-ONLY TOOL REJECTED');
+        expect(repair).toContain('rejected before local staging');
+        expect(repair).toContain('reply_to_operator');
+        expect(repair).not.toContain(operatorMessage.content);
+        return Promise.resolve(turnResult({
+          resultText: 'The private action was not created; no mutation occurred.',
+          accumulatedTurnText: 'The private action was not created; no mutation occurred.',
+          sawToolUse: true,
+          toolCallCount: 1,
+          sentOperatorMessage: true,
+        }));
+      },
+      () => true,
+    );
+    mockStartSession.mockReturnValue(sameSession);
+
+    const run = handleStrategicResident(
+      'task-rejected-private-tool',
+      {
+        project_name: 'P', open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 0,
+      },
+      { project_metadata: { project_id: 'proj-rejected-private-tool' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await run;
+
+    expect(sameSession.sendTurn).toHaveBeenCalledTimes(2);
+    expect(mockApiPost.mock.calls.filter(([url]) =>
+      url.includes('/messages/claim'))).toHaveLength(1);
+    expect(posts.filter(post => post.op === 'create_message')).toHaveLength(1);
+    expect(vi.mocked(persistAndPostStatus).mock.calls.some(([taskId, payload]) => (
+      taskId === 'task-rejected-private-tool' && payload.status === 'FAILED'
+    ))).toBe(false);
+  });
+
   it('fails closed after one same-session corrective omission without re-admitting input', async () => {
     vi.useFakeTimers();
     vi.mocked(fs.existsSync).mockImplementation((candidate) => (

@@ -70,7 +70,15 @@ function boundedStringArray(value, label, maxItems, maxStringBytes) {
   return value.map((entry) => nonEmpty(entry, label, maxStringBytes));
 }
 function validateCallPacket(value) {
-  const marker = regularJson(privateTurnMarkerPath, 'private Workday turn marker');
+  let marker;
+  try {
+    marker = regularJson(privateTurnMarkerPath, 'private Workday turn marker');
+  } catch (cause) {
+    if (!privateTurnMarkerPath || cause?.code === 'ENOENT') {
+      throw new Error('emit_call_packet requires an active private call turn');
+    }
+    throw cause;
+  }
   if (!object(marker) || marker.kind !== 'active-call') {
     throw new Error('emit_call_packet requires an active private call turn');
   }

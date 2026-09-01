@@ -156,23 +156,54 @@ const OPERATOR_REPLY_PROTOCOL_READ_COMPLETE_REPAIR_PROMPT = [
   'The existing claim, receipt, covered message ids, and idempotency key remain authoritative. Do not create or replay an operator message.',
 ].join('\n');
 
-function replyRepairPriorWorkIsSafe(result: ResidentTurnResult): boolean {
+const OPERATOR_REPLY_PROTOCOL_PRIVATE_TOOL_REJECTED_REPAIR_PROMPT = [
+  '[WORKDAY DELIVERY RECOVERY — PRIVATE-ONLY TOOL REJECTED]',
+  'Your preceding emit_call_packet attempt was rejected before local staging because this is the public operator turn, not an active private Call Workday turn.',
+  'Do not retry emit_call_packet, do not repeat the original analysis, and do not create or replay an operator message.',
+  `Call ${RESIDENT_REPLY_TOOL_NAME} exactly once with the complete operator-facing result already established by this thread.`,
+  'If the requested private action could not be created, deliver that bounded blocker honestly through reply_to_operator.',
+  'The existing claim, reply receipt, covered message ids, and idempotency key remain authoritative.',
+].join('\n');
+
+type ReplyRepairPriorWork = 'none' | 'project-read' | 'rejected-private-tool';
+
+function classifyReplyRepairPriorWork(
+  result: ResidentTurnResult,
+): ReplyRepairPriorWork | null {
   const trace = result.trace ?? [];
   const tools = trace.filter(event => event.kind === 'tool');
   if (result.toolCallCount === 0) {
-    return !result.sawToolUse && tools.length === 0;
+    return !result.sawToolUse && tools.length === 0 ? 'none' : null;
   }
-  const allowedReadLabels = new Set([
+  const projectReadLabels = new Set([
     RESIDENT_PROJECT_READ_TOOL_NAME,
     'MCP:project_read',
   ]);
   const results = trace.filter(event => event.kind === 'tool_result');
-  return result.sawToolUse
+  const exactTrace = result.sawToolUse
     && result.traceTruncated !== true
     && tools.length === result.toolCallCount
-    && tools.every(event => typeof event.label === 'string' && allowedReadLabels.has(event.label))
-    && results.length === result.toolCallCount
-    && results.every(event => event.isError !== true);
+    && results.length === result.toolCallCount;
+  if (!exactTrace) return null;
+  if (
+    tools.every(event => typeof event.label === 'string' && projectReadLabels.has(event.label))
+    && results.every(event => event.isError !== true)
+  ) {
+    return 'project-read';
+  }
+  // emit_call_packet validates the active private-turn marker before it can
+  // write a packet. On this public operator path there is deliberately no such
+  // marker, so an exact failed call is a proven local no-op. Permit only the
+  // same-claim reply correction; never rerun the rejected tool or operator
+  // input. Other failed tools remain ambiguous and fail closed below.
+  if (
+    result.toolCallCount === 1
+    && tools[0]?.label === 'mcp__call__emit_call_packet'
+    && results[0]?.isError === true
+  ) {
+    return 'rejected-private-tool';
+  }
+  return null;
 }
 // session.interrupt() on a typed Workday consultation abandon kills the whole
 // Claude Code child, not just the turn. One consecutive exit is recovered in
@@ -5777,11 +5808,12 @@ export async function handleStrategicResident(
       }
       r = await turnPromise;
       operatorAttempts.push(r);
+      const replyRepairPriorWork = classifyReplyRepairPriorWork(r);
       if (
         !r.sentOperatorMessage
         && r.operatorReply === null
         && !r.appliedStrategicOp
-        && replyRepairPriorWorkIsSafe(r)
+        && replyRepairPriorWork !== null
         && !r.providerFailed
         && !r.interrupted
         && !r.timedOut
@@ -5821,9 +5853,11 @@ export async function handleStrategicResident(
               + `trace=${JSON.stringify((r.trace ?? []).slice(-16))})\n`,
           );
           const repairPromise = runTurn(
-            r.toolCallCount === 0
+            replyRepairPriorWork === 'none'
               ? OPERATOR_REPLY_PROTOCOL_REPAIR_PROMPT
-              : OPERATOR_REPLY_PROTOCOL_READ_COMPLETE_REPAIR_PROMPT,
+              : replyRepairPriorWork === 'project-read'
+                ? OPERATOR_REPLY_PROTOCOL_READ_COMPLETE_REPAIR_PROMPT
+                : OPERATOR_REPLY_PROTOCOL_PRIVATE_TOOL_REJECTED_REPAIR_PROMPT,
             true,
             null,
             undefined,
