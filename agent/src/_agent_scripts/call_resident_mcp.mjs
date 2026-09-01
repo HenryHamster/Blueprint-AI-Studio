@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* global Buffer, process */
 // Strictly local MCP bridge for the text-only Call Coordinator.  It never
 // calls Blueprint or the network: it validates and stages a typed intent for
 // the parent process to fence against the current call lease.
@@ -15,23 +16,14 @@ const privateTurnMarkerPath = process.env.BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER
 const MAX_BYTES = 65_536;
 const MAX_PACKET_TEXT = 24_000;
 const CALL_PACKET_REQUIRED = [
-  'version', 'packet_id', 'project_id', 'call_session_id', 'call_generation',
-  'request_id', 'originating_user_turn_ids', 'input_revision',
-  'context_sequence', 'kind', 'spoken_text',
+  'packet_id', 'kind', 'spoken_text',
+];
+const CALL_PACKET_AUTHORITY_FIELDS = [
+  'version', 'project_id', 'call_session_id', 'call_generation', 'request_id',
+  'originating_user_turn_ids', 'input_revision', 'context_sequence',
 ];
 const CALL_PACKET_PROPERTIES = {
-  version: { type: 'integer', enum: [1] },
   packet_id: { type: 'string', minLength: 1, maxLength: 256 },
-  project_id: { type: 'string', minLength: 1, maxLength: 256 },
-  call_session_id: { type: 'string', minLength: 1, maxLength: 256 },
-  call_generation: { type: 'integer', minimum: 1 },
-  request_id: { type: 'string', minLength: 1, maxLength: 256 },
-  originating_user_turn_ids: {
-    type: 'array', minItems: 1, maxItems: 32,
-    items: { type: 'string', minLength: 1, maxLength: 256 },
-  },
-  input_revision: { type: 'integer', minimum: 0 },
-  context_sequence: { type: 'integer', minimum: 0 },
   kind: { type: 'string', enum: ['progress', 'final', 'blocked'] },
   spoken_text: { type: 'string', minLength: 1, maxLength: MAX_PACKET_TEXT },
   exact_text: { type: 'string', minLength: 1, maxLength: MAX_PACKET_TEXT },
@@ -82,21 +74,33 @@ function validateCallPacket(value) {
   if (!object(marker) || marker.kind !== 'active-call') {
     throw new Error('emit_call_packet requires an active private call turn');
   }
-  if (!object(value) || value.version !== 1 || !['progress', 'final', 'blocked'].includes(value.kind)) {
+  if (!object(value) || !['progress', 'final', 'blocked'].includes(value.kind)) {
     throw new Error('invalid call packet');
+  }
+  if (CALL_PACKET_AUTHORITY_FIELDS.some((field) => Object.hasOwn(value, field))) {
+    throw new Error('call packet authority is Coordinator-owned');
+  }
+  const authority = {
+    project_id: nonEmpty(marker.project_id, 'project_id', 256),
+    call_session_id: nonEmpty(marker.call_session_id, 'call_session_id', 256),
+    call_generation: marker.call_generation,
+    request_id: nonEmpty(marker.request_id, 'request_id', 256),
+    originating_user_turn_ids: boundedStringArray(
+      marker.originating_user_turn_ids, 'originating_user_turn_ids', 32, 256,
+    ),
+    input_revision: marker.input_revision,
+    context_sequence: marker.context_sequence,
+  };
+  if (!Number.isSafeInteger(authority.call_generation) || authority.call_generation < 1
+    || !Number.isSafeInteger(authority.input_revision) || authority.input_revision < 0
+    || !Number.isSafeInteger(authority.context_sequence) || authority.context_sequence < 0
+    || authority.originating_user_turn_ids.length === 0) {
+    throw new Error('private Workday turn marker has invalid call authority');
   }
   const packet = {
     version: 1,
     packet_id: nonEmpty(value.packet_id, 'packet_id', 256),
-    project_id: nonEmpty(value.project_id, 'project_id', 256),
-    call_session_id: nonEmpty(value.call_session_id, 'call_session_id', 256),
-    call_generation: value.call_generation,
-    request_id: nonEmpty(value.request_id, 'request_id', 256),
-    originating_user_turn_ids: boundedStringArray(
-      value.originating_user_turn_ids, 'originating_user_turn_ids', 32, 256,
-    ),
-    input_revision: value.input_revision,
-    context_sequence: value.context_sequence,
+    ...authority,
     kind: value.kind,
     spoken_text: nonEmpty(value.spoken_text, 'spoken_text', MAX_PACKET_TEXT),
     ...(value.exact_text === undefined
@@ -109,10 +113,6 @@ function validateCallPacket(value) {
       supersedes_packet_id: nonEmpty(value.supersedes_packet_id, 'supersedes_packet_id', 256),
     }),
   };
-  if (!Number.isSafeInteger(packet.call_generation) || packet.call_generation < 1
-    || !Number.isSafeInteger(packet.input_revision) || packet.input_revision < 0
-    || !Number.isSafeInteger(packet.context_sequence) || packet.context_sequence < 0
-    || packet.originating_user_turn_ids.length === 0) throw new Error('invalid call packet');
   if (packet.display_blocks !== undefined) {
     if (!Array.isArray(packet.display_blocks) || packet.display_blocks.length > 8) {
       throw new Error('invalid display_blocks');
@@ -136,6 +136,10 @@ function activeReceipt() {
     && typeof receipt.call_id === 'string'
     && Number.isSafeInteger(receipt.call_generation)
     && Number.isSafeInteger(receipt.input_revision)
+    && Number.isSafeInteger(receipt.context_sequence)
+    && Array.isArray(receipt.originating_user_turn_ids)
+    && receipt.originating_user_turn_ids.length > 0
+    && receipt.originating_user_turn_ids.every((id) => typeof id === 'string' && id)
     && typeof receipt.idempotency_key === 'string';
   const typedReceipt = role === 'typed'
     && typeof receipt.claim_id === 'string'
@@ -158,7 +162,7 @@ function stage(kind, value, identity) {
   try {
     fs.writeFileSync(temporary, JSON.stringify(value), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     fs.linkSync(temporary, target); // first write wins; duplicate calls fail closed
-  } finally { try { fs.unlinkSync(temporary); } catch {} }
+  } finally { try { fs.unlinkSync(temporary); } catch { /* already absent */ } }
 }
 function definitions() {
   if (role === 'typed') return [
@@ -202,10 +206,14 @@ function handleCall(id, params) {
         : 'Call completion accepted for Coordinator validation.');
     }
     if (name === 'request_workday') {
+      const receipt = activeReceipt();
       const request = role === 'typed'
-        ? { delivery_key: nonEmpty(args.request_id, 'delivery_key', 256), prompt: nonEmpty(args.prompt, 'prompt'), receipt: activeReceipt() }
-        : { request_id: nonEmpty(args.request_id, 'request_id', 256), prompt: nonEmpty(args.prompt, 'prompt'), receipt: activeReceipt() };
-      stage('request', request, role === 'typed' ? request.delivery_key : request.request_id);
+        ? { delivery_key: nonEmpty(args.request_id, 'delivery_key', 256), prompt: nonEmpty(args.prompt, 'prompt'), receipt }
+        : { request_id: nonEmpty(args.request_id, 'request_id', 256), prompt: nonEmpty(args.prompt, 'prompt'), receipt };
+      // The model chooses the descriptive request id, but the immutable turn
+      // receipt owns authority. First write wins for that exact input so one
+      // turn cannot fan out duplicate private Workday jobs under fresh ids.
+      stage('request', request, receipt.idempotency_key);
       return text(id, role === 'typed'
         ? 'Workday consultation request accepted for Coordinator validation.'
         : 'Private Workday request accepted for Coordinator validation.');

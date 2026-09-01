@@ -274,6 +274,84 @@ async def test_typed_fast_resident_fails_closed_on_incompatible_exact_route(
 
 
 @pytest.mark.asyncio
+async def test_balanced_resident_preserves_healthy_provider_precedence_then_falls_through(
+    clean_runtime_pool,
+):
+    now = _utcnow()
+    accounts = [
+        _runtime_account("claude-20", "anthropic"),
+        _runtime_account("codex-18", "openai"),
+        _runtime_account("zai-15", "zai"),
+        _runtime_account("deepseek-10", "deepseek"),
+    ]
+    for account, utilization in zip(accounts, (20.0, 18.0, 15.0, 10.0), strict=True):
+        account.update(
+            usage_snapshot=_known_usage(utilization, now), usage_snapshot_at=now
+        )
+    _register(*accounts)
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=_task(),
+        runtime_config=_config("balanced"),
+    )
+
+    assert result is not None
+    assert (result.provider, result.account_id) == ("anthropic", "claude-20")
+    assert all(account["active_tasks"] == 0 for account in accounts[1:])
+
+    _max_plan_pools.clear()
+    _account_by_id.clear()
+    exhausted_claude = _runtime_account("claude-99", "anthropic")
+    exhausted_claude.update(
+        usage_snapshot=_known_usage(99.0, now), usage_snapshot_at=now
+    )
+    healthy_codex = _runtime_account("codex-after-exhaustion", "openai")
+    healthy_codex.update(
+        usage_snapshot=_known_usage(18.0, now), usage_snapshot_at=now
+    )
+    _register(exhausted_claude, healthy_codex)
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=_task(),
+        runtime_config=_config("balanced"),
+    )
+
+    assert result is not None
+    assert (result.provider, result.account_id) == (
+        "openai",
+        "codex-after-exhaustion",
+    )
+    assert exhausted_claude["active_tasks"] == 0
+
+    _max_plan_pools.clear()
+    _account_by_id.clear()
+    failed_claude = _runtime_account("claude-auth-failed", "anthropic")
+    failed_claude.update(
+        usage_snapshot=_known_usage(2.0, now),
+        usage_snapshot_at=now,
+        usage_probe_failure_kind="authentication",
+        usage_probe_attempt_at=now,
+    )
+    healthy_codex = _runtime_account("codex-after-auth", "openai")
+    healthy_codex.update(
+        usage_snapshot=_known_usage(18.0, now), usage_snapshot_at=now
+    )
+    _register(failed_claude, healthy_codex)
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=_task(),
+        runtime_config=_config("balanced"),
+    )
+
+    assert result is not None
+    assert (result.provider, result.account_id) == ("openai", "codex-after-auth")
+    assert failed_claude["active_tasks"] == 0
+
+
+@pytest.mark.asyncio
 async def test_strategic_runtime_uses_credential_healthy_before_failed_probe(
     clean_runtime_pool,
 ):

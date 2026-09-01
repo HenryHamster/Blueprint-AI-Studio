@@ -883,8 +883,9 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(heartbeatBodies.length).toBeGreaterThan(0);
     expect(heartbeatBodies.every((body) => body.autonomous_turn === false)).toBe(true);
     expect(heartbeatBodies.every((body) => (
-      (body.activity as Record<string, unknown>)?.autonomy_state === 'paused'
-      && (body.activity as Record<string, unknown>)?.autonomy_reason_code === 'chat_or_disabled'
+      (body.activity as Record<string, unknown> | undefined)?.autonomy_state === 'paused'
+      && (body.activity as Record<string, unknown> | undefined)?.autonomy_reason_code
+        === 'chat_or_disabled'
     ))).toBe(true);
   });
 
@@ -3592,9 +3593,12 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       ...qualifiedPayload(),
       strategic_session_message_poll_seconds: 0.001,
     });
+    const consultationSettled = (): boolean => (
+      consultationAcknowledged && olderContinuationCompleted
+    );
     for (
       let i = 0;
-      i < 50 && !(consultationAcknowledged && olderContinuationCompleted);
+      i < 50 && !consultationSettled();
       i += 1
     ) {
       await vi.advanceTimersByTimeAsync(100);
@@ -4965,23 +4969,19 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await activeDone;
 
     expect(messagePolls).toBeGreaterThan(0);
-    expect(staleReleaseBodies).toEqual([
-      expect.objectContaining({
-        task_id: staleTaskId,
-        continuation_claim_id: 'stale-continuation-claim',
-        incarnation_id: expect.any(String),
-      }),
-    ]);
+    expect(staleReleaseBodies).toHaveLength(1);
+    expect(staleReleaseBodies[0]).toMatchObject({
+      task_id: staleTaskId,
+      continuation_claim_id: 'stale-continuation-claim',
+    });
+    expect(staleReleaseBodies[0]?.incarnation_id).toEqual(expect.any(String));
     expect(mockSendLog.mock.calls.some(([, text]) => (
       String(text).includes('typed continuation release deferred')
       && String(text).includes('(401)')
     ))).toBe(true);
-    expect(activeClaimBodies).toEqual([
-      expect.objectContaining({
-        task_id: activeTaskId,
-        incarnation_id: expect.any(String),
-      }),
-    ]);
+    expect(activeClaimBodies).toHaveLength(1);
+    expect(activeClaimBodies[0]).toMatchObject({ task_id: activeTaskId });
+    expect(activeClaimBodies[0]?.incarnation_id).toEqual(expect.any(String));
     expect(activeClaimBodies[0]?.incarnation_id)
       .not.toBe(staleReleaseBodies[0]?.incarnation_id);
     expect(activeAckBodies).toEqual([
@@ -7099,6 +7099,15 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
               packet_id: '00000000-0000-0000-0000-000000000952',
               workday_claim_id: '00000000-0000-0000-0000-000000000953',
             } : {}),
+            ...(kind === 'active-call' ? {
+              project_id: '00000000-0000-0000-0000-000000000954',
+              call_session_id: '00000000-0000-0000-0000-000000000955',
+              call_generation: 7,
+              request_id: '00000000-0000-0000-0000-000000000956',
+              originating_user_turn_ids: ['00000000-0000-0000-0000-000000000957'],
+              input_revision: 11,
+              context_sequence: 23,
+            } : {}),
           });
           await new Promise<void>((resolve) => { release = resolve; });
           expect(fs.lstatSync(markerPath).isFile()).toBe(true);
@@ -7106,6 +7115,16 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
         kind === 'typed-consultation' ? {
           packetId: '00000000-0000-0000-0000-000000000952',
           workdayClaimId: '00000000-0000-0000-0000-000000000953',
+        } : undefined,
+        undefined,
+        kind === 'active-call' ? {
+          project_id: '00000000-0000-0000-0000-000000000954',
+          call_session_id: '00000000-0000-0000-0000-000000000955',
+          call_generation: 7,
+          request_id: '00000000-0000-0000-0000-000000000956',
+          originating_user_turn_ids: ['00000000-0000-0000-0000-000000000957'],
+          input_revision: 11,
+          context_sequence: 23,
         } : undefined,
       );
 
@@ -11261,7 +11280,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     );
     expect(sameSession.close).toHaveBeenCalledTimes(1);
     expect(mockApiPost.mock.calls.filter(([url]) =>
-      String(url).includes('/messages/claim'))).toHaveLength(1);
+      url.includes('/messages/claim'))).toHaveLength(1);
     const operatorLatency = vi.mocked(recordResidentTurnLatency).mock.calls
       .map((call) => call[0])
       .filter((sample) => sample.kind === 'operator');
@@ -11355,7 +11374,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     );
     expect(brokenSession.close).toHaveBeenCalledTimes(1);
     expect(mockApiPost.mock.calls.filter(([url]) =>
-      String(url).includes('/messages/claim'))).toHaveLength(1);
+      url.includes('/messages/claim'))).toHaveLength(1);
     expect(mockApiPost.mock.calls.filter(([, body]) =>
       body?.op === 'create_message')).toHaveLength(0);
     expect(vi.mocked(persistAndPostStatus).mock.calls.some(([taskId, payload]) => (
@@ -11422,7 +11441,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
 
     expect(session.sendTurn).toHaveBeenCalledTimes(1);
     expect(mockApiPost.mock.calls.filter(([url]) =>
-      String(url).includes('/messages/claim'))).toHaveLength(1);
+      url.includes('/messages/claim'))).toHaveLength(1);
     expect(vi.mocked(persistAndPostStatus).mock.calls.some(([taskId, payload]) => (
       taskId === 'task-repair-claim-lost'
       && payload.status === 'FAILED'

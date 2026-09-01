@@ -83,10 +83,12 @@ import {
 } from './resident-repo-freshness.js';
 import {
   CallCoordinatorState, CallCoordinatorWakeGate, ForegroundCallController,
+  activeCallPacketAuthority,
   callLeaseIsPubliclyActive, callLeaseKey, parseCallLeaseProjection, parseCallTransportProjection,
   speechOriginIsCurrent,
   shouldImmediatelyReconcileCallMedia,
-  type CallDisplayBlock, type CallTurnReceipt, type CallWorkPacket,
+  type ActiveCallPacketAuthority, type CallDisplayBlock, type CallTurnReceipt,
+  type CallWorkPacket,
 } from './live-conversation-resident.js';
 import {
   configuredClaudeForegroundAdapter, typedFastRuntimeConfig,
@@ -441,12 +443,16 @@ export async function withPrivateWorkdayTurnFence<T>(
   run: () => Promise<T>,
   consultation?: PrivateWorkdayConsultationProvenance,
   autonomous?: PrivateWorkdayAutonomousProvenance,
+  activeCall?: ActiveCallPacketAuthority,
 ): Promise<T> {
   if (
     kind === 'typed-consultation'
     && (!consultation?.packetId.trim() || !consultation.workdayClaimId.trim())
   ) {
     throw new Error('typed consultation requires exact packet and Workday claim provenance');
+  }
+  if (kind === 'active-call' && activeCall === undefined) {
+    throw new Error('active call requires exact packet authority');
   }
   fs.writeFileSync(
     markerPath,
@@ -462,6 +468,7 @@ export async function withPrivateWorkdayTurnFence<T>(
         autonomous_turn_lease_id: autonomous.leaseId,
         autonomous_handoff_idempotency_key: autonomous.handoffIdempotencyKey,
       } : {}),
+      ...(kind === 'active-call' ? activeCall : {}),
     }),
     { encoding: 'utf8', flag: 'wx', mode: 0o600 },
   );
@@ -1310,6 +1317,7 @@ export async function handleStrategicResident(
   // server-confirmed handoff until claim-next has answered, so the loop cannot
   // start another autonomous turn in the small interval before its normal poll.
   let typedConsultationAwaitingClaim = false;
+  const typedConsultationClaimIsPending = (): boolean => typedConsultationAwaitingClaim;
   let cursor = initialCursor(task, payload);
   // Bounded set of message ids already handled — with `created_at >= since` poll
   // semantics the boundary message re-appears each poll and is dropped here.
@@ -2019,6 +2027,7 @@ export async function handleStrategicResident(
     repoSnapshot?: ResidentRepoSnapshot,
     consultation?: PrivateWorkdayConsultationProvenance,
     autonomous?: PrivateWorkdayAutonomousProvenance,
+    activeCall?: ActiveCallPacketAuthority,
   ): Promise<ResidentTurnResult> => {
     revokeNativeReplyForPrivateWorkday();
     privateTurnStreamSuppressionDepth += 1;
@@ -2045,6 +2054,7 @@ export async function handleStrategicResident(
       ),
       consultation,
       autonomous,
+      activeCall,
     ).finally(() => {
       privateTurnStreamSuppressionDepth = Math.max(0, privateTurnStreamSuppressionDepth - 1);
     });
@@ -3665,14 +3675,14 @@ export async function handleStrategicResident(
     if (!callCoordinator.completionIsCurrent(request.receipt)) return [];
     const lease = callCoordinator.currentLease();
     if (!lease) return [];
+    const packetAuthority = activeCallPacketAuthority(request, projectId);
     const turn = await runPrivateWorkdayTurn('active-call', [
       { type: 'text', text: [
         'This is private Call Workday reasoning. You MUST NOT reply to the operator or use the native Workday reply tool.',
-        'Use only mcp__call__emit_call_packet to return a schema-valid progress/final/blocked packet to Fast Resident.',
-        `Call ${lease.callId} generation ${lease.generation}, input revision ${lease.inputRevision}, request ${request.request_id}.`,
+        'Use only mcp__call__emit_call_packet to return a progress/final/blocked packet to Fast Resident. The Coordinator binds every authority field; provide only packet content fields exposed by the tool schema.',
         `Private request:\n${request.prompt}`,
       ].join('\n\n') },
-    ]);
+    ], undefined, undefined, undefined, packetAuthority);
     if (turn.processGone) sendLog(ws, '[resident] Workday exited during private call request; preserving call state\n');
     return readWorkdayPackets();
   };
@@ -4676,7 +4686,7 @@ export async function handleStrategicResident(
       if (inputs.length > 0) callInputAfterSequence = Math.max(...inputs.map(input => input.sequence));
       if (newest) {
         const input = newest;
-        const receipt = callCoordinator.beginPublicTurn(input.id);
+        const receipt = callCoordinator.beginPublicTurn([input.id], input.sequence);
         await dispatchFastPrompt(receipt, fastPromptForInput(input), [input.id]);
         if (!callCoordinator.completionIsCurrent(receipt)) return;
         return;
@@ -4693,7 +4703,8 @@ export async function handleStrategicResident(
           || packet.call_generation !== lease.generation
           || packet.input_revision !== lease.inputRevision) continue;
         const packetReceipt = callCoordinator.beginPublicTurn(
-          packet.originating_user_turn_ids[0] ?? packet.request_id,
+          packet.originating_user_turn_ids,
+          packet.context_sequence,
         );
         await dispatchFastPrompt(
           packetReceipt,
@@ -6321,7 +6332,7 @@ export async function handleStrategicResident(
       // cannot safely wait behind an unbounded recovery backlog because its
       // envelope may expire before Workday ever sees it. Operator messages and
       // an already-running private job still retain priority above this gate.
-      if (typedConsultationAwaitingClaim) {
+      if (typedConsultationClaimIsPending()) {
         if (await maybeClaimTypedConsultation()) {
           const hb = await livenessHeartbeat();
           if (hb?.stop_requested) break;
@@ -6331,7 +6342,7 @@ export async function handleStrategicResident(
         // A transport failure leaves the durable handoff hint armed. Do not
         // let an older continuation consume the shared Workday/Fast capacity
         // until claim-next either succeeds or returns authoritative `empty`.
-        if (typedConsultationAwaitingClaim) {
+        if (typedConsultationClaimIsPending()) {
           const activityChanged = setResidentActivity(
             'waiting',
             'Private Workday consultation is queued',

@@ -960,9 +960,10 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page",
         "handleStrategicResident — typed Fast lease lifecycle > claims a just-created bounded consultation before an older continuation after operator input",
-        "handleStrategicResident — typed Fast lease lifecycle > claims a queued consultation without new operator input after stale Resident continuation cleanup is deauthorized"
+        "handleStrategicResident — typed Fast lease lifecycle > claims a queued consultation without new operator input after stale Resident continuation cleanup is deauthorized",
+        "handleStrategicResident — typed Fast lease lifecycle > serves queued operator work but never runs an autonomous turn when canonical project autonomy is off"
       ],
-      "test_count": 163
+      "test_count": 164
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",

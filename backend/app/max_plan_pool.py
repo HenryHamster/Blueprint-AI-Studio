@@ -5203,6 +5203,11 @@ async def select_llm_runtime_for_task(
     allow_degraded_usage = strategic_usage_pass != "fresh"
     allow_failed_usage_probe = strategic_usage_pass == "any"
     require_fresh_known_usage = strategic_usage_pass == "fresh"
+    resident_provider_precedence = (
+        routing_task_type == "strategic_review"
+        and task_context.get("_resident_session") is True
+        and not exact_route_is_valid
+    )
     capability = get_task_capability(routing_task_type)
     hard_allowed_providers = (
         capability.allowed_providers
@@ -5450,7 +5455,12 @@ async def select_llm_runtime_for_task(
     # (health, -load). An explicit per-task provider/model still pins the
     # selection (handled above via trimmed provider_preference), so this only
     # kicks in for the common path where no pin is set.
-    if mode == "balanced" and len(provider_preference) > 1 and not explicit_model:
+    if (
+        mode == "balanced"
+        and len(provider_preference) > 1
+        and not explicit_model
+        and not resident_provider_precedence
+    ):
         provider_models: list[tuple[str, str | None]] = []
         for provider_name in provider_preference:
             provider = get_provider(provider_name)

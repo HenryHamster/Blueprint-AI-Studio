@@ -64,7 +64,20 @@ export interface CallTurnReceipt {
   call_generation: number;
   input_revision: number;
   public_input_message_id: string;
+  originating_user_turn_ids: string[];
+  context_sequence: number;
   idempotency_key: string;
+}
+
+/** Exact host-owned authority projected into one private active-call packet. */
+export interface ActiveCallPacketAuthority {
+  project_id: string;
+  call_session_id: string;
+  call_generation: number;
+  request_id: string;
+  originating_user_turn_ids: string[];
+  input_revision: number;
+  context_sequence: number;
 }
 
 export interface CallCompletion {
@@ -304,14 +317,25 @@ export class CallCoordinatorState {
   suppressOrdinaryWorkday(): boolean { return this.currentLease() !== null; }
   suppressAutonomy(): boolean { return this.suppressOrdinaryWorkday(); }
 
-  beginPublicTurn(publicInputMessageId: string): CallTurnReceipt {
+  beginPublicTurn(
+    originatingUserTurnIds: string[],
+    contextSequence: number,
+  ): CallTurnReceipt {
     const lease = this.currentLease();
     if (!lease) throw new Error('no active call lease');
+    if (originatingUserTurnIds.length === 0 || originatingUserTurnIds.length > 32) {
+      throw new Error('invalid originating_user_turn_ids');
+    }
+    const originating = originatingUserTurnIds.map((id) => (
+      nonEmptyString(id, 'originating_user_turn_id', 256)
+    ));
     return {
       call_id: lease.callId,
       call_generation: lease.generation,
       input_revision: lease.inputRevision,
-      public_input_message_id: nonEmptyString(publicInputMessageId, 'public_input_message_id', 256),
+      public_input_message_id: originating[0],
+      originating_user_turn_ids: originating,
+      context_sequence: integer(contextSequence, 'context_sequence', 0),
       idempotency_key: `call-complete:${lease.callId}:${lease.generation}:${lease.inputRevision}:${randomUUID()}`,
     };
   }
@@ -356,12 +380,20 @@ function removePathQuietly(target: string | undefined): void {
 
 function validateReceipt(value: unknown): CallTurnReceipt {
   const raw = record(value, 'call turn receipt');
+  const originating = Array.isArray(raw.originating_user_turn_ids)
+    ? raw.originating_user_turn_ids.map((id) => nonEmptyString(id, 'originating_user_turn_id', 256))
+    : [];
+  if (originating.length === 0 || originating.length > 32) {
+    throw new Error('invalid originating_user_turn_ids');
+  }
   return {
     call_id: nonEmptyString(raw.call_id, 'call_id', 256),
     call_generation: integer(raw.call_generation, 'call_generation', 1),
     input_revision: integer(raw.input_revision, 'input_revision', 0),
     public_input_message_id: typeof raw.public_input_message_id === 'string'
       ? nonEmptyString(raw.public_input_message_id, 'public_input_message_id', 256) : '',
+    originating_user_turn_ids: originating,
+    context_sequence: integer(raw.context_sequence, 'context_sequence', 0),
     idempotency_key: nonEmptyString(raw.idempotency_key, 'idempotency_key', 512),
   };
 }
@@ -371,7 +403,33 @@ function sameReceipt(left: CallTurnReceipt, right: CallTurnReceipt): boolean {
     && left.call_generation === right.call_generation
     && left.input_revision === right.input_revision
     && left.idempotency_key === right.idempotency_key
-    && left.public_input_message_id === right.public_input_message_id;
+    && left.public_input_message_id === right.public_input_message_id
+    && left.context_sequence === right.context_sequence
+    && left.originating_user_turn_ids.length === right.originating_user_turn_ids.length
+    && left.originating_user_turn_ids.every((id, index) => (
+      id === right.originating_user_turn_ids[index]
+    ));
+}
+
+export function activeCallPacketAuthority(
+  request: StagedWorkdayRequest,
+  projectId: string,
+): ActiveCallPacketAuthority {
+  const originating = request.receipt.originating_user_turn_ids.map((id) => (
+    nonEmptyString(id, 'originating_user_turn_id', 256)
+  ));
+  if (originating.length === 0 || originating.length > 32) {
+    throw new Error('invalid originating_user_turn_ids');
+  }
+  return {
+    project_id: nonEmptyString(projectId, 'project_id', 256),
+    call_session_id: nonEmptyString(request.receipt.call_id, 'call_session_id', 256),
+    call_generation: integer(request.receipt.call_generation, 'call_generation', 1),
+    request_id: nonEmptyString(request.request_id, 'request_id', 256),
+    originating_user_turn_ids: originating,
+    input_revision: integer(request.receipt.input_revision, 'input_revision', 0),
+    context_sequence: integer(request.receipt.context_sequence, 'context_sequence', 0),
+  };
 }
 
 function completionFromStaged(value: unknown): StagedCallCompletion {
