@@ -58,6 +58,19 @@ describe('local Call Resident MCP tools', () => {
       expect(packetSchema.additionalProperties).toBe(false);
       expect(packetSchema.properties).not.toHaveProperty('project_id');
       expect(packetSchema.properties).not.toHaveProperty('request_id');
+      const missingMarker = invoke(config.mcpServers.call.args[0], {
+        ...process.env, ...config.mcpServers.call.env,
+      }, {
+        jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+          name: 'emit_call_packet', arguments: { packet: {
+            packet_id: 'missing-marker', kind: 'final', spoken_text: 'Result.',
+          } },
+        },
+      });
+      expect((missingMarker.result as { isError: boolean }).isError).toBe(true);
+      expect(JSON.stringify(missingMarker)).toContain('requires an active private call turn');
+      expect(JSON.stringify(missingMarker)).not.toContain('ENOENT');
+      expect(fs.readdirSync(path.join(workspace, 'stage'))).toEqual([]);
       fs.writeFileSync(markerPath, JSON.stringify({
         kind: 'active-call', incarnation_id: 'resident-1',
         project_id: 'project-1', call_session_id: 'call-1', call_generation: 1,
