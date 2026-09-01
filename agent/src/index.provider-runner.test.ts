@@ -1762,7 +1762,10 @@ describe('setupWorkspace reference-cache reuse', () => {
     vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
       const a = Array.isArray(args) ? (args as string[]) : [];
       if (String(cmd) === 'git' && a[0] === 'ls-remote') {
-        throw new Error('fatal: branch not found'); // → staleBranchExists = false
+        // `git ls-remote --exit-code` reserves status 2 for an absent ref.
+        // Preserve that contract in this workspace fixture so transport/auth
+        // failures remain distinguishable and fail closed.
+        throw Object.assign(new Error('fatal: branch not found'), { status: 2 });
       }
       return '';
     });
