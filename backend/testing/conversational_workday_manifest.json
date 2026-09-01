@@ -827,6 +827,7 @@
         "handleStrategicResident - failed-turn recovery > preserves private provider state when credential recovery forbids cleanup",
         "handleStrategicResident - failed-turn recovery > re-admits a required ArtifactRef after transient materialization failure without starting a model turn or reply",
         "handleStrategicResident - failed-turn recovery > uses one same-session corrective turn and persists exactly one reply without re-admitting input",
+        "handleStrategicResident - failed-turn recovery > recovers an authenticated reply after a private-only packet tool is rejected on the public turn",
         "handleStrategicResident - failed-turn recovery > fails closed after one same-session corrective omission without re-admitting input",
         "handleStrategicResident - failed-turn recovery > does not dispatch a corrective turn without fresh exact-claim authority",
         "handleStrategicResident - failed-turn recovery > never corrects or replays after an ambiguous strategic tool turn",
@@ -963,7 +964,7 @@
         "handleStrategicResident — typed Fast lease lifecycle > claims a queued consultation without new operator input after stale Resident continuation cleanup is deauthorized",
         "handleStrategicResident — typed Fast lease lifecycle > serves queued operator work but never runs an autonomous turn when canonical project autonomy is off"
       ],
-      "test_count": 164
+      "test_count": 165
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
