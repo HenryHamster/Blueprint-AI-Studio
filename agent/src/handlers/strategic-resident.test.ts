@@ -4559,6 +4559,178 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(workday.interrupt).not.toHaveBeenCalled();
   });
 
+  it('claims a queued consultation without new operator input after stale Resident continuation cleanup is deauthorized', async () => {
+    vi.useFakeTimers();
+    const staleTaskId = 'stale-resident-continuation-cleanup';
+    const activeTaskId = 'active-resident-queued-consultation';
+    const queuedPacketId = 'packet-c6e48b77-regression';
+    const staleEnvelope = typedEnvelope('Deliver the prior Resident result.', 851);
+    const queuedEnvelope = typedEnvelope('Investigate the already-queued request.', 852);
+    let staleResidentAlive = true;
+    let activeResidentAlive = true;
+    let staleContinuationClaimed = false;
+    let activeConsultationClaimed = false;
+    let messagePolls = 0;
+    const staleReleaseBodies: Array<Record<string, unknown>> = [];
+    const activeClaimBodies: Array<Record<string, unknown>> = [];
+    const activeAckBodies: Array<Record<string, unknown>> = [];
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) messagePolls += 1;
+      return Promise.resolve({
+        messages: [],
+        fast_message_ids: [],
+        claim_required: true,
+      });
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      const requestTaskId = body?.task_id;
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({
+          authority_held: true,
+          resident_incarnation_held: true,
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true,
+          lease: {
+            lease_id: requestTaskId === staleTaskId
+              ? 'lease-stale-continuation-cleanup'
+              : 'lease-active-queued-consultation',
+            generation: 1,
+          },
+        });
+      }
+      if (url.endsWith('/typed-fast-lease/release')) {
+        return Promise.resolve({ released: true });
+      }
+      if (url.endsWith('/workday-consultations/continuations/claim-next')) {
+        if (requestTaskId === activeTaskId) return Promise.resolve({ status: 'empty' });
+        if (requestTaskId === staleTaskId && !staleContinuationClaimed) {
+          staleContinuationClaimed = true;
+          return Promise.resolve({
+            status: 'claimed',
+            continuation: {
+              result_packet_id: 'stale-result-packet',
+              continuation_claim_id: 'stale-continuation-claim',
+              lease_expires_at: '2035-01-01T00:00:00.000Z',
+              attempt: 1,
+              claim_id: 'stale-fast-claim',
+              delivery_key: 'stale-delivery-key',
+              continuation_key: 'stale-continuation-key',
+              result_summary: 'This result belongs to the stopped Resident.',
+              envelope: staleEnvelope,
+            },
+          });
+        }
+        return Promise.resolve({ status: 'empty' });
+      }
+      if (url.endsWith('/workday-consultations/continuations/stale-result-packet/release')) {
+        staleReleaseBodies.push(body ?? {});
+        staleResidentAlive = false;
+        return Promise.reject(new Error('continuation cleanup rejected (401): Resident deauthorized'));
+      }
+      if (url.endsWith('/workday-consultations/claim-next')) {
+        if (requestTaskId !== activeTaskId || activeConsultationClaimed) {
+          return Promise.resolve({ status: 'empty' });
+        }
+        activeConsultationClaimed = true;
+        activeClaimBodies.push(body ?? {});
+        return Promise.resolve({
+          status: 'claimed',
+          packet: {
+            packet_id: queuedPacketId,
+            workday_claim_id: 'active-workday-claim',
+            lease_expires_at: '2035-01-01T00:00:00.000Z',
+            attempt: 1,
+            claim_id: 'original-fast-claim',
+            delivery_key: 'active-delivery-key',
+            continuation_key: 'active-continuation-key',
+            consultation_id: 'queued-consultation-id',
+            question: 'Investigate the already-queued request.',
+            envelope: queuedEnvelope,
+          },
+        });
+      }
+      if (url.endsWith(`/workday-consultations/${queuedPacketId}/renew`)) {
+        return Promise.resolve({
+          workday_claim_id: 'active-workday-claim',
+          lease_expires_at: '2035-01-01T00:00:00.000Z',
+        });
+      }
+      if (url.endsWith(`/workday-consultations/${queuedPacketId}/ack`)) {
+        activeAckBodies.push(body ?? {});
+        activeResidentAlive = false;
+        return Promise.resolve({ status: 'completed' });
+      }
+      return Promise.resolve({});
+    });
+    typedFastMocks.dispatch.mockRejectedValue(new Error(
+      'the stopped Resident cannot format its stale continuation',
+    ));
+    const staleWorkday = makeSession(
+      () => Promise.resolve(turnResult()),
+      () => staleResidentAlive,
+    );
+    const activeWorkday = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'The queued consultation completed on the active Resident.',
+        sentOperatorMessage: false,
+      })),
+      () => activeResidentAlive,
+    );
+    bindSessionWithPrivateRuntime([staleWorkday, activeWorkday]);
+
+    const staleDone = run(staleTaskId, {
+      ...qualifiedPayload(),
+      strategic_session_message_poll_seconds: 0.001,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(staleReleaseBodies).toHaveLength(1);
+    await staleDone;
+
+    const activeDone = run(activeTaskId, {
+      ...qualifiedPayload(),
+      strategic_session_message_poll_seconds: 0.001,
+    });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(activeClaimBodies).toHaveLength(1);
+    expect(activeWorkday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(activeAckBodies).toHaveLength(1);
+    await activeDone;
+
+    expect(messagePolls).toBeGreaterThan(0);
+    expect(staleReleaseBodies).toEqual([
+      expect.objectContaining({
+        task_id: staleTaskId,
+        continuation_claim_id: 'stale-continuation-claim',
+        incarnation_id: expect.any(String),
+      }),
+    ]);
+    expect(mockSendLog.mock.calls.some(([, text]) => (
+      String(text).includes('typed continuation release deferred')
+      && String(text).includes('(401)')
+    ))).toBe(true);
+    expect(activeClaimBodies).toEqual([
+      expect.objectContaining({
+        task_id: activeTaskId,
+        incarnation_id: expect.any(String),
+      }),
+    ]);
+    expect(activeClaimBodies[0]?.incarnation_id)
+      .not.toBe(staleReleaseBodies[0]?.incarnation_id);
+    expect(activeAckBodies).toEqual([
+      expect.objectContaining({
+        task_id: activeTaskId,
+        workday_claim_id: 'active-workday-claim',
+        outcome: 'completed',
+      }),
+    ]);
+    expect(activeWorkday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(staleWorkday.sendTurn).not.toHaveBeenCalled();
+  });
+
   it('does not preempt an active autonomous Workday turn for a Fast-only reply', async () => {
     vi.useFakeTimers();
     typedFastMocks.abandonDispositionWithConfirmation.mockReturnValue('completed');
