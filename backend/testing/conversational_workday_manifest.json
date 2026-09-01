@@ -284,7 +284,7 @@
         "test_strategic_create_message_strips_server_owned_chat_provenance",
         "test_typed_fast_autonomy_cannot_emit_unclaimed_public_messages"
       ],
-      "test_count": 29
+      "test_count": 31
     },
     {
       "path": "backend/testing/test_admin_routers.py",
