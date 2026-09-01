@@ -178,6 +178,45 @@ async def _claim_continuation(
 
 
 @pytest.mark.asyncio
+async def test_autonomous_handoff_begin_fails_closed_when_project_autonomy_is_disabled(
+    client: AsyncClient, db_session
+):
+    project, task, incarnation = await _make_worker(db_session)
+    before_vision = project.vision
+    assert before_vision["_resident_strategic_session"]["activity"][
+        "autonomy_state"
+    ] == "active"
+
+    # Model the production race: the last Resident heartbeat left stale-active
+    # activity in vision, then the operator disabled the canonical project
+    # switch before the worker attempted to acquire its next private-turn lease.
+    project.autonomous_enabled = False
+    db_session.add(project)
+    await db_session.commit()
+
+    rejected = await _begin(client, task, incarnation)
+
+    assert rejected.status_code == 409
+    assert rejected.json()["error"] == {
+        "code": 409,
+        "message": "Project autonomy is disabled",
+    }
+    await db_session.refresh(project)
+    assert project.autonomous_enabled is False
+    assert project.vision == before_vision
+    assert (
+        "autonomous_private_turn"
+        not in project.vision["_resident_strategic_session"]
+    )
+    messages = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    assert messages == []
+
+
+@pytest.mark.asyncio
 async def test_autonomous_handoff_requires_exact_server_turn_and_replays_once(
     client: AsyncClient, db_session
 ):
