@@ -207,6 +207,64 @@ async def _make_resident_message_worker(
     return project, task
 
 
+async def _seed_terminal_resident_reply_without_link(db_session, *, suffix: str):
+    project, task = await _make_resident_message_worker(
+        db_session,
+        session_id=f"resident-link-heal-{suffix}",
+    )
+    claim_id = uuid.uuid4()
+    claim_incarnation = uuid.uuid4()
+    source = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        status="open",
+        content="Please finish this exact claimed turn.",
+        resident_session_id=f"resident-link-heal-{suffix}",
+    )
+    db_session.add(source)
+    await db_session.commit()
+    await db_session.refresh(source)
+    source.status = "handled"
+    source.handling_state = MessageHandlingState.RESPONDED
+    source.handled_by_task_id = task.id
+    source.conversation_claim_id = claim_id
+    source.conversation_claim_generation = 1
+    source.conversation_claim_incarnation = claim_incarnation
+    source.conversation_claim_expires_at = None
+    db_session.add(source)
+    await db_session.commit()
+
+    idem_key = f"resident-link-heal-{suffix}"
+    reply = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.RESPONDED,
+        handled_by_task_id=task.id,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        from_task_id=task.id,
+        status="resolved",
+        content="The claimed turn is complete.",
+        context={
+            "_resident_reply_covered_message_ids": [str(source.id)],
+            "_conversation_claim_id": str(claim_id),
+            "_conversation_claim_incarnation": str(claim_incarnation),
+            "message_role": "operator_reply",
+        },
+        idempotency_key=idem_key,
+        resident_session_id=f"resident-link-heal-{suffix}",
+        reply_to_message_id=None,
+    )
+    db_session.add(reply)
+    await db_session.commit()
+    await db_session.refresh(reply)
+    return project, task, source, reply, claim_id, claim_incarnation, idem_key
+
+
 @pytest.mark.asyncio
 async def test_stale_resident_process_cannot_mutate_or_post_terminal_status(
     client: AsyncClient, db_session
@@ -1543,6 +1601,160 @@ async def test_resident_reply_completes_exact_live_conversation_claim(
     replay = await client.post("/api/agent/strategic", headers=headers, json=body)
     assert replay.status_code == 200, replay.text
     assert replay.json()["message_id"] == first.json()["message_id"]
+
+
+@pytest.mark.asyncio
+async def test_resident_reply_exact_replay_heals_missing_source_link(
+    client: AsyncClient, db_session
+):
+    """A proven replay backfills the old reply instead of creating another."""
+    from app.auth import create_agent_token
+
+    (
+        project,
+        task,
+        source,
+        reply,
+        claim_id,
+        claim_incarnation,
+        idem_key,
+    ) = await _seed_terminal_resident_reply_without_link(db_session, suffix="success")
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+    response = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": project.vision[
+                "_resident_strategic_session"
+            ]["worker_incarnation_id"],
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": reply.content,
+                "idempotency_key": idem_key,
+                "covered_message_ids": [str(source.id)],
+                "conversation_claim_id": str(claim_id),
+                "conversation_claim_incarnation": str(claim_incarnation),
+                "context": {"reply_to": str(source.id)},
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["message_id"] == str(reply.id)
+    await db_session.refresh(reply)
+    assert reply.reply_to_message_id == source.id
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    assert {row.id for row in rows} == {source.id, reply.id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "proof_break",
+    ("missing_claim", "wrong_task", "ambiguous_reply", "different_link"),
+)
+async def test_resident_reply_link_heal_rejects_incomplete_or_ambiguous_proof(
+    client: AsyncClient, db_session, proof_break: str
+):
+    """A null link is mutable only under one exact terminal claim proof."""
+    from app.auth import create_agent_token
+
+    (
+        project,
+        task,
+        source,
+        reply,
+        claim_id,
+        claim_incarnation,
+        idem_key,
+    ) = await _seed_terminal_resident_reply_without_link(
+        db_session, suffix=proof_break
+    )
+    if proof_break == "missing_claim":
+        source.conversation_claim_id = None
+        db_session.add(source)
+    elif proof_break == "wrong_task":
+        other_task = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id=f"vm-other-{proof_break}",
+            payloads=[{"type": "strategic_review", "prompt": "other"}],
+        )
+        db_session.add(other_task)
+        await db_session.flush()
+        source.handled_by_task_id = other_task.id
+        db_session.add(source)
+    else:
+        other_source = ProjectMessage(
+            project_id=project.id,
+            sequence=3,
+            surface=MessageSurface.CONVERSATION,
+            handling_state=MessageHandlingState.PENDING,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            status="open",
+            content="Unrelated message.",
+            resident_session_id=source.resident_session_id,
+        )
+        db_session.add(other_source)
+        await db_session.flush()
+        if proof_break == "ambiguous_reply":
+            competing = ProjectMessage(
+                project_id=project.id,
+                sequence=4,
+                surface=MessageSurface.CONVERSATION,
+                handling_state=MessageHandlingState.RESPONDED,
+                handled_by_task_id=task.id,
+                reply_to_message_id=source.id,
+                message_type=MessageType.NOTE,
+                from_type="strategic",
+                from_task_id=task.id,
+                status="resolved",
+                content="Competing linked reply.",
+                idempotency_key=f"{idem_key}-competing",
+                resident_session_id=source.resident_session_id,
+            )
+            db_session.add(competing)
+        else:
+            reply.reply_to_message_id = other_source.id
+            db_session.add(reply)
+    await db_session.commit()
+
+    token = create_agent_token(
+        str(task.id), "vm-resident-receipt", task_type="strategic_review"
+    )
+    response = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": project.vision[
+                "_resident_strategic_session"
+            ]["worker_incarnation_id"],
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": reply.content,
+                "idempotency_key": idem_key,
+                "covered_message_ids": [str(source.id)],
+                "conversation_claim_id": str(claim_id),
+                "conversation_claim_incarnation": str(claim_incarnation),
+                "context": {"reply_to": str(source.id)},
+            },
+        },
+    )
+
+    assert response.status_code == 409
+    await db_session.refresh(reply)
+    expected_link = None if proof_break != "different_link" else other_source.id
+    assert reply.reply_to_message_id == expected_link
 
 
 @pytest.mark.asyncio

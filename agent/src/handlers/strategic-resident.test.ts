@@ -498,7 +498,9 @@ function makeSession(
         const { receiptPath, stagedReplyPath: stagedPath } = replyToolPaths.current;
         try {
           const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8')) as {
-            idempotency_key: string; covered_message_ids: string[];
+            idempotency_key: string;
+            covered_message_ids: string[];
+            reply_to_message_id: string;
           };
           fs.writeFileSync(stagedPath, JSON.stringify({
             type: operatorReply.type, content: operatorReply.content, ...receipt,
@@ -6783,7 +6785,11 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'resident-staged-read-'));
     const stagedPath = path.join(tempDir, '.resident-reply-staged-message.json');
     const targetPath = path.join(tempDir, 'target.json');
-    const receipt = { idempotency_key: 'receipt-key', covered_message_ids: ['m1'] };
+    const receipt = {
+      idempotency_key: 'receipt-key',
+      covered_message_ids: ['m1'],
+      reply_to_message_id: 'm1',
+    };
     try {
       fs.writeFileSync(targetPath, JSON.stringify({
         type: 'NOTE', content: 'must not follow', ...receipt,
@@ -9877,7 +9883,11 @@ describe('handleStrategicResident - failed-turn recovery', () => {
       from_type: 'user',
     };
     const installedKeys: string[] = [];
-    const installedReceipts: Array<{ idempotency_key: string; covered_message_ids: string[] }> = [];
+    const installedReceipts: Array<{
+      idempotency_key: string;
+      covered_message_ids: string[];
+      reply_to_message_id: string;
+    }> = [];
     const heartbeatBodies: Array<Record<string, unknown>> = [];
     const realWriteFileSync = fs.writeFileSync;
     vi.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
@@ -9954,8 +9964,16 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(installedKeys).toHaveLength(2);
     expect(installedKeys[1]).not.toBe(installedKeys[0]);
     expect(installedReceipts).toEqual([
-      { idempotency_key: installedKeys[0], covered_message_ids: ['msg-anchor-m1'] },
-      { idempotency_key: installedKeys[1], covered_message_ids: ['msg-newer-m2'] },
+      {
+        idempotency_key: installedKeys[0],
+        covered_message_ids: ['msg-anchor-m1'],
+        reply_to_message_id: 'msg-anchor-m1',
+      },
+      {
+        idempotency_key: installedKeys[1],
+        covered_message_ids: ['msg-newer-m2'],
+        reply_to_message_id: 'msg-newer-m2',
+      },
     ]);
     expect(heartbeatBodies).toHaveLength(2);
     expect(heartbeatBodies.every(body => !('handled_message_ids' in body))).toBe(true);
@@ -10038,6 +10056,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
     expect(replyBodies).toHaveLength(1);
     expect(replyBodies[0]).toMatchObject({
       covered_message_ids: [operatorMessage.id],
+      context: { reply_to: operatorMessage.id },
       conversation_claim_id: 'claim-durable-1',
       conversation_claim_incarnation:
         claimBodies[0].resident_incarnation_id,

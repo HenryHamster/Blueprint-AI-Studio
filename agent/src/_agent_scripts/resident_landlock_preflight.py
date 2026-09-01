@@ -470,25 +470,29 @@ def validate_responses_mcp_roundtrips(requests: list[dict]) -> None:
                 f"Codex private call {call_index + 1} changed the namespaced "
                 f"{spec['tool']} call"
             )
-        structured = parse_responses_tool_output(
+        model_output = parse_responses_tool_output(
             outputs[0][1].get("output"),
             f"Codex private call {call_index + 1} {spec['tool']}",
         )
         if spec["tool"] == "project_read":
-            if structured != {"resource": "running-update", "bytes": 40}:
+            if model_output != [{
+                "type": "text",
+                "text": '{"markdown": "preflight running update"}',
+            }]:
                 abort(
-                    f"Codex private call {call_index + 1} returned an invalid "
-                    "project_read receipt"
+                    f"Codex private call {call_index + 1} hid the canonical "
+                    "project_read body from the model; "
+                    f"actual={bounded_json(model_output)}"
                 )
         elif spec["tool"] == "strategic_operation":
             validate_strategic_receipt(
-                structured, spec["arguments"],
+                model_output, spec["arguments"],
                 f"Codex private call {call_index + 1}",
             )
-        elif structured != {"accepted": True}:
+        elif model_output != {"accepted": True}:
             abort(
                 f"Codex private call {call_index + 1} native reply was not accepted; "
-                f"actual={bounded_json(structured)}"
+                f"actual={bounded_json(model_output)}"
             )
         previous_output_index = outputs[0][0]
 
@@ -623,11 +627,11 @@ def run_codex_turn(
                     "type": "text",
                     "text": '{"markdown": "preflight running update"}',
                 }]
-                or structured != {"resource": "running-update", "bytes": 40}
+                or structured is not None
             ):
                 abort(
                     f"Codex {turn_label} call {call_number} did not preserve the "
-                    "project_read result"
+                    "model-visible project_read body"
                 )
         elif spec["tool"] == "strategic_operation":
             validate_strategic_receipt(
@@ -951,7 +955,8 @@ def run_restricted_child(options: argparse.Namespace) -> int:
         )}
         tools = responses[2]["result"]["tools"]
         project_text = responses[3]["result"]["content"][0]["text"]
-        project_read = responses[3]["result"]["structuredContent"]
+        project_read_result = responses[3]["result"]
+        project_read = project_read_result["_meta"]["blueprintProjectReadReceipt"]
         strategic = responses[4]["result"]["structuredContent"]
         accepted = responses[5]["result"]["structuredContent"]["accepted"]
     except (KeyError, TypeError, json.JSONDecodeError):
@@ -1020,6 +1025,7 @@ def run_restricted_child(options: argparse.Namespace) -> int:
         project_read.get("resource") != "running-update"
         or project_read.get("bytes") != len(expected_project.encode())
         or project_text != expected_project
+        or "structuredContent" in project_read_result
     ):
         abort("MCP project-read helper did not complete")
     try:
@@ -1173,6 +1179,7 @@ def controller(options: argparse.Namespace) -> int:
     receipt.write_text(json.dumps({
         "idempotency_key": "resident-landlock-preflight",
         "covered_message_ids": ["preflight-message"],
+        "reply_to_message_id": "preflight-message",
     }), encoding="utf-8")
     source_dir = Path(__file__).resolve().parent
     mcp_script = mcp_dir / "resident_reply_mcp.mjs"
@@ -1351,6 +1358,7 @@ def controller(options: argparse.Namespace) -> int:
             "content": expected_content,
             "idempotency_key": "resident-landlock-preflight",
             "covered_message_ids": ["preflight-message"],
+            "reply_to_message_id": "preflight-message",
         }:
             abort(
                 f"MCP connection {connection_number} staged the wrong receipt-bound "

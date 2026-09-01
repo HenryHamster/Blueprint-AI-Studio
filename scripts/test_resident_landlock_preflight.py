@@ -88,16 +88,19 @@ def responses_packets():
             "arguments": json.dumps(spec["arguments"], separators=(",", ":")),
         }
         if spec["tool"] == "project_read":
-            structured = {"bytes": 40, "resource": "running-update"}
+            model_output = [{
+                "type": "text",
+                "text": '{"markdown": "preflight running update"}',
+            }]
         elif spec["tool"] == "strategic_operation":
-            structured = strategic_receipt(spec["arguments"], call_number)
+            model_output = strategic_receipt(spec["arguments"], call_number)
         else:
-            structured = {"accepted": True}
+            model_output = {"accepted": True}
         output = {
             "type": "function_call_output", "call_id": call_id,
             "output": (
                 "Wall time: 0.0001 seconds\nOutput:\n"
-                + json.dumps(structured, separators=(",", ":"))
+                + json.dumps(model_output, separators=(",", ":"))
             ),
         }
         retained.extend((call, output))
@@ -123,7 +126,6 @@ def jsonl_private_events(*, rejected_reply=False):
                 "content": [{
                     "type": "text", "text": '{"markdown": "preflight running update"}',
                 }],
-                "structured_content": {"resource": "running-update", "bytes": 40},
             }
         elif spec["tool"] == "strategic_operation":
             result = {
@@ -217,6 +219,16 @@ class TestResidentLandlockPreflight(unittest.TestCase):
     def test_responses_roundtrip_preserves_greeting_and_private_tool_sequence(self):
         packets = responses_packets()
         PREFLIGHT.validate_responses_mcp_roundtrips(packets)
+        receipt_only = copy.deepcopy(packets)
+        receipt_only[2]["input"][-1]["output"] = (
+            'Wall time: 0.0001 seconds\nOutput:\n'
+            '{"resource":"running-update","bytes":40}'
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            PREFLIGHT.validate_responses_mcp_roundtrips(receipt_only)
+        self.assertEqual(raised.exception.code, 126)
+        self.assertIn("hid the canonical project_read body", stderr.getvalue())
         rejected = copy.deepcopy(packets)
         rejected[-1]["input"][-1]["output"] = (
             'Wall time: 0.0001 seconds\nOutput:\n{"accepted":false}'
