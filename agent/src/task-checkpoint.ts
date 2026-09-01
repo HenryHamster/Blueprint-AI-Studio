@@ -307,6 +307,10 @@ export async function prepareTaskWorkBranch(
           'preserving the conflicted recovery tree for the retry to resolve.\n',
         );
       }
+      // The checkpoint tip is the same exact publication authority as an open
+      // PR head. Carry it across the model/tool turn so a later remote advance
+      // cannot be freshly adopted as the force-with-lease target.
+      git(['config', 'blueprint.taskRemoteLeaseSha', fetchedSha]);
       return { restoredCheckpoint: true };
     }
 

@@ -433,7 +433,7 @@ exit 0
     expect(result.stderr).toContain(competingSha);
   });
 
-  it('anchors an in-place PR retry to the exact head observed before the model turn', async () => {
+  it('anchors a resumed PR or checkpoint to the exact head observed before the model turn', async () => {
     const preparedSha = 'a'.repeat(40);
     const advancedSha = 'c'.repeat(40);
     const localSha = 'b'.repeat(40);
@@ -447,6 +447,7 @@ exit 0
     expect(result.stderr).toContain('task branch advanced after retry checkout');
     expect(result.stderr).toContain(preparedSha);
     expect(result.stderr).toContain(advancedSha);
+    expect(result.stderr).not.toContain('send-pack');
   });
 
   it('advances the prepared retry lease after an exactly reconciled push', async () => {

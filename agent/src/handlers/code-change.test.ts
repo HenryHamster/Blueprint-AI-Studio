@@ -1040,6 +1040,9 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     expect(gitOps).toHaveBeenCalledWith([
       'merge', '--squash', '--no-commit', `origin/${workBranch}`,
     ]);
+    expect(gitOps).toHaveBeenCalledWith([
+      'config', 'blueprint.taskRemoteLeaseSha', 'd'.repeat(40),
+    ]);
     expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
 
     // The durable remote checkpoint intentionally remains as the lease target.
