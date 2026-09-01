@@ -74,7 +74,9 @@ async def has_active_pr_repair_owner(task: Task, session: AsyncSession) -> bool:
     from app.ci_merge_helpers import _pr_number_match, effective_pr_number
 
     try:
-        pr_number = int(effective_pr_number(task) or 0)
+        pr_number = int(
+            effective_pr_number(task) or task.first_payload.get("pr_number") or 0
+        )
     except (TypeError, ValueError):
         return False
     if pr_number <= 0:

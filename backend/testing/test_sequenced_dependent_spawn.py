@@ -140,7 +140,6 @@ class TestRequireDepsLandedOnGate:
             assert dependent.started_at is None
             assert dependent.last_heartbeat is None
             assert not (dependent.context or {}).get("_deps_satisfied")
-            assert not (dependent.context or {}).get("_deps_satisfied")
 
         await assert_held()
 
@@ -177,7 +176,12 @@ class TestRequireDepsLandedOnGate:
         prerequisite = make_task(
             project_id=project.id,
             payloads=[
-                {"type": "create", "prompt": "T1", "base_branch": "automain"}
+                {
+                    "type": "create",
+                    "prompt": "T1",
+                    "base_branch": "automain",
+                    "pr_number": 18215,
+                }
             ],
             status=TaskStatus.FAILED,
             context={
@@ -229,14 +233,18 @@ class TestRequireDepsLandedOnGate:
         prerequisite = make_task(
             project_id=project.id,
             payloads=[
-                {"type": "create", "prompt": "T1", "base_branch": "automain"}
+                {
+                    "type": "create",
+                    "prompt": "T1",
+                    "base_branch": "automain",
+                    "pr_number": 18215,
+                }
             ],
             status=TaskStatus.FAILED,
             latest_status_message="Fatal: stale open PR requires canonical repair",
             context={
                 "failure_category": "CODE_ERROR",
                 "_resurrection_count": 1,
-                "review_loop": {"pr_number": 18215},
             },
         )
         await _persist(db_session, prerequisite)
