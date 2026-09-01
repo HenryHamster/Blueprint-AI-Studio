@@ -1480,6 +1480,9 @@ async def test_operator_message_preensure_treats_mode_change_as_chat_safe(
 async def test_continuous_hydration_ensure_succeeds(db_session, monkeypatch):
     monkeypatch.setenv("CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1")
     project = await _make_project(db_session)
+    project.autonomous_enabled = False
+    db_session.add(project)
+    await db_session.commit()
     runner = await _make_runner(db_session, project)
     await persist_strategic_workbench_update(
         db_session,
@@ -1516,6 +1519,7 @@ async def test_continuous_hydration_ensure_succeeds(db_session, monkeypatch):
     assert tasks[0].first_payload["typed_fast_qualification"] == (
         "claude-warm-stream-json:phase0-v1"
     )
+    assert tasks[0].first_payload["project_autonomous_enabled"] is False
 
 
 @pytest.mark.asyncio
@@ -1917,6 +1921,9 @@ async def test_start_adopts_task_and_liveness_heartbeat_renews_lease(db_session,
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
     runner = await _make_runner(db_session, project)
+    project.autonomous_enabled = False
+    db_session.add(project)
+    await db_session.commit()
 
     snapshot = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
@@ -1934,6 +1941,7 @@ async def test_start_adopts_task_and_liveness_heartbeat_renews_lease(db_session,
         "claude-warm-stream-json:phase0-v1"
     )
     assert refreshed_task.first_payload["typed_fast_models"]["anthropic"]
+    assert refreshed_task.first_payload["project_autonomous_enabled"] is False
     assert refreshed_task.launched_by_user_id == TEST_USER_ID
     assert refreshed_task.priority == RESIDENT_TASK_PRIORITY
 
@@ -1947,6 +1955,7 @@ async def test_start_adopts_task_and_liveness_heartbeat_renews_lease(db_session,
     )
     lease = progress["leased_until"]
     assert progress["authority_held"] is True
+    assert progress["project_autonomous_enabled"] is False
     assert lease is not None
 
     project = await db_session.get(Project, project.id)
@@ -1958,6 +1967,7 @@ async def test_start_adopts_task_and_liveness_heartbeat_renews_lease(db_session,
         progress=False,
     )
     assert liveness["authority_held"] is True
+    assert liveness["project_autonomous_enabled"] is False
     assert datetime.fromisoformat(liveness["leased_until"]) > datetime.fromisoformat(lease)
     refreshed = await db_session.get(Project, project.id)
     marker = refreshed.vision[STRATEGIC_LOCAL_CONTINUATION_KEY]

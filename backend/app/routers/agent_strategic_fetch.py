@@ -2784,6 +2784,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     # no independent fetch path. These critical scalars are carried verbatim.
     "typed_fast_enabled": None, "typed_fast_models": None,
     "typed_fast_effort": None, "typed_fast_qualification": None,
+    "project_autonomous_enabled": None,
     # High — dedicated fetch verbs
     "open_messages": "message",
     "directions_summary": "direction",

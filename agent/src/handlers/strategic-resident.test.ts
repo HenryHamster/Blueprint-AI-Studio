@@ -821,6 +821,73 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(statusAtLoopEntry).toBe('Resident ready — waiting for operator input');
   });
 
+  it('serves queued operator work but never runs an autonomous turn when canonical project autonomy is off', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'msg-project-autonomy-off',
+      content: 'Answer this queued operator request without advancing the project.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let delivered = false;
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?')) return Promise.resolve(null);
+      if (delivered) return Promise.resolve({ messages: [] });
+      delivered = true;
+      return Promise.resolve({ messages: [operatorMessage] });
+    });
+    let heartbeatCount = 0;
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (!url.includes('/strategic-session/heartbeat')) return Promise.resolve({});
+      heartbeatCount += 1;
+      if (body?.activity) heartbeatBodies.push(body);
+      return Promise.resolve({
+        authority_held: true,
+        resident_incarnation_held: true,
+        project_autonomous_enabled: false,
+        stop_requested: heartbeatCount >= 6,
+      });
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        sentOperatorMessage: true,
+        resultText: 'Operator request answered.',
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    const done = handleStrategicResident(
+      'resident-project-autonomy-off',
+      {
+        project_name: 'P',
+        open_messages: [],
+        // Prove the live canonical heartbeat wins over a stale-true bootstrap.
+        project_autonomous_enabled: true,
+        strategic_session_autonomous: true,
+        strategic_session_idle_tick_seconds: 1,
+        strategic_session_message_poll_seconds: 0.001,
+        typed_fast_enabled: false,
+      },
+      { project_metadata: { project_id: 'project-autonomy-off' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+    await vi.advanceTimersByTimeAsync(10_000);
+    await done;
+
+    expect(session.sendTurn).toHaveBeenCalledTimes(1);
+    expect(session.sendTurn.mock.calls[0]?.[0]).toEqual(
+      expect.stringContaining(operatorMessage.content),
+    );
+    expect(heartbeatBodies.length).toBeGreaterThan(0);
+    expect(heartbeatBodies.every((body) => body.autonomous_turn === false)).toBe(true);
+    expect(heartbeatBodies.every((body) => (
+      (body.activity as Record<string, unknown>)?.autonomy_state === 'paused'
+      && (body.activity as Record<string, unknown>)?.autonomy_reason_code === 'chat_or_disabled'
+    ))).toBe(true);
+  });
+
   it('publishes a bounded active-to-authority-paused follow-up heartbeat', async () => {
     const operatorMessage = {
       id: 'msg-autonomy-active-to-paused',

@@ -3416,6 +3416,7 @@ def _stamp_resident_context(
     *,
     session_id: str,
     runner_id: str | None,
+    project_autonomous_enabled: bool,
     worker_generation: int = 1,
     conversation_floor_sequence: int | None = None,
     open_messages: list[dict[str, Any]] | None = None,
@@ -3462,6 +3463,12 @@ def _stamp_resident_context(
     if payloads:
         first_payload = dict(task.first_payload or {})
         first_payload.update(_resident_typed_fast_payload())
+        # Adoption can claim a cadence task created before the current Resident
+        # deployment. Stamp the live canonical project fence at adoption time
+        # rather than trusting that task's older bootstrap payload.
+        first_payload["project_autonomous_enabled"] = bool(
+            project_autonomous_enabled
+        )
         if open_messages is not None:
             first_payload["open_messages"] = open_messages
             first_payload["open_message_count"] = len(open_messages)
@@ -4748,6 +4755,9 @@ async def start_resident_session(
                             task,
                             session_id=session_id,
                             runner_id=effective_runner_id,
+                            project_autonomous_enabled=bool(
+                                locked_project.autonomous_enabled
+                            ),
                             worker_generation=worker_generation,
                             conversation_floor_sequence=(
                                 conversation_floor_sequence
@@ -6185,6 +6195,7 @@ async def renew_resident_session_lease(
         )
         return {
             "authority_held": False,
+            "project_autonomous_enabled": bool(project.autonomous_enabled),
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
             "status": status,
@@ -6582,6 +6593,7 @@ async def renew_resident_session_lease(
         refreshed = read_resident_session(project.vision) or {}
         return {
             "authority_held": False,
+            "project_autonomous_enabled": bool(project.autonomous_enabled),
             "resident_incarnation_held": False,
             "resident_incarnation_id": str(incarnation_id),
             "admission_status": "legacy_grace",
@@ -6612,6 +6624,7 @@ async def renew_resident_session_lease(
         refreshed = read_resident_session(project.vision) or {}
         return {
             "authority_held": False,
+            "project_autonomous_enabled": bool(project.autonomous_enabled),
             "resident_incarnation_held": False,
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
@@ -6681,6 +6694,7 @@ async def renew_resident_session_lease(
         refreshed = read_resident_session(project.vision) or {}
         return {
             "authority_held": False,
+            "project_autonomous_enabled": bool(project.autonomous_enabled),
             "resident_incarnation_held": holder["incarnation_held"],
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
@@ -6912,6 +6926,7 @@ async def renew_resident_session_lease(
     if holder["stopped"]:
         return {
             "authority_held": False,
+            "project_autonomous_enabled": bool(project.autonomous_enabled),
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
             "status": refreshed.get("status") or STATUS_ENDED,
@@ -6927,6 +6942,7 @@ async def renew_resident_session_lease(
         "authority_held": bool(cont.get("fresh"))
         and not refreshed_stop
         and holder["effective_authority_held"],
+        "project_autonomous_enabled": bool(project.autonomous_enabled),
         "resident_incarnation_held": holder["incarnation_held"],
         "resident_incarnation_id": str(
             incarnation_id

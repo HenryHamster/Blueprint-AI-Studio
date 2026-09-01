@@ -1114,6 +1114,17 @@ export async function handleStrategicResident(
   });
 
   const cfg = residentConfig(payload);
+  // Continuous Workday configures the private loop, but canonical project
+  // autonomy remains the outer execution fence. The admission heartbeat is
+  // received before any provider turn can start, so a disabled project enters
+  // conversational/passive mode without an autonomous orientation turn. Older
+  // backends omit the field; in that rollout window the trim-proof task payload
+  // is the fallback authority.
+  let projectAutonomousEnabled = (
+    typeof initialAuthorityAdmission.project_autonomous_enabled === 'boolean'
+      ? initialAuthorityAdmission.project_autonomous_enabled
+      : payload.project_autonomous_enabled !== false
+  );
   // The task bootstrap never grants call ownership.  Only a current backend
   // heartbeat/control projection may activate this Coordinator state.
   const callCoordinator = new CallCoordinatorState();
@@ -1492,7 +1503,7 @@ export async function handleStrategicResident(
     ResidentActivityUpdate,
     'autonomy_state' | 'autonomy_reason_code'
   > => {
-    const reason = !cfg.autonomousEnabled
+    const reason = !cfg.autonomousEnabled || !projectAutonomousEnabled
       ? 'chat_or_disabled'
       : !authorityHeld
         ? 'authority_not_held'
@@ -1759,6 +1770,9 @@ export async function handleStrategicResident(
           return;
         }
         initialAuthorityAdmission = launchAdmission;
+        if (typeof launchAdmission.project_autonomous_enabled === 'boolean') {
+          projectAutonomousEnabled = launchAdmission.project_autonomous_enabled;
+        }
         break;
       } catch (error) {
         if (admissionErrorIsTerminal(error)) {
@@ -2819,6 +2833,9 @@ export async function handleStrategicResident(
       }
     }
     authorityHeld = nextAuthorityHeld(authorityHeld, resp);
+    if (typeof resp.project_autonomous_enabled === 'boolean') {
+      projectAutonomousEnabled = resp.project_autonomous_enabled;
+    }
     const autonomyProjectionChanged = refreshResidentAutonomy();
     if (typeof resp.work_state_rev === 'string') {
       currentWorkStateRev = resp.work_state_rev;
@@ -6406,7 +6423,10 @@ export async function handleStrategicResident(
       // We never self-prompt or mutate strategic state on a lapsed lease.
       if (
         callCoordinator.suppressAutonomy()
-        || !autonomousActive(cfg.autonomousEnabled, authorityHeld)
+        || !autonomousActive(
+          cfg.autonomousEnabled && projectAutonomousEnabled,
+          authorityHeld,
+        )
       ) {
         setResidentActivity(
           'waiting',
