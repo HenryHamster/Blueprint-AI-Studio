@@ -1483,7 +1483,21 @@ async def strategic_operation(
     # the strongest lock this operation needs, so no later lock upgrade can
     # occur while the shared sequence counter is held.
     preallocated_message_sequence: int | None = None
-    if payload.op in MESSAGE_OPS:
+    create_message_replay_exists = False
+    if payload.op == "create_message":
+        replay_key = str(payload.data.get("idempotency_key") or "").strip()
+        if replay_key:
+            create_message_replay_exists = bool(
+                await session.scalar(
+                    select(ProjectMessage.id)
+                    .where(
+                        ProjectMessage.project_id == task.project_id,
+                        ProjectMessage.idempotency_key == replay_key,
+                    )
+                    .limit(1)
+                )
+            )
+    if payload.op in MESSAGE_OPS and not create_message_replay_exists:
         preallocated_message_sequence = (
             await lock_project_and_next_message_sequence(
                 session,
@@ -3947,6 +3961,114 @@ async def strategic_operation(
                 == current_resident_session_id
             )
 
+        async def _reconcile_existing_message(
+            existing: ProjectMessage,
+            *,
+            allow_reply_link_heal: bool,
+        ) -> Literal["exact", "healed"] | None:
+            existing_context = existing.context or {}
+            exact_identity = bool(
+                existing.from_type == "strategic"
+                and await _same_message_producer(existing)
+                and existing.message_type == msg_type
+                and existing.content == content
+                and existing_context.get(covered_context_key)
+                == covered_message_id_strings
+                and existing_context.get("_conversation_claim_id")
+                == (
+                    str(conversation_claim_id)
+                    if conversation_claim_id is not None
+                    else None
+                )
+                and existing_context.get("_conversation_claim_incarnation")
+                == (
+                    str(conversation_claim_incarnation)
+                    if conversation_claim_incarnation is not None
+                    else None
+                )
+                and existing_context.get(turn_state_context_key)
+                == resident_turn_state_sha256
+                and existing.surface
+                == (
+                    MessageSurface.ACTIVITY
+                    if is_routine
+                    else MessageSurface.CONVERSATION
+                )
+            )
+            if not exact_identity:
+                return None
+            if existing.reply_to_message_id == reply_to_message_id:
+                return "exact"
+            if (
+                not allow_reply_link_heal
+                or existing.reply_to_message_id is not None
+                or reply_to_message_id is None
+                or resident_ctx.get("_resident_session") is not True
+                or conversation_claim_id is None
+                or conversation_claim_incarnation is None
+                or covered_message_ids != [reply_to_message_id]
+                or existing.from_task_id != _task_id
+                or existing.handled_by_task_id != _task_id
+                or str(existing.resident_session_id or "")
+                != current_resident_session_id
+            ):
+                return None
+
+            # A forward-fixed Resident may retry a reply that was durably
+            # committed before its client stamped context.reply_to. Heal only
+            # the one canonical terminal source proven by the immutable reply
+            # identity and exact claim. Never infer a target from coverage
+            # alone, and never overwrite or compete with another linked reply.
+            claim_rows = (
+                (
+                    await session.execute(
+                        select(ProjectMessage)
+                        .where(
+                            ProjectMessage.project_id == _project_id,
+                            ProjectMessage.conversation_claim_id
+                            == conversation_claim_id,
+                        )
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(claim_rows) != 1:
+                return None
+            source = claim_rows[0]
+            if (
+                source.id != reply_to_message_id
+                or source.from_type != "user"
+                or source.surface != MessageSurface.CONVERSATION
+                or source.status != "handled"
+                or source.handling_state != MessageHandlingState.RESPONDED
+                or source.handled_by_task_id != _task_id
+                or source.conversation_claim_generation
+                != conversation_claim_generation
+                or source.conversation_claim_incarnation
+                != conversation_claim_incarnation
+                or source.conversation_claim_expires_at is not None
+                or str(source.resident_session_id or "")
+                != current_resident_session_id
+            ):
+                return None
+            linked_reply_id = await session.scalar(
+                select(ProjectMessage.id)
+                .where(
+                    ProjectMessage.project_id == _project_id,
+                    ProjectMessage.reply_to_message_id == source.id,
+                    ProjectMessage.id != existing.id,
+                )
+                .limit(1)
+            )
+            if linked_reply_id is not None:
+                return None
+            existing.reply_to_message_id = source.id
+            session.add(existing)
+            await session.commit()
+            return "healed"
+
         async def _apply_covered_messages() -> None:
             if covered_message_ids is None:
                 return
@@ -4093,49 +4215,25 @@ async def strategic_operation(
                     select(ProjectMessage).where(
                         ProjectMessage.project_id == project.id,
                         ProjectMessage.idempotency_key == idem_key,
-                    )
+                    ).with_for_update()
                 )
             ).scalar_one_or_none()
             if existing is not None:
-                if not (
-                    existing.from_type == "strategic"
-                    and await _same_message_producer(existing)
-                    and existing.message_type == msg_type
-                    and existing.content == content
-                    and (existing.context or {}).get(covered_context_key)
-                    == covered_message_id_strings
-                    and (existing.context or {}).get("_conversation_claim_id")
-                    == (
-                        str(conversation_claim_id)
-                        if conversation_claim_id is not None
-                        else None
-                    )
-                    and (existing.context or {}).get(
-                        "_conversation_claim_incarnation"
-                    )
-                    == (
-                        str(conversation_claim_incarnation)
-                        if conversation_claim_incarnation is not None
-                        else None
-                    )
-                    and (existing.context or {}).get(turn_state_context_key)
-                    == resident_turn_state_sha256
-                    and existing.reply_to_message_id == reply_to_message_id
-                    and existing.surface
-                    == (
-                        MessageSurface.ACTIVITY
-                        if is_routine
-                        else MessageSurface.CONVERSATION
-                    )
-                ):
+                replay_state = await _reconcile_existing_message(
+                    existing,
+                    allow_reply_link_heal=True,
+                )
+                if replay_state is None:
                     raise HTTPException(
                         status_code=409,
                         detail="idempotency_key already belongs to a different message",
                     )
                 existing_message_id = str(existing.id)
                 # Sequence allocation and reply-target bookkeeping preceded the
-                # replay lookup. Exact replay is read-only.
-                await session.rollback()
+                # replay lookup. Exact replay is read-only; the narrowly proven
+                # missing-link repair committed its one canonical backfill.
+                if replay_state == "exact":
+                    await session.rollback()
                 return _resp(
                     {
                         "status": "ok",
@@ -4201,37 +4299,14 @@ async def strategic_operation(
                     )
                 ).scalar_one_or_none()
                 if existing is not None:
-                    if not (
-                        existing.from_type == "strategic"
-                        and await _same_message_producer(existing)
-                        and existing.message_type == msg_type
-                        and existing.content == content
-                        and (existing.context or {}).get(covered_context_key)
-                        == covered_message_id_strings
-                        and (existing.context or {}).get("_conversation_claim_id")
-                        == (
-                            str(conversation_claim_id)
-                            if conversation_claim_id is not None
-                            else None
-                        )
-                        and (existing.context or {}).get(
-                            "_conversation_claim_incarnation"
-                        )
-                        == (
-                            str(conversation_claim_incarnation)
-                            if conversation_claim_incarnation is not None
-                            else None
-                        )
-                        and (existing.context or {}).get(turn_state_context_key)
-                        == resident_turn_state_sha256
-                        and existing.reply_to_message_id == reply_to_message_id
-                        and existing.surface
-                        == (
-                            MessageSurface.ACTIVITY
-                            if is_routine
-                            else MessageSurface.CONVERSATION
-                        )
-                    ):
+                    replay_state = await _reconcile_existing_message(
+                        existing,
+                        # The losing INSERT transaction released its canonical
+                        # Project/Task locks. Let the next exact retry perform a
+                        # link repair under the normal lock order.
+                        allow_reply_link_heal=False,
+                    )
+                    if replay_state is None:
                         raise HTTPException(  # noqa: B904
                             status_code=409,
                             detail="idempotency_key already belongs to a different message",

@@ -59,7 +59,11 @@ describe('Resident Workday reply MCP tool', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'resident-reply-mcp-'));
     const receiptPath = path.join(workspace, '.resident-reply-receipt.json');
     const stagedReplyPath = path.join(workspace, '.resident-reply-staged-message.json');
-    const receipt = { idempotency_key: 'resident-reply-key', covered_message_ids: ['message-1', 'message-2'] };
+    const receipt = {
+      idempotency_key: 'resident-reply-key',
+      covered_message_ids: ['message-1', 'message-2'],
+      reply_to_message_id: 'message-1',
+    };
     fs.writeFileSync(receiptPath, JSON.stringify(receipt), { mode: 0o600 });
     try {
       const tool = provisionResidentReplyTool(workspace, { receiptPath, stagedReplyPath });
@@ -104,6 +108,7 @@ describe('Resident Workday reply MCP tool', () => {
     const stagedReplyPath = path.join(workspace, '.resident-reply-staged-message.json');
     fs.writeFileSync(receiptPath, JSON.stringify({
       idempotency_key: 'resident-reply-key', covered_message_ids: ['message-1'],
+      reply_to_message_id: 'message-1',
     }), { mode: 0o600 });
     try {
       const tool = provisionResidentReplyTool(workspace, { receiptPath, stagedReplyPath });
@@ -279,10 +284,19 @@ describe('Resident Workday reply MCP tool', () => {
       expect(strategic.response.env.BLUEPRINT_STRATEGIC_MAX_ATTEMPTS).toBe('2');
       expect(strategic.response.leaked).toEqual([]);
 
-      const readText = (responses[2].result as { content: Array<{ text: string }> }).content[0].text;
+      const readResult = responses[2].result as {
+        content: Array<{ text: string }>;
+        structuredContent?: unknown;
+        _meta: { blueprintProjectReadReceipt: { resource: string; id: string; bytes: number } };
+      };
+      const readText = readResult.content[0].text;
       const read = JSON.parse(readText) as { args: string[]; leaked: string[] };
       expect(read.args).toEqual(['direction', 'd-123']);
       expect(read.leaked).toEqual([]);
+      expect(readResult.structuredContent).toBeUndefined();
+      expect(readResult._meta.blueprintProjectReadReceipt).toEqual({
+        resource: 'direction', id: 'd-123', bytes: Buffer.byteLength(readText, 'utf8'),
+      });
       expect((responses[3].result as { isError: boolean }).isError).toBe(true);
       expect(fs.statSync(tool.configPath).mode & 0o777).toBe(0o600);
       expect(fs.statSync(path.join(workspace, '.resident-strategic-ops.json')).mode & 0o777).toBe(0o600);
