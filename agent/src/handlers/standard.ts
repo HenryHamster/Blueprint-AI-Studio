@@ -47,6 +47,7 @@ import {
   formatProjectTools, type TaskToolContent,
 } from '../prompt.js';
 import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
+import { taskOwnedOpenPullRequest } from '../task-checkpoint.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import {
   fetchKnowledgeDocumentById,
@@ -529,7 +530,17 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     prTitlePrefixNote,
   });
 
-  const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
+  const ownedOpenPullRequest = taskOwnedOpenPullRequest(payload);
+  const workspace = ownedOpenPullRequest
+    ? await setupWorkspace(
+      owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef,
+      resolveTaskBranchNamespace(task), buildConfig, ownedOpenPullRequest,
+    )
+    : await setupWorkspace(
+      owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef,
+      resolveTaskBranchNamespace(task), buildConfig,
+    );
+  const { workBranch } = workspace;
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const artifactsHelperAvailable = writeArtifactsHelper(WORKSPACE);

@@ -1241,16 +1241,18 @@ describe('handleInvestigate — bounded self-repair on format miss', () => {
 //
 // 2026-05-04: handleMigrate's post-Claude commit/rebase/push/PR pipeline was
 // replaced with runCodeChangeTask. The handler now: (1) clones, (2) handles
-// stale branch deletion (still active production code), (3) builds the
+// fail-closed stale branch reconciliation, (3) builds the
 // migration prompt (alembic guidance + ./check test mention +
 // CODE_CHANGE_HELPER_GUIDANCE), (4) delegates to runCodeChangeTask. Tests
 // assert on the prompt, opts forwarding, and the stale-branch guard.
 describe('handleMigrate — stale-branch handling and runCodeChangeTask delegation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // Default: ls-remote throws (work branch does not exist on remote)
+    // Default: ls-remote status 2 means the work branch does not exist.
     vi.mocked(git).mockImplementation((args: string[]) => {
-      if (args[0] === 'ls-remote') throw new Error('exit code 2: branch not found');
+      if (args[0] === 'ls-remote') {
+        throw Object.assign(new Error('exit code 2: branch not found'), { status: 2 });
+      }
       if (args[0] === 'rev-parse') return 'abc1234567';
       return '';
     });
@@ -1399,8 +1401,9 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
 
   it('throws when stale remote branch has open PRs (refuses to delete)', async () => {
     // ls-remote succeeds (branch exists); simulate open PR on that branch
+    const remoteHead = 'a'.repeat(40);
     vi.mocked(git).mockImplementation((args: string[]) => {
-      if (args[0] === 'ls-remote') return 'abc\trefs/heads/blueprint/migrate-xxx';
+      if (args[0] === 'ls-remote') return `${remoteHead}\trefs/heads/blueprint/migrate-xxx`;
       return '';
     });
     vi.mocked(listOpenPullRequestsForBranch).mockResolvedValue([
@@ -1413,7 +1416,7 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
         { ...BASE_PAYLOAD, prompt: 'Add column' },
         BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
       ),
-    ).rejects.toThrow(/Refusing to delete stale branch.*#42/);
+    ).rejects.toThrow(/Cannot resume task branch.*#42/);
 
     // Must not have pushed --delete when refusing
     const deleteCall = vi.mocked(git).mock.calls.find(c => {
@@ -1425,28 +1428,28 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
   });
 
-  it('deletes stale remote branch and continues when no open PRs exist', async () => {
+  it('preserves an unowned stale branch when no open PR exists', async () => {
     // ls-remote succeeds (branch exists); no open PRs
+    const remoteHead = 'a'.repeat(40);
     vi.mocked(git).mockImplementation((args: string[]) => {
-      if (args[0] === 'ls-remote') return 'abc\trefs/heads/blueprint/migrate-xxx';
-      if (args[0] === 'rev-parse') return 'abc1234567';
+      if (args[0] === 'ls-remote') return `${remoteHead}\trefs/heads/blueprint/migrate-xxx`;
+      if (args[0] === 'rev-parse') return remoteHead;
+      if (args[0] === 'show') return 'ordinary unowned commit';
       return '';
     });
     vi.mocked(listOpenPullRequestsForBranch).mockResolvedValue([]);
 
-    await handleMigrate(
-      TASK_ID,
-      { ...BASE_PAYLOAD, prompt: 'Add column' },
+    await expect(handleMigrate(
+      TASK_ID, { ...BASE_PAYLOAD, prompt: 'Add column' },
       BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
-    );
+    )).rejects.toThrow(/refusing automatic deletion/);
 
     const deleteCall = vi.mocked(git).mock.calls.find(c => {
       const a = c[0];
       return a[0] === 'push' && a.includes('--delete');
     });
-    expect(deleteCall).toBeDefined();
-    // After cleanup, runCodeChangeTask must still be invoked.
-    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
+    expect(deleteCall).toBeUndefined();
+    expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
   });
 
   it('migrate prompt instructs agent to bump EXPECTED_SCHEMA_REVISION', async () => {
@@ -1754,7 +1757,9 @@ describe('handleMigrate — migrate self-review focus block', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(git).mockImplementation((args: string[]) => {
-      if (args[0] === 'ls-remote') throw new Error('branch not found');
+      if (args[0] === 'ls-remote') {
+        throw Object.assign(new Error('branch not found'), { status: 2 });
+      }
       if (args[0] === 'rev-parse') return 'abc1234567';
       return '';
     });

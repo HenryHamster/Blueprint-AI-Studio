@@ -8,6 +8,24 @@ export interface TaskCheckpointMetadata {
   baseCommit: string;
 }
 
+export interface TaskOwnedOpenPullRequest {
+  number: number;
+  branch: string;
+}
+
+/** Read the backend-persisted PR linkage from a task's canonical first payload. */
+export function taskOwnedOpenPullRequest(
+  payload: Record<string, unknown>,
+): TaskOwnedOpenPullRequest | undefined {
+  const rawNumber = payload.pr_number;
+  const number = typeof rawNumber === 'number'
+    ? rawNumber
+    : (typeof rawNumber === 'string' && /^\d+$/.test(rawNumber) ? Number(rawNumber) : NaN);
+  const branch = typeof payload.branch === 'string' ? payload.branch : '';
+  if (!Number.isSafeInteger(number) || number <= 0 || !branch) return undefined;
+  return { number, branch };
+}
+
 export function buildTaskCheckpointCommitMessage(taskId: string, baseCommit: string): string {
   return `${CHECKPOINT_SUBJECT_PREFIX}${taskId}\n\n` +
     `Blueprint-Checkpoint-Version: ${CHECKPOINT_VERSION}\n` +
@@ -115,6 +133,15 @@ export interface PrepareTaskWorkBranchOpts {
   workBranch: string;
   taskId: string;
   ws: WebSocket | null;
+  /** Canonical task-row linkage written when this task opened its PR. */
+  ownedOpenPullRequest?: TaskOwnedOpenPullRequest;
+}
+
+export interface OpenPullRequestBranchState {
+  number: number;
+  html_url: string;
+  head?: { ref?: string; sha?: string; repo?: { full_name?: string } | null };
+  base?: { ref?: string };
 }
 
 export interface PrepareTaskWorkBranchDeps {
@@ -124,7 +151,7 @@ export interface PrepareTaskWorkBranchDeps {
     owner: string,
     repo: string,
     branch: string,
-  ) => Promise<Array<{ number: number; html_url: string }>>;
+  ) => Promise<OpenPullRequestBranchState[]>;
   sendLog: (ws: WebSocket | null, content: string) => void;
 }
 
@@ -142,24 +169,102 @@ export interface PrepareTaskWorkBranchDeps {
 export async function prepareTaskWorkBranch(
   opts: PrepareTaskWorkBranchOpts,
   deps: PrepareTaskWorkBranchDeps,
-): Promise<{ restoredCheckpoint: boolean }> {
+): Promise<{
+  restoredCheckpoint: boolean;
+  resumedOpenPullRequest?: { number: number; htmlUrl: string };
+}> {
   const { owner, repo, ghToken, baseBranch, workBranch, taskId, ws } = opts;
   const { git, listOpenPullRequestsForBranch, sendLog } = deps;
 
-  let staleBranchExists = false;
+  let staleBranchTip = '';
   try {
-    git(['ls-remote', '--exit-code', 'origin', workBranch]);
-    staleBranchExists = true;
-  } catch { /* branch does not exist on remote — normal first attempt */ }
+    staleBranchTip = git(['ls-remote', '--exit-code', 'origin', workBranch])
+      .trim().split(/\s+/)[0] ?? '';
+  } catch (error) {
+    // `git ls-remote --exit-code` uses status 2 only for "no matching ref".
+    // Authentication, transport, timeout, and protocol failures must not be
+    // reinterpreted as branch absence: doing so loses the authority read and
+    // can create or overwrite work under an ambiguous remote state.
+    const status = typeof error === 'object' && error !== null && 'status' in error
+      ? Number((error as { status?: unknown }).status)
+      : NaN;
+    if (status !== 2) {
+      throw new Error(
+        `Cannot determine whether task branch ${workBranch} exists; refusing retry without ` +
+        `an authoritative remote read: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    // Status 2 is the normal first-attempt case: the branch does not exist.
+  }
+  if (staleBranchTip && !/^[0-9a-f]{40,64}$/i.test(staleBranchTip)) {
+    throw new Error(
+      `Cannot determine exact head of task branch ${workBranch}; refusing malformed remote read.`,
+    );
+  }
 
-  if (staleBranchExists) {
+  if (staleBranchTip) {
     const openPrs = await listOpenPullRequestsForBranch(ghToken, owner, repo, workBranch);
     if (openPrs.length > 0) {
       const prList = openPrs.map(p => `#${p.number}`).join(', ');
-      throw new Error(
-        `Refusing to delete stale branch ${workBranch}: has ${openPrs.length} open PR(s) (${prList}) ` +
-        'from a previous attempt. Resolve the PR(s) manually before retrying.',
+      if (openPrs.length !== 1) {
+        throw new Error(
+          `Cannot resume task branch ${workBranch}: has ${openPrs.length} open PR(s) (${prList}); ` +
+          'the retry authority is ambiguous.',
+        );
+      }
+
+      // The branch name is derived from the exact task id, so its one open PR is
+      // this task's normal in-place repair surface only when every immutable
+      // identity agrees.  A branch/API race, forked head, or retargeted base must
+      // fail closed rather than checking out or overwriting an ambiguous writer.
+      const pr = openPrs[0];
+      const expectedRepo = `${owner}/${repo}`.toLowerCase();
+      const expectedUrl = `https://github.com/${owner}/${repo}/pull/${pr.number}`;
+      const headSha = pr.head?.sha ?? '';
+      const identitiesMatch = (
+        opts.ownedOpenPullRequest?.number === pr.number &&
+        opts.ownedOpenPullRequest?.branch === workBranch &&
+        pr.head?.ref === workBranch &&
+        pr.base?.ref === baseBranch &&
+        pr.head?.repo?.full_name?.toLowerCase() === expectedRepo &&
+        pr.html_url === expectedUrl &&
+        /^[0-9a-f]{40,64}$/i.test(headSha) &&
+        headSha === staleBranchTip
       );
+      if (!identitiesMatch) {
+        throw new Error(
+          `Cannot resume task branch ${workBranch}: open PR #${pr.number} cannot be ` +
+          'proven to match the exact task branch, repository, base, and observed head SHA.',
+        );
+      }
+
+      git([
+        'fetch', '--no-tags', '--depth=100', 'origin',
+        `+refs/heads/${workBranch}:refs/remotes/origin/${workBranch}`,
+      ]);
+      const fetchedSha = git(['rev-parse', `origin/${workBranch}`]).trim();
+      if (fetchedSha !== headSha) {
+        throw new Error(
+          `Open PR #${pr.number} head changed while preparing retry for ${workBranch}; ` +
+          'refusing to resume from an ambiguous branch tip.',
+        );
+      }
+      git(['checkout', '-b', workBranch, '--track', `origin/${workBranch}`]);
+      // Carry the exact retry authority through the model/tool turn.  Reading a
+      // fresh remote head only at ./pr time would let a concurrent writer advance
+      // this branch after checkout and then be silently accepted as the new
+      // force-with-lease target.  The generated helper advances this local lease
+      // only after a successful or exactly reconciled push.
+      git(['config', 'blueprint.taskRemoteLeaseSha', headSha]);
+      sendLog(
+        ws,
+        `Resuming open PR #${pr.number} for task ${taskId} at exact head ${headSha}; ` +
+        'the retry will update the existing task branch in place.\n',
+      );
+      return {
+        restoredCheckpoint: false,
+        resumedOpenPullRequest: { number: pr.number, htmlUrl: pr.html_url },
+      };
     }
 
     // Materialize the exact remote tip before deciding whether this is disposable
@@ -168,6 +273,13 @@ export async function prepareTaskWorkBranch(
       'fetch', '--no-tags', '--depth=100', 'origin',
       `+refs/heads/${workBranch}:refs/remotes/origin/${workBranch}`,
     ]);
+    const fetchedSha = git(['rev-parse', `origin/${workBranch}`]).trim();
+    if (fetchedSha !== staleBranchTip) {
+      throw new Error(
+        `Task branch ${workBranch} advanced while checking for retry ownership; ` +
+        'refusing stale cleanup or checkpoint restore from an ambiguous tip.',
+      );
+    }
     const remoteMessage = git(['show', '-s', '--format=%B', `origin/${workBranch}`]);
     const checkpoint = parseTaskCheckpointCommitMessage(remoteMessage, taskId);
     if (checkpoint) {
@@ -176,6 +288,16 @@ export async function prepareTaskWorkBranch(
       // outside both shallow boundaries; without this the squash below fails
       // with "unrelated histories" on a clean tree and rethrows forever.
       ensureCheckpointMergeBase(git, baseBranch, workBranch, ws, sendLog);
+      // The deepening helper may have to refetch this branch. Re-bind that local
+      // remote-tracking ref to the exact checkpoint tip already parsed above
+      // before allowing any squash merge from it.
+      const restoreTip = git(['rev-parse', `origin/${workBranch}`]).trim();
+      if (restoreTip !== fetchedSha) {
+        throw new Error(
+          `Checkpoint branch ${workBranch} advanced while deepening its history; ` +
+          'refusing to restore an unverified tip.',
+        );
+      }
       try {
         git(['merge', '--squash', '--no-commit', `origin/${workBranch}`]);
         sendLog(
@@ -195,21 +317,21 @@ export async function prepareTaskWorkBranch(
           'preserving the conflicted recovery tree for the retry to resolve.\n',
         );
       }
+      // The checkpoint tip is the same exact publication authority as an open
+      // PR head. Carry it across the model/tool turn so a later remote advance
+      // cannot be freshly adopted as the force-with-lease target.
+      git(['config', 'blueprint.taskRemoteLeaseSha', fetchedSha]);
       return { restoredCheckpoint: true };
     }
 
-    // Legacy stale branches had no checkpoint provenance and retain the prior
-    // cleanup behavior. Never interpret an arbitrary branch as retry work.
-    try {
-      git(['push', 'origin', '--delete', workBranch]);
-      sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt (no open PRs)\n`);
-    } catch (error) {
-      sendLog(
-        ws,
-        `WARNING: Could not delete stale remote branch ${workBranch}: ` +
-        `${error instanceof Error ? error.message : String(error)}\n`,
-      );
-    }
+    // There is no atomic Git primitive that can prove both "tip is unchanged"
+    // and "no PR was opened" while deleting a branch.  The legacy automatic
+    // delete could therefore remove a concurrent writer or a just-opened PR.
+    // Preserve the branch and require an explicit, separately reconciled cleanup.
+    throw new Error(
+      `Remote branch ${workBranch} exists without this task's checkpoint or an ` +
+      'authoritatively linked open PR; refusing automatic deletion.',
+    );
   }
 
   git(['checkout', '-b', workBranch]);

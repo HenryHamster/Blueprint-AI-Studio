@@ -58,7 +58,11 @@ import {
 import {
   detectLoopDivergence,
 } from './utils/diff-detection.js';
-import { prepareTaskWorkBranch } from './task-checkpoint.js';
+import {
+  prepareTaskWorkBranch,
+  type OpenPullRequestBranchState,
+  type TaskOwnedOpenPullRequest,
+} from './task-checkpoint.js';
 import {
   type BuildConfig, type TestRunner,
   detectTestRunners,
@@ -3264,7 +3268,7 @@ export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEO
 /** List open PRs whose head branch matches `branch` on `owner/repo`. */
 export async function listOpenPullRequestsForBranch(
   ghToken: string, owner: string, repo: string, branch: string
-): Promise<{ number: number; html_url: string }[]> {
+): Promise<OpenPullRequestBranchState[]> {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}&per_page=10`;
   const controller = new AbortController();
   const timeout = setTimeout(() => { controller.abort(); }, 30_000);
@@ -3278,11 +3282,36 @@ export async function listOpenPullRequestsForBranch(
       signal: controller.signal,
     });
     if (!res.ok) {
-      log(`listOpenPullRequestsForBranch ${branch} got HTTP ${res.status} — assuming no open PRs`);
-      return [];
+      throw new Error(
+        `Cannot verify open pull requests for ${branch}: GitHub returned HTTP ${res.status}; ` +
+        'refusing stale-branch cleanup without an authoritative PR read.',
+      );
     }
-    const data = await res.json() as Array<{ number: number; html_url: string }>;
-    return Array.isArray(data) ? data : [];
+    const data = await res.json() as OpenPullRequestBranchState[];
+    if (!Array.isArray(data)) {
+      throw new Error(
+        `Cannot verify open pull requests for ${branch}: GitHub returned a non-array response; ` +
+        'refusing stale-branch cleanup.',
+      );
+    }
+    for (const entry of data) {
+      const valid = (
+        typeof entry === 'object' && entry !== null &&
+        Number.isSafeInteger(entry.number) && entry.number > 0 &&
+        typeof entry.html_url === 'string' && /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+$/.test(entry.html_url) &&
+        typeof entry.head?.ref === 'string' && entry.head.ref.length > 0 &&
+        typeof entry.head.sha === 'string' && /^[0-9a-f]{40,64}$/i.test(entry.head.sha) &&
+        typeof entry.head.repo?.full_name === 'string' && entry.head.repo.full_name.length > 0 &&
+        typeof entry.base?.ref === 'string' && entry.base.ref.length > 0
+      );
+      if (!valid) {
+        throw new Error(
+          `Cannot verify open pull requests for ${branch}: GitHub returned a malformed PR entry; ` +
+          'refusing stale-branch cleanup.',
+        );
+      }
+    }
+    return data;
   } finally {
     clearTimeout(timeout);
   }
@@ -3294,7 +3323,8 @@ export async function setupWorkspace(
   branchPrefix: string, taskId: string,
   ws: WebSocket | null, statusRef: { value: string },
   taskBranchNamespace: string,
-  buildConfig?: BuildConfig
+  buildConfig?: BuildConfig,
+  ownedOpenPullRequest?: TaskOwnedOpenPullRequest,
 ): Promise<{ workBranch: string; shortId: string }> {
   statusRef.value = `Cloning ${owner}/${repo}...`;
   sendLog(ws, `Cloning ${owner}/${repo}...\n`);
@@ -3374,7 +3404,7 @@ export async function setupWorkspace(
   const namespace = taskBranchNamespace;
   const workBranch = `${namespace}/${branchPrefix}-${shortId}`;
   await prepareTaskWorkBranch(
-    { owner, repo, ghToken, baseBranch, workBranch, taskId, ws },
+    { owner, repo, ghToken, baseBranch, workBranch, taskId, ws, ownedOpenPullRequest },
     { git, listOpenPullRequestsForBranch, sendLog },
   );
   return { workBranch, shortId };

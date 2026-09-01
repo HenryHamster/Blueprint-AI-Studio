@@ -470,6 +470,21 @@ describe('handleCreate configuration', () => {
     );
   });
 
+  it('forwards canonical PR linkage so a retry can prove full-task ownership', async () => {
+    const task = { title: 'Task', description: '' };
+    const payload = {
+      prompt: 'Fix the existing task PR',
+      pr_number: 42,
+      branch: 'blueprint/task-task123',
+    };
+    await handleCreate(TASK_ID, payload, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expectCalledWith(setupWorkspace,
+      OWNER, REPO, GH_TOKEN, 'main', 'task', TASK_ID, WS, expect.any(Object), 'blueprint', undefined,
+      { number: 42, branch: 'blueprint/task-task123' },
+    );
+  });
+
   it('throws when no prompt is found in payload or task', async () => {
     const task = { title: '', description: '' };
     await expect(

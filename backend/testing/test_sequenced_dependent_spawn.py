@@ -82,6 +82,286 @@ class TestRequireDepsLandedOnGate:
     dependency has landed on the named branch."""
 
     @pytest.mark.asyncio
+    async def test_retryable_ci_failure_requeue_keeps_child_held(self, db_session):
+        """A transient FAILED observation cannot kill a sequenced child.
+
+        The CI failure path can leave an EVALUATING prerequisite briefly FAILED
+        before the bounded infrastructure-recovery sweep repairs that same row
+        through QUEUED and PROVISIONING. The dependent must remain unclaimed and
+        held for the whole transition; only landing on the declared branch may
+        release it.
+        """
+        project = make_project(name="Retryable CI Dependency", user_id="u1")
+        await _persist(db_session, project)
+
+        prerequisite = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "T1",
+                    "base_branch": "automain",
+                    "pr_number": 18215,
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            context={"failure_category": "AGENT_TIMEOUT"},
+        )
+        await _persist(db_session, prerequisite)
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "T2 builds on T1",
+                    "base_branch": "automain",
+                    "require_deps_landed_on": "automain",
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(prerequisite.id)],
+            attempt_count=0,
+        )
+        await _persist(db_session, dependent)
+
+        async def assert_held() -> None:
+            result, remapped = await _check_candidate_task_deps(
+                dependent,
+                [prerequisite],
+                [prerequisite.id],
+                db_session,
+                _noop_verify,
+            )
+            assert result == "waiting"
+            assert remapped == {}
+            await db_session.refresh(dependent)
+            assert dependent.status == TaskStatus.QUEUED
+            assert dependent.attempt_count == 0
+            assert dependent.started_at is None
+            assert dependent.last_heartbeat is None
+            assert not (dependent.context or {}).get("_deps_satisfied")
+
+        await assert_held()
+
+        # Exact anomaly window: CI closes EVALUATING as FAILED, while the
+        # pre-existing transient infra category still admits one in-place repair.
+        prerequisite.status = TaskStatus.FAILED
+        prerequisite.latest_status_message = (
+            "CI failed on PR #18215, fix not spawned (pipeline limit)"
+        )
+        await _persist(db_session, prerequisite)
+        await assert_held()
+
+        # The recovery sweep repairs the same durable task rather than cloning it.
+        prerequisite_id = prerequisite.id
+        prerequisite.context = {
+            **(prerequisite.context or {}),
+            "_resurrection_count": 1,
+            "_resurrected_from": "AGENT_TIMEOUT",
+        }
+        prerequisite.context.pop("failure_category", None)
+        prerequisite.status = TaskStatus.QUEUED
+        await _persist(db_session, prerequisite)
+        await assert_held()
+        prerequisite.status = TaskStatus.PROVISIONING
+        await _persist(db_session, prerequisite)
+        await assert_held()
+        assert prerequisite.id == prerequisite_id
+
+    @pytest.mark.asyncio
+    async def test_exhausted_retryable_failure_cascade_cancels_child(self, db_session):
+        """Once the single in-place repair is spent, FAILED is dependency-dead."""
+        project = make_project(name="Final CI Dependency Failure", user_id="u1")
+        await _persist(db_session, project)
+        prerequisite = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "T1",
+                    "base_branch": "automain",
+                    "pr_number": 18215,
+                }
+            ],
+            status=TaskStatus.FAILED,
+            context={
+                "failure_category": "AGENT_TIMEOUT",
+                "_resurrection_count": 1,
+            },
+        )
+        await _persist(db_session, prerequisite)
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "T2 builds on T1",
+                    "base_branch": "automain",
+                    "require_deps_landed_on": "automain",
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(prerequisite.id)],
+            attempt_count=0,
+        )
+        await _persist(db_session, dependent)
+
+        result, remapped = await _check_candidate_task_deps(
+            dependent,
+            [prerequisite],
+            [prerequisite.id],
+            db_session,
+            _noop_verify,
+        )
+
+        assert result == "cascade_cancel"
+        assert remapped == {}
+
+    @pytest.mark.asyncio
+    async def test_active_pr_repair_chain_keeps_failed_prerequisite_held(
+        self, db_session
+    ):
+        """An open PR remains owned through review, request-changes, and fix.
+
+        The originating create has spent its one infra resurrection and later
+        failed fatally, but its canonical PR pipeline is still repairing the
+        durable PR. The dependent cannot be cancelled until that exact chain has
+        no execution owner left.
+        """
+        project = make_project(name="Active PR Repair Dependency", user_id="u1")
+        await _persist(db_session, project)
+        prerequisite = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "T1",
+                    "base_branch": "automain",
+                    "pr_number": 18215,
+                }
+            ],
+            status=TaskStatus.FAILED,
+            latest_status_message="Fatal: stale open PR requires canonical repair",
+            context={
+                "failure_category": "CODE_ERROR",
+                "_resurrection_count": 1,
+            },
+        )
+        await _persist(db_session, prerequisite)
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "T2 builds on T1",
+                    "base_branch": "automain",
+                    "require_deps_landed_on": "automain",
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(prerequisite.id)],
+            attempt_count=0,
+        )
+        review = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 18215,
+                    "original_task_id": str(prerequisite.id),
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            context={
+                "review_loop": {
+                    "pr_number": 18215,
+                    "original_task_id": str(prerequisite.id),
+                }
+            },
+        )
+        await _persist(db_session, dependent, review)
+
+        async def assert_held() -> None:
+            result, remapped = await _check_candidate_task_deps(
+                dependent,
+                [prerequisite],
+                [prerequisite.id],
+                db_session,
+                _noop_verify,
+            )
+            assert result == "waiting"
+            assert remapped == {}
+            await db_session.refresh(dependent)
+            assert dependent.status == TaskStatus.QUEUED
+            assert dependent.attempt_count == 0
+            assert dependent.started_at is None
+            assert dependent.last_heartbeat is None
+
+        # The active exact-target review owns the PR repair.
+        await assert_held()
+
+        # REQUEST_CHANGES completion retains ownership until its post-commit
+        # continuation durably publishes the corresponding fix.
+        review.status = TaskStatus.COMPLETED
+        review.post_commit_pending = True
+        await _persist(db_session, review)
+        await assert_held()
+
+        fix = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "fix",
+                    "pr_number": 18215,
+                    "original_task_id": str(prerequisite.id),
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            context={
+                "review_loop": {
+                    "pr_number": 18215,
+                    "original_task_id": str(prerequisite.id),
+                }
+            },
+        )
+        review.post_commit_pending = False
+        await _persist(db_session, review, fix)
+        await assert_held()
+
+        # A same-PR owner for another chain cannot keep this prerequisite alive.
+        unrelated_review = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 18215,
+                    "original_task_id": str(dependent.id),
+                }
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        await _persist(db_session, unrelated_review)
+
+        # Once the canonical repair owner itself terminates without a pending
+        # continuation, the spent/fatal prerequisite is finally dependency-dead.
+        fix.status = TaskStatus.FAILED
+        fix.context = {
+            **(fix.context or {}),
+            "failure_category": "CODE_ERROR",
+            "_resurrection_count": 1,
+        }
+        await _persist(db_session, fix)
+        result, remapped = await _check_candidate_task_deps(
+            dependent,
+            [prerequisite],
+            [prerequisite.id],
+            db_session,
+            _noop_verify,
+        )
+        assert result == "cascade_cancel"
+        assert remapped == {}
+
+    @pytest.mark.asyncio
     async def test_holds_ordering_only_cross_base_dep_until_landed(self, db_session):
         """An ordering-only cross-base dep is non-blocking under the heuristic;
         the declared gate must hold it until the dep LANDS on the named branch."""
