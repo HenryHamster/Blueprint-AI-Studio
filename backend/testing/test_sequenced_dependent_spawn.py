@@ -140,6 +140,7 @@ class TestRequireDepsLandedOnGate:
             assert dependent.started_at is None
             assert dependent.last_heartbeat is None
             assert not (dependent.context or {}).get("_deps_satisfied")
+            assert not (dependent.context or {}).get("_deps_satisfied")
 
         await assert_held()
 
@@ -209,6 +210,146 @@ class TestRequireDepsLandedOnGate:
             _noop_verify,
         )
 
+        assert result == "cascade_cancel"
+        assert remapped == {}
+
+    @pytest.mark.asyncio
+    async def test_active_pr_repair_chain_keeps_failed_prerequisite_held(
+        self, db_session
+    ):
+        """An open PR remains owned through review, request-changes, and fix.
+
+        The originating create has spent its one infra resurrection and later
+        failed fatally, but its canonical PR pipeline is still repairing the
+        durable PR. The dependent cannot be cancelled until that exact chain has
+        no execution owner left.
+        """
+        project = make_project(name="Active PR Repair Dependency", user_id="u1")
+        await _persist(db_session, project)
+        prerequisite = make_task(
+            project_id=project.id,
+            payloads=[
+                {"type": "create", "prompt": "T1", "base_branch": "automain"}
+            ],
+            status=TaskStatus.FAILED,
+            latest_status_message="Fatal: stale open PR requires canonical repair",
+            context={
+                "failure_category": "CODE_ERROR",
+                "_resurrection_count": 1,
+                "review_loop": {"pr_number": 18215},
+            },
+        )
+        await _persist(db_session, prerequisite)
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "T2 builds on T1",
+                    "base_branch": "automain",
+                    "require_deps_landed_on": "automain",
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(prerequisite.id)],
+            attempt_count=0,
+        )
+        review = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 18215,
+                    "original_task_id": str(prerequisite.id),
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            context={
+                "review_loop": {
+                    "pr_number": 18215,
+                    "original_task_id": str(prerequisite.id),
+                }
+            },
+        )
+        await _persist(db_session, dependent, review)
+
+        async def assert_held() -> None:
+            result, remapped = await _check_candidate_task_deps(
+                dependent,
+                [prerequisite],
+                [prerequisite.id],
+                db_session,
+                _noop_verify,
+            )
+            assert result == "waiting"
+            assert remapped == {}
+            await db_session.refresh(dependent)
+            assert dependent.status == TaskStatus.QUEUED
+            assert dependent.attempt_count == 0
+            assert dependent.started_at is None
+            assert dependent.last_heartbeat is None
+
+        # The active exact-target review owns the PR repair.
+        await assert_held()
+
+        # REQUEST_CHANGES completion retains ownership until its post-commit
+        # continuation durably publishes the corresponding fix.
+        review.status = TaskStatus.COMPLETED
+        review.post_commit_pending = True
+        await _persist(db_session, review)
+        await assert_held()
+
+        fix = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "fix",
+                    "pr_number": 18215,
+                    "original_task_id": str(prerequisite.id),
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            context={
+                "review_loop": {
+                    "pr_number": 18215,
+                    "original_task_id": str(prerequisite.id),
+                }
+            },
+        )
+        review.post_commit_pending = False
+        await _persist(db_session, review, fix)
+        await assert_held()
+
+        # A same-PR owner for another chain cannot keep this prerequisite alive.
+        unrelated_review = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 18215,
+                    "original_task_id": str(dependent.id),
+                }
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        await _persist(db_session, unrelated_review)
+
+        # Once the canonical repair owner itself terminates without a pending
+        # continuation, the spent/fatal prerequisite is finally dependency-dead.
+        fix.status = TaskStatus.FAILED
+        fix.context = {
+            **(fix.context or {}),
+            "failure_category": "CODE_ERROR",
+            "_resurrection_count": 1,
+        }
+        await _persist(db_session, fix)
+        result, remapped = await _check_candidate_task_deps(
+            dependent,
+            [prerequisite],
+            [prerequisite.id],
+            db_session,
+            _noop_verify,
+        )
         assert result == "cascade_cancel"
         assert remapped == {}
 

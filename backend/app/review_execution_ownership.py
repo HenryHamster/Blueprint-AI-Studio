@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from sqlalchemy import and_, or_
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
 
 from app.models import Task, TaskStatus
 
@@ -59,6 +61,52 @@ def is_pending_pr_continuation_owner(task: Task) -> bool:
         and not task.archived
         and task.status in POST_COMMIT_CONTINUATION_STATUSES
     )
+
+
+async def has_active_pr_repair_owner(task: Task, session: AsyncSession) -> bool:
+    """Return whether the task's canonical PR chain still owns repair work.
+
+    A failed originating task is not dependency-dead while an exact-chain
+    review/fix task owns execution. This includes a terminal review/fix row with
+    a durable post-commit continuation, which closes the request-changes -> fix
+    handoff gap without inventing a second ownership marker.
+    """
+    from app.ci_merge_helpers import _pr_number_match, effective_pr_number
+
+    try:
+        pr_number = int(effective_pr_number(task) or 0)
+    except (TypeError, ValueError):
+        return False
+    if pr_number <= 0:
+        return False
+    owners = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == task.project_id,
+                    _pr_number_match(session, pr_number),
+                    pr_execution_owner_clause(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    original_task_id = str(task.id)
+    for owner in owners:
+        payload = owner.first_payload
+        if payload.get("type") not in {"review", "fix"}:
+            continue
+        review_loop = (owner.context or {}).get("review_loop") or {}
+        if str(
+            payload.get("original_task_id")
+            or review_loop.get("original_task_id")
+            or ""
+        ) != original_task_id:
+            continue
+        if is_pr_execution_owner(owner):
+            return True
+    return False
 
 
 def pr_execution_owner_priority(task: Task) -> tuple[int, str]:

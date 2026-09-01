@@ -1307,6 +1307,16 @@ async def _check_candidate_task_deps(
             if infra_resurrection_block_reason(effective_dt) is None:
                 all_met = False
                 continue
+            # A spent infra retry does not make an originating create task final
+            # while its canonical same-PR review/fix chain still owns repair.
+            # Execution ownership includes the durable post-commit continuation
+            # that bridges a REQUEST_CHANGES review into its fix spawn, so there
+            # is no transient ownerless window for dependents to misread as death.
+            from app.review_execution_ownership import has_active_pr_repair_owner
+
+            if await has_active_pr_repair_owner(effective_dt, session):
+                all_met = False
+                continue
             any_failed = True
             break
         if effective_dt.status == TaskStatus.CANCELLED:
