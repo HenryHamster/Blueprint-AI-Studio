@@ -82,6 +82,137 @@ class TestRequireDepsLandedOnGate:
     dependency has landed on the named branch."""
 
     @pytest.mark.asyncio
+    async def test_retryable_ci_failure_requeue_keeps_child_held(self, db_session):
+        """A transient FAILED observation cannot kill a sequenced child.
+
+        The CI failure path can leave an EVALUATING prerequisite briefly FAILED
+        before the bounded infrastructure-recovery sweep repairs that same row
+        through QUEUED and PROVISIONING. The dependent must remain unclaimed and
+        held for the whole transition; only landing on the declared branch may
+        release it.
+        """
+        project = make_project(name="Retryable CI Dependency", user_id="u1")
+        await _persist(db_session, project)
+
+        prerequisite = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "T1",
+                    "base_branch": "automain",
+                    "pr_number": 18215,
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            context={"failure_category": "AGENT_TIMEOUT"},
+        )
+        await _persist(db_session, prerequisite)
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "T2 builds on T1",
+                    "base_branch": "automain",
+                    "require_deps_landed_on": "automain",
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(prerequisite.id)],
+            attempt_count=0,
+        )
+        await _persist(db_session, dependent)
+
+        async def assert_held() -> None:
+            result, remapped = await _check_candidate_task_deps(
+                dependent,
+                [prerequisite],
+                [prerequisite.id],
+                db_session,
+                _noop_verify,
+            )
+            assert result == "waiting"
+            assert remapped == {}
+            await db_session.refresh(dependent)
+            assert dependent.status == TaskStatus.QUEUED
+            assert dependent.attempt_count == 0
+            assert dependent.started_at is None
+            assert dependent.last_heartbeat is None
+            assert not (dependent.context or {}).get("_deps_satisfied")
+
+        await assert_held()
+
+        # Exact anomaly window: CI closes EVALUATING as FAILED, while the
+        # pre-existing transient infra category still admits one in-place repair.
+        prerequisite.status = TaskStatus.FAILED
+        prerequisite.latest_status_message = (
+            "CI failed on PR #18215, fix not spawned (pipeline limit)"
+        )
+        await _persist(db_session, prerequisite)
+        await assert_held()
+
+        # The recovery sweep repairs the same durable task rather than cloning it.
+        prerequisite_id = prerequisite.id
+        prerequisite.context = {
+            **(prerequisite.context or {}),
+            "_resurrection_count": 1,
+            "_resurrected_from": "AGENT_TIMEOUT",
+        }
+        prerequisite.context.pop("failure_category", None)
+        prerequisite.status = TaskStatus.QUEUED
+        await _persist(db_session, prerequisite)
+        await assert_held()
+        prerequisite.status = TaskStatus.PROVISIONING
+        await _persist(db_session, prerequisite)
+        await assert_held()
+        assert prerequisite.id == prerequisite_id
+
+    @pytest.mark.asyncio
+    async def test_exhausted_retryable_failure_cascade_cancels_child(self, db_session):
+        """Once the single in-place repair is spent, FAILED is dependency-dead."""
+        project = make_project(name="Final CI Dependency Failure", user_id="u1")
+        await _persist(db_session, project)
+        prerequisite = make_task(
+            project_id=project.id,
+            payloads=[
+                {"type": "create", "prompt": "T1", "base_branch": "automain"}
+            ],
+            status=TaskStatus.FAILED,
+            context={
+                "failure_category": "AGENT_TIMEOUT",
+                "_resurrection_count": 1,
+            },
+        )
+        await _persist(db_session, prerequisite)
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "T2 builds on T1",
+                    "base_branch": "automain",
+                    "require_deps_landed_on": "automain",
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(prerequisite.id)],
+            attempt_count=0,
+        )
+        await _persist(db_session, dependent)
+
+        result, remapped = await _check_candidate_task_deps(
+            dependent,
+            [prerequisite],
+            [prerequisite.id],
+            db_session,
+            _noop_verify,
+        )
+
+        assert result == "cascade_cancel"
+        assert remapped == {}
+
+    @pytest.mark.asyncio
     async def test_holds_ordering_only_cross_base_dep_until_landed(self, db_session):
         """An ordering-only cross-base dep is non-blocking under the heuristic;
         the declared gate must hold it until the dep LANDS on the named branch."""

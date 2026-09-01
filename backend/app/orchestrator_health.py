@@ -1242,7 +1242,10 @@ async def _check_candidate_task_deps(
     # resume system's dead-foundation detector uses, so the two cannot drift. A
     # requeue-replaced dep keeps its distinct remap mechanics (the dependent waits
     # on the live replacement clone, not a satisfied no-op).
-    from app.failure_classification import is_non_death_cancellation
+    from app.failure_classification import (
+        infra_resurrection_block_reason,
+        is_non_death_cancellation,
+    )
 
     # Batch-fetch all replacement tasks up front to avoid N+1 queries.
     _replacement_uuids: list[uuid.UUID] = []
@@ -1292,6 +1295,18 @@ async def _check_candidate_task_deps(
         if effective_dt.status == TaskStatus.FAILED:
             if is_non_death_cancellation(effective_dt):
                 continue  # legacy FAILED+SCOPE_EMPTY rows — satisfied
+            # FAILED is not necessarily a final dependency outcome. The bounded
+            # infra-recovery sweep repairs an eligible task in place
+            # (FAILED -> QUEUED -> PROVISIONING), preserving its id and every
+            # dependency edge. A dispatch cycle can observe the FAILED row before
+            # that sweep does; cascade-cancelling its held children in that window
+            # is irreversible even though the prerequisite is about to resume.
+            # Share the recovery sweep's intrinsic retry predicate so only a
+            # failure whose retry policy is exhausted (or otherwise permanently
+            # blocked) is dependency-dead.
+            if infra_resurrection_block_reason(effective_dt) is None:
+                all_met = False
+                continue
             any_failed = True
             break
         if effective_dt.status == TaskStatus.CANCELLED:
