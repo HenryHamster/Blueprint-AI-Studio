@@ -551,6 +551,21 @@ EXACT_MODEL_ROUTE_EFFORTS: frozenset[str] = frozenset(
 # ordinary OpenAI work can continue to use the global tier map, while an exact
 # server-authored route remains authoritative.
 RESIDENT_OPENAI_COMPATIBLE_MODEL = "gpt-5.5"
+# The two-speed typed conversation child currently uses the qualified Claude
+# stream-json foreground adapter.  A Workday provider outside this set can run
+# the long-lived private Resident, but cannot own a payload that promises Fast's
+# receipt-bound request_workday consultation bridge.
+RESIDENT_TYPED_FAST_COMPATIBLE_PROVIDERS: frozenset[str] = frozenset(
+    {"anthropic", "zai", "deepseek"}
+)
+
+
+def _resident_typed_fast_requires_compatible_provider(task: Any) -> bool:
+    if _task_context(task).get("_resident_session") is not True:
+        return False
+    payloads = getattr(task, "payloads", None) or []
+    payload = payloads[0] if payloads and isinstance(payloads[0], Mapping) else {}
+    return payload.get("typed_fast_enabled") is True
 
 
 def resolve_exact_model_route(context: Any) -> tuple[str, str, str] | None:
@@ -5141,8 +5156,23 @@ async def select_llm_runtime_for_task(
         return None
     exact_route = resolve_exact_model_route(task_context)
     exact_route_is_valid = exact_route is not None
+    typed_fast_requires_compatible_provider = (
+        _resident_typed_fast_requires_compatible_provider(task)
+    )
     if exact_route is not None:
         exact_provider, exact_model, _exact_effort = exact_route
+        if (
+            typed_fast_requires_compatible_provider
+            and exact_provider not in RESIDENT_TYPED_FAST_COMPATIBLE_PROVIDERS
+        ):
+            exact_incompatibility = (
+                "server-authored exact route is incompatible with the typed "
+                f"Fast request_workday adapter: {exact_provider}"
+            )
+            logger.error("[LLM_SELECT] %s", exact_incompatibility)
+            if failure_reasons is not None:
+                failure_reasons.append(exact_incompatibility)
+            return None
     else:
         exact_provider = None
         exact_model = None
@@ -5191,6 +5221,52 @@ async def select_llm_runtime_for_task(
             for preference in model_preferences
             if preference.get("provider") in hard_allowed_providers
         ]
+    if (
+        not exact_route_is_valid
+        and typed_fast_requires_compatible_provider
+    ):
+        # The payload is an explicit server promise that public operator rows
+        # have a receipt-bound Fast owner capable of request_workday.  Codex's
+        # long-lived Workday adapter is supported, but its foreground adapter
+        # is not yet qualified; selecting OpenAI here silently hands those rows
+        # back to broad Workday, where emit_call_packet is a voice-call packet
+        # and cannot create a typed consultation.  Filter at route authority so
+        # the next compatible provider (DeepSeek in the default precedence)
+        # owns both halves of the promised conversation contract.
+        incompatible_providers = [
+            provider_name
+            for provider_name in provider_preference
+            if provider_name not in RESIDENT_TYPED_FAST_COMPATIBLE_PROVIDERS
+        ]
+        provider_preference = [
+            provider_name
+            for provider_name in provider_preference
+            if provider_name in RESIDENT_TYPED_FAST_COMPATIBLE_PROVIDERS
+        ]
+        model_preferences = [
+            preference
+            for preference in model_preferences
+            if preference.get("provider")
+            in RESIDENT_TYPED_FAST_COMPATIBLE_PROVIDERS
+        ]
+        if (
+            explicit_provider is not None
+            and explicit_provider not in RESIDENT_TYPED_FAST_COMPATIBLE_PROVIDERS
+        ):
+            explicit_provider = None
+            explicit_model = None
+        if incompatible_providers:
+            incompatibility_reason = (
+                "typed Fast route excluded providers without a qualified "
+                "foreground request_workday adapter: "
+                + ", ".join(incompatible_providers)
+            )
+            logger.info("[LLM_SELECT] %s", incompatibility_reason)
+            if (
+                failure_reasons is not None
+                and incompatibility_reason not in failure_reasons
+            ):
+                failure_reasons.append(incompatibility_reason)
     # Resolve project_id: explicit parameter takes precedence, then task attribute.
     _resolved_project_id = (
         project_id

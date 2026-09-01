@@ -1658,6 +1658,7 @@ export async function handleStrategicResident(
     });
     const callTool = provisionCallResidentTool(generationDir, 'workday', {
       stageDir: workdayCallStageDir,
+      privateTurnMarkerPath: RESIDENT_PRIVATE_TURN_MARKER_PATH,
     });
     const configPath = mergeCallMcpConfigs(
       generationDir, replyTool.configPath, callTool.configPath,

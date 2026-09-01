@@ -42,6 +42,19 @@ def _task(*, context=None, resident: bool = True):
     )
 
 
+def _typed_fast_task(*, context=None):
+    task_context = dict(context or {})
+    task_context["_resident_session"] = True
+    return SimpleNamespace(
+        payloads=[{
+            "type": "strategic_review",
+            "quality_tier": "opus",
+            "typed_fast_enabled": True,
+        }],
+        context=task_context,
+    )
+
+
 def _known_usage(utilization: float, now: datetime) -> UsageSnapshot:
     return UsageSnapshot(
         known=True,
@@ -189,6 +202,75 @@ async def test_strategic_runtime_global_usage_precedence_prefers_fresh_known(
         "deepseek-18",
     )
     assert saturated_codex["active_tasks"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection_mode", ["preferred", "balanced"])
+async def test_typed_fast_resident_skips_provider_without_qualified_foreground_adapter(
+    clean_runtime_pool,
+    selection_mode,
+):
+    now = _utcnow()
+    healthy_codex = _runtime_account("codex-healthy", "openai")
+    healthy_codex.update(
+        usage_snapshot=_known_usage(2.0, now), usage_snapshot_at=now
+    )
+    healthy_deepseek = _runtime_account("deepseek-compatible", "deepseek")
+    healthy_deepseek.update(
+        usage_snapshot=_known_usage(18.0, now), usage_snapshot_at=now
+    )
+    _register(healthy_codex, healthy_deepseek)
+    routing_diagnostics = []
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=_typed_fast_task(),
+        runtime_config=_config(selection_mode),
+        failure_reasons=routing_diagnostics,
+    )
+
+    assert result is not None
+    assert (result.provider, result.model, result.account_id) == (
+        "deepseek",
+        "deepseek-v4-pro",
+        "deepseek-compatible",
+    )
+    assert healthy_codex["active_tasks"] == 0
+    assert routing_diagnostics == [
+        "typed Fast route excluded providers without a qualified foreground "
+        "request_workday adapter: openai"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_typed_fast_resident_fails_closed_on_incompatible_exact_route(
+    clean_runtime_pool,
+):
+    now = _utcnow()
+    codex = _runtime_account("codex-exact-incompatible", "openai")
+    codex.update(usage_snapshot=_known_usage(2.0, now), usage_snapshot_at=now)
+    _register(codex)
+    diagnostics = []
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=_typed_fast_task(context={
+            EXACT_MODEL_ROUTE_CONTEXT_KEY: {
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "effort": "max",
+            }
+        }),
+        runtime_config=_config(),
+        failure_reasons=diagnostics,
+    )
+
+    assert result is None
+    assert codex["active_tasks"] == 0
+    assert diagnostics == [
+        "server-authored exact route is incompatible with the typed Fast "
+        "request_workday adapter: openai"
+    ]
 
 
 @pytest.mark.asyncio

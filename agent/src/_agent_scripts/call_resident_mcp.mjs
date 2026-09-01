@@ -11,7 +11,48 @@ import readline from 'node:readline';
 const role = process.env.CALL_RESIDENT_ROLE || '';
 const receiptPath = process.env.CALL_TURN_RECEIPT_PATH || '';
 const stageDir = process.env.CALL_LOCAL_STAGE_DIR || '';
+const privateTurnMarkerPath = process.env.BLUEPRINT_RESIDENT_PRIVATE_TURN_MARKER_PATH || '';
 const MAX_BYTES = 65_536;
+const MAX_PACKET_TEXT = 24_000;
+const CALL_PACKET_REQUIRED = [
+  'version', 'packet_id', 'project_id', 'call_session_id', 'call_generation',
+  'request_id', 'originating_user_turn_ids', 'input_revision',
+  'context_sequence', 'kind', 'spoken_text',
+];
+const CALL_PACKET_PROPERTIES = {
+  version: { type: 'integer', enum: [1] },
+  packet_id: { type: 'string', minLength: 1, maxLength: 256 },
+  project_id: { type: 'string', minLength: 1, maxLength: 256 },
+  call_session_id: { type: 'string', minLength: 1, maxLength: 256 },
+  call_generation: { type: 'integer', minimum: 1 },
+  request_id: { type: 'string', minLength: 1, maxLength: 256 },
+  originating_user_turn_ids: {
+    type: 'array', minItems: 1, maxItems: 32,
+    items: { type: 'string', minLength: 1, maxLength: 256 },
+  },
+  input_revision: { type: 'integer', minimum: 0 },
+  context_sequence: { type: 'integer', minimum: 0 },
+  kind: { type: 'string', enum: ['progress', 'final', 'blocked'] },
+  spoken_text: { type: 'string', minLength: 1, maxLength: MAX_PACKET_TEXT },
+  exact_text: { type: 'string', minLength: 1, maxLength: MAX_PACKET_TEXT },
+  display_blocks: {
+    type: 'array', maxItems: 8,
+    items: {
+      type: 'object',
+      properties: {
+        type: { type: 'string', enum: ['latex', 'code', 'table', 'artifact_ref'] },
+        content: { type: 'string', minLength: 1, maxLength: 16_000 },
+      },
+      required: ['type', 'content'],
+      additionalProperties: false,
+    },
+  },
+  evidence_refs: {
+    type: 'array', maxItems: 32,
+    items: { type: 'string', minLength: 1, maxLength: 512 },
+  },
+  supersedes_packet_id: { type: 'string', minLength: 1, maxLength: 256 },
+};
 
 function send(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }
 function error(id, text) { send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError: true } }); }
@@ -31,6 +72,63 @@ function regularJson(filename, label) {
     if (!stat.isFile() || stat.dev !== before.dev || stat.ino !== before.ino) throw new Error(`${label} changed identity`);
     return JSON.parse(fs.readFileSync(fd, 'utf8'));
   } finally { fs.closeSync(fd); }
+}
+function boundedStringArray(value, label, maxItems, maxStringBytes) {
+  if (!Array.isArray(value) || value.length > maxItems) throw new Error(`invalid ${label}`);
+  return value.map((entry) => nonEmpty(entry, label, maxStringBytes));
+}
+function validateCallPacket(value) {
+  const marker = regularJson(privateTurnMarkerPath, 'private Workday turn marker');
+  if (!object(marker) || marker.kind !== 'active-call') {
+    throw new Error('emit_call_packet requires an active private call turn');
+  }
+  if (!object(value) || value.version !== 1 || !['progress', 'final', 'blocked'].includes(value.kind)) {
+    throw new Error('invalid call packet');
+  }
+  const packet = {
+    version: 1,
+    packet_id: nonEmpty(value.packet_id, 'packet_id', 256),
+    project_id: nonEmpty(value.project_id, 'project_id', 256),
+    call_session_id: nonEmpty(value.call_session_id, 'call_session_id', 256),
+    call_generation: value.call_generation,
+    request_id: nonEmpty(value.request_id, 'request_id', 256),
+    originating_user_turn_ids: boundedStringArray(
+      value.originating_user_turn_ids, 'originating_user_turn_ids', 32, 256,
+    ),
+    input_revision: value.input_revision,
+    context_sequence: value.context_sequence,
+    kind: value.kind,
+    spoken_text: nonEmpty(value.spoken_text, 'spoken_text', MAX_PACKET_TEXT),
+    ...(value.exact_text === undefined
+      ? {} : { exact_text: nonEmpty(value.exact_text, 'exact_text', MAX_PACKET_TEXT) }),
+    ...(value.display_blocks === undefined ? {} : { display_blocks: value.display_blocks }),
+    ...(value.evidence_refs === undefined ? {} : {
+      evidence_refs: boundedStringArray(value.evidence_refs, 'evidence_refs', 32, 512),
+    }),
+    ...(value.supersedes_packet_id === undefined ? {} : {
+      supersedes_packet_id: nonEmpty(value.supersedes_packet_id, 'supersedes_packet_id', 256),
+    }),
+  };
+  if (!Number.isSafeInteger(packet.call_generation) || packet.call_generation < 1
+    || !Number.isSafeInteger(packet.input_revision) || packet.input_revision < 0
+    || !Number.isSafeInteger(packet.context_sequence) || packet.context_sequence < 0
+    || packet.originating_user_turn_ids.length === 0) throw new Error('invalid call packet');
+  if (packet.display_blocks !== undefined) {
+    if (!Array.isArray(packet.display_blocks) || packet.display_blocks.length > 8) {
+      throw new Error('invalid display_blocks');
+    }
+    packet.display_blocks = packet.display_blocks.map((entry) => {
+      if (!object(entry) || !['latex', 'code', 'table', 'artifact_ref'].includes(entry.type)) {
+        throw new Error('invalid display_blocks');
+      }
+      return { type: entry.type, content: nonEmpty(entry.content, 'display block content', 16_000) };
+    });
+  }
+  if (packet.evidence_refs?.some((ref) => /^[a-z][a-z0-9+.-]*:\/\//i.test(ref))) {
+    throw new Error('invalid evidence_refs');
+  }
+  if (Buffer.byteLength(JSON.stringify(packet), 'utf8') > MAX_BYTES) throw new Error('call packet exceeds staging limit');
+  return packet;
 }
 function activeReceipt() {
   const receipt = regularJson(receiptPath, 'foreground turn receipt');
@@ -72,7 +170,20 @@ function definitions() {
     { name: 'request_workday', description: 'Request private Workday reasoning. This does not speak or grant authority.', inputSchema: { type: 'object', properties: { request_id: { type: 'string' }, prompt: { type: 'string' } }, required: ['request_id', 'prompt'], additionalProperties: false } },
     { name: 'show_display_blocks', description: 'Render exact opaque display blocks through the Coordinator.', inputSchema: { type: 'object', properties: { display_blocks: { type: 'array' } }, required: ['display_blocks'], additionalProperties: false } },
   ];
-  if (role === 'workday') return [{ name: 'emit_call_packet', description: 'Emit one private, schema-validated call work packet. It never replies directly to the operator.', inputSchema: { type: 'object', properties: { packet: { type: 'object' } }, required: ['packet'], additionalProperties: false } }];
+  if (role === 'workday') return [{
+    name: 'emit_call_packet',
+    description: 'Emit one private call work packet using the exact active-call identity supplied by the Coordinator. Never guess an identity. This tool never replies directly to the operator.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        packet: {
+          type: 'object', properties: CALL_PACKET_PROPERTIES,
+          required: CALL_PACKET_REQUIRED, additionalProperties: false,
+        },
+      },
+      required: ['packet'], additionalProperties: false,
+    },
+  }];
   return [];
 }
 function handleCall(id, params) {
@@ -105,12 +216,7 @@ function handleCall(id, params) {
       stage('display', { receipt, display_blocks: args.display_blocks }, `${receipt.idempotency_key}:${JSON.stringify(args.display_blocks)}`);
       return text(id, 'Display blocks accepted for Coordinator validation.');
     }
-    const packet = args.packet;
-    if (!object(packet) || packet.version !== 1 || !['progress', 'final', 'blocked'].includes(packet.kind)
-      || typeof packet.packet_id !== 'string' || !packet.packet_id || typeof packet.project_id !== 'string'
-      || typeof packet.call_session_id !== 'string' || !Number.isSafeInteger(packet.call_generation)
-      || !Number.isSafeInteger(packet.input_revision) || typeof packet.request_id !== 'string'
-      || typeof packet.spoken_text !== 'string' || !packet.spoken_text.trim()) throw new Error('invalid call packet');
+    const packet = validateCallPacket(args.packet);
     stage('packet', packet, packet.packet_id);
     return text(id, 'Private call packet accepted for Coordinator validation.');
   } catch (cause) { return error(id, `local call tool rejected input: ${String(cause)}`); }
