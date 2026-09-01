@@ -6296,6 +6296,41 @@ export async function handleStrategicResident(
         continue;
       }
 
+      // A Fast turn that just durably created a consultation carries a
+      // short-lived context envelope for that exact operator exchange. Claim
+      // it before draining older, already-durable continuation results. Those
+      // results can safely wait in their server queue; the new consultation
+      // cannot safely wait behind an unbounded recovery backlog because its
+      // envelope may expire before Workday ever sees it. Operator messages and
+      // an already-running private job still retain priority above this gate.
+      if (typedConsultationAwaitingClaim) {
+        if (await maybeClaimTypedConsultation()) {
+          const hb = await livenessHeartbeat();
+          if (hb?.stop_requested) break;
+          await sleep(cfg.messagePollMs);
+          continue;
+        }
+        // A transport failure leaves the durable handoff hint armed. Do not
+        // let an older continuation consume the shared Workday/Fast capacity
+        // until claim-next either succeeds or returns authoritative `empty`.
+        if (typedConsultationAwaitingClaim) {
+          const activityChanged = setResidentActivity(
+            'waiting',
+            'Private Workday consultation is queued',
+            null,
+            'consultation_queued',
+            'consultation_queued',
+            typedConsultationDelivery.consultationId,
+          );
+          if (activityChanged || livenessHeartbeatDue()) {
+            const hb = await livenessHeartbeat();
+            if (hb?.stop_requested) break;
+          }
+          await sleep(cfg.messagePollMs);
+          continue;
+        }
+      }
+
       // A completed private investigation is delivered by Fast through a
       // distinct server-created continuation receipt. It never reuses the
       // original input claim or the native Workday reply capability.

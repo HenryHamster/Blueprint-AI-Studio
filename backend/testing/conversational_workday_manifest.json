@@ -958,9 +958,11 @@
         "selectTypedFastClaimMessages > recovers an older claimed turn before newer unclaimed input after restart",
         "selectTypedFastClaimMessages > retries only M1 when a later page contains M1 plus M2",
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
-        "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
+        "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page",
+        "handleStrategicResident — typed Fast lease lifecycle > claims a just-created bounded consultation before an older continuation after operator input",
+        "handleStrategicResident — typed Fast lease lifecycle > claims a queued consultation without new operator input after stale Resident continuation cleanup is deauthorized"
       ],
-      "test_count": 161
+      "test_count": 163
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
