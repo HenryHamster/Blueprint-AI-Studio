@@ -47,6 +47,7 @@ import { writeCodeChangeHelpers } from '../prompt.js';
 import {
   buildTaskCheckpointCommitMessage,
   prepareTaskWorkBranch,
+  taskOwnedOpenPullRequest,
 } from '../task-checkpoint.js';
 import { writePrHelper } from '../prompts/pr-helper.js';
 import * as fs from 'fs';
@@ -564,6 +565,29 @@ describe('runCodeChangeTask forced terminal-verb continuation', () => {
   });
 });
 
+describe('task-owned open PR linkage', () => {
+  it('accepts only a complete canonical PR number and branch pair', () => {
+    expect(taskOwnedOpenPullRequest({
+      pr_number: 42,
+      branch: 'blueprint/task-1234abcd',
+    })).toEqual({ number: 42, branch: 'blueprint/task-1234abcd' });
+    expect(taskOwnedOpenPullRequest({
+      pr_number: '42',
+      branch: 'blueprint/task-1234abcd',
+    })).toEqual({ number: 42, branch: 'blueprint/task-1234abcd' });
+  });
+
+  it.each([
+    {},
+    { pr_number: 0, branch: 'blueprint/task-1234abcd' },
+    { pr_number: 'not-a-number', branch: 'blueprint/task-1234abcd' },
+    { pr_number: 42 },
+    { pr_number: 42, branch: '' },
+  ])('rejects incomplete or malformed linkage %#', (payload) => {
+    expect(taskOwnedOpenPullRequest(payload)).toBeUndefined();
+  });
+});
+
 // ── durable unshipped-work checkpoint / retry transition ─────────────────────
 describe('durable unshipped-work checkpoint retry transition', () => {
   const taskId = 'checkpoint-retry-task';
@@ -769,10 +793,230 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     );
   });
 
+  it('fails closed when the remote branch probe fails for transport or auth reasons', async () => {
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') throw new Error('authentication failed');
+      return '';
+    });
+    const listOpen = vi.fn().mockResolvedValue([]);
+
+    await expect(prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+      },
+      { git: gitOps, listOpenPullRequestsForBranch: listOpen, sendLog: vi.fn() },
+    )).rejects.toThrow(/refusing retry without an authoritative remote read/);
+
+    expect(listOpen).not.toHaveBeenCalled();
+    expect(gitOps.mock.calls.some(([args]) => args[0] === 'checkout')).toBe(false);
+    expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
+  });
+
+  it('preserves an unowned non-checkpoint branch instead of deleting it', async () => {
+    const remoteHead = '4'.repeat(40);
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `${remoteHead}\trefs/heads/${workBranch}`;
+      if (args[0] === 'rev-parse' && args[1] === `origin/${workBranch}`) return remoteHead;
+      if (args[0] === 'show') return 'ordinary commit without task checkpoint trailers';
+      return '';
+    });
+
+    await expect(prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+      },
+      {
+        git: gitOps,
+        listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([]),
+        sendLog: vi.fn(),
+      },
+    )).rejects.toThrow(/refusing automatic deletion/);
+
+    expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
+    expect(gitOps.mock.calls.some(([args]) => args[0] === 'checkout')).toBe(false);
+  });
+
+  it('refuses checkpoint inspection when the branch advances after the PR read', async () => {
+    const observedHead = '4'.repeat(40);
+    const fetchedHead = '5'.repeat(40);
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `${observedHead}\trefs/heads/${workBranch}`;
+      if (args[0] === 'rev-parse' && args[1] === `origin/${workBranch}`) return fetchedHead;
+      return '';
+    });
+
+    await expect(prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+      },
+      {
+        git: gitOps,
+        listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([]),
+        sendLog: vi.fn(),
+      },
+    )).rejects.toThrow(/advanced while checking for retry ownership/);
+
+    expect(gitOps.mock.calls.some(([args]) => args[0] === 'show')).toBe(false);
+    expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
+  });
+
+  it('refuses a matching branch PR without canonical full-task linkage', async () => {
+    const openHead = '4'.repeat(40);
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `${openHead}\trefs/heads/${workBranch}`;
+      return '';
+    });
+
+    await expect(prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+      },
+      {
+        git: gitOps,
+        listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([{
+          number: 42,
+          html_url: 'https://github.com/owner/repo/pull/42',
+          head: { ref: workBranch, sha: openHead, repo: { full_name: 'owner/repo' } },
+          base: { ref: 'main' },
+        }]),
+        sendLog: vi.fn(),
+      },
+    )).rejects.toThrow(/cannot be proven to match the exact task branch/);
+
+    expect(gitOps.mock.calls.some(([args]) => args[0] === 'fetch')).toBe(false);
+    expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
+  });
+
+  it('resumes the exact single open PR owned by the retrying task', async () => {
+    const openHead = '4'.repeat(40);
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `${openHead}\trefs/heads/${workBranch}`;
+      if (args[0] === 'rev-parse' && args[1] === `origin/${workBranch}`) return openHead;
+      return '';
+    });
+    const listOpen = vi.fn().mockResolvedValue([{
+      number: 42,
+      html_url: 'https://github.com/owner/repo/pull/42',
+      head: { ref: workBranch, sha: openHead, repo: { full_name: 'owner/repo' } },
+      base: { ref: 'main' },
+    }]);
+    const log = vi.fn();
+
+    const result = await prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+        ownedOpenPullRequest: { number: 42, branch: workBranch },
+      },
+      { git: gitOps, listOpenPullRequestsForBranch: listOpen, sendLog: log },
+    );
+
+    expect(result).toEqual({
+      restoredCheckpoint: false,
+      resumedOpenPullRequest: {
+        number: 42,
+        htmlUrl: 'https://github.com/owner/repo/pull/42',
+      },
+    });
+    expect(gitOps).toHaveBeenCalledWith([
+      'fetch', '--no-tags', '--depth=100', 'origin',
+      `+refs/heads/${workBranch}:refs/remotes/origin/${workBranch}`,
+    ]);
+    expect(gitOps).toHaveBeenCalledWith([
+      'checkout', '-b', workBranch, '--track', `origin/${workBranch}`,
+    ]);
+    expect(gitOps).toHaveBeenCalledWith([
+      'config', 'blueprint.taskRemoteLeaseSha', openHead,
+    ]);
+    expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
+    expect(log).toHaveBeenCalledWith(
+      null,
+      expect.stringContaining(`Resuming open PR #42 for task ${taskId} at exact head ${openHead}`),
+    );
+  });
+
+  it.each([
+    ['head branch', { head: { ref: 'foreign-branch' } }],
+    ['head repository', { head: { repo: { full_name: 'other/repo' } } }],
+    ['base branch', { base: { ref: 'release' } }],
+    ['observed head', { head: { sha: '5'.repeat(40) } }],
+  ])('refuses an open PR whose %s does not match the exact retry identity', async (_label, override) => {
+    const openHead = '4'.repeat(40);
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `${openHead}\trefs/heads/${workBranch}`;
+      return '';
+    });
+    const canonical = {
+      number: 42,
+      html_url: 'https://github.com/owner/repo/pull/42',
+      head: { ref: workBranch, sha: openHead, repo: { full_name: 'owner/repo' } },
+      base: { ref: 'main' },
+    };
+    const candidate = {
+      ...canonical,
+      ...override,
+      head: { ...canonical.head, ...('head' in override ? override.head : {}) },
+      base: { ...canonical.base, ...('base' in override ? override.base : {}) },
+    };
+
+    await expect(prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+        ownedOpenPullRequest: { number: 42, branch: workBranch },
+      },
+      {
+        git: gitOps,
+        listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([candidate]),
+        sendLog: vi.fn(),
+      },
+    )).rejects.toThrow(/cannot be proven to match the exact task branch/);
+
+    expect(gitOps.mock.calls.some(([args]) => args[0] === 'fetch')).toBe(false);
+    expect(gitOps.mock.calls.some(([args]) => args[0] === 'checkout')).toBe(false);
+    expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
+  });
+
+  it('refuses when the task branch advances between PR read and fetch', async () => {
+    const openHead = '4'.repeat(40);
+    const advancedHead = '5'.repeat(40);
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `${openHead}\trefs/heads/${workBranch}`;
+      if (args[0] === 'rev-parse' && args[1] === `origin/${workBranch}`) return advancedHead;
+      return '';
+    });
+
+    await expect(prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+        ownedOpenPullRequest: { number: 42, branch: workBranch },
+      },
+      {
+        git: gitOps,
+        listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([{
+          number: 42,
+          html_url: 'https://github.com/owner/repo/pull/42',
+          head: { ref: workBranch, sha: openHead, repo: { full_name: 'owner/repo' } },
+          base: { ref: 'main' },
+        }]),
+        sendLog: vi.fn(),
+      },
+    )).rejects.toThrow(/head changed while preparing retry/);
+
+    expect(gitOps.mock.calls.some(([args]) => args[0] === 'checkout')).toBe(false);
+    expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
+  });
+
   it('restores the checkpoint as retry work and keeps publication force-with-lease capable', async () => {
     const checkpointMessage = buildTaskCheckpointCommitMessage(taskId, baseCommit);
     const gitOps = vi.fn((args: string[]): string => {
-      if (args[0] === 'ls-remote') return `deadbeef\trefs/heads/${workBranch}`;
+      if (args[0] === 'ls-remote') return `${'d'.repeat(40)}\trefs/heads/${workBranch}`;
+      if (args[0] === 'rev-parse' && args[1] === `origin/${workBranch}`) return 'd'.repeat(40);
       if (args[0] === 'show') return checkpointMessage;
       return '';
     });
@@ -795,6 +1039,9 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     expect(gitOps).toHaveBeenCalledWith(['checkout', '-b', workBranch]);
     expect(gitOps).toHaveBeenCalledWith([
       'merge', '--squash', '--no-commit', `origin/${workBranch}`,
+    ]);
+    expect(gitOps).toHaveBeenCalledWith([
+      'config', 'blueprint.taskRemoteLeaseSha', 'd'.repeat(40),
     ]);
     expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
 
@@ -841,7 +1088,8 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     const checkpointMessage = buildTaskCheckpointCommitMessage(taskId, baseCommit);
     let deepened = false;
     const gitOps = vi.fn((args: string[]): string => {
-      if (args[0] === 'ls-remote') return `deadbeef\trefs/heads/${workBranch}`;
+      if (args[0] === 'ls-remote') return `${'d'.repeat(40)}\trefs/heads/${workBranch}`;
+      if (args[0] === 'rev-parse' && args[1] === `origin/${workBranch}`) return 'd'.repeat(40);
       if (args[0] === 'show') return checkpointMessage;
       if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') {
         return deepened ? 'false' : 'true';
@@ -885,10 +1133,59 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
   });
 
+  it('refuses a checkpoint branch that advances during the deepening refetch', async () => {
+    const checkpointHead = 'd'.repeat(40);
+    const advancedHead = 'e'.repeat(40);
+    const checkpointMessage = buildTaskCheckpointCommitMessage(taskId, baseCommit);
+    let deepened = false;
+    let branchRefetchCount = 0;
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `${checkpointHead}\trefs/heads/${workBranch}`;
+      if (args[0] === 'show') return checkpointMessage;
+      if (args[0] === 'rev-parse' && args[1] === `origin/${workBranch}`) {
+        return branchRefetchCount >= 2 ? advancedHead : checkpointHead;
+      }
+      if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return 'true';
+      if (args[0] === 'merge-base') {
+        if (!deepened) throw new Error('fatal: no merge base found');
+        return 'a'.repeat(40);
+      }
+      if (args[0] === 'fetch' && args.includes('--unshallow')) {
+        deepened = true;
+        return '';
+      }
+      if (args[0] === 'fetch' && args.includes(`+refs/heads/${workBranch}:refs/remotes/origin/${workBranch}`)) {
+        // The first fetch materializes A; the deepening helper's second fetch
+        // observes competing B.
+        branchRefetchCount += 1;
+        return '';
+      }
+      return '';
+    });
+
+    await expect(prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+      },
+      {
+        git: gitOps,
+        listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([]),
+        sendLog: vi.fn(),
+      },
+    )).rejects.toThrow(/advanced while deepening its history/);
+
+    expect(gitOps.mock.calls.some(([args]) => args[0] === 'merge')).toBe(false);
+    expect(gitOps).not.toHaveBeenCalledWith([
+      'config', 'blueprint.taskRemoteLeaseSha', expect.any(String),
+    ]);
+  });
+
   it('does not deepen when the checkpoint merge base is already reachable', async () => {
     const checkpointMessage = buildTaskCheckpointCommitMessage(taskId, baseCommit);
     const gitOps = vi.fn((args: string[]): string => {
-      if (args[0] === 'ls-remote') return `deadbeef\trefs/heads/${workBranch}`;
+      if (args[0] === 'ls-remote') return `${'d'.repeat(40)}\trefs/heads/${workBranch}`;
+      if (args[0] === 'rev-parse' && args[1] === `origin/${workBranch}`) return 'd'.repeat(40);
       if (args[0] === 'show') return checkpointMessage;
       if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return 'true';
       if (args[0] === 'merge-base') return 'b'.repeat(40);
@@ -915,7 +1212,8 @@ describe('durable unshipped-work checkpoint retry transition', () => {
   it('refuses the squash restore when histories stay unrelated after deepening', async () => {
     const checkpointMessage = buildTaskCheckpointCommitMessage(taskId, baseCommit);
     const gitOps = vi.fn((args: string[]): string => {
-      if (args[0] === 'ls-remote') return `deadbeef\trefs/heads/${workBranch}`;
+      if (args[0] === 'ls-remote') return `${'d'.repeat(40)}\trefs/heads/${workBranch}`;
+      if (args[0] === 'rev-parse' && args[1] === `origin/${workBranch}`) return 'd'.repeat(40);
       if (args[0] === 'show') return checkpointMessage;
       if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return 'true';
       if (args[0] === 'merge-base') throw new Error('fatal: no merge base found');
