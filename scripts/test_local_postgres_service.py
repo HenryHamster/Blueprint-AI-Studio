@@ -61,8 +61,19 @@ class LocalPostgresServiceTests(unittest.TestCase):
             ),
         )
         self.data_info_mock = self.data_info.start()
+        # Service-start tests exercise the Docker contract, not the host that
+        # happens to run this unit suite.  Give them deterministic adequate
+        # headroom; the dedicated fail-closed test below overrides this mock
+        # with an explicitly insufficient value.
+        self.free_disk = patch.object(
+            postgres,
+            "_free_disk_bytes",
+            return_value=2 * 1024**3,
+        )
+        self.free_disk_mock = self.free_disk.start()
 
     def tearDown(self):
+        self.free_disk.stop()
         self.data_info.stop()
         if os.name != "nt":
             self.data.chmod(0o700)
