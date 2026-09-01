@@ -534,7 +534,14 @@ class AssetSecurityTests(unittest.TestCase):
             docker_calls = docker_log.read_text(encoding="utf-8")
             self.assertNotRegex(docker_calls, r"(?m)^(run|stop|rm) ")
 
-    def _volume_gc_harness(self, temporary: str, *, freezer_state: str) -> tuple[dict[str, str], Path, Path]:
+    def _volume_gc_harness(
+        self,
+        temporary: str,
+        *,
+        freezer_state: str,
+        runner_state: str = "active",
+        inactive_cgroup_pid: int | None = None,
+    ) -> tuple[dict[str, str], Path, Path]:
         root = Path(temporary)
         state_root = root / "state"
         socket_root = root / "sockets"
@@ -551,8 +558,10 @@ class AssetSecurityTests(unittest.TestCase):
             / "system-blueprint\\x2dgithub\\x2dactions.slice"
             / "blueprint-github-actions@1.service"
         )
-        cgroup.mkdir(parents=True)
-        (cgroup / "cgroup.procs").write_text(f"{os.getpid()}\n", encoding="utf-8")
+        if runner_state == "active" or inactive_cgroup_pid is not None:
+            cgroup.mkdir(parents=True)
+            cgroup_pid = os.getpid() if runner_state == "active" else inactive_cgroup_pid
+            (cgroup / "cgroup.procs").write_text(f"{cgroup_pid}\n", encoding="utf-8")
 
         commands = {
             "df": """
@@ -565,15 +574,38 @@ class AssetSecurityTests(unittest.TestCase):
             """,
             "stat": """
                 #!/usr/bin/env bash
-                if [[ "$*" == *"%u:%a"* ]]; then printf '0:600\\n'; else printf '0 660\\n'; fi
+                if [[ "$*" == *"%u:%a"* ]]; then
+                  printf '0:600\\n'
+                elif [[ "$*" == *"%u %g %a %F"* && "${@: -1}" == *.sock ]]; then
+                  printf '0 4242 660 socket\\n'
+                else
+                  printf '0 4242 710 directory\\n'
+                fi
+            """,
+            "getent": """
+                #!/usr/bin/env bash
+                [[ "$1" == "group" ]] || exit 2
+                printf '%s:x:4242:\\n' "$2"
             """,
             "docker": """
                 #!/usr/bin/env bash
+                printf '%s\\n' "$*" >> "$BLUEPRINT_TEST_DOCKER_LOG"
                 case "$*" in
                   *"info --format"*) printf '%s/docker-1\\n' "$BLUEPRINT_ACTIONS_STATE_ROOT" ;;
                   *"image ls"*) printf 'sha256:test-image\\n' ;;
                   *"volume ls"*) printf 'test-volume\\n' ;;
+                  *" ps --quiet --no-trunc"*)
+                    if [[ -n "${BLUEPRINT_TEST_CONTAINER_ID:-}" && ! -e "$BLUEPRINT_TEST_CONTAINER_REMOVED" ]]; then
+                      printf '%s\\n' "$BLUEPRINT_TEST_CONTAINER_ID"
+                    fi
+                    ;;
                   *" ps --quiet"*) : ;;
+                  *" inspect --format"*)
+                    printf '%s|/stale-test-container|%s|%s|true|%s|false|false|postgres:15|4242\\n' \
+                      "$BLUEPRINT_TEST_CONTAINER_ID" "$BLUEPRINT_TEST_CONTAINER_CREATED" \
+                      "$BLUEPRINT_TEST_CONTAINER_STATUS" "$BLUEPRINT_TEST_CONTAINER_PAUSED"
+                    ;;
+                  *" rm --force --"*) touch "$BLUEPRINT_TEST_CONTAINER_REMOVED" ;;
                   *"volume prune --force"*) printf 'Total reclaimed space: 1GB\\n' ;;
                   *) exit 2 ;;
                 esac
@@ -582,10 +614,37 @@ class AssetSecurityTests(unittest.TestCase):
                 #!/usr/bin/env bash
                 printf '%s\\n' "$*" >> "$BLUEPRINT_TEST_SYSTEMCTL_LOG"
                 case "$1" in
-                  is-active) printf 'active\\n' ;;
+                  is-active) printf '%s\\n' "$BLUEPRINT_TEST_RUNNER_STATE" ;;
                   show)
-                    if [[ "$*" == *"FreezerState"* ]]; then
+                    if [[ "$2" == blueprint-dockerd@* ]]; then
+                      case "$*" in
+                        *"LoadState"*) printf 'loaded\\n' ;;
+                        *"ActiveState"*) printf 'active\\n' ;;
+                        *"SubState"*) printf 'running\\n' ;;
+                        *"MainPID"*) printf '4242\\n' ;;
+                        *"FragmentPath"*) printf '/etc/systemd/system/blueprint-dockerd@.service\\n' ;;
+                        *) exit 2 ;;
+                      esac
+                    elif [[ "$*" == *"FreezerState"* ]]; then
                       printf '%s\\n' "$BLUEPRINT_TEST_FREEZER_STATE"
+                    elif [[ "$*" == *"ControlGroup"* ]]; then
+                      if [[ "$BLUEPRINT_TEST_RUNNER_STATE" == "active" || -d "$BLUEPRINT_ACTIONS_CGROUP_ROOT/system.slice/system-blueprint\\x2dgithub\\x2dactions.slice/blueprint-github-actions@1.service" ]]; then
+                        printf '/system.slice/system-blueprint\\x2dgithub\\x2dactions.slice/blueprint-github-actions@1.service\\n'
+                      fi
+                    elif [[ "$*" == *"ActiveState"* ]]; then
+                      printf '%s\\n' "$BLUEPRINT_TEST_RUNNER_STATE"
+                    elif [[ "$*" == *"SubState"* ]]; then
+                      case "$BLUEPRINT_TEST_RUNNER_STATE" in
+                        active) printf 'running\\n' ;;
+                        inactive) printf 'dead\\n' ;;
+                        failed) printf 'failed\\n' ;;
+                      esac
+                    elif [[ "$*" == *"MainPID"* ]]; then
+                      if [[ "$BLUEPRINT_TEST_RUNNER_STATE" == "active" ]]; then printf '%s\\n' "$PPID"; else printf '0\\n'; fi
+                    elif [[ "$*" == *"LoadState"* ]]; then
+                      printf 'loaded\\n'
+                    elif [[ "$*" == *"FragmentPath"* ]]; then
+                      printf '/etc/systemd/system/blueprint-github-actions@.service\\n'
                     else
                       printf '/system.slice/system-blueprint\\x2dgithub\\x2dactions.slice/blueprint-github-actions@1.service\\n'
                     fi
@@ -616,6 +675,11 @@ class AssetSecurityTests(unittest.TestCase):
                 "BLUEPRINT_ACTIONS_GC_OWNERSHIP_ROOT": str(ownership_root),
                 "BLUEPRINT_TEST_SYSTEMCTL_LOG": str(log_path),
                 "BLUEPRINT_TEST_FREEZER_STATE": freezer_state,
+                "BLUEPRINT_TEST_RUNNER_STATE": runner_state,
+                "BLUEPRINT_TEST_DOCKER_LOG": str(root / "docker.log"),
+                "BLUEPRINT_TEST_CONTAINER_REMOVED": str(root / "container-removed"),
+                "BLUEPRINT_TEST_CONTAINER_STATUS": "running",
+                "BLUEPRINT_TEST_CONTAINER_PAUSED": "false",
             }
         )
         return environment, socket_root / "1" / "docker.sock", log_path
@@ -681,6 +745,164 @@ class AssetSecurityTests(unittest.TestCase):
             self.assertFalse(
                 (Path(environment["BLUEPRINT_ACTIONS_GC_OWNERSHIP_ROOT"]) / "frozen-1").exists()
             )
+
+    @unittest.skipIf(os.name == "nt", "requires a Unix socket")
+    def test_volume_gc_recovers_old_container_from_failed_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, socket_path, log_path = self._volume_gc_harness(
+                temporary,
+                freezer_state="dead",
+                runner_state="failed",
+            )
+            container_id = "a" * 64
+            environment.update(
+                {
+                    "BLUEPRINT_ACTIONS_GC_NOW_EPOCH": "2000000000",
+                    "BLUEPRINT_TEST_CONTAINER_ID": container_id,
+                    "BLUEPRINT_TEST_CONTAINER_CREATED": "2033-05-18T00:46:40Z",
+                }
+            )
+            listener = socket.socket(socket.AF_UNIX)
+            try:
+                listener.bind(str(socket_path))
+                result = subprocess.run(
+                    ["bash", str(ASSET_DIR / "prune-runner-volumes.sh")],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=15,
+                )
+            finally:
+                listener.close()
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                f"event=orphan_reaped slot=1 container={container_id}",
+                result.stdout,
+            )
+            docker_calls = Path(environment["BLUEPRINT_TEST_DOCKER_LOG"]).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(f"rm --force -- {container_id}", docker_calls)
+            self.assertIn("volume prune --force", docker_calls)
+            systemctl_calls = log_path.read_text(encoding="utf-8")
+            self.assertNotIn("freeze blueprint-github-actions@1.service", systemctl_calls)
+
+    @unittest.skipIf(os.name == "nt", "requires a Unix socket")
+    def test_volume_gc_refuses_recent_container_from_failed_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, socket_path, _log_path = self._volume_gc_harness(
+                temporary,
+                freezer_state="dead",
+                runner_state="failed",
+            )
+            container_id = "b" * 64
+            environment.update(
+                {
+                    "BLUEPRINT_ACTIONS_GC_NOW_EPOCH": "2000000000",
+                    "BLUEPRINT_TEST_CONTAINER_ID": container_id,
+                    "BLUEPRINT_TEST_CONTAINER_CREATED": "2033-05-18T03:16:40Z",
+                }
+            )
+            listener = socket.socket(socket.AF_UNIX)
+            try:
+                listener.bind(str(socket_path))
+                result = subprocess.run(
+                    ["bash", str(ASSET_DIR / "prune-runner-volumes.sh")],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=15,
+                )
+            finally:
+                listener.close()
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("reason=unclassified_or_changing_containers", result.stdout)
+            docker_calls = Path(environment["BLUEPRINT_TEST_DOCKER_LOG"]).read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("rm --force", docker_calls)
+            self.assertNotIn("volume prune --force", docker_calls)
+
+    @unittest.skipIf(os.name == "nt", "requires a Unix socket")
+    def test_volume_gc_refuses_old_paused_container_from_failed_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, socket_path, _log_path = self._volume_gc_harness(
+                temporary,
+                freezer_state="dead",
+                runner_state="failed",
+            )
+            environment.update(
+                {
+                    "BLUEPRINT_ACTIONS_GC_NOW_EPOCH": "2000000000",
+                    "BLUEPRINT_TEST_CONTAINER_ID": "d" * 64,
+                    "BLUEPRINT_TEST_CONTAINER_CREATED": "2033-05-18T00:46:40Z",
+                    "BLUEPRINT_TEST_CONTAINER_STATUS": "paused",
+                    "BLUEPRINT_TEST_CONTAINER_PAUSED": "true",
+                }
+            )
+            listener = socket.socket(socket.AF_UNIX)
+            try:
+                listener.bind(str(socket_path))
+                result = subprocess.run(
+                    ["bash", str(ASSET_DIR / "prune-runner-volumes.sh")],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=15,
+                )
+            finally:
+                listener.close()
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("reason=unclassified_or_changing_containers", result.stdout)
+            docker_calls = Path(environment["BLUEPRINT_TEST_DOCKER_LOG"]).read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("rm --force", docker_calls)
+            self.assertNotIn("volume prune --force", docker_calls)
+
+    @unittest.skipIf(os.name == "nt", "requires a Unix socket")
+    def test_volume_gc_refuses_failed_runner_with_residual_cgroup_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, socket_path, _log_path = self._volume_gc_harness(
+                temporary,
+                freezer_state="dead",
+                runner_state="failed",
+                inactive_cgroup_pid=os.getpid(),
+            )
+            environment.update(
+                {
+                    "BLUEPRINT_ACTIONS_GC_NOW_EPOCH": "2000000000",
+                    "BLUEPRINT_TEST_CONTAINER_ID": "c" * 64,
+                    "BLUEPRINT_TEST_CONTAINER_CREATED": "2033-05-18T00:46:40Z",
+                }
+            )
+            listener = socket.socket(socket.AF_UNIX)
+            try:
+                listener.bind(str(socket_path))
+                result = subprocess.run(
+                    ["bash", str(ASSET_DIR / "prune-runner-volumes.sh")],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=15,
+                )
+            finally:
+                listener.close()
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("reason=ambiguous_inactive_runner", result.stdout)
+            docker_calls = Path(environment["BLUEPRINT_TEST_DOCKER_LOG"]).read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("rm --force", docker_calls)
+            self.assertNotIn("volume prune --force", docker_calls)
 
     def test_host_image_and_cloud_image_are_immutable_inputs(self):
         dockerfile = (ASSET_DIR / "Dockerfile").read_text(encoding="utf-8")
@@ -829,6 +1051,11 @@ class AssetSecurityTests(unittest.TestCase):
         self.assertIn('sleep 2', cleanup)
         self.assertIn('docker --host "unix://$SOCKET_ROOT/$slot/docker.sock"', cleanup)
         self.assertIn('actual_root="$(docker_for_slot', cleanup)
+        self.assertIn('ORPHAN_MIN_AGE_SECONDS=', cleanup)
+        self.assertIn('inactive_runner_is_quiescent', cleanup)
+        self.assertIn('docker_boundary_is_exact', cleanup)
+        self.assertIn('ps --quiet --no-trunc', cleanup)
+        self.assertIn('rm --force -- "$id"', cleanup)
         self.assertIn('volume prune --force', cleanup)
         self.assertIn('images_before=', cleanup)
         self.assertIn('images_after=', cleanup)
