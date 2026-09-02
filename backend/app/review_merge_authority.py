@@ -249,6 +249,38 @@ async def enforce_merge_authority(
         session.add(task)
         return MergeAuthorityDecision(False, expected_head, expected_base, ci_loop)
 
+    # ``pr_closed_unmerged`` is a terminal read-model for the PR attempt that
+    # set it, not permanent chain authority.  A recovered task can legitimately
+    # publish a new PR on the same branch after the prior PR was closed.  The
+    # old unscoped boolean must not make the exact-review spawner reject that
+    # distinct attempt forever.
+    #
+    # Clear it only at this final authority boundary, after the live GitHub GET
+    # has proved the *currently tracked* checked base/head is explicitly open
+    # and unmerged while the merge/PR locks are held.  Unknown GitHub state,
+    # closed/merged PRs, or any base/head drift take the fail-closed return above
+    # and retain the marker.
+    live_state = str(live_target.get("state") or "").lower()
+    live_unmerged = live_target.get("merged") is False
+    task_context = dict(task.context or {})
+    if (
+        task_context.get("pr_closed_unmerged") is True
+        and live_state == "open"
+        and live_unmerged
+    ):
+        task_context.pop("pr_closed_unmerged", None)
+        task.context = {**task_context, "review_loop": ci_loop}
+        flag_modified(task, "context")
+        session.add(task)
+        logger.info(
+            "[CI] Cleared stale pr_closed_unmerged on task %s after exact "
+            "live-open proof for PR #%s at %s..%s",
+            task.id,
+            pr_number,
+            expected_base[:8],
+            expected_head[:8],
+        )
+
     from app.review_repository_scope import repository_project_ids
 
     repository_projects = await repository_project_ids(

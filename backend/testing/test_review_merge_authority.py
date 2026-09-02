@@ -112,6 +112,151 @@ async def _make_task(db_session, project: Project, pr_number: int, mode: str) ->
 
 
 @pytest.mark.asyncio
+async def test_exact_live_open_pr_clears_stale_closed_attempt_before_review_spawn(
+    db_session, mocker
+):
+    """A prior closed-PR latch cannot strand a distinct verified open attempt."""
+    project = Project(name="Recovered open PR", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    pr_number = 17000
+    target = _target(project, pr_number)
+    loop = _loop(project, pr_number, "approval")
+    loop.pop("review_approved", None)
+    loop.pop("review_history", None)
+    loop.pop("issue_ledger", None)
+    task = Task(
+        project_id=project.id,
+        title="Recovered merge authority source",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "recover the replacement PR",
+                "pr_number": pr_number,
+                "branch": f"blueprint/task-{pr_number}",
+                "base_branch": "main",
+            }
+        ],
+        context={"pr_closed_unmerged": True, "review_loop": loop},
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "draft": False,
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "base": {"sha": target["base_sha"], "ref": "main"},
+                "head": {
+                    "sha": target["head_sha"],
+                    "ref": f"blueprint/task-{pr_number}",
+                },
+            }
+        ),
+    )
+    mocker.patch(
+        "app.task_locking.acquire_merge_submission_locks",
+        new_callable=AsyncMock,
+    )
+
+    async def _spawn(source_task, kind, *_args, **_kwargs):
+        assert kind == "review"
+        assert (source_task.context or {}).get("pr_closed_unmerged") is None
+        return None, False
+
+    spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", side_effect=_spawn
+    )
+
+    decision = await enforce_merge_authority(
+        task,
+        db_session,
+        gh_token="token",
+        owner="owner",
+        repo="repo",
+        ci_loop=loop,
+        pr_number=pr_number,
+        branch=f"blueprint/task-{pr_number}",
+        base_branch="main",
+        original_task_id=str(task.id),
+        checked_head_sha=target["head_sha"],
+        checked_base_sha=target["base_sha"],
+    )
+
+    assert decision.allowed is False
+    spawn.assert_awaited_once()
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert (task.context or {}).get("pr_closed_unmerged") is None
+    assert task.latest_status_message == (
+        f"Merge held for PR #{pr_number}: authoritative blockers/proof "
+        "require an exact-target review"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "merged"),
+    [("closed", False), ("closed", True), ("", None)],
+)
+async def test_closed_attempt_marker_survives_without_explicit_live_open_proof(
+    db_session, mocker, state, merged
+):
+    project = Project(name=f"Unproven PR {state}-{merged}", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    pr_number = 17009
+    task = await _make_task(db_session, project, pr_number, "bypass")
+    task.context = {**(task.context or {}), "pr_closed_unmerged": True}
+    db_session.add(task)
+    await db_session.commit()
+    target = _target(project, pr_number)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": state,
+                "merged": merged,
+                "base": {"sha": target["base_sha"], "ref": "main"},
+                "head": {"sha": target["head_sha"]},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.task_locking.acquire_merge_submission_locks",
+        new_callable=AsyncMock,
+    )
+
+    decision = await enforce_merge_authority(
+        task,
+        db_session,
+        gh_token="token",
+        owner="owner",
+        repo="repo",
+        ci_loop=(task.context or {})["review_loop"],
+        pr_number=pr_number,
+        branch=f"blueprint/task-{pr_number}",
+        base_branch="main",
+        original_task_id=str(task.id),
+        checked_head_sha=target["head_sha"],
+        checked_base_sha=target["base_sha"],
+    )
+
+    if state == "closed":
+        assert decision.allowed is False
+    assert (task.context or {}).get("pr_closed_unmerged") is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["bypass", "approval"])
 async def test_exact_live_pair_locks_before_query_and_merge(
     db_session, mocker, mode
