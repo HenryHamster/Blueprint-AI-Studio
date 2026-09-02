@@ -59,7 +59,7 @@ class VolumeGcRuntimeTests(unittest.TestCase):
                 elif [[ "$*" == *"%u %g %a %F"* && "${@: -1}" == *.sock ]]; then
                   printf '0 4242 660 socket\\n'
                 else
-                  printf '0 4242 710 directory\\n'
+                  printf '0 %s 710 directory\\n' "${BLUEPRINT_TEST_DATA_ROOT_GID:-0}"
                 fi
             """,
             "getent": """
@@ -163,6 +163,32 @@ class VolumeGcRuntimeTests(unittest.TestCase):
             }
         )
         return environment, socket_root / "1" / "docker.sock", log_path
+
+    @unittest.skipIf(os.name == "nt", "requires a Unix socket")
+    def test_volume_gc_rejects_group_owned_steady_state_data_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, socket_path, _log_path = self._volume_gc_harness(
+                temporary, freezer_state="running"
+            )
+            environment["BLUEPRINT_TEST_DATA_ROOT_GID"] = "4242"
+            listener = socket.socket(socket.AF_UNIX)
+            try:
+                listener.bind(str(socket_path))
+                result = subprocess.run(
+                    ["bash", str(ASSET_DIR / "prune-runner-volumes.sh")],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+            finally:
+                listener.close()
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("reason=ambiguous_docker_boundary", result.stdout)
+            docker_calls = Path(environment["BLUEPRINT_TEST_DOCKER_LOG"])
+            self.assertFalse(docker_calls.exists())
 
     @unittest.skipIf(os.name == "nt", "requires POSIX signals and Unix sockets")
     def test_volume_gc_hard_kill_after_freeze_is_recovered_by_stop_post(self):
