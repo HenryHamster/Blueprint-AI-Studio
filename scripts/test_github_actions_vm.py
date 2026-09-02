@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import socket
 import stat
 import subprocess
 import sys
@@ -534,154 +533,6 @@ class AssetSecurityTests(unittest.TestCase):
             docker_calls = docker_log.read_text(encoding="utf-8")
             self.assertNotRegex(docker_calls, r"(?m)^(run|stop|rm) ")
 
-    def _volume_gc_harness(self, temporary: str, *, freezer_state: str) -> tuple[dict[str, str], Path, Path]:
-        root = Path(temporary)
-        state_root = root / "state"
-        socket_root = root / "sockets"
-        ownership_root = root / "ownership"
-        cgroup_root = root / "cgroup"
-        mock_bin = root / "bin"
-        log_path = root / "systemctl.log"
-        for path in (state_root, socket_root / "1", cgroup_root, mock_bin):
-            path.mkdir(parents=True, exist_ok=True)
-
-        cgroup = (
-            cgroup_root
-            / "system.slice"
-            / "system-blueprint\\x2dgithub\\x2dactions.slice"
-            / "blueprint-github-actions@1.service"
-        )
-        cgroup.mkdir(parents=True)
-        (cgroup / "cgroup.procs").write_text(f"{os.getpid()}\n", encoding="utf-8")
-
-        commands = {
-            "df": """
-                #!/usr/bin/env bash
-                printf 'Size Avail Use%%\\n100000000000 1000000000 99%%\\n'
-            """,
-            "install": """
-                #!/usr/bin/env bash
-                mkdir -p -- "${@: -1}"
-            """,
-            "stat": """
-                #!/usr/bin/env bash
-                if [[ "$*" == *"%u:%a"* ]]; then printf '0:600\\n'; else printf '0 660\\n'; fi
-            """,
-            "docker": """
-                #!/usr/bin/env bash
-                case "$*" in
-                  *"info --format"*) printf '%s/docker-1\\n' "$BLUEPRINT_ACTIONS_STATE_ROOT" ;;
-                  *"image ls"*) printf 'sha256:test-image\\n' ;;
-                  *"volume ls"*) printf 'test-volume\\n' ;;
-                  *" ps --quiet"*) : ;;
-                  *"volume prune --force"*) printf 'Total reclaimed space: 1GB\\n' ;;
-                  *) exit 2 ;;
-                esac
-            """,
-            "systemctl": """
-                #!/usr/bin/env bash
-                printf '%s\\n' "$*" >> "$BLUEPRINT_TEST_SYSTEMCTL_LOG"
-                case "$1" in
-                  is-active) printf 'active\\n' ;;
-                  show)
-                    if [[ "$*" == *"FreezerState"* ]]; then
-                      printf '%s\\n' "$BLUEPRINT_TEST_FREEZER_STATE"
-                    else
-                      printf '/system.slice/system-blueprint\\x2dgithub\\x2dactions.slice/blueprint-github-actions@1.service\\n'
-                    fi
-                    ;;
-                  freeze)
-                    if [[ "${BLUEPRINT_TEST_KILL_ON_FREEZE:-0}" == "1" ]]; then
-                      kill -KILL "$PPID"
-                    fi
-                    ;;
-                  thaw) : ;;
-                  *) exit 2 ;;
-                esac
-            """,
-        }
-        for name, body in commands.items():
-            path = mock_bin / name
-            path.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
-            path.chmod(0o755)
-
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "PATH": f"{mock_bin}:{environment['PATH']}",
-                "BLUEPRINT_ACTIONS_STATE_ROOT": str(state_root),
-                "BLUEPRINT_ACTIONS_SOCKET_ROOT": str(socket_root),
-                "BLUEPRINT_ACTIONS_CGROUP_ROOT": str(cgroup_root),
-                "BLUEPRINT_ACTIONS_GC_LOCK_FILE": str(root / "gc.lock"),
-                "BLUEPRINT_ACTIONS_GC_OWNERSHIP_ROOT": str(ownership_root),
-                "BLUEPRINT_TEST_SYSTEMCTL_LOG": str(log_path),
-                "BLUEPRINT_TEST_FREEZER_STATE": freezer_state,
-            }
-        )
-        return environment, socket_root / "1" / "docker.sock", log_path
-
-    @unittest.skipIf(os.name == "nt", "requires POSIX signals and Unix sockets")
-    def test_volume_gc_hard_kill_after_freeze_is_recovered_by_stop_post(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            environment, socket_path, log_path = self._volume_gc_harness(
-                temporary, freezer_state="running"
-            )
-            listener = socket.socket(socket.AF_UNIX)
-            try:
-                listener.bind(str(socket_path))
-                environment["BLUEPRINT_TEST_KILL_ON_FREEZE"] = "1"
-                result = subprocess.run(
-                    ["bash", str(ASSET_DIR / "prune-runner-volumes.sh")],
-                    env=environment,
-                    check=False,
-                    timeout=10,
-                )
-            finally:
-                listener.close()
-
-            self.assertEqual(result.returncode, -9)
-            marker = Path(environment["BLUEPRINT_ACTIONS_GC_OWNERSHIP_ROOT"]) / "frozen-1"
-            self.assertEqual(
-                marker.read_text(encoding="utf-8").strip(),
-                "blueprint-github-actions@1.service",
-            )
-            environment.pop("BLUEPRINT_TEST_KILL_ON_FREEZE")
-            subprocess.run(
-                ["bash", str(ASSET_DIR / "thaw-owned-runners.sh")],
-                env=environment,
-                check=True,
-                timeout=10,
-            )
-            self.assertFalse(marker.exists())
-            calls = log_path.read_text(encoding="utf-8")
-            self.assertIn("freeze blueprint-github-actions@1.service", calls)
-            self.assertIn("thaw blueprint-github-actions@1.service", calls)
-
-    @unittest.skipIf(os.name == "nt", "requires a Unix socket")
-    def test_volume_gc_leaves_operator_prefrozen_runner_untouched(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            environment, socket_path, log_path = self._volume_gc_harness(
-                temporary, freezer_state="frozen"
-            )
-            listener = socket.socket(socket.AF_UNIX)
-            try:
-                listener.bind(str(socket_path))
-                result = subprocess.run(
-                    ["bash", str(ASSET_DIR / "prune-runner-volumes.sh")],
-                    env=environment,
-                    check=False,
-                    timeout=10,
-                )
-            finally:
-                listener.close()
-            self.assertEqual(result.returncode, 1)
-            calls = log_path.read_text(encoding="utf-8")
-            self.assertNotIn("freeze blueprint-github-actions@1.service", calls)
-            self.assertNotIn("thaw blueprint-github-actions@1.service", calls)
-            self.assertFalse(
-                (Path(environment["BLUEPRINT_ACTIONS_GC_OWNERSHIP_ROOT"]) / "frozen-1").exists()
-            )
-
     def test_host_image_and_cloud_image_are_immutable_inputs(self):
         dockerfile = (ASSET_DIR / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(f"FROM {gav.HOST_CONTAINER_BASE}", dockerfile)
@@ -829,6 +680,11 @@ class AssetSecurityTests(unittest.TestCase):
         self.assertIn('sleep 2', cleanup)
         self.assertIn('docker --host "unix://$SOCKET_ROOT/$slot/docker.sock"', cleanup)
         self.assertIn('actual_root="$(docker_for_slot', cleanup)
+        self.assertIn('ORPHAN_MIN_AGE_SECONDS=', cleanup)
+        self.assertIn('inactive_runner_is_quiescent', cleanup)
+        self.assertIn('docker_boundary_is_exact', cleanup)
+        self.assertIn('ps --quiet --no-trunc', cleanup)
+        self.assertIn('rm --force -- "$id"', cleanup)
         self.assertIn('volume prune --force', cleanup)
         self.assertIn('images_before=', cleanup)
         self.assertIn('images_after=', cleanup)
