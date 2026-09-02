@@ -128,7 +128,11 @@ docker_boundary_is_exact() {
   [[ "$socket_uid" == "0" && "$socket_gid" == "$group_gid" && \
      "$socket_mode" == "660" && "$socket_kind" == "socket" ]] || return 1
   read -r root_uid root_gid root_mode root_kind < <(stat --format='%u %g %a %F' "$expected_root")
-  [[ "$root_uid" == "0" && "$root_gid" == "$group_gid" && \
+  # dockerd normalizes its data-root directory to root:root after the unit's
+  # ExecStartPre creates it.  The per-runner group is the authority boundary
+  # for the socket only; accepting it on the steady-state data root would both
+  # miss production and grant the runner direct traversal of daemon storage.
+  [[ "$root_uid" == "0" && "$root_gid" == "0" && \
      "$root_mode" == "710" && "$root_kind" == "directory" ]] || return 1
   daemon="blueprint-dockerd@$slot.service"
   load="$(systemctl show "$daemon" --property=LoadState --value)"
