@@ -157,7 +157,7 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     echo '| Failure | Repair |'
     echo '|---|---|'
     echo '| ROT in any durations artifact | `python scripts/prune_stale_durations.py --write` (offline, seconds) |'
-    echo '| ROT or ADDITION in `test-estate-ranked-queue.md` | `python scripts/generate_test_estate_ranked_queue.py --write` (offline; `./check` already does this) |'
+    echo '| ROT or ADDITION in `backend/testing/test-estate-ranked-queue.md` | `python scripts/generate_test_estate_ranked_queue.py --write` (offline; `./check` already does this) |'
     echo '| ADDITION in `backend/.test_durations` | `bash scripts/store-backend-durations.sh` — a timed run, Docker + Postgres, 15–20 min |'
     echo '| ADDITION in `admin-ui/.test_durations.json` | `node scripts/vitest-test-telemetry.mjs --suite admin-ui` |'
     echo '| ADDITION in `agent/.test_durations.json` | `node scripts/vitest-test-telemetry.mjs --suite agent` |'

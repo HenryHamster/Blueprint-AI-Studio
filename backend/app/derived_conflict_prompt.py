@@ -13,7 +13,7 @@ merge_size_limits.py`` and ``scripts/generate_test_estate_ranked_queue.py`` do.
 
 Prose that restates a deterministic procedure is the expensive way to run it:
 the agent re-derives the policy from the description, and on
-``test-estate-ranked-queue.md`` it re-derives it wrongly often enough that the
+``backend/testing/test-estate-ranked-queue.md`` it re-derives it wrongly often enough that the
 same conflict came back five times in one afternoon (2026-08-26). This module
 holds the command instead, in one place, so the three prompts cannot drift into
 three slightly different descriptions of the same procedure.
@@ -41,13 +41,13 @@ DERIVED_CONFLICT_PROMPT_BLOCK = (
     f"a script that produces it. Once you have resolved the conflicts that need "
     f"real judgement, run:\n\n"
     f"    bash {RESOLVE_SCRIPT}\n\n"
-    "It resolves and stages `test-estate-ranked-queue.md` (regenerated from the "
+    "It resolves and stages `backend/testing/test-estate-ranked-queue.md` (regenerated from the "
     "merged tree), `backend/.test_durations` (insert-only union) and "
     "`backend/testing/module_size_limits.json` (max-cap union, the same driver "
     "git itself uses), and it refuses to touch anything else -- if it exits "
     "non-zero it has changed NOTHING and the paths it names are yours to "
     "resolve. Exit 2 just means there was nothing left for it to do.\n"
-    "Do not hand-resolve those three: `test-estate-ranked-queue.md` in "
+    "Do not hand-resolve those three: `backend/testing/test-estate-ranked-queue.md` in "
     "particular is a whole-tree report, so picking either side leaves it stale "
     "and the `Derived artifacts` check goes red on the merge result even though "
     "both sides were individually correct."

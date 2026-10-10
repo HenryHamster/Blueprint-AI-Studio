@@ -61,7 +61,7 @@ scripts/github-actions-vm/*.timer text eol=lf
 # landing as a whole-file diff that conflicts with every concurrent branch.
 # Without them, only a developer happening to have core.autocrlf=input stood
 # between `--write`/`--fix` on Windows and a ~1050-row phantom diff.
-test-estate-ranked-queue.md text eol=lf
+backend/testing/test-estate-ranked-queue.md text eol=lf
 backend/.test_durations text eol=lf
 backend/testing/module_size_limits.json text eol=lf
 backend/testing/cap_bump_history.json text eol=lf
@@ -73,4 +73,4 @@ agent/.test_durations.json text eol=lf
 backend/.test_durations linguist-generated=true
 admin-ui/.test_durations.json linguist-generated=true
 agent/.test_durations.json linguist-generated=true
-test-estate-ranked-queue.md linguist-generated=true
+backend/testing/test-estate-ranked-queue.md linguist-generated=true

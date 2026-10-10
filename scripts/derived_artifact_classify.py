@@ -36,7 +36,7 @@ would be a second version of the same mistake:
   ``derived_artifact_repair.MEASUREMENT_TAX_GUIDANCE``).  That inversion is the
   single most useful thing this module reports.
 
-* For ``test-estate-ranked-queue.md`` both directions are mechanical: the
+* For ``backend/testing/test-estate-ranked-queue.md`` both directions are mechanical: the
   generator is a total function of the tree, and ``./check`` already repairs it.
 
 * For a RATCHET, FLOOR, SNAPSHOT or CAP, direction is computable but changes
@@ -310,7 +310,7 @@ def vitest_live(repo: Path, suite: str) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# test-estate-ranked-queue.md
+# backend/testing/test-estate-ranked-queue.md
 # ---------------------------------------------------------------------------
 
 # Same row shape the guard itself matches. Kept here as a literal on purpose:
@@ -324,7 +324,7 @@ _RANKED_ROW = re.compile(r"^\| \S+ \| \S+ \| `([^`]+)` \|", re.MULTILINE)
 
 
 def ranked_queue_recorded(repo: Path) -> set[str]:
-    text = (repo / "test-estate-ranked-queue.md").read_text(encoding="utf-8")
+    text = (repo / "backend/testing/test-estate-ranked-queue.md").read_text(encoding="utf-8")
     return set(_RANKED_ROW.findall(text))
 
 
@@ -439,7 +439,7 @@ DIRECTIONAL: dict[str, tuple[DerivedArtifact, ...]] = {
     "backend/testing/test_test_estate_ranked_queue.py": (
         DerivedArtifact(
             sentinel="backend/testing/test_test_estate_ranked_queue.py",
-            artifact="test-estate-ranked-queue.md",
+            artifact="backend/testing/test-estate-ranked-queue.md",
             unit="ranked row",
             recorded=ranked_queue_recorded,
             live=ranked_queue_live,

@@ -49,7 +49,7 @@ from derived_artifact_repair import (  # noqa: E402
 from static_release_guard import SENTINEL_REPAIR_COMMANDS  # noqa: E402
 
 QUEUE_SENTINEL = "backend/testing/test_test_estate_ranked_queue.py"
-QUEUE_ARTIFACT = "test-estate-ranked-queue.md"
+QUEUE_ARTIFACT = "backend/testing/test-estate-ranked-queue.md"
 GENERATOR = "scripts/generate_test_estate_ranked_queue.py"
 
 # Stdlib-only helpers the generator imports from the repository root it

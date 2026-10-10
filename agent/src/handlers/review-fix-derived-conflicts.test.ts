@@ -35,11 +35,11 @@ import {
 
 const COMPLETE_REPORT = JSON.stringify({
   complete: true,
-  resolved: ['backend/.test_durations', 'test-estate-ranked-queue.md'],
+  resolved: ['backend/.test_durations', 'backend/testing/test-estate-ranked-queue.md'],
   unhandled: [],
   details: {
     'backend/.test_durations': 'union of insert-only measurement maps',
-    'test-estate-ranked-queue.md': 'regenerated from the merged tree',
+    'backend/testing/test-estate-ranked-queue.md': 'regenerated from the merged tree',
   },
   error: null,
 });
@@ -85,7 +85,7 @@ describe('parseResolverReport', () => {
   it('reads a well-formed report', () => {
     const report = parseResolverReport(COMPLETE_REPORT);
     expect(report?.complete).toBe(true);
-    expect(report?.resolved).toEqual(['backend/.test_durations', 'test-estate-ranked-queue.md']);
+    expect(report?.resolved).toEqual(['backend/.test_durations', 'backend/testing/test-estate-ranked-queue.md']);
   });
 
   it.each([
@@ -119,7 +119,7 @@ describe('resolveDerivedArtifactConflicts', () => {
     const outcome = await run(push);
 
     expect(outcome.complete).toBe(true);
-    expect(outcome.resolved).toEqual(['backend/.test_durations', 'test-estate-ranked-queue.md']);
+    expect(outcome.resolved).toEqual(['backend/.test_durations', 'backend/testing/test-estate-ranked-queue.md']);
     expect(execFileSyncMock).toHaveBeenCalledWith(
       'python3',
       [DERIVED_RESOLVER_SCRIPT, '--repo', '/ws', '--json'],

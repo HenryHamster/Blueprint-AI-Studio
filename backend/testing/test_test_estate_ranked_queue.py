@@ -195,7 +195,7 @@ def test_checked_in_queue_ranks_every_collected_test_file() -> None:
     """
     generator = _require_generator()
     assert REPOSITORY_ROOT is not None
-    queue_text = (REPOSITORY_ROOT / "test-estate-ranked-queue.md").read_text(
+    queue_text = (REPOSITORY_ROOT / "backend/testing/test-estate-ranked-queue.md").read_text(
         encoding="utf-8"
     )
     ranked = set(_RANKED_ROW.findall(queue_text))
@@ -204,7 +204,7 @@ def test_checked_in_queue_ranks_every_collected_test_file() -> None:
 
     missing = sorted(collected - ranked)
     assert not missing, (
-        "test files exist but are absent from test-estate-ranked-queue.md; "
+        "test files exist but are absent from backend/testing/test-estate-ranked-queue.md; "
         "regenerate with `python3 scripts/generate_test_estate_ranked_queue.py "
         "--write` (`python` on Windows, which ships no `python3`):" + NL
         + NL.join(f"  - {path}" for path in missing)
@@ -213,7 +213,7 @@ def test_checked_in_queue_ranks_every_collected_test_file() -> None:
     )
     vanished = sorted(ranked - collected)
     assert not vanished, (
-        "test-estate-ranked-queue.md ranks files that are no longer collected; "
+        "backend/testing/test-estate-ranked-queue.md ranks files that are no longer collected; "
         "regenerate with `python3 scripts/generate_test_estate_ranked_queue.py "
         "--write` (`python` on Windows, which ships no `python3`):" + NL
         + NL.join(f"  - {path}" for path in vanished)
@@ -275,7 +275,7 @@ def test_check_reports_threshold_crossing_until_queue_is_regenerated(
     assert main(["--write", "--root", str(tmp_path)]) == 0
     assert main(["--check", "--root", str(tmp_path)]) == 0
     assert "moderate (1500\u20132999 LOC)" in (
-        tmp_path / "test-estate-ranked-queue.md"
+        tmp_path / "backend/testing/test-estate-ranked-queue.md"
     ).read_text(encoding="utf-8")
 
 
@@ -445,7 +445,7 @@ def test_summary_totals_are_available_but_never_committed(tmp_path: Path) -> Non
     assert "| backend |" in summary
 
     assert main(["--write", "--root", str(root)]) == 0
-    queue = (root / "test-estate-ranked-queue.md").read_text(encoding="utf-8")
+    queue = (root / "backend/testing/test-estate-ranked-queue.md").read_text(encoding="utf-8")
     assert "| Area | Files |" not in queue, (
         "the per-area totals are back in the committed artifact; every branch "
         "that adds a test now rewrites the same line again"

@@ -131,7 +131,7 @@ def _write_ranked_queue(root: Path, paths: tuple[str, ...]) -> None:
     artifact conflict with every concurrent branch.
     """
     rows = "\n".join(f"| P2 | backend | `{path}` | 120 |" for path in paths)
-    (root / "test-estate-ranked-queue.md").write_text(
+    (root / "backend/testing/test-estate-ranked-queue.md").write_text(
         "# queue\n\n| pri | area | path | lines |\n|---|---|---|---|\n" + rows + "\n",
         encoding="utf-8",
         newline="",
@@ -292,7 +292,7 @@ def test_a_deleted_vitest_file_is_rot_and_a_new_one_is_an_addition(
 
 
 # ---------------------------------------------------------------------------
-# test-estate-ranked-queue.md
+# backend/testing/test-estate-ranked-queue.md
 # ---------------------------------------------------------------------------
 
 
@@ -309,7 +309,7 @@ def test_the_ranked_queue_reports_both_directions_as_mechanical(
     _write_ranked_queue(repo, rows)
 
     result = _only(
-        classify_sentinel(repo, QUEUE_SENTINEL), "test-estate-ranked-queue.md"
+        classify_sentinel(repo, QUEUE_SENTINEL), "backend/testing/test-estate-ranked-queue.md"
     )
 
     assert result.verdict == MIXED

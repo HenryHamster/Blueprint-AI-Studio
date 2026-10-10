@@ -7,7 +7,7 @@
 # `static_release_guard.py --size-only`, and --size-only explicitly skips the
 # corpus. Every stale derived artifact that failed promotion PR #17738
 # (manifest test counts, the websocket emitter fixture and its hand-kept
-# workbench_contracts twin, backend/.test_durations, test-estate-ranked-queue.md)
+# workbench_contracts twin, backend/.test_durations, backend/testing/test-estate-ranked-queue.md)
 # entered through exactly that hole and stayed invisible afterwards, because
 # base attribution correctly suppresses inherited failures on every later PR
 # until the promotion matrix — which has no base to attribute against — surfaces

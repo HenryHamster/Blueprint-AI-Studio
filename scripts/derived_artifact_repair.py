@@ -48,7 +48,7 @@ encodes a DECISION:
   ``backend/.test_durations`` and the two ``.test_durations.json`` files come
   from timed runs; "regenerating" them from a checkout would fabricate data.
 
-* A **pure report** encodes neither.  ``test-estate-ranked-queue.md`` is a
+* A **pure report** encodes neither.  ``backend/testing/test-estate-ranked-queue.md`` is a
   total function of the checked-out tree, it has no consumer other than the
   guard that compares it to that tree (nothing in ``backend/app``, the agent,
   CI sharding or the runtime reads it), and the entire correct human response
@@ -105,7 +105,7 @@ AUTOREPAIRABLE: dict[str, AutoRepair] = {
     "backend/testing/test_test_estate_ranked_queue.py": AutoRepair(
         script="scripts/generate_test_estate_ranked_queue.py",
         args=("--write",),
-        artifacts=("test-estate-ranked-queue.md",),
+        artifacts=("backend/testing/test-estate-ranked-queue.md",),
         why=(
             "The ranked queue is a pure report: render_queue() is a total "
             "function of the checked-out tree, and no consumer reads it -- not "

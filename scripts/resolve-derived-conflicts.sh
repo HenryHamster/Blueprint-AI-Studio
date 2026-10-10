@@ -3,10 +3,10 @@
 #
 # THE THREE COMMANDS THIS REPLACES
 # --------------------------------
-# The hand-resolution of a `test-estate-ranked-queue.md` conflict is always the
+# The hand-resolution of a `backend/testing/test-estate-ranked-queue.md` conflict is always the
 # same three commands, in the same order, with no judgement anywhere in them:
 #
-#     git checkout --theirs test-estate-ranked-queue.md
+#     git checkout --theirs backend/testing/test-estate-ranked-queue.md
 #     python scripts/generate_test_estate_ranked_queue.py --write
 #     python scripts/generate_test_estate_ranked_queue.py --check
 #

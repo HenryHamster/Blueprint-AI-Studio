@@ -74,7 +74,7 @@ import derived_artifact_merge_resolve as dar  # noqa: E402
 from derived_artifact_repair import AUTOREPAIRABLE  # noqa: E402
 
 DURATIONS = "backend/.test_durations"
-RANKED_QUEUE = "test-estate-ranked-queue.md"
+RANKED_QUEUE = "backend/testing/test-estate-ranked-queue.md"
 SIZE_LIMITS = "backend/testing/module_size_limits.json"
 SIZE_LIMITS_DRIVER = "backend/testing/merge_size_limits.py"
 
@@ -87,7 +87,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "test-estate-ranked-queue.md"
+OUT = ROOT / "backend/testing/test-estate-ranked-queue.md"
 
 
 def render():
@@ -251,7 +251,7 @@ def test_classify_orders_by_phase_and_not_by_path_name(monkeypatch):
     """Pin the ORDERING RULE, not the accident of these two path names.
 
     ``backend/.test_durations`` happens to sort alphabetically before
-    ``test-estate-ranked-queue.md``, so a sort key that dropped ``phase``
+    ``backend/testing/test-estate-ranked-queue.md``, so a sort key that dropped ``phase``
     entirely still produces the right order for today's registry -- the
     assertion above passes against that broken code. This registers a
     content-merge path that sorts LAST by name, so only a phase-aware sort can
@@ -1023,7 +1023,7 @@ def test_the_one_command_wrapper_exists_and_runs_the_resolver():
 # tasks, and it is all-or-nothing: a merge carrying BOTH a real source conflict
 # and a derived-artifact one comes back declined, with every conflict still in
 # the tree. The agent then resolves the derived files by hand -- which is how
-# the same test-estate-ranked-queue.md conflict came back five times in one
+# the same backend/testing/test-estate-ranked-queue.md conflict came back five times in one
 # afternoon. These pins keep the one command in front of that agent.
 # --------------------------------------------------------------------------
 

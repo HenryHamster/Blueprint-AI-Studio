@@ -6,7 +6,7 @@ THE DEFECT THIS CLOSES
 Two derived artifacts are committed to this repository and are rewritten by
 essentially every PR that touches the test estate:
 
-* ``test-estate-ranked-queue.md`` -- a ~1200-line generated report. FIXED AT
+* ``backend/testing/test-estate-ranked-queue.md`` -- a ~1200-line generated report. FIXED AT
   THE SOURCE 2026-08-26: its ``Rank`` ordinal column and its estate-summary
   table were GLOBAL fields that rewrote the whole table when any test file was
   added or resized, so two concurrent PRs could not both touch the estate
@@ -43,7 +43,7 @@ MEASURED FREQUENCY (2026-08-26)
 Twenty real ``origin/automain`` re-sync merges from automain's history were
 replayed from their two parents with STOCK drivers -- which is exactly what a
 developer clone has, and exactly how GitHub computes ``mergeable`` server-side.
-Nine conflicted. ``test-estate-ranked-queue.md`` accounted for eight of those
+Nine conflicted. ``backend/testing/test-estate-ranked-queue.md`` accounted for eight of those
 nine (40% of all merges); ``module_size_limits.json`` for two and
 ``cap_bump_history.json`` for one; only three carried a real source conflict.
 So the dominant cost of a merge in this repository was not merging code.
@@ -83,7 +83,7 @@ that policy's taxonomy rather than restating it:
 * A **pure report** encodes neither a decision nor an observation. It is a
   total function of the tree, so the conflicted *content* is irrelevant: the
   one correct answer is whatever the generator emits from the merged tree.
-  ``test-estate-ranked-queue.md`` is this, and ``derived_artifact_repair``
+  ``backend/testing/test-estate-ranked-queue.md`` is this, and ``derived_artifact_repair``
   already licenses regenerating it unattended for the same reason.
 
 * A **measurement** encodes an observation nothing in a checkout can
@@ -138,7 +138,7 @@ cleanly under stock local git and is reported CONFLICTING by the GitHub API
 must merge on the server -- which is why the ranked queue was fixed in its
 RENDERING rather than given one.
 
-``--resolve`` also still covers ``test-estate-ranked-queue.md``, which could
+``--resolve`` also still covers ``backend/testing/test-estate-ranked-queue.md``, which could
 never have been a merge driver in any case: a driver is handed three blobs, and
 the one correct resolution here is a function of the whole MERGED TREE, which
 does not exist yet at driver time.
@@ -246,8 +246,8 @@ MECHANICAL_RESOLVERS: dict[str, MechanicalResolution] = {
             "is handed back unresolved."
         ),
     ),
-    "test-estate-ranked-queue.md": MechanicalResolution(
-        path="test-estate-ranked-queue.md",
+    "backend/testing/test-estate-ranked-queue.md": MechanicalResolution(
+        path="backend/testing/test-estate-ranked-queue.md",
         strategy="regenerate",
         phase=PHASE_REGENERATE,
         why=(

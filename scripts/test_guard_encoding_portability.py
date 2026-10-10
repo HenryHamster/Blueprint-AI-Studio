@@ -408,7 +408,7 @@ class TestGeneratedArtifactPathsPinLf:
             if line.strip() and not line.lstrip().startswith("#") and "eol=lf" in line
         }
         required = {
-            "test-estate-ranked-queue.md",
+            "backend/testing/test-estate-ranked-queue.md",
             "backend/.test_durations",
             "backend/testing/module_size_limits.json",
             "backend/testing/cap_bump_history.json",

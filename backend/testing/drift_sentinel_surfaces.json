@@ -42,7 +42,7 @@
         "backend/testing/test_test_estate_ranked_queue.py",
         "backend/testing/test_conversational_workday_protection.py"
       ],
-      "why": "All three sentinels read the backend test INVENTORY itself (estate_inventory.iter_backend_test_files -> backend/testing/test_*.py) instead of importing anything the changed file imports, so adding, deleting or renaming a backend test file is invisible to the reverse-dep scan: it selects the changed test file and never the guards over the inventory that file belongs to. test_test_durations_freshness.py checks the coverage fraction and re-derives every collected node id to reject stale entries in backend/.test_durations; test_test_estate_ranked_queue.py set-compares the collected inventory against test-estate-ranked-queue.md; test_conversational_workday_protection.py pins an exact per-file test COUNT for the nineteen backend/testing paths in conversational_workday_manifest.json's PROTECT list. This single glob is deliberately broader than that nineteen-file subset: the PROTECT list is edited far more often than it is stable, so nineteen literal globs here would need a manifest edit every time it moves and would fail OPEN when someone forgot. The cost is bounded and already paid elsewhere - all three are scripts/test-backend.sh STANDALONE_ARGS members that any backend/ change already runs through the static corpus; this registration additionally puts them in the targeted merge lane so the failure is attributed to the PR that caused it."
+      "why": "All three sentinels read the backend test INVENTORY itself (estate_inventory.iter_backend_test_files -> backend/testing/test_*.py) instead of importing anything the changed file imports, so adding, deleting or renaming a backend test file is invisible to the reverse-dep scan: it selects the changed test file and never the guards over the inventory that file belongs to. test_test_durations_freshness.py checks the coverage fraction and re-derives every collected node id to reject stale entries in backend/.test_durations; test_test_estate_ranked_queue.py set-compares the collected inventory against backend/testing/test-estate-ranked-queue.md; test_conversational_workday_protection.py pins an exact per-file test COUNT for the nineteen backend/testing paths in conversational_workday_manifest.json's PROTECT list. This single glob is deliberately broader than that nineteen-file subset: the PROTECT list is edited far more often than it is stable, so nineteen literal globs here would need a manifest edit every time it moves and would fail OPEN when someone forgot. The cost is bounded and already paid elsewhere - all three are scripts/test-backend.sh STANDALONE_ARGS members that any backend/ change already runs through the static corpus; this registration additionally puts them in the targeted merge lane so the failure is attributed to the PR that caused it."
     },
     {
       "glob": "backend/.test_durations",
@@ -55,9 +55,9 @@
       "why": "test_outlier_cap_matches_durations_quality reads this file BY PATH (it parses the source to recover the outlier cap) rather than importing it, so a cap change here silently desynchronises the two definitions. Scoped to the exact file, not scripts/**, for the same reason as the scripts/test_runner_isolation.py entry below."
     },
     {
-      "glob": "test-estate-ranked-queue.md",
+      "glob": "backend/testing/test-estate-ranked-queue.md",
       "sentinels": ["backend/testing/test_test_estate_ranked_queue.py"],
-      "why": "The derived artifact the sentinel set-compares against the collected inventory. It is a root-level markdown file: it matches no STATIC_PATH_PREFIXES entry and sits in no import graph, so before this registration a hand-edit to the queue was the one change to it that ran none of its own guards. Repair command: python3 scripts/generate_test_estate_ranked_queue.py --write."
+      "why": "The derived artifact the sentinel set-compares against the collected inventory. This Markdown file sits outside the Python import graph, so this explicit registration selects its inventory guard when the queue changes. Repair command: python3 scripts/generate_test_estate_ranked_queue.py --write."
     },
     {
       "glob": "scripts/generate_test_estate_ranked_queue.py",
@@ -75,7 +75,7 @@
     {
       "glob": "admin-ui/src/**/*.test.ts",
       "sentinels": ["backend/testing/test_test_estate_ranked_queue.py"],
-      "why": "test_test_estate_ranked_queue.py set-compares the Vitest inventory (estate_inventory.is_vitest_test_path) against test-estate-ranked-queue.md, so it fires only when a Vitest test file is ADDED or DELETED. Scoped to the five test-file globs the inventory predicate actually collects rather than to admin-ui/** so a routine component edit does not pay the guard."
+      "why": "test_test_estate_ranked_queue.py set-compares the Vitest inventory (estate_inventory.is_vitest_test_path) against backend/testing/test-estate-ranked-queue.md, so it fires only when a Vitest test file is ADDED or DELETED. Scoped to the five test-file globs the inventory predicate actually collects rather than to admin-ui/** so a routine component edit does not pay the guard."
     },
     {
       "glob": "admin-ui/src/**/*.test.tsx",

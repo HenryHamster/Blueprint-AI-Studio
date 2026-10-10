@@ -219,7 +219,7 @@ source scripts/backend-test-route.sh
 # `--fix` and the position matter, and both are load-bearing:
 #
 #  * `--fix` regenerates a drifted artifact that derived_artifact_repair
-#    registers as decision-free (today: test-estate-ranked-queue.md, a pure
+#    registers as decision-free (today: backend/testing/test-estate-ranked-queue.md, a pure
 #    report with no consumer but its own guard) and then RE-RUNS the sentinel to
 #    prove the drift cleared. Ratchets, floors, snapshots, caps and measured
 #    durations are never regenerated. Reporting alone was not enough: three

@@ -1157,7 +1157,7 @@ def test_committed_manifest_registers_the_guards_that_failed_promotion_17738():
         "backend/.test_durations": (
             "backend/testing/test_test_durations_freshness.py"
         ),
-        "test-estate-ranked-queue.md": (
+        "backend/testing/test-estate-ranked-queue.md": (
             "backend/testing/test_test_estate_ranked_queue.py"
         ),
         "backend/testing/conversational_workday_manifest.json": (

@@ -437,7 +437,7 @@ def test_new_drift_in_a_pure_report_is_regenerated_and_reverified(
     assert calls["corpus"][1][1] == ("testing/test_test_estate_ranked_queue.py",)
     output = capsys.readouterr()
     assert "SELF-HEALED" in output.err
-    assert "test-estate-ranked-queue.md" in output.out + output.err
+    assert "backend/testing/test-estate-ranked-queue.md" in output.out + output.err
 
 
 def test_inherited_drift_in_a_pure_report_is_healed_not_merely_reported(

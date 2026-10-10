@@ -76,7 +76,7 @@ except ImportError:  # pragma: no cover - fixture trees run on UTF-8 hosts
     def force_utf8_streams() -> None:
         return None
 
-QUEUE_PATH = "test-estate-ranked-queue.md"
+QUEUE_PATH = "backend/testing/test-estate-ranked-queue.md"
 MANIFEST_PATH = "backend/testing/conversational_workday_manifest.json"
 BACKEND_DURATIONS_PATH = "backend/.test_durations"
 VITEST_DURATION_PATHS = {
@@ -311,7 +311,7 @@ def render_queue(root: Path) -> str:
         "> `python3 scripts/generate_test_estate_ranked_queue.py --summary`.\n"
         "> On Windows the interpreter is `python`: the python.org installer ships\n"
         "> no `python3`, so the commands above cannot run there as written.\n"
-        "> Policy and threshold definitions: `test-estate-rubric.md`.\n\n"
+        "> Policy and threshold definitions: `backend/testing/test-estate-rubric.md`.\n\n"
         "Rows are in rank order, highest priority first; there is deliberately no rank "
         "ordinal, because an ordinal renumbers every row below an insertion and made this "
         "report conflict on 40% of merges. Every row is a function of its own file alone, "

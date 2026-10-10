@@ -4,7 +4,7 @@
  * THE DEFECT
  * ----------
  * Committed derived artifacts re-conflict every open PR whenever anything merges
- * into `automain`. The worst offender was `test-estate-ranked-queue.md`, a
+ * into `automain`. The worst offender was `backend/testing/test-estate-ranked-queue.md`, a
  * ~1200-line generated report whose rank ordinal and estate-summary table shifted
  * table-wide when any test file was added; both of those GLOBAL fields were
  * removed on 2026-08-26, so its rows now merge as disjoint insertions under stock
@@ -30,7 +30,7 @@
  *  - GitHub computes `mergeable` server-side with stock drivers and never
  *    consults ours, so the PR still goes unmergeable and the fix task is still
  *    spawned. Something has to end the turn cheaply once it exists.
- *  - `test-estate-ranked-queue.md` could never be a merge driver at all. A driver
+ *  - `backend/testing/test-estate-ranked-queue.md` could never be a merge driver at all. A driver
  *    is handed three blobs, and the one correct resolution is a function of the
  *    whole MERGED TREE, which does not exist yet at driver time. Its residual
  *    conflicts (two branches adding files that rank adjacently, a hand-edit) still
