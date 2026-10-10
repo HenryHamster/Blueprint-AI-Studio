@@ -271,7 +271,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_acceptance_criteria__trials.py` | 586 | 13 | under 1500 LOC | 17.408s measured | — |
 | G | backend | `backend/testing/test_release_promotion_metric_manifest.py` | 173 | 6 | under 1500 LOC | 17.020s measured | — |
 | G | backend | `backend/testing/test_admin_acceptance_criteria_router.py` | 1,453 | 36 | under 1500 LOC | 16.509s measured | — |
-| G | backend | `backend/testing/test_url_security.py` | 179 | 11 | under 1500 LOC | 16.416s measured | — |
+| G | backend | `backend/testing/test_url_security.py` | 217 | 12 | under 1500 LOC | 16.416s measured | — |
 | G | backend | `backend/testing/test_admin_tasks_fix_loop_summary.py` | 158 | 16 | under 1500 LOC | 16.378s measured | — |
 | G | backend | `backend/testing/test_viewable_watch.py` | 335 | 19 | under 1500 LOC | 16.048s measured | — |
 | G | backend | `backend/testing/test_pipeline_alert_scan.py` | 736 | 21 | under 1500 LOC | 15.851s measured | — |

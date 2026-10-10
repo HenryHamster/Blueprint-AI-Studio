@@ -19,6 +19,12 @@ def _check_ip_address_safe(addr: str) -> Tuple[bool, str]:
     except ValueError:
         return False, f"invalid IP address: {addr!r}"
 
+    # Evaluate mapped IPv4 addresses using their actual destination. Older
+    # Python versions can otherwise classify mapped shared-space addresses as
+    # global, and mapped multicast addresses do not set IPv6 is_multicast.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+
     if ip.is_loopback:
         return False, f"loopback address blocked: {addr}"
     if ip.is_link_local:
@@ -31,6 +37,12 @@ def _check_ip_address_safe(addr: str) -> Tuple[bool, str]:
     # Python < 3.11 is_private may not cover fd00::/8 (RFC4193 unique-local)
     if ip.version == 6 and (int(ip) >> 120) == 0xFD:
         return False, f"unique-local IPv6 address blocked: {addr}"
+    if ip.is_multicast:
+        return False, f"multicast address blocked: {addr}"
+    # RFC6598 shared address space (100.64.0.0/10) is neither private nor
+    # global. Requiring global unicast also excludes other nonpublic ranges.
+    if not ip.is_global:
+        return False, f"non-global address blocked: {addr}"
 
     return True, ""
 
@@ -43,8 +55,8 @@ def _resolve_safe_external_url(url: str) -> Tuple[bool, str, Optional[str]]:
     Checks:
       1. Scheme must be http or https.
       2. Hostname must be present.
-      3. All resolved IPs must be public (blocks loopback, link-local,
-         metadata, RFC1918/RFC4193 private ranges, and 0.0.0.0).
+      3. All resolved IPs must be global unicast (blocks loopback, link-local,
+         metadata, private/shared ranges, multicast, and unspecified addresses).
 
     Returns (True, "", resolved_ip) when safe, or (False, reason, None) when blocked.
 

@@ -42,6 +42,15 @@ def _mock_getaddrinfo_v6(ip: str):
         ("::", False),
         ("fd00::1", False),  # RFC4193 unique-local
         ("fd12:3456:789a::1", False),  # RFC4193 unique-local (fd00::/8)
+        ("100.64.0.1", False),  # RFC6598 shared address space
+        ("100.127.255.254", False),  # upper end of RFC6598
+        ("224.0.0.1", False),  # IPv4 multicast
+        ("239.255.255.250", False),  # administratively scoped multicast
+        ("ff02::1", False),  # IPv6 link-local multicast
+        ("ff0e::1", False),  # IPv6 global-scope multicast
+        ("::ffff:100.64.0.1", False),  # IPv4-mapped shared address
+        ("::ffff:224.0.0.1", False),  # IPv4-mapped multicast
+        ("::ffff:8.8.8.8", True),  # IPv4-mapped public unicast
         ("8.8.8.8", True),
         ("1.1.1.1", True),
         ("2606:4700:4700::1111", True),  # Cloudflare public IPv6
@@ -111,6 +120,35 @@ def test_rejects_private_resolved_ip(ip):
         safe, reason = _is_safe_external_url("https://internal.example.com/hook")
     assert not safe, f"Expected {ip!r} to be blocked"
     assert reason
+
+
+@pytest.mark.parametrize(
+    "unsafe_ip",
+    [
+        "100.64.0.1",
+        "100.127.255.254",
+        "224.0.0.1",
+        "239.255.255.250",
+        "ff02::1",
+        "ff0e::1",
+        "::ffff:100.64.0.1",
+        "::ffff:224.0.0.1",
+    ],
+)
+def test_rejects_mixed_public_and_nonpublic_dns_answers(unsafe_ip):
+    unsafe_info = (
+        _mock_getaddrinfo_v6(unsafe_ip)
+        if ":" in unsafe_ip
+        else _mock_getaddrinfo(unsafe_ip)
+    )
+    answers = _mock_getaddrinfo("8.8.8.8") + unsafe_info
+    with patch("socket.getaddrinfo", return_value=answers):
+        safe, reason, pinned_ip = _resolve_safe_external_url(
+            "https://hooks.example.com/webhook"
+        )
+    assert not safe
+    assert reason
+    assert pinned_ip is None
 
 
 # ---------------------------------------------------------------------------

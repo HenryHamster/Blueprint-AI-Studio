@@ -37,7 +37,7 @@ services:
       - ORCHESTRATOR_URL=http://app:8080
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - LOCAL_MODE=${LOCAL_MODE:-false}
-      - ADMIN_API_KEY=${ADMIN_API_KEY:-dev-admin-key}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-}
       - MAX_CONCURRENT_VMS=${MAX_CONCURRENT_VMS:-5}
       # Reported verbatim by GET /api/version as the engine SHA the stack serves.
       # The walkthrough_e2e lane labels its candidate stack with the candidate SHA
