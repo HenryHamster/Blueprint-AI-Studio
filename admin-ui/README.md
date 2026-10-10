@@ -33,4 +33,4 @@ Unit tests use happy-dom. Browser viewport tests are a separate suite; see [TEST
 | `src/types/`, `src/utils/` | Contracts and shared helpers |
 | `src/test/` | Unit and viewport test support |
 
-For a short source tour, read the [architecture guide](../docs/portfolio/ARCHITECTURE.md). For detailed component reference, read [FRONTEND_COMPONENTS.md](../docs/FRONTEND_COMPONENTS.md).
+For the component boundaries and backend connections, read the [architecture guide](../docs/ARCHITECTURE.md).

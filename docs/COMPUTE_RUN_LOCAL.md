@@ -261,7 +261,7 @@ exit=0
 
 ## 11. Related
 
-- [PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md) — the cloud `compute_experiment`
-  payload that this spec is a local subset of.
+- [payload_schemas.py](../backend/app/payload_schemas.py) — the cloud
+  `compute_experiment` payload that this spec is a local subset of.
 - [RUNNER_RUNBOOK.md](RUNNER_RUNBOOK.md) — running the same experiments through a
   self-hosted runner instead of by hand.

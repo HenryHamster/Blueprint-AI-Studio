@@ -2,9 +2,9 @@
 
 An AI coding-agent orchestration platform with a React operator workspace, a Python control plane, a TypeScript agent runtime, and local/cloud runners.
 
-Blueprint coordinates repository tasks, tracks execution and recovery, and connects changes to review and release workflows. This is a paused personal project developed with AI assistance. The code and engineering history are retained here; running the full system requires configured infrastructure and integrations.
+Blueprint coordinates repository tasks, tracks execution and recovery, and connects changes to review and release workflows. This is a paused personal project developed with AI assistance. Running the full system requires configured infrastructure and integrations.
 
-[Architecture](docs/portfolio/ARCHITECTURE.md) · [Engineering case study](docs/portfolio/CASE_STUDY.md) · [Local setup](CONTRIBUTING.md) · [Verification](docs/portfolio/VERIFICATION.md)
+[Local setup](CONTRIBUTING.md) · [Architecture](docs/ARCHITECTURE.md) · [Testing](docs/TESTING_GUIDE.md)
 
 ## Run the existing UI
 
@@ -17,9 +17,7 @@ npm run dev
 
 Open http://localhost:3001. The dashboard uses the backend API and authentication configuration described in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-`npm run demo` starts the **same application** on http://127.0.0.1:3002. It is a convenient frontend launch command; the backend and configured integrations are still needed to operate the system. See the [local UI guide](docs/portfolio/DEMO.md).
-
-For a recorded look at the application, the [operator walkthrough](docs/walkthroughs/v26-operator-walkthrough.md) includes screenshots and observations from an earlier session.
+`npm run demo` starts the frontend on http://127.0.0.1:3002. The backend and configured integrations are needed to operate the system.
 
 ## How it fits together
 
@@ -44,10 +42,10 @@ flowchart LR
 | [`agent/src/`](agent/src/) | Task handlers, provider execution, checkpoints, and telemetry |
 | [`scripts/`](scripts/) | Operator CLI, self-hosted runners, checks, and deployment tooling |
 | [`infra/`](infra/) | Terraform, VM images, networking, backup, and recovery |
-| [`docs/`](docs/README.md) | Guided reading, implementation references, and operations |
+| [`docs/`](docs/README.md) | Setup, architecture, testing, and operating instructions |
 | [`backend/testing/`](backend/testing/) | Backend tests and invariant checks |
 
-The [architecture guide](docs/portfolio/ARCHITECTURE.md) maps these boundaries to source files. The [case study](docs/portfolio/CASE_STUDY.md) covers persistent task state, concurrency, revision-bound review, and deployment observation, with tradeoffs and representative tests.
+The [architecture guide](docs/ARCHITECTURE.md) maps these boundaries to source files.
 
 ## Verify changes
 
@@ -66,13 +64,11 @@ npm test --prefix agent
 bash scripts/test-backend.sh testing/test_task_capabilities.py
 ```
 
-The [verification record](docs/portfolio/VERIFICATION.md) lists checks run during cleanup. Backend tests use an isolated database. Use targeted backend files on agent VMs; the full suite and operational frontend build run in CI.
+Backend tests use an isolated database. Use targeted backend files on agent VMs; the full suite and production frontend build run in CI. See the [testing guide](docs/TESTING_GUIDE.md).
 
-## Documentation and history
+## Documentation
 
-Start with the [documentation index](docs/README.md). For operation, see the [development guide](docs/DEVELOPMENT_GUIDE.md), [runner runbook](docs/RUNNER_RUNBOOK.md), and [deployment guide](Deploy.md).
-
-Superseded plans, handoffs, and one-off reports are preserved in Git history. The current documentation focuses on implementation, setup, and operation. [History preparation](docs/portfolio/HISTORY.md) describes the original-history backup and how to produce a clean checkout with that history intact.
+Start with the [documentation index](docs/README.md). For operation, see the [runner runbook](docs/RUNNER_RUNBOOK.md) and [deployment guide](Deploy.md).
 
 ## License
 

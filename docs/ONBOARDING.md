@@ -33,7 +33,8 @@ control over other projects.
 Invite collaborators from the project's member management UI and give the
 least-powerful role they need. Project configuration endpoints document their
 exact `viewer`, `member`, or `owner` requirement in
-[API_REFERENCE.md](API_REFERENCE.md); deployment-wide settings remain admin-only.
+[project configuration routes](../backend/app/routers/admin_project_config.py);
+deployment-wide settings remain admin-only.
 
 ---
 
@@ -346,7 +347,7 @@ through phases:
 
 Operators drive and inspect this from the release admin endpoints (all under
 `/api/admin/projects/{project_id}`; see
-[API_REFERENCE.md — Release Version Lifecycle](API_REFERENCE.md#release-version-lifecycle)):
+[release routes](../backend/app/routers/admin_release_version.py)):
 
 - **`GET /version-lifecycle`** — the current open version (phase, qualification
   attempts, merged-task count, last verdict), recent closed versions, and whether
@@ -362,7 +363,7 @@ Operators drive and inspect this from the release admin endpoints (all under
 - **`GET /audit-findings`** — the release-audit findings behind a verdict, so a
   low score is explainable.
 
-See [DATA_MODELS.md — Release Lifecycle Models](DATA_MODELS.md#release-lifecycle-models)
+See [models.py](../backend/app/models.py)
 for the `ReleaseVersion` and `QualificationVerdict` schemas.
 
 ---
@@ -394,5 +395,5 @@ for the `ReleaseVersion` and `QualificationVerdict` schemas.
    the promotion target only when the release qualifier's confidence clears its
    threshold. Watch it via `GET /api/admin/projects/{project_id}/version-lifecycle`.
 
-See also: [API_REFERENCE.md — Project Onboarding](API_REFERENCE.md#project-onboarding)
-and [DATA_MODELS.md — Project](DATA_MODELS.md#project).
+See also: the [API documentation](http://127.0.0.1:8080/docs) when the backend is
+running, and the [project models](../backend/app/models.py).

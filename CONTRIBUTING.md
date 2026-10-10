@@ -18,7 +18,7 @@ npm ci
 npm run dev
 ```
 
-Open http://localhost:3001. The backend and authentication setup are described below. `npm run demo` starts the same dashboard on port 3002; see the [local UI guide](docs/portfolio/DEMO.md).
+Open http://localhost:3001. The backend and authentication setup are described below. `npm run demo` starts the same dashboard on port 3002, bound to loopback. Forward that port when working over SSH.
 
 ## Operational dashboard and backend
 
@@ -43,11 +43,11 @@ Open http://localhost:3001. The backend and authentication setup are described b
    uvicorn app.main:app --host 127.0.0.1 --port 8080 --reload
    ```
 
-   The API role does not run leader-only scheduling. Running tasks also needs a configured worker role and execution capacity; see the [local control-plane guide](docs/local-control-plane.md) and [runner runbook](docs/RUNNER_RUNBOOK.md).
+   The API role does not run leader-only scheduling. Running tasks also needs a configured worker role and execution capacity; see the [local control-plane guide](docs/operations/local-control-plane.md) and [runner runbook](docs/RUNNER_RUNBOOK.md).
 
 5. For the dashboard, configure Firebase web authentication through `VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_AUTH_DOMAIN`, and `VITE_FIREBASE_PROJECT_ID`. For trusted local development, `VITE_DASHBOARD_API_TOKEN` can match a backend `ADMIN_API_KEY`; use it only in a local frontend. Run `npm run dev` from the repository root and open http://localhost:3001. Vite proxies `/api` to `127.0.0.1:8080` unless `VITE_DEV_PROXY_TARGET` is set.
 
-Real GitHub/provider workflows additionally require their configured identities and credentials. Consult [configuration](docs/CONFIGURATION.md), [onboarding](docs/ONBOARDING.md), and [coding-agent access](docs/CODING_AGENT_ACCESS.md). The [verification record](docs/portfolio/VERIFICATION.md) identifies the operational checks actually performed for the portfolio cleanup.
+Real GitHub/provider workflows additionally require their configured identities and credentials. Consult [configuration](docs/CONFIGURATION.md), [onboarding](docs/ONBOARDING.md), and [coding-agent access](docs/CODING_AGENT_ACCESS.md).
 
 ## Checks
 

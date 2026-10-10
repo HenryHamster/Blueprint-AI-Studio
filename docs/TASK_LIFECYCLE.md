@@ -426,6 +426,6 @@ if failed_tasks / total_tasks > threshold:
 
 ## See Also
 
-- [DATA_MODELS.md](DATA_MODELS.md) — Database schema field reference
-- [BACKEND_MODULES.md](BACKEND_MODULES.md) — Module responsibilities (orchestrator, task_lifecycle, etc.)
-- [DEBUG_GUIDE.md](DEBUG_GUIDE.md) — How to troubleshoot failed tasks
+- [models.py](../backend/app/models.py) — Database schema
+- [task_lifecycle.py](../backend/app/task_lifecycle.py) — Lifecycle implementation
+- [RUNNER_RUNBOOK.md](RUNNER_RUNBOOK.md) — Runner operation and diagnosis
