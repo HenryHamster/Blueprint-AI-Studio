@@ -13,14 +13,10 @@
   "scripts": {
     "dev": "npm run dev --prefix admin-ui",
     "dev:admin": "npm run dev --prefix admin-ui",
-    "clean": "rm -rf dist admin-ui/dist admin-ui/dist-demo",
+    "clean": "rm -rf dist admin-ui/dist",
     "build": "npm run build --prefix admin-ui",
     "lint": "npm run lint --prefix admin-ui",
-    "demo": "npm run demo --workspace admin-ui",
-    "demo:build": "npm run demo:build --workspace admin-ui",
-    "demo:preview": "npm run demo:preview --workspace admin-ui",
-    "demo:test": "npm run demo:test --workspace admin-ui",
-    "demo:check": "npm run demo:check --workspace admin-ui"
+    "demo": "npm run demo --workspace admin-ui"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

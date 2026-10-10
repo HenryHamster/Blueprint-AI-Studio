@@ -1,16 +1,16 @@
-# Operator workspace and portfolio demo
+# Operator workspace
 
-React 19, TypeScript, and Vite. The operational dashboard uses Tailwind CSS and authenticated backend APIs; the standalone portfolio demo uses its own stylesheet, sample data, and HTML entry point.
+The existing Blueprint dashboard, built with React 19, TypeScript, Vite, and Tailwind CSS. It uses authenticated backend APIs.
 
 ## Run from the repository root
 
 ```bash
 npm ci
-npm run demo                    # Credential-free demo, port 3002
-npm run dev                     # Operational dashboard, port 3001
+npm run dev                     # Dashboard on port 3001
+npm run demo                    # Same dashboard on port 3002
 ```
 
-The dashboard needs the backend and authentication configuration. See [CONTRIBUTING.md](../CONTRIBUTING.md). The demo needs neither; see the [demo guide](../docs/portfolio/DEMO.md).
+Configure the backend and authentication using [CONTRIBUTING.md](../CONTRIBUTING.md). Both commands load `index.html`, `src/main.tsx`, and `src/App.tsx` through the existing Vite configuration.
 
 ## Verify
 
@@ -18,27 +18,19 @@ The dashboard needs the backend and authentication configuration. See [CONTRIBUT
 npm run typecheck --workspace admin-ui
 npm run lint --workspace admin-ui
 npm run test:run --workspace admin-ui
-npm run demo:test
-npm run demo:build
-
-# Install Chromium once before the browser check
-npx playwright install chromium
-npm run demo:check
 ```
 
-Unit tests use happy-dom. Browser viewport tests are a separate suite; see [TESTING_GUIDE.md](../docs/TESTING_GUIDE.md). On agent VMs, use type checking for the full dashboard; its production bundle runs in CI. The small demo bundle is built and checked locally.
+Unit tests use happy-dom. Browser viewport tests are a separate suite; see [TESTING_GUIDE.md](../docs/TESTING_GUIDE.md). On agent VMs, use type checking; the production bundle runs in CI.
 
 ## Source map
 
 | Path | Responsibility |
 | --- | --- |
-| `src/main.tsx`, `src/App.tsx` | Operational application and workspace routing |
+| `src/main.tsx`, `src/App.tsx` | Application and workspace routing |
 | `src/components/` | Task, project, conversation, fleet, settings, and release surfaces |
 | `src/hooks/` | State, polling, WebSocket, and navigation hooks |
 | `src/api/` | Authenticated request paths; `src/api.ts` provides the compatibility facade |
 | `src/types/`, `src/utils/` | Contracts and shared helpers |
 | `src/test/` | Unit and viewport test support |
-| `src/demo/`, `vite.demo.config.ts` | Independent portfolio presentation and static build |
-| `scripts/check-demo.mjs` | Browser checks of the built demo |
 
 For a short source tour, read the [architecture guide](../docs/portfolio/ARCHITECTURE.md). For detailed component reference, read [FRONTEND_COMPONENTS.md](../docs/FRONTEND_COMPONENTS.md).

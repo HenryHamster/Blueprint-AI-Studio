@@ -1,8 +1,8 @@
-# Interactive demo
+# Run the existing application UI
 
-The portfolio demo is a standalone React application with sample tasks, logs, patch, and fleet data. It presents the system's core workflow without running a model, contacting GitHub, or starting the backend.
+`npm run demo` launches Blueprint's existing operator workspace on port 3002. It uses the same HTML entry point, React components, styles, authentication, API client, and Vite configuration as `npm run dev`.
 
-## Run
+## Start the frontend
 
 Requires Node.js 22+ and npm. From the repository root:
 
@@ -11,66 +11,28 @@ npm ci
 npm run demo
 ```
 
-Open http://127.0.0.1:3002. The dev server binds to loopback and fails if the port is already occupied. For a custom port, invoke the workspace directly:
+Open http://127.0.0.1:3002. The server binds to loopback and fails if the port is already occupied. When working over SSH, forward port 3002 to your computer.
 
-```bash
-npm run demo --workspace admin-ui -- --port 3003
-```
+For normal frontend development, `npm run dev` starts the same UI on port 3001.
 
-## Two-minute walkthrough
+## Backend and authentication
 
-1. Inspect the running activity-pagination task and its lifecycle.
-2. Choose **Interrupt worker**. Execution stops and the log shows recovery becoming available.
-3. Choose **Retry task**. The attempt number increments and playback stops at **Needs review**.
-4. Open **Changes** to inspect the illustrative patch, then choose **Approve sample**. Task completion does not claim a deployment.
-5. Choose **New sample task**, enter a title and goal, and queue it. Use **Next step** or **Replay** to explore its lifecycle.
-6. Visit **Fleet** and **Architecture** for the execution boundaries and a map to the source.
+The dashboard expects an API at `http://127.0.0.1:8080`; Vite proxies `/api` there. Set `VITE_DEV_PROXY_TARGET` to change the development proxy.
 
-Search filters the task list. Arrow keys, Home, and End navigate the detail tabs. Refresh resets the in-memory sample state. A new prompt stays in this browser session.
+Configure Firebase web authentication or the existing trusted-local-development token path as described in [CONTRIBUTING.md](../../CONTRIBUTING.md). Starting the frontend alone does not start the database, API, workers, or execution capacity.
 
-## Static artifact
+A full workflow also needs the relevant GitHub and model-provider configuration. The [runner runbook](../RUNNER_RUNBOOK.md) covers execution capacity. These requirements are part of the current application.
 
-```bash
-npm run demo:build
-npm run demo:preview
-```
+## Take a look
 
-The output is `admin-ui/dist-demo/`. Its assets use relative paths, so it can be served from a static host or a subdirectory. Serve it over HTTP; opening `index.html` with `file://` is not a supported browser module setup.
-
-The build uses `vite.demo.config.ts`, a separate HTML entry point, `envDir: false`, and no API proxy. It does not load `.env` files or the operational dashboard. Only explicitly public sample content belongs in the demo.
+With a configured backend, explore the existing conversations, project workspace, pipeline, and runtime views. The [recorded operator walkthrough](../walkthroughs/v26-operator-walkthrough.md) also includes screenshots of the application and observations from an earlier session.
 
 ## Verify
 
 ```bash
-npm run demo:test
 npm run typecheck --workspace admin-ui
 npm run lint --workspace admin-ui
-
-# Install the browser once, then check the built artifact
-npx playwright install chromium
-npm run demo:check
+npm run test:run --workspace admin-ui
 ```
 
-The browser check starts and removes its own loopback preview server on port 3102. It tests submission, interruption/retry, review approval, keyboard tabs, reload reset, and all three views at widths 375, 768, and 1440. It also fails on browser errors, asset failures, external requests, and `/api` requests.
-
-For an already-installed Chromium executable, set `BLUEPRINT_DEMO_BROWSER_PATH`. Set `BLUEPRINT_DEMO_PORT` if the check's port is occupied. To capture screenshots for an intentional presentation update:
-
-```bash
-npm run demo:build
-node admin-ui/scripts/check-demo.mjs --screenshots
-```
-
-Screenshots are written to `.scratch/portfolio/browser/`. Curated copies used by the README live in `docs/portfolio/images/`; generated test attachments remain ignored.
-
-## Source
-
-| File | Responsibility |
-| --- | --- |
-| [`DemoApp.tsx`](../../admin-ui/src/demo/DemoApp.tsx) | Workspace navigation and in-memory task/playback state |
-| [`TaskDetail.tsx`](../../admin-ui/src/demo/TaskDetail.tsx) | Task phases, simulated output, patch, and review controls |
-| [`NewTaskForm.tsx`](../../admin-ui/src/demo/NewTaskForm.tsx) | Local sample prompt submission |
-| [`SystemViews.tsx`](../../admin-ui/src/demo/SystemViews.tsx) | Fleet and architecture tours |
-| [`model.ts`](../../admin-ui/src/demo/model.ts) | Fixtures, bounded transitions, and illustrative logs |
-| [`check-demo.mjs`](../../admin-ui/scripts/check-demo.mjs) | Browser verification of the built artifact |
-
-The production dashboard remains at `admin-ui/src/main.tsx` and runs with `npm run dev` on port 3001. Its setup and authentication requirements are different; see [CONTRIBUTING.md](../../CONTRIBUTING.md).
+See the [verification record](VERIFICATION.md) for executed checks.

@@ -46,11 +46,9 @@ The implementation combines a FastAPI/PostgreSQL control plane, a TypeScript run
 
 **Tradeoff.** Startup depends on a complete contract. That explicit failure is useful because a partial table is an ambiguous permission boundary. It also requires compatibility testing when introducing a new task type.
 
-## What the portfolio demonstration establishes
+## Running the application
 
-The demo provides a small, deterministic tour of task submission, preparation, execution, interruption, retry, and review. It uses the production `TaskStatus` type and a separate simulated transition function. Its output and fleet are labeled sample data. It loads no production application, authentication code, or API proxy.
-
-The demo's browser checks establish that the built artifact runs, its interactions work, layouts fit several viewport sizes, and the workflow makes no API or external requests. Backend and agent checks are independent. See the [verification record](VERIFICATION.md) for executed checks and limits.
+The [local UI guide](DEMO.md) starts the existing operator workspace. It uses the real backend and authentication flow. See the [verification record](VERIFICATION.md) for the checks run during cleanup and the remaining setup requirements.
 
 ## What I would simplify next
 

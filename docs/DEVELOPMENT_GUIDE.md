@@ -6,7 +6,7 @@ This guide covers common development workflows, patterns, and best practices for
 
 ## Development workflow
 
-Use [CONTRIBUTING.md](../CONTRIBUTING.md) for prerequisites, installation, local authentication, database setup, and current verification commands. The credential-free [portfolio demo](portfolio/DEMO.md) runs on port 3002; the operational dashboard runs on port 3001 and needs the backend.
+Use [CONTRIBUTING.md](../CONTRIBUTING.md) for prerequisites, installation, local authentication, database setup, and current verification commands. `npm run dev` starts the existing dashboard on port 3001; `npm run demo` starts the same application on port 3002. Both need the backend.
 
 For changes to Blueprint's multi-branch integration flow, check the configured project integration branch before opening a PR. Ordinary local development can start from the current `main`; repository cleanup must preserve deployment and release state independently.
 

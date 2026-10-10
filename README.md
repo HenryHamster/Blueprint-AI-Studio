@@ -1,113 +1,79 @@
-<div align="center">
+# Blueprint AI Studio
 
-# Blueprint
+An AI coding-agent orchestration platform with a React operator workspace, a Python control plane, a TypeScript agent runtime, and local/cloud runners.
 
-### An observable control plane for AI coding agents.
+Blueprint coordinates repository tasks, tracks execution and recovery, and connects changes to review and release workflows. This is a paused personal project developed with AI assistance. The code and engineering history are retained here; running the full system requires configured infrastructure and integrations.
 
-Turn a repository and a task into isolated execution, a reviewable change, and a verified release.
+[Architecture](docs/portfolio/ARCHITECTURE.md) · [Engineering case study](docs/portfolio/CASE_STUDY.md) · [Local setup](CONTRIBUTING.md) · [Verification](docs/portfolio/VERIFICATION.md)
 
-**[Explore the demo](#try-it-locally)** · **[Architecture](docs/portfolio/ARCHITECTURE.md)** · **[Engineering case study](docs/portfolio/CASE_STUDY.md)** · **[Verification](docs/portfolio/VERIFICATION.md)**
+## Run the existing UI
 
-![Blueprint interactive demo: task pipeline, execution lifecycle, and review controls](docs/portfolio/images/pipeline.png)
-
-*The portfolio demo uses sample data and simulated execution. It runs entirely in your browser.*
-
-</div>
-
-## Why this exists
-
-Running a coding agent is easy. Managing its work after a process crashes, a review changes, or a deployment fails is a systems problem.
-
-Blueprint explores that problem: a persistent task lifecycle, isolated workers, observable execution, bounded recovery, and explicit review and release decisions. The platform includes a React operator workspace, a Python control plane, a TypeScript agent runtime, self-hosted runners, and GCP infrastructure.
-
-This is a paused personal project, developed with AI-assisted implementation and review. The repository preserves the working system and its tests alongside a small, credential-free demonstration. Live infrastructure and model execution require separate configuration.
-
-## Try it locally
-
-Requires **Node.js 22+** and npm. From the repository root:
+Requires Node.js 22+ and npm. From the repository root:
 
 ```bash
 npm ci
-npm run demo
+npm run dev
 ```
 
-Open **http://127.0.0.1:3002**. No database, cloud account, model key, or GitHub login is needed.
+Open http://localhost:3001. The dashboard uses the backend API and authentication configuration described in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-- **New sample task** accepts a title and goal locally.
-- **Replay a task** follows queue → workspace → execution → review.
-- **Interrupt worker**, then **Retry task**, to explore recovery.
-- Inspect the sample patch and choose **Approve sample** to finish the task.
-- Open **Fleet** and **Architecture** for the execution boundaries and source map.
+`npm run demo` starts the **same application** on http://127.0.0.1:3002. It is a convenient frontend launch command; the backend and configured integrations are still needed to operate the system. See the [local UI guide](docs/portfolio/DEMO.md).
 
-Build a portable static demo with `npm run demo:build`; serve it with `npm run demo:preview`. The output is `admin-ui/dist-demo/`. See the [demo guide](docs/portfolio/DEMO.md) for the walkthrough and browser checks.
+For a recorded look at the application, the [operator walkthrough](docs/walkthroughs/v26-operator-walkthrough.md) includes screenshots and observations from an earlier session.
 
-## The system
+## How it fits together
 
 ```mermaid
 flowchart LR
     UI[Operator workspace<br/>React + TypeScript] --> API[Control plane<br/>FastAPI]
-    API <--> DB[(PostgreSQL<br/>tasks, projects, artifacts)]
+    API <--> DB[(PostgreSQL)]
     API --> Scheduler[Scheduling & recovery]
-    Scheduler --> Local[Self-hosted runners]
-    Scheduler --> Cloud[GCP execution]
-    Local --> Runtime[Agent runtime<br/>TypeScript]
-    Cloud --> Runtime
-    Runtime --> GitHub[Branches, PRs & CI]
+    Scheduler --> Runners[Local runners / GCP]
+    Runners --> Runtime[Agent runtime<br/>TypeScript]
     Runtime --> API
-    GitHub --> Review[Review & promotion gates]
-    Review --> Serving[Deployment & serving verification]
-    Serving --> API
+    Runtime --> GitHub[Branches, PRs & CI]
+    GitHub --> Review[Review & promotion]
+    Review --> Deployment[Deployment & serving observation]
+    Deployment --> API
 ```
-
-| Engineering concern | Implementation |
-| --- | --- |
-| Work survives a worker process | Persisted task state, heartbeats, bounded retries, and recovery sweeps |
-| Concurrent actors mutate the same task | Canonical row-lock helpers and explicit admission decisions |
-| Agents need limited authority | Task-scoped credentials and a validated runtime capability contract |
-| A successful agent run needs review | PR lifecycle, review/fix workflows, and merge authority checks |
-| A merge is only one release step | CI qualification, promotion, deployment artifacts, and serving observations |
-
-The [case study](docs/portfolio/CASE_STUDY.md) connects these decisions to representative source files and tests, including the tradeoffs and limitations.
-
-## Repository map
 
 | Directory | Responsibility |
 | --- | --- |
+| [`admin-ui/src/`](admin-ui/src/) | Operator workspace: conversations, projects, pipeline, fleet, and settings |
 | [`backend/app/`](backend/app/) | API, scheduling, task lifecycle, recovery, permissions, and releases |
-| [`admin-ui/src/`](admin-ui/src/) | Operator workspace; [`demo/`](admin-ui/src/demo/) is the standalone presentation |
 | [`agent/src/`](agent/src/) | Task handlers, provider execution, checkpoints, and telemetry |
 | [`scripts/`](scripts/) | Operator CLI, self-hosted runners, checks, and deployment tooling |
-| [`infra/`](infra/) | Terraform, VM images, networking, identity, backup, and recovery |
+| [`infra/`](infra/) | Terraform, VM images, networking, backup, and recovery |
 | [`docs/`](docs/README.md) | Guided reading, implementation references, and operations |
 | [`backend/testing/`](backend/testing/) | Backend tests and invariant checks |
 
-## Develop and verify
+The [architecture guide](docs/portfolio/ARCHITECTURE.md) maps these boundaries to source files. The [case study](docs/portfolio/CASE_STUDY.md) covers persistent task state, concurrency, revision-bound review, and deployment observation, with tradeoffs and representative tests.
+
+## Verify changes
 
 ```bash
-# Demo workflow tests
-npm run demo:test
-
-# Dashboard types and unit tests
+# Frontend
 npm run typecheck --workspace admin-ui
+npm run lint --workspace admin-ui
 npm run test:run --workspace admin-ui
 
-# Dashboard lint
-npm run lint --workspace admin-ui
-
-# Agent types (install agent dependencies first)
+# Agent
 npm ci --prefix agent
 npm run typecheck --prefix agent
+npm test --prefix agent
 
-# Targeted backend checks; select files covering your change
+# Backend: select the files covering your change
 bash scripts/test-backend.sh testing/test_task_capabilities.py
 ```
 
-Start with [CONTRIBUTING.md](CONTRIBUTING.md). Backend tests use an isolated database; run targeted files rather than the full backend suite on agent VMs. The [verification record](docs/portfolio/VERIFICATION.md) states exactly which checks were run for this snapshot.
+The [verification record](docs/portfolio/VERIFICATION.md) lists checks run during cleanup. Backend tests use an isolated database. Use targeted backend files on agent VMs; the full suite and operational frontend build run in CI.
 
-For the operational application, read the [development guide](docs/DEVELOPMENT_GUIDE.md), [runner runbook](docs/RUNNER_RUNBOOK.md), and [deployment guide](Deploy.md). The static demo does not exercise model providers, GitHub mutations, or live deployment.
+## Documentation and history
 
-## Project history and license
+Start with the [documentation index](docs/README.md). For operation, see the [development guide](docs/DEVELOPMENT_GUIDE.md), [runner runbook](docs/RUNNER_RUNBOOK.md), and [deployment guide](Deploy.md).
 
-The portfolio presentation curates a larger development history. Historical plans and recorded walkthroughs remain available through the [documentation index](docs/README.md); they carry their original scope and are not a claim about current runtime behavior. See [history and snapshot preparation](docs/portfolio/HISTORY.md) for preserving the original Git history and producing a clean portfolio checkout.
+Historical plans remain available at their original paths. [History preparation](docs/portfolio/HISTORY.md) describes the private Git-history backup and how to produce a separate clean checkout.
 
-Source availability does not grant reuse rights. The current [license](LICENSE) reserves all rights to the copyright holder.
+## License
+
+The current [license](LICENSE) reserves all rights to the copyright holder.

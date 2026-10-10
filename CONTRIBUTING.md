@@ -1,6 +1,6 @@
 # Development and verification
 
-Blueprint is a paused personal project. The easiest entry point is the [portfolio demo](docs/portfolio/DEMO.md); operational development requires a database and configured integrations. Read [AGENTS.md](AGENTS.md) before editing lifecycle, release, or conversational code.
+Blueprint is a paused personal project. Local development uses the existing dashboard, backend, database, and configured integrations. Read [AGENTS.md](AGENTS.md) before editing lifecycle, release, or conversational code.
 
 ## Prerequisites
 
@@ -9,16 +9,16 @@ Blueprint is a paused personal project. The easiest entry point is the [portfoli
 - PostgreSQL with the migration-required `pg_trgm` and `pgcrypto` extensions, or Docker for the repository test harness
 - Credentials only for the integrations you intend to exercise
 
-## Credential-free demo
+## Start the frontend
 
 Run these commands from the repository root:
 
 ```bash
 npm ci
-npm run demo
+npm run dev
 ```
 
-Open http://127.0.0.1:3002. See the [demo guide](docs/portfolio/DEMO.md) for a walkthrough, static build, and browser checks.
+Open http://localhost:3001. The backend and authentication setup are described below. `npm run demo` starts the same dashboard on port 3002; see the [local UI guide](docs/portfolio/DEMO.md).
 
 ## Operational dashboard and backend
 
@@ -54,11 +54,7 @@ Real GitHub/provider workflows additionally require their configured identities 
 From the repository root, select the checks appropriate to your change:
 
 ```bash
-# Demo
-npm run demo:test
-npm run demo:check             # Requires Playwright Chromium
-
-# Operational frontend
+# Frontend
 npm run typecheck --workspace admin-ui
 npm run lint --workspace admin-ui
 npm run test:run --workspace admin-ui
@@ -76,7 +72,7 @@ bash scripts/test-backend.sh --standalone --no-postgres
 
 The backend harness starts and removes its own test database. Its normal route uses Docker; provisioned agent environments may offer the private `--sandbox-postgres` route. Do not point test configuration at a live database. Do not run the full backend suite on an agent VM. The repository's promotion CI owns the full deterministic release gate.
 
-Use frontend type checking on agent VMs; the full operational Vite bundle belongs in CI. The small demo has its own build and browser check. See [TESTING_GUIDE.md](docs/TESTING_GUIDE.md) for viewport tests and deeper test infrastructure.
+Use frontend type checking on agent VMs; the full Vite bundle belongs in CI. See [TESTING_GUIDE.md](docs/TESTING_GUIDE.md) for viewport tests and deeper test infrastructure.
 
 ## Change boundaries
 

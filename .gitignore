@@ -13,7 +13,6 @@ terraform.tfstate*
 build/
 dist/
 coverage/
-admin-ui/dist-demo/
 admin-ui/.vitest-attachments/
 /task_*.json
 admin-ui/test-results/

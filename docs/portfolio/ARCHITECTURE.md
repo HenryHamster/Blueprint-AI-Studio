@@ -2,7 +2,7 @@
 
 Blueprint is a control plane for repository work performed by AI agents. The backend persists intent and execution state; workers perform bounded tasks; the operator workspace makes progress, failures, and decisions visible.
 
-The portfolio demo is a separate entry point under `admin-ui/src/demo/`. It models a short workflow using the production TypeScript `TaskStatus` type, but its transitions, logs, patch, and fleet are simulated. The files below map the real implementation.
+The existing operator workspace starts at `admin-ui/src/main.tsx` and `admin-ui/src/App.tsx`. The files below map the implementation.
 
 ## Component boundaries
 
@@ -63,4 +63,4 @@ This is a reading order, not a complete state machine. The implementation also i
 
 The system grew from cloud VM orchestration into a broader platform with local runners, multiple provider paths, compute/research workflows, and conversational operation. Its persistence and recovery mechanisms are substantial, while the source remains uneven: many flat backend modules, large coordination files, and compatibility surfaces retained for tests and older persisted state.
 
-This cleanup improves the entry points, demonstration, and documentation without claiming a redesign of that entire implementation. New development should preserve the supported Workday conversation and artifact handoff surfaces and respect the retired architecture boundaries in [AGENTS.md](../../AGENTS.md).
+New development should preserve the supported Workday conversation and artifact handoff surfaces and respect the retired architecture boundaries in [AGENTS.md](../../AGENTS.md).

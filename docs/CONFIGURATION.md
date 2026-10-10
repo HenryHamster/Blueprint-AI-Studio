@@ -1,6 +1,6 @@
 # Blueprint Configuration Guide
 
-Reference for environment variables, feature flags, and runtime configuration. The [portfolio demo](portfolio/DEMO.md) needs no environment variables; this guide concerns the operational application. Validate mode-specific requirements against the current implementation and runbooks.
+Reference for environment variables, feature flags, and runtime configuration. See [CONTRIBUTING.md](../CONTRIBUTING.md) for local setup. Validate mode-specific requirements against the current implementation and runbooks.
 
 ---
 
@@ -226,7 +226,7 @@ For PostgreSQL, consider:
 
 ## Local Development
 
-Use [CONTRIBUTING.md](../CONTRIBUTING.md) for the current host/Compose database distinction, signing secrets, migrations, API-only role, and dashboard authentication. The operational dashboard runs on port 3001; the [portfolio demo](portfolio/DEMO.md) runs on port 3002 without configuration.
+Use [CONTRIBUTING.md](../CONTRIBUTING.md) for the current host/Compose database distinction, signing secrets, migrations, API-only role, and dashboard authentication. The dashboard runs on port 3001 with `npm run dev`, or port 3002 with `npm run demo`; both use the same application and configuration.
 
 Compose reads the root `.env` file. Host Python commands need their variables exported explicitly or supplied through an appropriate environment loader. The template's database hostname `db` is for containers; a host API uses a host-reachable address. Agent and WebSocket signing secrets must each be at least 32 bytes, and the field-encryption key must be a valid Fernet key.
 

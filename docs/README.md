@@ -1,6 +1,6 @@
 # Documentation
 
-For a first visit, start with the [project overview](../README.md), run the [interactive demo](portfolio/DEMO.md), then read the [architecture](portfolio/ARCHITECTURE.md) and [engineering case study](portfolio/CASE_STUDY.md).
+For a first visit, start with the [project overview](../README.md), then read the [architecture](portfolio/ARCHITECTURE.md) and [engineering case study](portfolio/CASE_STUDY.md). [Local setup](../CONTRIBUTING.md) covers running the existing application.
 
 ## Portfolio reading path
 
@@ -8,7 +8,7 @@ For a first visit, start with the [project overview](../README.md), run the [int
 | --- | --- |
 | [Architecture](portfolio/ARCHITECTURE.md) | Component boundaries, task flow, and representative source files |
 | [Case study](portfolio/CASE_STUDY.md) | Engineering decisions, tradeoffs, and discussion points |
-| [Demo](portfolio/DEMO.md) | Credential-free setup, guided interactions, and browser verification |
+| [Local UI](portfolio/DEMO.md) | Launch commands and backend/authentication requirements |
 | [Verification](portfolio/VERIFICATION.md) | Checks run for the cleanup and their limits |
 | [History](portfolio/HISTORY.md) | Original-history backup and a clean, unpublished portfolio snapshot |
 
@@ -32,7 +32,7 @@ The detailed references cover a system that evolved over many iterations. When a
 ## Design history and evidence
 
 - [Design plans](plans/README.md) retain the rationale and scope of earlier proposals. A proposal alone does not establish implementation or current support.
-- [Recorded operator walkthrough](walkthroughs/v26-operator-walkthrough.md) preserves a July 2026 execution, including failures and dead ends. Its screenshots are historical evidence, distinct from the current simulated demo.
+- [Recorded operator walkthrough](walkthroughs/v26-operator-walkthrough.md) preserves a July 2026 execution, including screenshots, failures, and dead ends.
 - [Release authorship history](findings/release-authorship-history.md) is a generated account of release-tag provenance, not personal-contribution attribution.
 - [Merge-rate measurement finding](findings/medium-scope-merge-rate-measurement.md) documents a measurement interface; its unfilled snapshot does not support a numerical performance claim.
 - [Persistent-agent-memory research](archive/research-persistent-agent-memory.md) is retained as an exploratory note.
