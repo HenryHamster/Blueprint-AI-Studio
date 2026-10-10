@@ -2,7 +2,7 @@
 
 Blueprint explores how to turn agent execution into a process an operator can inspect and control. A model invocation is one step. The surrounding system must decide what may run, recover interrupted work, interpret artifacts, and determine whether a particular revision is ready to merge or serve.
 
-The implementation combines a FastAPI/PostgreSQL control plane, a TypeScript runtime, a React workspace, self-hosted runners, and GCP infrastructure. This is a personal project developed with substantial AI assistance. The engineering discussion should distinguish the owner's requirements, design decisions, operation, and validation from code produced or reviewed by agents; commit counts alone cannot establish that attribution.
+The implementation combines a FastAPI/PostgreSQL control plane, a TypeScript runtime, a React workspace, self-hosted runners, and GCP infrastructure. This is a personal project developed with substantial AI assistance.
 
 ## 1. State must survive the executor
 
@@ -50,19 +50,14 @@ The implementation combines a FastAPI/PostgreSQL control plane, a TypeScript run
 
 The [local UI guide](DEMO.md) starts the existing operator workspace. It uses the real backend and authentication flow. See the [verification record](VERIFICATION.md) for the checks run during cleanup and the remaining setup requirements.
 
-## What I would simplify next
+## Engineering limitations and next priorities
 
-- Consolidate closely related lifecycle decisions behind explicit interfaces and keep orchestration separate from mutation authority.
-- Reduce the number of overlapping persisted compatibility flags and document the canonical source for each decision.
-- Keep provider and execution-placement contracts small enough to test with a real input through the result interpretation path.
-- Measure task outcomes from identified execution attempts. Avoid treating test volume, PR volume, or a metric endpoint as evidence of agent effectiveness.
+The boundaries above demonstrate useful systems principles: durable state, explicit mutation authority, conservative permission defaults, and evidence tied to the revision being acted on. Maintainability is uneven. [`release_qualifier.py`](../../backend/app/release_qualifier.py) exceeds 10,000 lines, [`models.py`](../../backend/app/models.py) exceeds 8,000, and [`MessagesPanel.tsx`](../../admin-ui/src/components/MessagesPanel.tsx) exceeds 3,000. Release coordination, persistence, and UI orchestration need smaller cohesive interfaces before substantial further expansion.
 
-The historical [merge-rate measurement finding](../findings/medium-scope-merge-rate-measurement.md) has an unfilled numerical snapshot. The [July operator walkthrough](../walkthroughs/v26-operator-walkthrough.md) records both successful and unsuccessful flows. They are useful evidence of what was investigated, and neither justifies a blanket performance or current reliability claim.
+The next engineering work should focus on three things:
 
-## Resume and interview use
+1. Extract lifecycle and release decisions by responsibility, with behavior tests around each boundary. A file split is useful only when it reduces the state a reader must understand together.
+2. Reduce overlapping persisted compatibility flags and identify the canonical source for each decision. Persisted-state changes require explicit migration and recovery behavior.
+3. Establish a reproducible authenticated path from task submission through execution and result interpretation. The cleanup verified targeted backend behavior and the unit suites; it did not verify a complete configured workflow.
 
-A concise project description:
-
-> Built an AI-agent orchestration platform spanning a Python/PostgreSQL control plane, TypeScript execution runtime, React operator workspace, and local/cloud runners, with persistent task state, failure recovery, and review and release gates.
-
-Use that wording only to the extent it matches your personal ownership. Add metrics when an identified execution record supports the number and its scope. For interviews, prepare one concrete failure/recovery example, one concurrency decision, and one revision-bound review or deployment decision from the source tours above.
+The [July operator walkthrough](../walkthroughs/v26-operator-walkthrough.md) records successful and unsuccessful flows on an earlier revision. Current test counts describe coverage executed during cleanup. Neither establishes current end-to-end reliability or agent effectiveness; those claims need identified executions and measured outcomes.

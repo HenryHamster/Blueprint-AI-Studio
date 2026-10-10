@@ -67,3 +67,10 @@ backend/testing/module_size_limits.json text eol=lf
 backend/testing/cap_bump_history.json text eol=lf
 admin-ui/.test_durations.json text eol=lf
 agent/.test_durations.json text eol=lf
+
+# GitHub should collapse reproducible timing data and the generated test report
+# in diffs. These files remain tracked at the paths used by validation tooling.
+backend/.test_durations linguist-generated=true
+admin-ui/.test_durations.json linguist-generated=true
+agent/.test_durations.json linguist-generated=true
+test-estate-ranked-queue.md linguist-generated=true

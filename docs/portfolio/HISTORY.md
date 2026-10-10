@@ -23,7 +23,9 @@ The development checkout and GitHub history are unchanged by export. The origina
 
 The history-preserving checkout is generated into `.scratch/portfolio/clean-checkout/`. Its final commit and tracked tree match the selected source revision exactly. It imports the selected revision's ancestry and reachable release tags, with no remotes, abandoned task branch references, local configuration, environment files, or build outputs.
 
-The previous single-commit export is superseded. It is retained privately in `.scratch/portfolio/superseded-one-commit-checkout/`.
+The previous single-commit exports were superseded and their temporary checkout folders removed. Their source revisions remain in development history; the current export preserves that history.
+
+Superseded plans, handoffs, exploratory notes, and one-off reports are also removed from the current tree. Their contents remain in earlier commits. Use `git log -- <path>` to locate a record and `git show <commit>:<path>` to read it.
 
 ## Reproduce
 

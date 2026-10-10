@@ -15,7 +15,9 @@ The cleanup retains the existing application UI. Its source under `admin-ui/src/
 | Agent dependency installation and types | `npm ci --prefix agent` and `npm run typecheck --prefix agent` passed |
 | Full agent unit suite | **131 files, 6,615 tests passed** |
 | Selected backend tests on fresh PostgreSQL | **106 passed, 1 skipped**: capabilities, task locking, serving observation |
-| Documentation guard | **1 passed**: revised documentation references no registered retired code paths |
+| Documentation guard | **1 passed** after documentation pruning: retained references contain no registered retired code paths |
+| Documentation contracts | **5 passed**: compute commands, exit codes, index link, and canonical deployment-unit ownership |
+| Markdown links | **46 documents checked**, no missing local link targets |
 | History-export tests | **8 passed**: original commit IDs and metadata, merge graph, content and modes, annotated tags, abandoned-ref exclusion, revision selection, and refusal to overwrite other work |
 | Exporter Python lint | Ruff passed |
 | Real backend API startup smoke | Fresh migrations, application lifespan, and schema checks passed; `/health`, `/api/version`, and `/openapi.json` returned HTTP 200 |
@@ -24,6 +26,8 @@ The cleanup retains the existing application UI. Its source under `admin-ui/src/
 The PostgreSQL skip is the SQLite-only fallback test. PostgreSQL locking tests ran. The agent suite's subprocess fixtures required host permissions in this environment; the complete suite passed with those permissions.
 
 Agent and backend checks remain applicable because their application source is unchanged. The earlier standalone simulated UI was removed, along with its dedicated tests and screenshots; it is not part of this checkout's presentation.
+
+The follow-up cleanup removed 30 superseded documents (10,228 lines), retained their contents in Git history, and removed two obsolete local export folders. Setup, operational runbooks, referenced integration design, and validation artifacts remain. Generated timing data and the ranked test report are marked as generated for GitHub diffs.
 
 ## Environment and local evidence
 
@@ -47,6 +51,7 @@ npm test --prefix agent -- --maxWorkers=2 --minWorkers=1
 bash scripts/test-backend.sh testing/test_task_capabilities.py testing/test_task_locking.py testing/test_release_serving_observation.py
 bash scripts/test-backend.sh testing/test_audit_finding_class_guards.py -k long_lived
 python3 -m pytest scripts/test_export_portfolio.py -q
+python3 -m pytest scripts/test_blueprint_compute_local.py scripts/test_bootstrap_local_app_release.py -k 'documented or docs_index or deploy_agent_unit_has_one_repository_writer' -q
 ```
 
 The normal backend harness uses Docker; this host used the provisioned `--sandbox-postgres --no-testmon` route. Backend startup and dashboard authentication are described in [CONTRIBUTING.md](../../CONTRIBUTING.md).

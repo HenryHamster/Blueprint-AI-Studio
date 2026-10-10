@@ -10,7 +10,7 @@ For a first visit, start with the [project overview](../README.md), then read th
 | [Case study](portfolio/CASE_STUDY.md) | Engineering decisions, tradeoffs, and discussion points |
 | [Local UI](portfolio/DEMO.md) | Launch commands and backend/authentication requirements |
 | [Verification](portfolio/VERIFICATION.md) | Checks run for the cleanup and their limits |
-| [History](portfolio/HISTORY.md) | Original-history backup and a clean, unpublished portfolio snapshot |
+| [History](portfolio/HISTORY.md) | Original-history backup and a clean checkout retaining commits and tags |
 
 ## Development and operation
 
@@ -29,13 +29,10 @@ For a first visit, start with the [project overview](../README.md), then read th
 
 The detailed references cover a system that evolved over many iterations. When a reference and code disagree, use the current implementation and [AGENTS.md](../AGENTS.md) boundaries. The portfolio architecture is the short source-oriented map; it does not replace operational runbooks.
 
-## Design history and evidence
+## Evidence and history
 
-- [Design plans](plans/README.md) retain the rationale and scope of earlier proposals. A proposal alone does not establish implementation or current support.
-- [Recorded operator walkthrough](walkthroughs/v26-operator-walkthrough.md) preserves a July 2026 execution, including screenshots, failures, and dead ends.
-- [Release authorship history](findings/release-authorship-history.md) is a generated account of release-tag provenance, not personal-contribution attribution.
-- [Merge-rate measurement finding](findings/medium-scope-merge-rate-measurement.md) documents a measurement interface; its unfilled snapshot does not support a numerical performance claim.
-- [Persistent-agent-memory research](archive/research-persistent-agent-memory.md) is retained as an exploratory note.
-- [Viewport audit](audits/viewport_test_quality_audit.md), [CI cost audit](ci-cost-audit.md), and [dependency audit](v19-dependency-bump-audit.md) retain their original audit scope.
+The [recorded operator walkthrough](walkthroughs/v26-operator-walkthrough.md) preserves a July 2026 execution, including screenshots, failures, and dead ends. The [verification record](portfolio/VERIFICATION.md) describes the checks performed during cleanup and the workflows still requiring configured infrastructure.
 
-Generated test-estate reports remain at their existing repository paths because validation tooling consumes them: [rubric](../test-estate-rubric.md) and [ranked queue](../test-estate-ranked-queue.md).
+Superseded plans, handoffs, exploratory notes, and one-off reports have been removed from the current tree and remain in Git history. Use `git log -- docs/plans` to browse earlier proposals, and `git show <commit>:<path>` to read a document at an earlier revision. The [integration-branch design](plans/README.md) remains because current release modules refer to it; it is historical context.
+
+The [dependency audit](v19-dependency-bump-audit.md) records the rationale for an authentication regression test. The [test-estate rubric](../test-estate-rubric.md) and generated [ranked queue](../test-estate-ranked-queue.md) remain at paths consumed by validation tooling.

@@ -580,4 +580,4 @@ Each exemption is one unit in the budget (`admin-ui/src/test/viewport-escape-hat
 ## Related Documentation
 
 - [CLAUDE.md](../CLAUDE.md) — Testing section with common patterns
-- [.github/workflows/](.../.github/workflows/) — CI/CD pipeline definitions
+- [.github/workflows/](../.github/workflows/) — CI/CD pipeline definitions

@@ -576,7 +576,7 @@ If viewport tests fail locally but pass in CI:
 ## Getting Help
 
 - **Code questions?** Open an issue with [code] tag
-- **Architecture unclear?** Check docs/codebase-analysis.md
+- **Architecture unclear?** Read the [architecture and source guide](portfolio/ARCHITECTURE.md)
 - **Feature request?** Open an issue with [feature-request] tag
 - **Bug found?** Check existing issues first, then open new issue with [bug] tag
 

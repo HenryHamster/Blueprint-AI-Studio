@@ -72,7 +72,7 @@ The [verification record](docs/portfolio/VERIFICATION.md) lists checks run durin
 
 Start with the [documentation index](docs/README.md). For operation, see the [development guide](docs/DEVELOPMENT_GUIDE.md), [runner runbook](docs/RUNNER_RUNBOOK.md), and [deployment guide](Deploy.md).
 
-Historical plans remain available at their original paths. [History preparation](docs/portfolio/HISTORY.md) describes the private Git-history backup and how to produce a separate clean checkout.
+Superseded plans, handoffs, and one-off reports are preserved in Git history. The current documentation focuses on implementation, setup, and operation. [History preparation](docs/portfolio/HISTORY.md) describes the original-history backup and how to produce a clean checkout with that history intact.
 
 ## License
 
