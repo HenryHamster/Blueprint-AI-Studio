@@ -13,7 +13,12 @@
     "test:run": "vitest run",
     "test:unit": "vitest run",
     "test:viewport": "node scripts/check-viewport-coverage.js && vitest run --config vitest.viewport.config.ts",
-    "test:viewport:capture": "vitest run --config vitest.viewport.capture.config.ts"
+    "test:viewport:capture": "vitest run --config vitest.viewport.capture.config.ts",
+    "demo": "vite --config vite.demo.config.ts",
+    "demo:build": "vite build --config vite.demo.config.ts",
+    "demo:preview": "vite preview --config vite.demo.config.ts",
+    "demo:test": "vitest run src/demo/",
+    "demo:check": "npm run demo:build && node scripts/check-demo.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

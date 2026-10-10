@@ -13,6 +13,9 @@ terraform.tfstate*
 build/
 dist/
 coverage/
+admin-ui/dist-demo/
+admin-ui/.vitest-attachments/
+/task_*.json
 admin-ui/test-results/
 test-results/
 .DS_Store
@@ -47,7 +50,7 @@ backend/.testmondata*
 /symbols
 /viewport-snapshot
 /viewport-live
-research-*.md
+/research-*.md
 *.bak
 # Repo-root self-review JSON output (agents write to /tmp; strays at the root
 # are generated noise). Root-anchored so nested fixtures like

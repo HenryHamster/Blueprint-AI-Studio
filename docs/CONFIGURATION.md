@@ -1,6 +1,6 @@
 # Blueprint Configuration Guide
 
-Complete reference for all environment variables, feature flags, and runtime configuration options.
+Reference for environment variables, feature flags, and runtime configuration. The [portfolio demo](portfolio/DEMO.md) needs no environment variables; this guide concerns the operational application. Validate mode-specific requirements against the current implementation and runbooks.
 
 ---
 
@@ -24,11 +24,14 @@ These environment variables **must** be set for the system to function.
 
 | Variable | Type | Description | Example |
 |----------|------|-------------|---------|
-| `ADMIN_API_KEY` | string | Shared API key for admin UI and server-to-server requests (min 32 chars) | `sk-blueprint-1234567890abcdef` |
+| `ADMIN_API_KEY` | string | Admin/server credential; a trusted local dashboard may use the development bypass | `sk-blueprint-1234567890abcdef` |
 | `AGENT_JWT_SECRET` | string | Secret to sign agent JWT tokens (min 32 chars) | `jwt-secret-1234567890abcdef` |
 | `WS_TICKET_SECRET` | string | Secret for WebSocket ticket signing (min 32 chars) | `ws-secret-1234567890abcdef` |
 | `ANTHROPIC_API_KEY` | string | Claude API key for agent VMs (or empty if using local Claude login) | `sk-ant-v1-...` |
-| `VITE_ADMIN_API_KEY` | string | Frontend env var — **must match `ADMIN_API_KEY`** | Same as `ADMIN_API_KEY` |
+| `VITE_DASHBOARD_API_TOKEN` | string | Trusted local dashboard bypass; must match `ADMIN_API_KEY`. Leave empty in a public deployment. | Local development only |
+| `VITE_FIREBASE_API_KEY` | string | Firebase web application key for dashboard sign-in | Firebase web config |
+| `VITE_FIREBASE_AUTH_DOMAIN` | string | Firebase authentication domain | Firebase web config |
+| `VITE_FIREBASE_PROJECT_ID` | string | Firebase project identifier | Firebase web config |
 
 ### GitHub Configuration
 
@@ -223,42 +226,9 @@ For PostgreSQL, consider:
 
 ## Local Development
 
-### Minimal Setup
+Use [CONTRIBUTING.md](../CONTRIBUTING.md) for the current host/Compose database distinction, signing secrets, migrations, API-only role, and dashboard authentication. The operational dashboard runs on port 3001; the [portfolio demo](portfolio/DEMO.md) runs on port 3002 without configuration.
 
-```bash
-# .env file
-export LOCAL_MODE=true
-export ANTHROPIC_API_KEY=sk-ant-...
-export ADMIN_API_KEY=dev-admin-key
-export AGENT_JWT_SECRET=dev-jwt-32-chars-minimum
-export WS_TICKET_SECRET=dev-ws-32-chars-minimum
-export DATABASE_URL=postgresql+asyncpg://postgres:supersecret_blueprint_pass@localhost:5432/blueprint
-export GITHUB_APP_ID=123456
-export GITHUB_PRIVATE_KEY='-----BEGIN RSA PRIVATE KEY-----...'
-export GITHUB_WEBHOOK_SECRET=dev-webhook-secret
-export GITHUB_CLIENT_ID=dev-client-id
-export GITHUB_CLIENT_SECRET=dev-client-secret
-export ALLOWED_ORIGINS=http://localhost:3000,http://localhost:3001
-```
-
-### With Docker Compose
-
-```bash
-docker-compose up -d db    # Start PostgreSQL
-cd backend && bash run_migrations.sh
-cd ..
-npm run dev               # Starts frontend (3000) and admin UI (3001)
-# In another terminal:
-cd backend
-uvicorn app.main:app --reload --port 8080
-```
-
-### With GCP Emulator (for local GCP testing)
-
-```bash
-gcloud emulators firestore start   # or: gcloud emulators compute start (if available)
-export GRPC_HOST=localhost:4001    # Point to emulator
-```
+Compose reads the root `.env` file. Host Python commands need their variables exported explicitly or supplied through an appropriate environment loader. The template's database hostname `db` is for containers; a host API uses a host-reachable address. Agent and WebSocket signing secrets must each be at least 32 bytes, and the field-encryption key must be a valid Fernet key.
 
 ---
 
@@ -387,7 +357,7 @@ RATE_LIMIT_WINDOW
 TASK_TIMEOUT_MINUTES
 VPC_NETWORK
 VPC_SUBNET
-VITE_ADMIN_API_KEY
+VITE_DASHBOARD_API_TOKEN
 WARM_POOL_ENABLED
 WARM_POOL_SIZE
 WS_TICKET_EXPIRY_SECONDS

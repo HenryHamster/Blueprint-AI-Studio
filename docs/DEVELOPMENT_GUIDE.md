@@ -4,102 +4,13 @@ This guide covers common development workflows, patterns, and best practices for
 
 ---
 
-## Development Workflow
+## Development workflow
 
-### 1. Setting Up Your Local Environment
+Use [CONTRIBUTING.md](../CONTRIBUTING.md) for prerequisites, installation, local authentication, database setup, and current verification commands. The credential-free [portfolio demo](portfolio/DEMO.md) runs on port 3002; the operational dashboard runs on port 3001 and needs the backend.
 
-```bash
-# Clone the repo
-git clone https://github.com/your-org/blueprint.git
-cd blueprint
+For changes to Blueprint's multi-branch integration flow, check the configured project integration branch before opening a PR. Ordinary local development can start from the current `main`; repository cleanup must preserve deployment and release state independently.
 
-# Copy environment template
-cp .env.example .env
-
-# Edit .env with your configuration:
-# - Set LOCAL_MODE=true (runs agents as subprocess)
-# - Set ANTHROPIC_API_KEY if testing agent functionality
-# - Set ADMIN_API_KEY to a random string
-
-# Install dependencies
-npm install
-cd backend && pip install -r requirements.txt && cd ..
-cd agent && npm install && cd ..
-
-# (Optional but recommended) Install blueprint and blueprint-runner as bare commands.
-# Creates symlinks in ~/.local/bin so you can type 'blueprint status' instead of './blueprint status'.
-bash scripts/install-cli.sh
-```
-
-### 2. Starting Services
-
-**Terminal 1 — Database:**
-```bash
-docker compose up -d db
-cd backend && bash run_migrations.sh
-```
-
-**Terminal 2 — Backend API:**
-```bash
-cd backend
-export DATABASE_URL=postgresql+asyncpg://postgres:supersecret_blueprint_pass@localhost:5432/postgres
-export AGENT_JWT_SECRET=dev-jwt-secret
-export WS_TICKET_SECRET=dev-ws-ticket-secret
-export ADMIN_API_KEY=dev-admin-key
-export LOCAL_MODE=true
-export ORCHESTRATOR_URL=http://localhost:8080
-uvicorn app.main:app --reload --port 8080
-```
-
-**Terminal 3 — Frontends:**
-```bash
-npm run dev
-# Launcher UI on http://localhost:3000
-# Admin UI on http://localhost:3001
-```
-
-### 3. Creating a Feature Branch
-
-For Blueprint's own self-repo (which uses multi-branch promotion):
-```bash
-git checkout -b feature/my-feature automain  # Integration branch for self-repo
-# ... make changes ...
-git add <files>
-git commit -m "Describe the change"
-git push origin feature/my-feature
-```
-
-For other repositories:
-```bash
-git checkout -b feature/my-feature main  # Or your project's integration branch
-```
-
-See [DATA_MODELS.md — integration_branch](DATA_MODELS.md#project) for details on per-project branching configuration.
-
-### 4. Running Tests
-
-**Before committing:**
-```bash
-# Quick linting/build check
-./check
-
-# Full test suite (slower)
-bash scripts/test-backend.sh
-cd admin-ui && npm run build
-cd agent && npx tsc --noEmit
-```
-
-See [CLAUDE.md](../CLAUDE.md) for detailed test command reference.
-
-### 5. Opening a PR
-
-```bash
-# Create PR via GitHub web UI or CLI
-gh pr create --title "My feature" --body "Description"
-
-# GitHub CI runs full test suite automatically
-# Once CI passes, PR is ready for review
-```
+Run targeted backend files, frontend types/lint/unit tests for UI changes, and agent types/unit tests for runtime changes. Do not run the full backend suite or operational frontend bundle on an agent VM. The promotion PR's CI is the full release test gate.
 
 ---
 

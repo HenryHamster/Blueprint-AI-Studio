@@ -1,7 +1,7 @@
 {
   "name": "blueprint-agent",
   "version": "2.0.0",
-  "description": "Claude Code agent runner for Blueprint PVM launcher",
+  "description": "Task execution runtime for Blueprint AI Studio",
   "main": "src/index.ts",
   "type": "module",
   "scripts": {
