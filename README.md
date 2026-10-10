@@ -72,4 +72,5 @@ Start with the [documentation index](docs/README.md). For operation, see the [ru
 
 ## License
 
-The current [license](LICENSE) reserves all rights to the copyright holder.
+The [license](LICENSE) permits review and local, non-commercial evaluation.
+Other rights are reserved by the copyright holder.
