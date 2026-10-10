@@ -1,22 +1,36 @@
-# History preservation and portfolio snapshot
+# History preservation and branch cleanup
 
-The original repository accumulated a large development and release history. A curated portfolio checkout can present the final source with a single initial commit while preserving that history separately. This is a presentation boundary, not an attempt to reconstruct who wrote every line.
+Keep the project's development history and release tags. A presentable repository can retain the work that led to the current system while having a much smaller set of active branch references.
+
+The original `main` contains **8,495 commits** before the presentation cleanup. The clean checkout preserves those commits and the cleanup commits, including their original IDs, authors, dates, messages, and merge relationships. It has one active `main` branch and **49 original release tags**.
+
+## Useful points in the existing history
+
+| Point | Original reference | Date recorded in Git |
+| --- | --- | --- |
+| Initial repository | `972697d16` | March 12, 2026 |
+| Early end-to-end deployment and operator UI | `00f78de3b` | March 30, 2026 |
+| First tagged promotion | `v1` | May 23, 2026 |
+| Later platform release | `v21` | July 3, 2026 |
+| Latest existing release tag | `v53` | August 28, 2026 |
+| Latest original main commit | `4d83283bd` | September 1, 2026 |
+
+These are reading entry points taken from the existing history. Commit messages and tags describe what was recorded at the time; they do not substitute for current verification.
 
 ## Prepared artifacts
 
-The cleanup branch retains its ancestry. During the cleanup, the original refs and their complete reachable history were saved to an ignored local bundle at `.scratch/portfolio/original-history.bundle`. Git verified that the bundle records a complete history.
+The development checkout and GitHub history are unchanged by export. The original refs and complete reachable history are backed up in ignored `.scratch/portfolio/original-history.bundle`. Git verified the bundle.
 
-The clean checkout is generated into `.scratch/portfolio/clean-checkout/`. It contains the committed source plus `docs/portfolio/SNAPSHOT.json`, which identifies the original source commit and tree. It has one initial commit, no remote, and no imported local environment files or build artifacts.
+The history-preserving checkout is generated into `.scratch/portfolio/clean-checkout/`. Its final commit and tracked tree match the selected source revision exactly. It imports the selected revision's ancestry and reachable release tags, with no remotes, abandoned task branch references, local configuration, environment files, or build outputs.
 
-Local artifacts are intentionally absent from published source. Preserve the history bundle in durable private storage before discarding the original checkout. A Git bundle preserves committed objects and refs; it does not capture uncommitted files, local configuration, or arbitrary ignored artifacts.
+The previous single-commit export is superseded. It is retained privately in `.scratch/portfolio/superseded-one-commit-checkout/`.
 
 ## Reproduce
 
 From a clean, committed source checkout:
 
 ```bash
-# Preserve the original history privately
-mkdir -p .scratch/portfolio
+# Preserve all existing refs privately; use a new filename for a new backup
 git bundle create .scratch/portfolio/original-history.bundle --all
 git bundle verify .scratch/portfolio/original-history.bundle
 
@@ -24,12 +38,14 @@ git bundle verify .scratch/portfolio/original-history.bundle
 python3 scripts/export-portfolio.py .scratch/portfolio/clean-checkout
 ```
 
-The exporter reads the selected committed revision through `git archive`, initializes a new repository, and commits the exported files. It preserves tracked files even when `.gitignore` also lists them. It refuses a dirty source or existing destination and does not reset, rewrite, or push the source repository. To select another committed revision, pass `--ref`.
+The exporter copies original Git objects and checks out the selected revision. It preserves merge ancestry and annotated tag objects. It refuses a dirty source or existing destination. To export a different committed revision and its ancestry, pass `--ref`.
 
-The backup and clean checkout have different purposes. The bundle preserves the original development history; the clean checkout provides a concise source presentation. The [export tests](../../scripts/test_export_portfolio.py) exercise provenance, tracked-but-ignored files, ignored configuration exclusion, revision selection, and preservation of other work.
+The [export tests](../../scripts/test_export_portfolio.py) check original commit metadata and graph, tracked content and modes, tag preservation, abandoned-ref exclusion, revision selection, and protection of other work.
 
-## GitHub publication decision
+## GitHub branch cleanup
 
-The local cleanup does not replace the published default branch or release tags. For a portfolio, a separate repository with the curated checkout is the least disruptive publication path. It also keeps original PRs, release provenance, and operational references available in the development repository.
+At the October 9, 2026 audit, GitHub had 1,520 branches, 49 tags, and no open PRs. Branch count and commit count are separate: deleting a merged task branch reference does not delete the commits already reachable from `main`.
 
-Replacing an existing default branch's history would affect clones, open PRs, release tags, and automation. Make that choice only after deciding which repository remains operational and where the history archive will live. A clean commit history also does not settle the current proprietary license's public visibility or reuse terms; those remain the copyright holder's decision.
+A cleanup of the existing GitHub repository should identify merged task branches, preserve integration and release branches still used by automation, and retain unresolved work. The local export does not delete any remote branches or change GitHub PRs, tags, default-branch history, or visibility.
+
+Any selective squashing should be prepared separately for review, with an original-to-curated commit map and identical final source tree. The current checkout keeps the original commits.

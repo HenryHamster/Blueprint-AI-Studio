@@ -16,7 +16,7 @@ The cleanup retains the existing application UI. Its source under `admin-ui/src/
 | Full agent unit suite | **131 files, 6,615 tests passed** |
 | Selected backend tests on fresh PostgreSQL | **106 passed, 1 skipped**: capabilities, task locking, serving observation |
 | Documentation guard | **1 passed**: revised documentation references no registered retired code paths |
-| Snapshot-export tests | **5 passed**: Git identity, provenance, revision selection, content preservation, and refusal to overwrite other work |
+| History-export tests | **8 passed**: original commit IDs and metadata, merge graph, content and modes, annotated tags, abandoned-ref exclusion, revision selection, and refusal to overwrite other work |
 | Exporter Python lint | Ruff passed |
 | Real backend API startup smoke | Fresh migrations, application lifespan, and schema checks passed; `/health`, `/api/version`, and `/openapi.json` returned HTTP 200 |
 | History backup | Git verified a complete bundle; SHA-256 recorded locally |
