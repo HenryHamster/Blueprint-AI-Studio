@@ -2,7 +2,7 @@
 
 An AI coding-agent orchestration platform with a React operator workspace, a Python control plane, a TypeScript agent runtime, and local/cloud runners.
 
-Blueprint coordinates repository tasks, tracks execution and recovery, and connects changes to review and release workflows. This is a paused personal project developed with AI assistance. Running the full system requires configured infrastructure and integrations.
+Blueprint coordinates repository tasks, tracks execution and recovery, and connects changes to review and release workflows. Built Feb–Jun 2026 in a client engagement with Google's AlloyDB team; now paused. Running the full system requires configured infrastructure and integrations.
 
 [Local setup](CONTRIBUTING.md) · [Architecture](docs/ARCHITECTURE.md) · [Testing](docs/TESTING_GUIDE.md)
 
